@@ -371,25 +371,57 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // rune literal — modeled as a one-char string (slice 1)
+        // rune literal — a Go rune is an int32 code point, so it lexes to an
+        // integer token (matching string indexing and `range`, which also yield
+        // int code points). Handles the full Go escape set: `\n \t \r \0 \\ \' \"`,
+        // `\xHH` (hex byte), `\uHHHH` / `\UHHHHHHHH` (Unicode), and `\ooo` (octal).
         if c == '\'' {
             i += 1;
-            let ch = if bytes[i] == b'\\' {
+            let cp: u32 = if bytes[i] == b'\\' {
                 i += 1;
-                let c = unescape(bytes[i] as char);
-                i += 1;
-                c
+                let esc = bytes[i];
+                match esc {
+                    b'x' => {
+                        // \xHH — exactly two hex digits.
+                        i += 1;
+                        let hex = &src[i..i + 2];
+                        i += 2;
+                        u32::from_str_radix(hex, 16)
+                            .map_err(|_| format!("go-rs: bad hex rune escape on line {line}"))?
+                    }
+                    b'u' | b'U' => {
+                        // \uHHHH (4) / \UHHHHHHHH (8) — Unicode code point.
+                        let n = if esc == b'u' { 4 } else { 8 };
+                        i += 1;
+                        let hex = &src[i..i + n];
+                        i += n;
+                        u32::from_str_radix(hex, 16)
+                            .map_err(|_| format!("go-rs: bad unicode rune escape on line {line}"))?
+                    }
+                    b'0'..=b'7' => {
+                        // \ooo — exactly three octal digits.
+                        let oct = &src[i..i + 3];
+                        i += 3;
+                        u32::from_str_radix(oct, 8)
+                            .map_err(|_| format!("go-rs: bad octal rune escape on line {line}"))?
+                    }
+                    _ => {
+                        let ch = unescape(esc as char);
+                        i += 1;
+                        ch as u32
+                    }
+                }
             } else {
-                let c = src[i..].chars().next().unwrap();
-                i += c.len_utf8();
-                c
+                let ch = src[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+                ch as u32
             };
             if i >= bytes.len() || bytes[i] != b'\'' {
                 return Err(format!("go-rs: unterminated rune literal on line {line}"));
             }
             i += 1;
             out.push(Token {
-                kind: Tok::Str(ch.to_string()),
+                kind: Tok::Int(cp as i64),
                 line,
             });
             continue;

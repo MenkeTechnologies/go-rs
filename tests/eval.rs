@@ -1528,3 +1528,29 @@ func main() {
 ";
     assert_stdout(src, "2 0\n0\n");
 }
+
+#[test]
+fn rune_literals_are_int_code_points() {
+    // A Go rune is int32: a rune literal is its Unicode code point, so it prints
+    // as an integer, does arithmetic, and compares equal to a range/index value
+    // (both are code points). Escapes cover \n \xHH \uHHHH \U... and octal.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	fmt.Println('A')
+	fmt.Println('A' + 1)
+	var r rune = 'a'
+	fmt.Println(r - 'a')
+	fmt.Println('z' - '0')
+	fmt.Println(string(rune(65)))
+	for _, c := range \"cat\" {
+		if c == 'a' {
+			fmt.Println(\"found a\")
+		}
+	}
+	fmt.Println('\\n', '\\x41', '\\u00e9')
+}
+";
+    assert_stdout(src, "65\n66\n0\n74\nA\nfound a\n10 65 233\n");
+}
