@@ -1293,7 +1293,7 @@ impl Compiler {
                     self.fv_stmt(s, &mut inner, caps);
                 }
             }
-            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) => {}
+            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
         }
     }
 
@@ -1903,7 +1903,7 @@ impl Compiler {
             Expr::Int(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
-            Expr::Float(f) => {
+            Expr::Float(f, _) => {
                 self.b.emit(Op::LoadFloat(*f), 0);
             }
             Expr::Str(s) => {
@@ -1925,7 +1925,17 @@ impl Compiler {
                     0,
                 );
             }
-            Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
+            Expr::Binary { op, lhs, rhs } => {
+                // Constant float expression: evaluate exactly (rational) and round
+                // to f64 once, matching Go's arbitrary-precision constant rules.
+                if self.infer(e) == NumType::Float {
+                    if let Some(f) = fold_const_float(e) {
+                        self.b.emit(Op::LoadFloat(f), 0);
+                        return Ok(());
+                    }
+                }
+                self.binary(*op, lhs, rhs)?
+            }
             Expr::Call { func, args, line } => self.call(func, args, *line)?,
             // A bare selector `x.f` is a package constant (`math.Pi`) or a
             // struct field read.
@@ -2443,7 +2453,7 @@ impl Compiler {
     fn infer(&self, e: &Expr) -> NumType {
         match e {
             Expr::Int(_) => NumType::Int,
-            Expr::Float(_) => NumType::Float,
+            Expr::Float(..) => NumType::Float,
             Expr::Str(_) => NumType::Str,
             Expr::Bool(_) => NumType::Bool,
             Expr::Ident(name) => self.types.get(name).copied().unwrap_or(NumType::Unknown),
@@ -2526,6 +2536,100 @@ fn sub_name(f: &Func) -> String {
 /// value receiver `T` and pointer receiver `*T` mangle to the same method set.
 fn base_type(ty: &str) -> String {
     ty.trim_start_matches('*').to_string()
+}
+
+/// Fold a compile-time-constant float expression to a single `f64`, evaluated
+/// with exact rational arithmetic and rounded once — matching Go's
+/// arbitrary-precision constant semantics (where go-rs's runtime `f64` would
+/// double-round). Returns `None` for a non-constant expression or when the exact
+/// values leave the range where `f64` conversion is exact, so the caller falls
+/// back to ordinary runtime evaluation.
+fn fold_const_float(e: &Expr) -> Option<f64> {
+    let (num, den) = fold_rational(e)?;
+    rational_to_f64(num, den)
+}
+
+/// Evaluate a constant numeric expression to an exact rational `(num, den)`,
+/// `den > 0`. `None` if it references a variable/call or overflows `i128`.
+fn fold_rational(e: &Expr) -> Option<(i128, i128)> {
+    match e {
+        Expr::Int(n) => Some((*n as i128, 1)),
+        Expr::Float(_, Some((mant, scale))) => {
+            if *scale >= 0 {
+                Some((*mant, pow10(*scale as u32)?))
+            } else {
+                Some((mant.checked_mul(pow10((-scale) as u32)?)?, 1))
+            }
+        }
+        Expr::Float(_, None) => None,
+        Expr::Unary { op: UnOp::Neg, rhs } => {
+            let (a, b) = fold_rational(rhs)?;
+            Some((a.checked_neg()?, b))
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let (an, ad) = fold_rational(lhs)?;
+            let (bn, bd) = fold_rational(rhs)?;
+            let (n, d) = match op {
+                // a/b ± c/d = (a·d ± c·b) / (b·d)
+                BinOp::Add => (
+                    an.checked_mul(bd)?.checked_add(bn.checked_mul(ad)?)?,
+                    ad.checked_mul(bd)?,
+                ),
+                BinOp::Sub => (
+                    an.checked_mul(bd)?.checked_sub(bn.checked_mul(ad)?)?,
+                    ad.checked_mul(bd)?,
+                ),
+                BinOp::Mul => (an.checked_mul(bn)?, ad.checked_mul(bd)?),
+                BinOp::Div => {
+                    if bn == 0 {
+                        return None;
+                    }
+                    (an.checked_mul(bd)?, ad.checked_mul(bn)?)
+                }
+                _ => return None,
+            };
+            Some(reduce(n, d))
+        }
+        _ => None,
+    }
+}
+
+/// `10^n` as `i128`, or `None` on overflow.
+fn pow10(n: u32) -> Option<i128> {
+    10i128.checked_pow(n)
+}
+
+/// Reduce a rational to lowest terms with a positive denominator.
+fn reduce(mut n: i128, mut d: i128) -> (i128, i128) {
+    if d < 0 {
+        n = -n;
+        d = -d;
+    }
+    let g = gcd(n.unsigned_abs(), d.unsigned_abs()) as i128;
+    if g > 1 {
+        (n / g, d / g)
+    } else {
+        (n, d)
+    }
+}
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+/// Convert an exact rational to the nearest `f64`, but only when both terms are
+/// exactly representable (`< 2^53`) so the single IEEE division is correctly
+/// rounded — Go's round-once behavior. Otherwise `None` (fall back to runtime).
+fn rational_to_f64(num: i128, den: i128) -> Option<f64> {
+    const LIMIT: i128 = 1 << 53;
+    if num.abs() < LIMIT && den.abs() < LIMIT {
+        Some(num as f64 / den as f64)
+    } else {
+        None
+    }
 }
 
 /// Whether `name` is an imported package go-rs dispatches by name (so a `defer

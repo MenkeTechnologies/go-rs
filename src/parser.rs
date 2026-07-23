@@ -1113,7 +1113,7 @@ impl Parser {
         }
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
-            Tok::Float(f) => Ok(Expr::Float(f)),
+            Tok::Float(f, dec) => Ok(Expr::Float(f, dec)),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
@@ -1263,7 +1263,7 @@ impl Parser {
 /// The zero-value expression for a Go element type (drives `make([]T, n)` fill).
 fn zero_expr(ty: &str) -> Expr {
     match ty {
-        "float32" | "float64" => Expr::Float(0.0),
+        "float32" | "float64" => Expr::Float(0.0, Some((0, 0))),
         "string" => Expr::Str(String::new()),
         "bool" => Expr::Bool(false),
         _ => Expr::Int(0),

@@ -28,7 +28,10 @@ pub struct Token {
 pub enum Tok {
     // literals & names
     Int(i64),
-    Float(f64),
+    /// A float literal: its `f64` value and, when it fits, an exact decimal
+    /// `(mantissa, scale)` meaning `mantissa · 10⁻ˢᶜᵃˡᵉ` — used to constant-fold
+    /// float expressions with Go's arbitrary-precision rounding.
+    Float(f64, Option<(i128, i32)>),
     Str(String),
     Ident(String),
     // keywords
@@ -111,7 +114,7 @@ impl Tok {
             self,
             Tok::Ident(_)
                 | Tok::Int(_)
-                | Tok::Float(_)
+                | Tok::Float(..)
                 | Tok::Str(_)
                 | Tok::True
                 | Tok::False
@@ -247,7 +250,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     .parse()
                     .map_err(|_| format!("go-rs: bad float literal `{text}` on line {line}"))?;
                 out.push(Token {
-                    kind: Tok::Float(v),
+                    kind: Tok::Float(v, exact_decimal(text)),
                     line,
                 });
             } else {
@@ -403,6 +406,27 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         line,
     });
     Ok(out)
+}
+
+/// Parse a decimal float literal into an exact `(mantissa, scale)` such that its
+/// value is `mantissa · 10⁻ˢᶜᵃˡᵉ`. Returns `None` for exponent forms or when the
+/// digits overflow `i128` (the constant folder then falls back to `f64`).
+fn exact_decimal(text: &str) -> Option<(i128, i32)> {
+    // Exponent literals (`1e9`, `2.5e-3`) are left to the f64 path.
+    if text.contains(['e', 'E']) {
+        return None;
+    }
+    let (sign, body) = match text.strip_prefix('-') {
+        Some(rest) => (-1i128, rest),
+        None => (1i128, text),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (body, ""),
+    };
+    let digits = format!("{int_part}{frac_part}");
+    let mantissa: i128 = digits.parse().ok()?;
+    Some((sign * mantissa, frac_part.len() as i32))
 }
 
 fn keyword_or_ident(word: &str) -> Tok {

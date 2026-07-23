@@ -1016,3 +1016,21 @@ func main() {
 ";
     assert_stdout(src, "0 1 2\n");
 }
+
+#[test]
+fn constant_float_expressions_fold_exactly() {
+    // A compile-time-constant float expression is evaluated with Go's
+    // arbitrary-precision rounding (round once), not runtime f64 double-rounding.
+    // `1.950 * 10.187` and `0.1 + 0.2` are the classic differing cases.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	fmt.Printf(\"%.10f\\n\", 1.950*10.187)
+	fmt.Println(0.1 + 0.2)
+	fmt.Println(2.5 * 4.0)
+	fmt.Printf(\"%.10f\\n\", 100.0/8.0)
+}
+";
+    assert_stdout(src, "19.8646500000\n0.3\n10\n12.5000000000\n");
+}

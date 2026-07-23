@@ -170,7 +170,9 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
-    Float(f64),
+    /// A float literal: its `f64` value plus, when representable, an exact
+    /// decimal `(mantissa, scale)` (`mantissa · 10⁻ˢᶜᵃˡᵉ`) for constant folding.
+    Float(f64, Option<(i128, i32)>),
     Str(String),
     Bool(bool),
     Ident(String),

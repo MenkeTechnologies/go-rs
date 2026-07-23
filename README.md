@@ -201,15 +201,15 @@ map / control-flow / stdlib blocks and diffs both interpreters. go-rs runs
 single-file `package main` against its built-in stdlib subset — it has no module
 system, so `go get` / third-party imports are out of scope.
 
+Constant float expressions are **folded exactly** — go-rs evaluates a
+compile-time-constant float expression (`1.950 * 10.187`, `0.1 + 0.2`) with exact
+rational arithmetic and rounds to `f64` once, matching Go's arbitrary-precision
+constant semantics (a very long decimal or a non-terminating division whose exact
+terms leave the `f64`-exact range falls back to runtime `f64`).
+
 **Known, characterized divergences** (the harness surfaced these; they are
 documented rather than hidden):
 
-- **Constant folding of float arithmetic.** Go evaluates a *constant* float
-  expression (`1.950 * 10.187`) with arbitrary precision and rounds once; go-rs
-  evaluates it as runtime `f64` (double-rounded, like Rust), so the last digit of
-  a `%f` can differ. go-rs matches Go's *variable/runtime* float semantics
-  (`a := 1.950; a * b`) exactly — the fuzzer routes float operands through
-  variables to test that.
 - **Named return values** are not modeled as storage, so a deferred closure that
   assigns to a named result (`func f() (err error) { defer func(){ err = … }() }`)
   does not change what `f` returns (a plain `return v` and unnamed results work).

@@ -80,12 +80,50 @@ fn int_expr(rng: &mut Rng, depth: u32) -> String {
     }
 }
 
+/// A *constant* float expression: literal leaves and `+ - * /` only. go-rs
+/// constant-folds these with exact rational arithmetic and rounds once, matching
+/// Go's arbitrary-precision constant semantics, so both interpreters agree. Uses
+/// one-fractional-digit decimals and safe divisors so the exact terms stay in
+/// the `f64`-exact range.
+fn const_float_expr(rng: &mut Rng, depth: u32) -> String {
+    // One fractional digit (denominator 10) keeps the exact rational terms well
+    // inside the f64-exact range even after a few operations, so go-rs folds
+    // rather than falling back to runtime f64.
+    let lit = |rng: &mut Rng| format!("{}.{}", rng.int(1, 12), rng.below(10));
+    if depth == 0 || rng.below(3) == 0 {
+        return lit(rng);
+    }
+    match rng.below(4) {
+        0 => format!(
+            "({} + {})",
+            const_float_expr(rng, depth - 1),
+            const_float_expr(rng, depth - 1)
+        ),
+        1 => format!(
+            "({} - {})",
+            const_float_expr(rng, depth - 1),
+            const_float_expr(rng, depth - 1)
+        ),
+        2 => format!(
+            "({} * {})",
+            const_float_expr(rng, depth - 1),
+            const_float_expr(rng, depth - 1)
+        ),
+        // Divide by a small non-zero literal.
+        _ => format!(
+            "({} / {}.{})",
+            const_float_expr(rng, depth - 1),
+            rng.int(1, 12),
+            rng.below(10) + 1
+        ),
+    }
+}
+
 /// A float expression over the given (runtime) variables. Leaves are variables,
-/// NOT literals: Go evaluates a constant float expression with arbitrary
-/// precision and rounds once, but any variable forces the runtime `f64` path
-/// (double-rounded) that go-rs implements — so combining variables keeps both
-/// sides on the same footing. (The constant-folding difference is a documented
-/// go-rs limitation, tested here only via single literals, never arithmetic.)
+/// NOT literals: any variable forces the runtime `f64` path (double-rounded)
+/// that go-rs implements, so combining variables keeps both sides on the same
+/// footing. Constant (literal) float arithmetic is covered separately by
+/// [`const_float_expr`], which go-rs folds exactly.
 fn float_expr(rng: &mut Rng, vars: &[String], depth: u32) -> String {
     if depth == 0 || vars.is_empty() || rng.below(3) == 0 {
         return rng.pick(vars).clone();
@@ -175,7 +213,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix.
 fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
-    match rng.below(10) {
+    match rng.below(11) {
         0 => format!(
             "\tfmt.Printf(\"%d %d\\n\", {}, {})\n",
             int_expr(rng, 3),
@@ -237,6 +275,9 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
                 "\tfmt.Println(strings.ToUpper({s}), strings.Contains({s}, {sub}), strings.Count({s}, {sub}))\n"
             )
         }
+        // constant float expression (folded exactly by go-rs, matching Go's
+        // arbitrary-precision constant rounding)
+        9 => format!("\tfmt.Printf(\"%.8f\\n\", {})\n", const_float_expr(rng, 2)),
         // math stdlib (fixed precision so both format identically)
         _ => {
             uses.math = true;
