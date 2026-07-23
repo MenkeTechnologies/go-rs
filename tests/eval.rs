@@ -1484,3 +1484,26 @@ func main() {
 ";
     assert_stdout(src, "boom\nboom\n");
 }
+
+#[test]
+fn fmt_calls_error_and_stringer_methods() {
+    // fmt prints a value implementing error/Stringer via its method (Go's fmt
+    // interface handling), synthesized as `$stringify` and wrapped around args.
+    let src = "\
+package main
+import \"fmt\"
+type Color struct{ r, g, b int }
+func (c Color) String() string { return fmt.Sprintf(\"#%02x%02x%02x\", c.r, c.g, c.b) }
+type myErr struct{ msg string }
+func (e *myErr) Error() string { return e.msg }
+func main() {
+	c := Color{255, 128, 0}
+	fmt.Println(c)
+	fmt.Printf(\"%v %s\\n\", c, c)
+	var err error = &myErr{\"nope\"}
+	fmt.Println(err)
+	fmt.Println(\"plain\", 42, true)
+}
+";
+    assert_stdout(src, "#ff8000\n#ff8000 #ff8000\nnope\nplain 42 true\n");
+}

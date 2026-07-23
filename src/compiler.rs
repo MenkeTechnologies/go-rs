@@ -3100,8 +3100,21 @@ impl Compiler {
                             ))
                         }
                     };
+                    // A value implementing `error`/`Stringer` prints via its
+                    // method; `$stringify` (synthesized when such a type exists)
+                    // does that at runtime and passes other values through.
+                    let has_stringify = self.funcs.contains_key("$stringify");
                     for a in args {
-                        self.expr(a)?;
+                        if has_stringify {
+                            self.call(
+                                &Expr::Ident("$stringify".to_string()),
+                                std::slice::from_ref(a),
+                                false,
+                                line,
+                            )?;
+                        } else {
+                            self.expr(a)?;
+                        }
                     }
                     self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
                     return Ok(());

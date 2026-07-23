@@ -48,7 +48,73 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     }
     init_globals.extend(std::mem::take(&mut main.main));
     main.main = init_globals;
+    add_stringify(&mut main);
     Ok(main)
+}
+
+/// Synthesize the `$stringify` helper — a type switch over every type with a
+/// zero-argument `Error()`/`String()` method that calls it — so `fmt` prints
+/// error and `Stringer` values via their method (Go's fmt interface handling).
+/// The compiler wraps each `fmt.Print*`/`Sprint*` argument with a call to it.
+fn add_stringify(prog: &mut Program) {
+    // type → the method fmt should call (Error preferred over String).
+    let mut chosen: HashMap<String, &str> = HashMap::new();
+    for method in ["String", "Error"] {
+        for f in &prog.funcs {
+            if let Some(r) = &f.receiver {
+                if f.name == method && f.params.is_empty() {
+                    let ty = r.ty.trim_start_matches('*').to_string();
+                    chosen.insert(ty, method); // Error's later pass wins
+                }
+            }
+        }
+    }
+    if chosen.is_empty() {
+        return;
+    }
+    let mut types: Vec<_> = chosen.into_iter().collect();
+    types.sort(); // deterministic case order
+    let cases: Vec<TypeSwitchCase> = types
+        .into_iter()
+        .map(|(ty, method)| TypeSwitchCase {
+            types: vec![ty],
+            body: vec![Stmt::Return(
+                vec![Expr::Call {
+                    func: Box::new(Expr::Selector {
+                        recv: Box::new(Expr::Ident("$t".to_string())),
+                        field: method.to_string(),
+                    }),
+                    args: vec![],
+                    spread: false,
+                    line: 0,
+                }],
+                0,
+            )],
+        })
+        .collect();
+    prog.funcs.push(Func {
+        name: "$stringify".to_string(),
+        receiver: None,
+        params: vec![Param {
+            name: "$v".to_string(),
+            ty: "any".to_string(),
+        }],
+        variadic: false,
+        results: vec!["any".to_string()],
+        result_names: vec![String::new()],
+        body: vec![
+            Stmt::TypeSwitch {
+                init: None,
+                bind: Some("$t".to_string()),
+                expr: Expr::Ident("$v".to_string()),
+                cases,
+                default: None,
+                line: 0,
+            },
+            Stmt::Return(vec![Expr::Ident("$v".to_string())], 0),
+        ],
+        line: 0,
+    });
 }
 
 /// Load `path` and its (source) imports depth-first, qualifying each package's
