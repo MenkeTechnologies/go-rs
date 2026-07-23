@@ -769,46 +769,123 @@ fn sprintf(args: &[Value]) -> String {
     let fmt = args.first().map(go_str).unwrap_or_default();
     let mut out = String::new();
     let mut rest = args.iter().skip(1);
-    let bytes = fmt.as_bytes();
+    let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            out.push(bytes[i] as char);
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
             i += 1;
             continue;
         }
         i += 1;
-        if i >= bytes.len() {
+        if i >= chars.len() {
             out.push('%');
             break;
         }
-        // Skip flags/width/precision until the verb letter.
-        while i < bytes.len() && matches!(bytes[i], b'+' | b'-' | b'#' | b' ' | b'0' | b'.') {
+        // flags
+        let (mut left, mut zero, mut plus) = (false, false, false);
+        while i < chars.len() {
+            match chars[i] {
+                '-' => left = true,
+                '0' => zero = true,
+                '+' => plus = true,
+                ' ' | '#' => {}
+                _ => break,
+            }
             i += 1;
         }
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        // width
+        let mut width = 0usize;
+        let mut has_width = false;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            has_width = true;
+            width = width * 10 + (chars[i] as usize - '0' as usize);
             i += 1;
         }
-        if i >= bytes.len() {
+        // precision
+        let mut prec: Option<usize> = None;
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            let mut p = 0usize;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                p = p * 10 + (chars[i] as usize - '0' as usize);
+                i += 1;
+            }
+            prec = Some(p);
+        }
+        if i >= chars.len() {
             break;
         }
-        let verb = bytes[i] as char;
+        let verb = chars[i];
         i += 1;
-        match verb {
-            '%' => out.push('%'),
-            't' => out.push_str(&rest.next().map(go_str).unwrap_or_default()),
-            'q' => {
-                let s = rest.next().map(go_str).unwrap_or_default();
-                out.push('"');
-                out.push_str(&s);
-                out.push('"');
+
+        // Render the argument per verb (nil-safe on a missing argument).
+        let body = match verb {
+            '%' => {
+                out.push('%');
+                continue;
             }
-            'f' => {
-                let v = rest.next().cloned().unwrap_or(Value::Undef);
-                out.push_str(&format!("{:.6}", v.to_float()));
+            't' => rest.next().map(go_str).unwrap_or_default(),
+            'q' => format!("\"{}\"", rest.next().map(go_str).unwrap_or_default()),
+            'f' | 'F' => {
+                let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
+                let s = format!("{:.*}", prec.unwrap_or(6), v);
+                if plus && v >= 0.0 {
+                    format!("+{s}")
+                } else {
+                    s
+                }
             }
-            // %v, %d, %s and anything else: Go's default rendering.
-            _ => out.push_str(&rest.next().map(go_str).unwrap_or_default()),
+            'd' => {
+                let n = rest.next().map(|v| v.to_int()).unwrap_or(0);
+                if plus && n >= 0 {
+                    format!("+{n}")
+                } else {
+                    n.to_string()
+                }
+            }
+            'x' => format!("{:x}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
+            'X' => format!("{:X}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
+            'o' => format!("{:o}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
+            'b' => format!("{:b}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
+            'c' => char::from_u32(rest.next().map(|v| v.to_int()).unwrap_or(0) as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+            // %v, %s and anything else: Go's `%v` rendering, with precision
+            // truncating a string.
+            _ => {
+                let mut s = rest.next().map(go_str).unwrap_or_default();
+                if let Some(p) = prec {
+                    if s.chars().count() > p {
+                        s = s.chars().take(p).collect();
+                    }
+                }
+                s
+            }
+        };
+
+        // Apply width padding (right-justified by default; `-` left, `0` zero-fill
+        // for numeric verbs, after any sign).
+        let body_len = body.chars().count();
+        if has_width && body_len < width {
+            let pad = width - body_len;
+            if left {
+                out.push_str(&body);
+                out.push_str(&" ".repeat(pad));
+            } else if zero && matches!(verb, 'd' | 'f' | 'F' | 'x' | 'X' | 'o' | 'b') {
+                let (sign, digits) = match body.strip_prefix(['-', '+']) {
+                    Some(d) => (&body[..1], d),
+                    None => ("", body.as_str()),
+                };
+                out.push_str(sign);
+                out.push_str(&"0".repeat(pad));
+                out.push_str(digits);
+            } else {
+                out.push_str(&" ".repeat(pad));
+                out.push_str(&body);
+            }
+        } else {
+            out.push_str(&body);
         }
     }
     out
@@ -841,6 +918,7 @@ pub mod stdlib {
     pub const TITLE: u16 = 846;
     pub const EQUAL_FOLD: u16 = 847;
     pub const LAST_INDEX: u16 = 848;
+    pub const REPLACE: u16 = 849;
     // strconv.*
     pub const ITOA: u16 = 850;
     pub const ATOI: u16 = 851;
@@ -880,6 +958,7 @@ pub mod stdlib {
             ("strings", "Join") => JOIN,
             ("strings", "Repeat") => REPEAT,
             ("strings", "Index") => INDEX,
+            ("strings", "Replace") => REPLACE,
             ("strings", "ReplaceAll") => REPLACE_ALL,
             ("strings", "Fields") => FIELDS,
             ("strings", "Count") => COUNT,
@@ -938,6 +1017,7 @@ pub mod stdlib {
         vm.register_builtin(HAS_SUFFIX, |vm, a| b2(vm, a, |s, p| s.ends_with(p)));
         vm.register_builtin(INDEX, b_index);
         vm.register_builtin(REPEAT, b_repeat);
+        vm.register_builtin(REPLACE, b_replace);
         vm.register_builtin(REPLACE_ALL, b_replace_all);
         vm.register_builtin(SPLIT, b_split);
         vm.register_builtin(FIELDS, b_fields);
@@ -1127,6 +1207,16 @@ pub mod stdlib {
         let s = args.first().map(go_str).unwrap_or_default();
         let n = args.get(1).map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
         Value::str(s.repeat(n))
+    }
+
+    fn b_replace(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let old = args.get(1).map(go_str).unwrap_or_default();
+        let new = args.get(2).map(go_str).unwrap_or_default();
+        let n = args.get(3).map(|v| v.to_int()).unwrap_or(-1);
+        if old.is_empty() { return Value::str(s); }
+        Value::str(if n < 0 { s.replace(&old, &new) } else { s.replacen(&old, &new, n as usize) })
     }
 
     fn b_replace_all(vm: &mut VM, argc: u8) -> Value {

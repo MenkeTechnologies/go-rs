@@ -643,20 +643,41 @@ impl Compiler {
                 values,
                 line,
             } => {
-                if names.len() != values.len() {
+                // `a, b := f()` where `f` returns a single value in go-rs (e.g.
+                // `n, err := strconv.Atoi(s)`): bind the first name to the call
+                // result and the rest to nil. Go's multi-value returns are a
+                // future wave; this covers the common comma-ok / (v, err) idiom.
+                if names.len() > values.len()
+                    && values.len() == 1
+                    && matches!(&values[0], Expr::Call { .. })
+                {
+                    let e = &values[0];
+                    let nt = self.infer(e);
+                    let dt = self.type_name(e);
+                    self.emit_rhs(&names[0], e)?;
+                    self.types.insert(names[0].clone(), nt);
+                    self.decl_types.insert(names[0].clone(), dt);
+                    self.emit_set(&names[0], *line);
+                    for name in &names[1..] {
+                        self.b.emit(Op::LoadUndef, *line);
+                        self.types.insert(name.clone(), NumType::Unknown);
+                        self.emit_set(name, *line);
+                    }
+                } else if names.len() != values.len() {
                     return Err(format!(
                         "go-rs: assignment mismatch: {} variables but {} values (line {line})",
                         names.len(),
                         values.len()
                     ));
-                }
-                for (name, e) in names.iter().zip(values) {
-                    let nt = self.infer(e);
-                    let dt = self.type_name(e);
-                    self.emit_rhs(name, e)?;
-                    self.types.insert(name.clone(), nt);
-                    self.decl_types.insert(name.clone(), dt);
-                    self.emit_set(name, *line);
+                } else {
+                    for (name, e) in names.iter().zip(values) {
+                        let nt = self.infer(e);
+                        let dt = self.type_name(e);
+                        self.emit_rhs(name, e)?;
+                        self.types.insert(name.clone(), nt);
+                        self.decl_types.insert(name.clone(), dt);
+                        self.emit_set(name, *line);
+                    }
                 }
             }
             Stmt::Assign {

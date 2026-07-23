@@ -989,7 +989,13 @@ impl Parser {
         self.expect(&Tok::LBrace)?;
         let mut elems = Vec::new();
         while !matches!(self.peek(), Tok::RBrace) {
-            elems.push(self.expr()?);
+            // Elided element type: `[]T{ {…}, {…} }` — a bare `{…}` is a
+            // composite literal of the slice's element type.
+            if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&elem_ty) {
+                elems.push(self.struct_literal(elem_ty.clone())?);
+            } else {
+                elems.push(self.expr()?);
+            }
             if !self.eat(&Tok::Comma) {
                 break;
             }
