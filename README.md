@@ -118,14 +118,15 @@ Real Go, executed on fusevm:
 | Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
 | Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), parallel assignment `a, b = x, y` (swap/rotate; RHS evaluated first), `a, b = f()`, `+= -= *= /= %=`, `x++` / `x--` |
 | Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause / `fallthrough`) and type switch, `break`, `continue`, `return` |
-| Expressions    | int / float / string / bool literals (incl. `0x` / `0o` / `0b` bases and `_` separators), arithmetic, bitwise `& \| ^ << >> &^` (+ `^x` complement, compound `&= \|= ^= <<= >>= &^=`), comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
-| Types          | `int` family, `float32/64`, `string`, `bool`, defined types (`type Celsius float64`) — tracked statically so `int / int` truncates and `float / float` stays exact; conversions `T(x)` (`int(f)`, `float64(n)`, `string(rune)`, `byte`/`rune`/…) |
+| Expressions    | int / float / string / bool literals (incl. `0x` / `0o` / `0b` bases, `_` separators, and uint64 masks above `i64::MAX` stored by bit pattern), rune literals as int32 code points (`'A'` == 65, `'z' - '0'`) with the full escape set (`\n \t \xHH \uHHHH \UHHHHHHHH` + octal, in rune **and** string literals), arithmetic, bitwise `& \| ^ << >> &^` (+ `^x` complement, compound `&= \|= ^= <<= >>= &^=`), comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
+| Types          | `int` family, `float32/64`, `string`, `bool`, defined types (`type Celsius float64`) — tracked statically so `int / int` truncates and `float / float` stays exact; conversions `T(x)` (`int(f)`, `float64(n)`, `string(rune)`, `byte`/`rune`/…) and slice conversions `[]byte(s)` / `[]rune(s)` (and `string([]byte)` / `string([]rune)` back) |
 | Constants      | `const x = …` and grouped `const ( … )` blocks with `iota` (auto-increment, expression repetition, `1 << iota` flag patterns) |
-| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` (also on strings) that **share the backing array** (writes alias the parent; `cap` reflects the offset; `append` writes in place when the backing has room, else reallocates), `len` / `cap` / `append`, `for i, v := range s` |
+| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` / three-index `s[lo:hi:max]` (capacity bound accepted; also on strings) that **share the backing array** (writes alias the parent; `cap` reflects the offset; `append` writes in place when the backing has room, else reallocates), `len` / `cap` / `append`, `for i, v := range s`; ranging a **string** yields runes (byte offset + code point, once per rune) |
+| Arrays         | fixed-size `[N]T` / `[...]T` (modeled as slices): sequential `[3]int{…}`, sparse index-keyed `[N]T{3: v}` with zero-fill, struct elements with elided `{…}`, and bare `var buf [N]scalar` zero-filled to N |
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m` |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
-| Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref; a pointer shares the pointed-to struct |
+| Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref, `new(T)` (a pointer to a zero value of `T`); a pointer shares the pointed-to struct |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type; `any`/`interface{}` values, type assertions `x.(T)` (+ comma-ok `v, ok := x.(T)`), and type switches `switch v := x.(type) { case T: … }` |
 | Closures       | function literals `func(…){…}` with **capture-by-reference** (a closure mutating a captured variable propagates, and closures share captured state); `f := func(){…}; f()`, IIFE, `go func(){…}()`; Go 1.22 per-iteration loop-variable capture |
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
@@ -134,7 +135,7 @@ Real Go, executed on fusevm:
 | defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
 | panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; **runtime faults** (integer divide-by-zero, index-out-of-range, nil dereference) are recoverable too — `recover()` returns the `runtime error: …` value; an unrecovered panic prints `panic: <value>` and exits non-zero (matching Go, minus the goroutine trace) |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
-| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
+| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`new`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
 Goroutines, channels, and `select` run on a **cooperative scheduler added to the
@@ -226,7 +227,12 @@ terms leave the `f64`-exact range falls back to runtime `f64`).
   runtime internals don't load yet. `fmt`/`strings`/`strconv`/`math`/`sort`/`os`
   are provided by the native runtime layer.
 - **No fixed-width integer overflow wrapping** — all integers are 64-bit, so code
-  relying on `uint8`/`uint16`/`uint32` wraparound (some hashes) diverges.
+  relying on `uint8`/`uint16`/`uint32` wraparound (some hashes) diverges. A uint64
+  constant prints as its signed `i64` (its bit pattern is correct for bitwise use).
+- **Struct value semantics have a replication boundary** — a bare `var a [N]Struct`
+  (no literal) and circular self-referential structures share one element handle
+  rather than N distinct zero values; array/slice literals with explicit struct
+  elements copy correctly.
 
 ## License
 

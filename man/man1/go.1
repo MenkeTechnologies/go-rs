@@ -23,8 +23,16 @@ vimlrs, elisprs, rubylang, javars, kotlinrs, and scalars. There is no bespoke VM
 and no Go runtime; execution and codegen live in fusevm, with no goroutine
 scheduler and no garbage collector.
 .PP
-The current slice runs a single\-file
-.BR "package main" :
+A program is a
+.B package main
+plus any imported packages, which go\-rs resolves from real Go source (installed
+under
+.IR ~/.go\-rs ,
+vendored in the binary, or
+.IR $GOROOT ),
+links into one unit, and compiles \(em an executor swap, not a reimplementation.
+A native layer provides
+.BR fmt / strings / strconv / math / sort / os .
 go\-rs executes the body of
 .B func main
 and lowers every other top\-level
