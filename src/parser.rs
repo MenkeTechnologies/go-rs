@@ -1514,11 +1514,25 @@ impl Parser {
         }
     }
 
-    /// `[]T{ e0, e1, … }`.
+    /// `[]T{ e0, e1, … }` (slice composite literal) or `[]T(x)` (a slice
+    /// conversion — `[]byte(s)` / `[]rune(s)`).
     fn slice_literal(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::LBracket)?;
         self.expect(&Tok::RBracket)?;
         let elem_ty = self.type_name()?;
+        // `[]byte(x)` / `[]rune(x)` — a conversion, not a composite literal.
+        if matches!(self.peek(), Tok::LParen) {
+            let line = self.line();
+            self.expect(&Tok::LParen)?;
+            let arg = self.expr()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::Call {
+                func: Box::new(Expr::Ident(format!("[]{elem_ty}"))),
+                args: vec![arg],
+                spread: false,
+                line,
+            });
+        }
         self.expect(&Tok::LBrace)?;
         let mut elems = Vec::new();
         while !matches!(self.peek(), Tok::RBrace) {

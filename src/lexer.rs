@@ -258,12 +258,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         i += 1;
                     }
                     let digits = src[ds..i].replace('_', "");
-                    let v = i64::from_str_radix(&digits, radix).map_err(|_| {
-                        format!(
-                            "go-rs: bad integer literal `{}` on line {line}",
-                            &src[start..i]
-                        )
-                    })?;
+                    // A value above i64::MAX (a uint64 constant like
+                    // 0x8080808080808080) is reinterpreted as the i64 with the
+                    // same bit pattern — go-rs stores integers in an i64.
+                    let v = i64::from_str_radix(&digits, radix)
+                        .or_else(|_| u64::from_str_radix(&digits, radix).map(|u| u as i64))
+                        .map_err(|_| {
+                            format!(
+                                "go-rs: bad integer literal `{}` on line {line}",
+                                &src[start..i]
+                            )
+                        })?;
                     out.push(Token {
                         kind: Tok::Int(v),
                         line,
@@ -308,6 +313,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             } else {
                 let v: i64 = clean
                     .parse()
+                    .or_else(|_| clean.parse::<u64>().map(|u| u as i64))
                     .map_err(|_| format!("go-rs: bad integer literal `{text}` on line {line}"))?;
                 out.push(Token {
                     kind: Tok::Int(v),
@@ -323,9 +329,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let mut s = String::new();
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 1;
-                    s.push(unescape(bytes[i] as char));
-                    i += 1;
+                    let (cp, next) = scan_escape(src, bytes, i + 1);
+                    s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    i = next;
                 } else {
                     let ch = src[i..].chars().next().unwrap();
                     if ch == '\n' {
@@ -378,39 +384,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         if c == '\'' {
             i += 1;
             let cp: u32 = if bytes[i] == b'\\' {
-                i += 1;
-                let esc = bytes[i];
-                match esc {
-                    b'x' => {
-                        // \xHH — exactly two hex digits.
-                        i += 1;
-                        let hex = &src[i..i + 2];
-                        i += 2;
-                        u32::from_str_radix(hex, 16)
-                            .map_err(|_| format!("go-rs: bad hex rune escape on line {line}"))?
-                    }
-                    b'u' | b'U' => {
-                        // \uHHHH (4) / \UHHHHHHHH (8) — Unicode code point.
-                        let n = if esc == b'u' { 4 } else { 8 };
-                        i += 1;
-                        let hex = &src[i..i + n];
-                        i += n;
-                        u32::from_str_radix(hex, 16)
-                            .map_err(|_| format!("go-rs: bad unicode rune escape on line {line}"))?
-                    }
-                    b'0'..=b'7' => {
-                        // \ooo — exactly three octal digits.
-                        let oct = &src[i..i + 3];
-                        i += 3;
-                        u32::from_str_radix(oct, 8)
-                            .map_err(|_| format!("go-rs: bad octal rune escape on line {line}"))?
-                    }
-                    _ => {
-                        let ch = unescape(esc as char);
-                        i += 1;
-                        ch as u32
-                    }
-                }
+                let (cp, next) = scan_escape(src, bytes, i + 1);
+                i = next;
+                cp
             } else {
                 let ch = src[i..].chars().next().unwrap();
                 i += ch.len_utf8();
@@ -574,6 +550,32 @@ fn unescape(c: char) -> char {
         '`' => '`',
         '\'' => '\'',
         other => other,
+    }
+}
+
+/// Scan a Go escape sequence. `i` indexes the character just after the `\`.
+/// Returns the resulting Unicode code point and the index past the sequence.
+/// Handles `\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\ooo` (octal), and the simple
+/// single-char escapes (`\n \t \r \0 \\ \' \"` …).
+fn scan_escape(src: &str, bytes: &[u8], i: usize) -> (u32, usize) {
+    match bytes[i] {
+        b'x' => {
+            let hex = &src[i + 1..i + 3];
+            (u32::from_str_radix(hex, 16).unwrap_or(0xFFFD), i + 3)
+        }
+        b'u' => {
+            let hex = &src[i + 1..i + 5];
+            (u32::from_str_radix(hex, 16).unwrap_or(0xFFFD), i + 5)
+        }
+        b'U' => {
+            let hex = &src[i + 1..i + 9];
+            (u32::from_str_radix(hex, 16).unwrap_or(0xFFFD), i + 9)
+        }
+        b'0'..=b'7' => {
+            let oct = &src[i..i + 3];
+            (u32::from_str_radix(oct, 8).unwrap_or(0xFFFD), i + 3)
+        }
+        other => (unescape(other as char) as u32, i + 1),
     }
 }
 

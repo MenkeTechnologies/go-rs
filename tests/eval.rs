@@ -1554,3 +1554,61 @@ func main() {
 ";
     assert_stdout(src, "65\n66\n0\n74\nA\nfound a\n10 65 233\n");
 }
+
+#[test]
+fn byte_and_rune_slice_conversions() {
+    // []byte(s) yields the UTF-8 bytes; []rune(s) yields the code points; and
+    // string() converts each back — a []byte is UTF-8-decoded, a []rune is
+    // code-point-joined (go-rs erases the element type, so string() decides by
+    // whether the bytes form valid multibyte UTF-8).
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	s := \"AB\\u00e9\"
+	b := []byte(s)
+	fmt.Println(b, len(b))
+	r := []rune(s)
+	fmt.Println(r, len(r))
+	fmt.Println(string(b))
+	fmt.Println(string(r))
+	fmt.Println(string([]rune{72, 233, 108, 108, 111}))
+}
+";
+    assert_stdout(
+        src,
+        "[65 66 195 169] 4\n[65 66 233] 3\nAB\u{e9}\nAB\u{e9}\nH\u{e9}llo\n",
+    );
+}
+
+#[test]
+fn large_hex_literals_wrap_to_bit_pattern() {
+    // A base-prefixed constant above i64::MAX (a uint64 bit mask) is stored as
+    // the i64 with the same bit pattern, so bitwise use matches Go.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	const mask = 0x8080808080808080
+	fmt.Println(mask & 0xFF)
+	fmt.Println(0x0A&0x0F, 0xFF00>>8, 0o17, 0b1010)
+}
+";
+    assert_stdout(src, "128\n10 255 15 10\n");
+}
+
+#[test]
+fn string_literal_escapes() {
+    // Interpreted string literals decode the full Go escape set: \xHH byte,
+    // \uHHHH and \UHHHHHHHH Unicode, \ooo octal, and simple char escapes.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	fmt.Println(\"tab\\there\")
+	fmt.Println(\"A=\\x41 e=\\u00e9 smile=\\U0001F600\")
+	fmt.Println(\"octal-A=\\101\")
+}
+";
+    assert_stdout(src, "tab\there\nA=A e=\u{e9} smile=\u{1F600}\noctal-A=A\n");
+}

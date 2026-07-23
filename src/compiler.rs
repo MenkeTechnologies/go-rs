@@ -3578,6 +3578,9 @@ fn is_conversion_type(name: &str) -> bool {
             | "float64"
             | "string"
             | "bool"
+            // Slice conversions from a string: `[]byte(s)` / `[]rune(s)`.
+            | "[]byte"
+            | "[]rune"
     )
 }
 

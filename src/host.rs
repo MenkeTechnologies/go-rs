@@ -234,6 +234,22 @@ fn b_conv(vm: &mut VM, argc: u8) -> Value {
         "float64" => Value::Float(v.to_float()),
         "bool" => Value::bool(v.is_truthy()),
         "string" => conv_string(&v),
+        // `[]byte(s)` — the string's UTF-8 bytes as a slice of ints.
+        "[]byte" => match &v {
+            Value::Str(s) => {
+                let elems = s.bytes().map(|b| Value::Int(b as i64)).collect();
+                Value::Obj(heap_alloc(HostObj::Slice(elems)))
+            }
+            _ => v,
+        },
+        // `[]rune(s)` — the string's Unicode code points as a slice of ints.
+        "[]rune" => match &v {
+            Value::Str(s) => {
+                let elems = s.chars().map(|c| Value::Int(c as i64)).collect();
+                Value::Obj(heap_alloc(HostObj::Slice(elems)))
+            }
+            _ => v,
+        },
         // An unknown/named type conversion is the identity (dynamic value model).
         _ => v,
     }
@@ -260,9 +276,28 @@ fn conv_string(v: &Value) -> Value {
         }
         Value::Obj(id) => {
             if let Some((_, _, len)) = slice_backing(*id) {
-                let s: String = (0..len)
+                let elems: Vec<i64> = (0..len)
                     .filter_map(|i| slice_get(*id, i))
-                    .filter_map(|e| char::from_u32(e.to_int() as u32))
+                    .map(|e| e.to_int())
+                    .collect();
+                // go-rs erases the slice element type, so `string(slice)` must
+                // disambiguate `[]byte` (UTF-8 bytes to decode) from `[]rune`
+                // (code points to join). If every element is a byte and they form
+                // a valid multibyte UTF-8 sequence, decode as bytes; otherwise
+                // join as code points. This makes `string([]byte(s)) == s` for a
+                // real string while a lone code point ≥ 128 (not valid standalone
+                // UTF-8) still joins as a rune.
+                let all_bytes = elems.iter().all(|&e| (0..=255).contains(&e));
+                let has_high = elems.iter().any(|&e| e >= 128);
+                if all_bytes && has_high {
+                    let bytes: Vec<u8> = elems.iter().map(|&e| e as u8).collect();
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        return Value::str(s.to_string());
+                    }
+                }
+                let s: String = elems
+                    .iter()
+                    .filter_map(|&e| char::from_u32(e as u32))
                     .collect();
                 Value::str(s)
             } else {
