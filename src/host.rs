@@ -1314,6 +1314,12 @@ pub mod stdlib {
 /// a type error, reported rather than coerced (Go rejects `"a" - 1`).
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     match op {
+        // The zero value of an erased generic type parameter (`var total T`) is
+        // nil (`Undef`); Go would use T's concrete zero. Treat nil as the
+        // additive identity so a generic accumulator matches Go for whichever
+        // concrete type is passed: nil+int→int, nil+float→float, nil+str→str.
+        NumOp::Add if matches!(a, Value::Undef) => Ok(b.clone()),
+        NumOp::Add if matches!(b, Value::Undef) => Ok(a.clone()),
         NumOp::Add => Ok(Value::str(format!("{}{}", go_str(a), go_str(b)))),
         NumOp::Eq => Ok(Value::bool(go_str(a) == go_str(b))),
         NumOp::Ne => Ok(Value::bool(go_str(a) != go_str(b))),

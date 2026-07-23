@@ -769,3 +769,72 @@ fn go_doc_prints_reference_for_a_name() {
         .expect("spawn go doc");
     assert!(!bad.status.success());
 }
+
+#[test]
+fn generic_functions_erase_type_parameters() {
+    // Type parameters and constraint interfaces are erased; the dynamic value
+    // model runs the same code for int and float instantiations. `var total T`
+    // (a type-parameter zero value) accumulates correctly for either.
+    let src = "\
+package main
+import \"fmt\"
+type Number interface{ ~int | ~float64 }
+func Sum[T Number](xs []T) T {
+	var total T
+	for _, x := range xs {
+		total += x
+	}
+	return total
+}
+func Map[T any, U any](xs []T, f func(T) U) []U {
+	out := make([]U, 0)
+	for _, x := range xs {
+		out = append(out, f(x))
+	}
+	return out
+}
+func main() {
+	fmt.Println(Sum([]int{1, 2, 3, 4, 5}))
+	fmt.Println(Sum([]float64{1.5, 2.5, 3.0}))
+	fmt.Println(Map([]int{1, 2, 3}, func(n int) int { return n * n }))
+}
+";
+    assert_stdout(src, "15\n7\n[1 4 9]\n");
+}
+
+#[test]
+fn generic_struct_type_and_methods() {
+    // A generic struct `Stack[T]`, a pointer-receiver generic method, and both
+    // inferred and explicit instantiation of a generic constructor.
+    let src = "\
+package main
+import \"fmt\"
+type Stack[T any] struct {
+	items []T
+}
+func (s *Stack[T]) Push(x T) {
+	s.items = append(s.items, x)
+}
+func (s *Stack[T]) Len() int {
+	return len(s.items)
+}
+type Pair[K any, V any] struct {
+	Key K
+	Val V
+}
+func MakePair[K any, V any](k K, v V) Pair[K, V] {
+	return Pair[K, V]{Key: k, Val: v}
+}
+func main() {
+	var s Stack[int]
+	s.Push(10)
+	s.Push(20)
+	fmt.Println(s.Len(), s.items)
+	p := MakePair(1, \"one\")
+	fmt.Println(p.Key, p.Val)
+	q := Pair[string, int]{Key: \"age\", Val: 42}
+	fmt.Println(q.Key, q.Val)
+}
+";
+    assert_stdout(src, "2 [10 20]\n1 one\nage 42\n");
+}

@@ -88,6 +88,11 @@ pub enum Tok {
     AndAnd,
     OrOr,
     Not,
+    /// `|` — only appears in a generic type-constraint union (`~int | ~float64`),
+    /// which go-rs erases; not an expression operator.
+    Pipe,
+    /// `~` — the generic underlying-type constraint marker (`~int`); erased.
+    Tilde,
     Eof,
 }
 
@@ -376,6 +381,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 '<' => (Tok::Lt, 1),
                 '>' => (Tok::Gt, 1),
                 '!' => (Tok::Not, 1),
+                '|' => (Tok::Pipe, 1),
+                '~' => (Tok::Tilde, 1),
                 other => {
                     return Err(format!(
                         "go-rs: unexpected character `{other}` on line {line}"

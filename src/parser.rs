@@ -25,18 +25,18 @@ pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = lex(src)?;
     // Pre-scan `type <IDENT> struct` so a `T{…}` composite literal can be told
     // apart from an identifier `T` followed by a block `{`.
-    let mut struct_names = HashSet::new();
-    for w in tokens.windows(3) {
-        if matches!(w[0].kind, Tok::Type) && matches!(w[2].kind, Tok::Struct) {
-            if let Tok::Ident(n) = &w[1].kind {
-                struct_names.insert(n.clone());
-            }
-        }
-    }
+    let struct_names = scan_struct_names(&tokens);
+    // Pre-scan generic declarations — a `func Name[…]` / `type Name[…]` (Go 1.18
+    // type parameters). go-rs is dynamically typed on the fusevm value model, so
+    // generics are handled by *erasure*: the type-parameter and type-argument
+    // brackets are consumed and dropped. Recording the generic names lets a use
+    // site (`Name[int](…)`) tell an instantiation apart from an index `xs[i]`.
+    let generic_names = scan_generic_names(&tokens);
     let mut p = Parser {
         tokens,
         pos: 0,
         struct_names,
+        generic_names,
     };
     p.program()
 }
@@ -46,6 +46,93 @@ struct Parser {
     pos: usize,
     /// Names declared as `type T struct` — enables `T{…}` composite literals.
     struct_names: HashSet<String>,
+    /// Names declared generic (`func F[…]` / `type T[…]`) — enables telling an
+    /// instantiation `F[int](…)` apart from an index expression `xs[i]`.
+    generic_names: HashSet<String>,
+}
+
+/// Collect names declared as `type Name struct` — including generic structs
+/// `type Name[T any] struct`, where an optional `[ … ]` type-parameter list sits
+/// between the name and `struct`. Enables `Name{…}` composite-literal parsing.
+fn scan_struct_names(tokens: &[Token]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut i = 0;
+    while i + 2 < tokens.len() {
+        if matches!(tokens[i].kind, Tok::Type) {
+            if let Tok::Ident(n) = &tokens[i + 1].kind {
+                // Step past an optional `[ … ]` generic type-parameter list.
+                let mut j = i + 2;
+                if matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::LBracket)) {
+                    let mut depth = 0;
+                    while j < tokens.len() {
+                        match &tokens[j].kind {
+                            Tok::LBracket => depth += 1,
+                            Tok::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    j += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                if matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::Struct)) {
+                    names.insert(n.clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Collect the names of generic declarations: `func Name[…]` (with or without a
+/// method receiver) and `type Name[…]`. Used to erase type arguments at use
+/// sites without mistaking them for indexing.
+fn scan_generic_names(tokens: &[Token]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i].kind {
+            Tok::Type => {
+                // `type Name [` …
+                if let (Some(Tok::Ident(n)), Some(Tok::LBracket)) = (kind(i + 1), kind(i + 2)) {
+                    names.insert(n.clone());
+                }
+            }
+            Tok::Func => {
+                // Skip an optional method receiver `( … )` to reach the name.
+                let mut j = i + 1;
+                if matches!(kind(j), Some(Tok::LParen)) {
+                    let mut depth = 0;
+                    while j < tokens.len() {
+                        match &tokens[j].kind {
+                            Tok::LParen => depth += 1,
+                            Tok::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    j += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                if let (Some(Tok::Ident(n)), Some(Tok::LBracket)) = (kind(j), kind(j + 1)) {
+                    names.insert(n.clone());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    names
 }
 
 impl Parser {
@@ -174,6 +261,10 @@ impl Parser {
     fn type_decl(&mut self) -> Result<TypeDecl, String> {
         self.expect(&Tok::Type)?;
         let name = self.ident()?;
+        // Erase a generic type-parameter list: `type Stack[T any] struct{…}`.
+        if matches!(self.peek(), Tok::LBracket) {
+            self.skip_type_brackets()?;
+        }
         match self.peek() {
             Tok::Interface => {
                 self.advance();
@@ -181,11 +272,18 @@ impl Parser {
                 self.skip_semis();
                 let mut methods = Vec::new();
                 while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
-                    // `method(params) [results]` — record the name, skip the rest.
-                    methods.push(self.ident()?);
-                    self.expect(&Tok::LParen)?;
-                    self.skip_balanced_parens()?;
-                    while !matches!(self.peek(), Tok::Semi | Tok::RBrace) {
+                    // An element is either a method (`name(params) results`) or a
+                    // generic type-constraint term (`~int | ~float64`, an embedded
+                    // constraint name). A method is exactly `Ident (`; anything
+                    // else is a constraint term, which go-rs erases.
+                    if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::LParen) {
+                        methods.push(self.ident()?);
+                        self.expect(&Tok::LParen)?;
+                        self.skip_balanced_parens()?;
+                    }
+                    // Skip to the end of the element (method results, or the whole
+                    // constraint term including `~`, `|`, and bracketed types).
+                    while !matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::Eof) {
                         self.advance();
                     }
                     self.skip_semis();
@@ -227,6 +325,23 @@ impl Parser {
                 Tok::LParen => depth += 1,
                 Tok::RParen => depth -= 1,
                 Tok::Eof => return Err("go-rs: unterminated `(` in interface method".to_string()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a `[ … ]` bracket group (type parameters `[T any, U comparable]`
+    /// or type arguments `[int, string]`) and discard it — generics are erased.
+    /// The opening `[` must be the current token.
+    fn skip_type_brackets(&mut self) -> Result<(), String> {
+        self.expect(&Tok::LBracket)?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.advance() {
+                Tok::LBracket => depth += 1,
+                Tok::RBracket => depth -= 1,
+                Tok::Eof => return Err("go-rs: unterminated `[` in type parameters".to_string()),
                 _ => {}
             }
         }
@@ -279,6 +394,10 @@ impl Parser {
             None
         };
         let name = self.ident()?;
+        // Erase a generic type-parameter list: `func F[T any](…)`.
+        if matches!(self.peek(), Tok::LBracket) {
+            self.skip_type_brackets()?;
+        }
         self.expect(&Tok::LParen)?;
         let params = self.params()?;
         self.expect(&Tok::RParen)?;
@@ -424,7 +543,15 @@ impl Parser {
                 }
                 Ok("func".to_string())
             }
-            Tok::Ident(_) => self.ident(),
+            Tok::Ident(_) => {
+                let name = self.ident()?;
+                // Erase type arguments on a generic type reference: the base name
+                // of `Stack[int]` / `Pair[K, V]` is what go-rs types against.
+                if matches!(self.peek(), Tok::LBracket) && self.generic_names.contains(&name) {
+                    self.skip_type_brackets()?;
+                }
+                Ok(name)
+            }
             other => Err(format!(
                 "go-rs: expected type, found `{other}` on line {}",
                 self.line()
@@ -914,6 +1041,23 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
         loop {
+            // Erase type arguments on a generic instantiation: `F[int](x)` and
+            // `Stack[int]{…}`. When the base is a known generic name, the `[ … ]`
+            // is type arguments (not an index), so consume and drop it, leaving
+            // the bare name to be called or composite-literal'd below.
+            if matches!(self.peek(), Tok::LBracket) {
+                if let Expr::Ident(n) = &e {
+                    if self.generic_names.contains(n) {
+                        let base = n.clone();
+                        self.skip_type_brackets()?;
+                        // `Stack[int]{ … }` — a generic struct composite literal.
+                        if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&base) {
+                            e = self.struct_literal(base)?;
+                        }
+                        continue;
+                    }
+                }
+            }
             match self.peek() {
                 Tok::Dot => {
                     self.advance();

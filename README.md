@@ -125,6 +125,7 @@ A single-file `package main` that runs real Go programs:
 | Closures       | function literals `func(…){…}` with capture-by-value; `f := func(){…}; f()`, IIFE, `go func(){…}()` |
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
 | Functions      | multiple parameters, `(T, U)` multi-value results, `return a, b`, and `x, y := f()` destructuring |
+| Generics       | type parameters on funcs, types, and methods (`func F[T Number]`, `type Stack[T any]`, `Pair[K, V]{…}`), constraint interfaces (`~int \| ~float64`), inferred + explicit instantiation — **erased** onto the dynamic value model (no monomorphization) |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
 | Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
@@ -132,11 +133,14 @@ A single-file `package main` that runs real Go programs:
 Goroutines, channels, and `select` run on a **cooperative scheduler added to the
 shared `fusevm` VM** (`fusevm::sched`, v0.14.14–0.14.15): each goroutine is its
 own VM sharing the program and the single-threaded heap, yielding at channel
-operations. `defer` and generics are future waves. Documented
-simplifications: a map read of a missing key returns the numeric zero (`0`)
-rather than the comma-ok form; method receivers use reference semantics (a value
-receiver is not copied); and `go` targets a top-level function call (no closure
-goroutines yet).
+operations. **Generics are handled by erasure** — type-parameter and
+type-argument brackets are consumed and dropped, and the dynamically-typed value
+model runs one erased body for every instantiation (the zero value of a
+type-parameter-typed `var` is nil, treated as the additive identity so a generic
+accumulator matches Go for int/float/string). Documented simplifications: a map
+read of a missing key returns the numeric zero (`0`) rather than the comma-ok
+form; method receivers use reference semantics (a value receiver is not copied);
+and `go` targets a top-level function call (no closure goroutines yet).
 
 ## Toolchain
 
@@ -177,8 +181,8 @@ cargo run --bin parity-fuzz -- --seed 1234 --once   # replay one divergence
 ```
 
 The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
-slices/maps, structs/methods, interfaces, closures, goroutines/channels, and
-`select`. The fuzzer generates arithmetic / float / boolean / string / slice /
+slices/maps, structs/methods, interfaces, closures, generics, goroutines/channels,
+and `select`. The fuzzer generates arithmetic / float / boolean / string / slice /
 map / control-flow / stdlib blocks and diffs both interpreters. go-rs runs
 single-file `package main` against its built-in stdlib subset — it has no module
 system, so `go get` / third-party imports are out of scope.

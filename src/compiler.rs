@@ -642,6 +642,10 @@ impl Compiler {
                 };
                 match init {
                     Some(e) => self.emit_rhs(name, e)?,
+                    // `var s T` where T is a struct → its zero value is a struct
+                    // with every field zeroed, not nil (so `s.f` reads/writes and
+                    // methods work). Other types use the scalar/nil default.
+                    None if self.structs.contains(&decl_ty) => self.struct_lit(&decl_ty, &[])?,
                     None => self.emit_default(nt, *line),
                 }
                 self.types.insert(name.clone(), nt);
