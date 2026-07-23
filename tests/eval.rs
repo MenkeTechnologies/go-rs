@@ -1034,3 +1034,167 @@ func main() {
 ";
     assert_stdout(src, "19.8646500000\n0.3\n10\n12.5000000000\n");
 }
+
+#[test]
+fn sprintf_and_sprint() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	s := fmt.Sprintf(\"%d-%s-%.2f\", 42, \"go\", 3.14159)
+	fmt.Println(s, len(s))
+	fmt.Println(fmt.Sprint(\"a\", 1, \"b\"))
+}
+";
+    assert_stdout(src, "42-go-3.14 10\na1b\n");
+}
+
+#[test]
+fn call_func_value_from_index() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	fns := []func(int) int{}
+	for i := 0; i < 3; i++ {
+		fns = append(fns, func(x int) int { return x + i })
+	}
+	fmt.Println(fns[0](10), fns[1](10), fns[2](10))
+	ops := map[string]func(int, int) int{
+		\"add\": func(a, b int) int { return a + b },
+		\"mul\": func(a, b int) int { return a * b },
+	}
+	fmt.Println(ops[\"add\"](3, 4), ops[\"mul\"](3, 4))
+}
+";
+    assert_stdout(src, "10 11 12\n7 12\n");
+}
+
+#[test]
+fn slice_expressions_on_slices_and_strings() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	xs := []int{10, 20, 30, 40, 50}
+	fmt.Println(xs[1:3], xs[:2], xs[3:], xs[:])
+	s := \"hello, world\"
+	fmt.Println(s[0:5], s[7:])
+	stack := []int{1, 2, 3}
+	top := stack[len(stack)-1]
+	stack = stack[:len(stack)-1]
+	fmt.Println(top, stack)
+}
+";
+    assert_stdout(
+        src,
+        "[20 30] [10 20] [40 50] [10 20 30 40 50]\nhello world\n3 [1 2]\n",
+    );
+}
+
+#[test]
+fn address_of_shares_the_struct() {
+    let src = "\
+package main
+import \"fmt\"
+type Counter struct{ n int }
+func (c *Counter) Inc() { c.n++ }
+func newCounter() *Counter { return &Counter{n: 0} }
+func main() {
+	c := &Counter{n: 5}
+	c.Inc()
+	fmt.Println(c.n)
+	d := newCounter()
+	d.Inc()
+	fmt.Println(d.n)
+	e := Counter{n: 10}
+	p := &e
+	p.Inc()
+	fmt.Println(e.n)
+}
+";
+    assert_stdout(src, "6\n1\n11\n");
+}
+
+#[test]
+fn switch_tag_tagless_and_break_continue() {
+    let src = "\
+package main
+import \"fmt\"
+func describe(n int) string {
+	switch n {
+	case 0:
+		return \"zero\"
+	case 1, 2, 3:
+		return \"small\"
+	default:
+		return \"other\"
+	}
+}
+func grade(s int) string {
+	switch {
+	case s >= 90:
+		return \"A\"
+	case s >= 80:
+		return \"B\"
+	default:
+		return \"F\"
+	}
+}
+func main() {
+	fmt.Println(describe(0), describe(2), describe(9))
+	fmt.Println(grade(95), grade(85), grade(50))
+	total := 0
+	for i := 0; i < 5; i++ {
+		switch i {
+		case 2:
+			continue
+		case 4:
+			break
+		}
+		total += i
+	}
+	fmt.Println(total)
+}
+";
+    assert_stdout(src, "zero small other\nA B F\n8\n");
+}
+
+#[test]
+fn named_return_values() {
+    let src = "\
+package main
+import \"fmt\"
+func divmod(a, b int) (q, r int) {
+	q = a / b
+	r = a % b
+	return
+}
+func withDefer(x int) (result int) {
+	defer func() { result = result * 2 }()
+	result = x + 1
+	return
+}
+func safe(a, b int) (n int, err string) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = \"recovered\"
+		}
+	}()
+	if b == 0 {
+		panic(\"boom\")
+	}
+	return a / b, \"\"
+}
+func main() {
+	q, r := divmod(17, 5)
+	fmt.Println(q, r)
+	fmt.Println(withDefer(4))
+	n, e := safe(10, 2)
+	fmt.Println(n, e)
+	n2, e2 := safe(1, 0)
+	fmt.Println(n2, e2)
+}
+";
+    assert_stdout(src, "3 2\n10\n5 \n0 recovered\n");
+}

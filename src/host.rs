@@ -92,6 +92,14 @@ pub const GCELL_NEW: u16 = 890;
 pub const GCELL_GET: u16 = 891;
 /// `[value, cell]` → store into a boxed variable (shared with its closures).
 pub const GCELL_SET: u16 = 892;
+/// `fmt.Sprintf(format, …)` — format and return the string (no output).
+pub const GSPRINTF: u16 = 893;
+/// `fmt.Sprint(…)` — concatenate operands (Go spacing) and return the string.
+pub const GSPRINT: u16 = 894;
+/// `fmt.Sprintln(…)` — like `Sprint` with spaces + trailing newline.
+pub const GSPRINTLN: u16 = 895;
+/// `s[low:high]` — a sub-slice/substring: stack `[recv, low, high]`.
+pub const GSLICE_SUB: u16 = 896;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -135,7 +143,66 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GCELL_NEW, b_cell_new);
     vm.register_builtin(GCELL_GET, b_cell_get);
     vm.register_builtin(GCELL_SET, b_cell_set);
+    vm.register_builtin(GSPRINTF, b_sprintf);
+    vm.register_builtin(GSPRINT, b_sprint);
+    vm.register_builtin(GSPRINTLN, b_sprintln);
+    vm.register_builtin(GSLICE_SUB, b_slice_sub);
     stdlib::install(vm);
+}
+
+/// `s[low:high]` on a slice or string: stack `[recv, low, high]`. Returns a new
+/// slice (a copy — go-rs sub-slices don't share the parent's backing array) or a
+/// substring. `low`/`high` of `-1` mean "omitted" (0 / len).
+fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let recv = args.first().cloned().unwrap_or(Value::Undef);
+    let lo_raw = args.get(1).map(Value::to_int).unwrap_or(-1);
+    let hi_raw = args.get(2).map(Value::to_int).unwrap_or(-1);
+    match recv {
+        Value::Obj(id) => HEAP.with(|h| {
+            let sub = match h.borrow().get(id as usize) {
+                Some(HostObj::Slice(a)) => {
+                    let len = a.len() as i64;
+                    let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, len) as usize;
+                    let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, len) as usize;
+                    a.get(lo..hi.max(lo))
+                        .map(|s| s.to_vec())
+                        .unwrap_or_default()
+                }
+                _ => return Value::Undef,
+            };
+            Value::Obj(heap_alloc(HostObj::Slice(sub)))
+        }),
+        Value::Str(s) => {
+            // Byte-indexed substring, matching Go's string slicing.
+            let bytes = s.as_bytes();
+            let len = bytes.len() as i64;
+            let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, len) as usize;
+            let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, len) as usize;
+            let slice = bytes.get(lo..hi.max(lo)).unwrap_or(&[]);
+            Value::str(String::from_utf8_lossy(slice).into_owned())
+        }
+        _ => Value::Undef,
+    }
+}
+
+/// `fmt.Sprintf(format, …)` — the formatted string (no output).
+fn b_sprintf(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    Value::str(sprintf(&args))
+}
+
+/// `fmt.Sprint(…)` — operands concatenated with Go's between-non-strings spacing.
+fn b_sprint(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    Value::str(go_print_spacing(&args))
+}
+
+/// `fmt.Sprintln(…)` — operands space-separated with a trailing newline.
+fn b_sprintln(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let text: Vec<String> = args.iter().map(go_str).collect();
+    Value::str(format!("{}\n", text.join(" ")))
 }
 
 /// `[value]` → a fresh heap cell boxing `value` (a by-reference-captured var).

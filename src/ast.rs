@@ -47,8 +47,12 @@ pub struct Func {
     /// The receiver for a method (`func (r T) m()`); `None` for a plain `func`.
     pub receiver: Option<Param>,
     pub params: Vec<Param>,
-    /// Result types in declaration order (names, if any, are dropped in slice 1).
+    /// Result types in declaration order.
     pub results: Vec<String>,
+    /// Result names, aligned with `results` (`""` for an unnamed result). When
+    /// any result is named, they become zero-initialized locals the body can read
+    /// and assign, and a bare `return` yields their current values.
+    pub result_names: Vec<String>,
     pub body: Vec<Stmt>,
     pub line: u32,
 }
@@ -131,12 +135,30 @@ pub enum Stmt {
         default: Option<Vec<Stmt>>,
         line: u32,
     },
+    /// `switch [init;] [tag] { case …: …; default: … }`. With no `tag`, each
+    /// case expression is a boolean condition (expression switch). Cases run the
+    /// first match then break (no implicit fallthrough).
+    Switch {
+        init: Option<Box<Stmt>>,
+        tag: Option<Expr>,
+        cases: Vec<SwitchCase>,
+        default: Option<Vec<Stmt>>,
+        line: u32,
+    },
     /// `break`.
     Break(u32),
     /// `continue`.
     Continue(u32),
     /// A `{ ... }` block.
     Block(Vec<Stmt>),
+}
+
+/// One `case` clause of a `switch`: the case expressions (`case a, b:` matches
+/// either) and the statements to run.
+#[derive(Debug, Clone)]
+pub struct SwitchCase {
+    pub exprs: Vec<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 /// One `case` clause of a `select`.
@@ -203,6 +225,13 @@ pub enum Expr {
         recv: Box<Expr>,
         index: Box<Expr>,
     },
+    /// A slice expression `recv[low:high]` (either bound optional: `s[lo:]`,
+    /// `s[:hi]`, `s[:]`).
+    Slice {
+        recv: Box<Expr>,
+        low: Option<Box<Expr>>,
+        high: Option<Box<Expr>>,
+    },
     /// A slice composite literal `[]T{elems}`.
     SliceLit {
         elem_ty: String,
@@ -248,6 +277,11 @@ pub enum Expr {
 pub enum UnOp {
     Neg,
     Not,
+    /// `&x` — address-of. go-rs composite values are heap handles (reference
+    /// types), so this is a no-copy reference.
+    Addr,
+    /// `*p` — pointer dereference; identity on a go-rs handle.
+    Deref,
 }
 
 /// Binary operators.

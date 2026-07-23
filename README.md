@@ -114,22 +114,23 @@ A single-file `package main` that runs real Go programs:
 | -------------- | --------------------------------------------------------------------- |
 | Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
 | Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), `+= -= *= /= %=`, `x++` / `x--` |
-| Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `break`, `continue`, `return` |
+| Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause), `break`, `continue`, `return` |
 | Expressions    | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
 | Types          | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
-| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, `len` / `cap` / `append`, `for i, v := range s` |
+| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` (also on strings), `len` / `cap` / `append`, `for i, v := range s` |
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m` |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
+| Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref; a pointer shares the pointed-to struct |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type (a compiled type-switch over the concrete implementors) |
 | Closures       | function literals `func(…){…}` with **capture-by-reference** (a closure mutating a captured variable propagates, and closures share captured state); `f := func(){…}; f()`, IIFE, `go func(){…}()`; Go 1.22 per-iteration loop-variable capture |
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
-| Functions      | multiple parameters, `(T, U)` multi-value results, `return a, b`, and `x, y := f()` destructuring |
+| Functions      | multiple parameters, `(T, U)` multi-value results, named results (`func f() (n int, err error)` — zero-initialized, bare `return`, deferred/`recover` mutation), `return a, b`, `x, y := f()` destructuring, calling a function value from an index (`fns[i](x)`, `ops["k"](a, b)`) |
 | Generics       | type parameters on funcs, types, and methods (`func F[T Number]`, `type Stack[T any]`, `Pair[K, V]{…}`), constraint interfaces (`~int \| ~float64`), inferred + explicit instantiation — **erased** onto the dynamic value model (no monomorphization) |
 | defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
 | panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; an unrecovered panic prints `panic: <value>` and exits non-zero |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
-| Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
+| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
 Goroutines, channels, and `select` run on a **cooperative scheduler added to the
@@ -207,12 +208,17 @@ rational arithmetic and rounds to `f64` once, matching Go's arbitrary-precision
 constant semantics (a very long decimal or a non-terminating division whose exact
 terms leave the `f64`-exact range falls back to runtime `f64`).
 
-**Known, characterized divergences** (the harness surfaced these; they are
-documented rather than hidden):
+**Known gaps** (documented rather than hidden):
 
-- **Named return values** are not modeled as storage, so a deferred closure that
-  assigns to a named result (`func f() (err error) { defer func(){ err = … }() }`)
-  does not change what `f` returns (a plain `return v` and unnamed results work).
+- **Runtime panics are not catchable.** An explicit `panic(v)` is caught by
+  `recover()`, but a *runtime* fault (integer divide-by-zero, nil dereference,
+  index out of range) aborts the program rather than becoming a recoverable
+  panic; integer `a / 0` currently yields `0` instead of panicking.
+- **Parallel assignment to existing lvalues** (`a, b = x, y`, `a, b = b, a`) is
+  not supported (`:=` multi-value destructuring and named results are).
+- **Sub-slices copy rather than alias** — `s[lo:hi]` returns a new slice, so
+  mutating an element of the sub-slice is not observed through the parent (Go
+  shares the backing array). Truncation/extraction (`s = s[:n]`) works.
 
 ## License
 

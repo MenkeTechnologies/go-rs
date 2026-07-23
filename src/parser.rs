@@ -401,13 +401,15 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let params = self.params()?;
         self.expect(&Tok::RParen)?;
-        let results = self.results()?;
+        let (result_names, results): (Vec<String>, Vec<String>) =
+            self.results()?.into_iter().unzip();
         let body = self.block()?;
         Ok(Func {
             name,
             receiver,
             params,
             results,
+            result_names,
             body,
             line,
         })
@@ -458,19 +460,23 @@ impl Parser {
     }
 
     /// Parse a function result signature: nothing, a single type, or a
-    /// parenthesized list of types.
-    fn results(&mut self) -> Result<Vec<String>, String> {
+    /// parenthesized list. Each result is `(name, type)`; `name` is `""` for an
+    /// unnamed result. A parenthesized list is *named* iff any identifier in it is
+    /// immediately followed by a type (Go requires all-or-none).
+    fn results(&mut self) -> Result<Vec<(String, String)>, String> {
         if matches!(self.peek(), Tok::LBrace) {
             return Ok(Vec::new());
         }
         if self.eat(&Tok::LParen) {
+            if self.paren_list_is_named() {
+                // Named results share the grammar of a parameter list.
+                let params = self.params()?;
+                self.expect(&Tok::RParen)?;
+                return Ok(params.into_iter().map(|p| (p.name, p.ty)).collect());
+            }
             let mut out = Vec::new();
             while !matches!(self.peek(), Tok::RParen) {
-                // A named result `n int` — drop the name, keep the type.
-                if matches!(self.peek(), Tok::Ident(_)) && self.type_starts_at(self.pos + 1) {
-                    self.advance();
-                }
-                out.push(self.type_name()?);
+                out.push((String::new(), self.type_name()?));
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -478,8 +484,27 @@ impl Parser {
             self.expect(&Tok::RParen)?;
             Ok(out)
         } else {
-            Ok(vec![self.type_name()?])
+            Ok(vec![(String::new(), self.type_name()?)])
         }
+    }
+
+    /// Whether the parenthesized list starting at the current position (just after
+    /// its `(`) is a *named* list: some `Ident` is immediately followed by a token
+    /// that begins a type (so the ident is a name, not a type).
+    fn paren_list_is_named(&self) -> bool {
+        let mut i = self.pos;
+        let mut depth = 1;
+        while i < self.tokens.len() {
+            match &self.tokens[i].kind {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen if depth == 1 => break,
+                Tok::RParen | Tok::RBracket => depth -= 1,
+                Tok::Ident(_) if depth == 1 && self.type_starts_at(i + 1) => return true,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     /// True if the current token can begin a type in a parameter/result position.
@@ -613,6 +638,7 @@ impl Parser {
                 Ok(Stmt::Defer { call, line })
             }
             Tok::Select => self.select_stmt(),
+            Tok::Switch => self.switch_stmt(),
             Tok::LBrace => Ok(Stmt::Block(self.block()?)),
             _ => self.simple_stmt(),
         }
@@ -832,6 +858,61 @@ impl Parser {
         })
     }
 
+    fn switch_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.line();
+        self.expect(&Tok::Switch)?;
+
+        // Optional `init;` and optional tag expression before the `{`.
+        let mut init = None;
+        let mut tag = None;
+        if !matches!(self.peek(), Tok::LBrace) {
+            let first = self.simple_stmt()?;
+            if self.eat(&Tok::Semi) {
+                init = Some(Box::new(first));
+                if !matches!(self.peek(), Tok::LBrace) {
+                    tag = Some(self.expr()?);
+                }
+            } else {
+                tag = Some(stmt_into_expr(first, line)?);
+            }
+        }
+
+        self.expect(&Tok::LBrace)?;
+        self.skip_semis();
+        let mut cases = Vec::new();
+        let mut default = None;
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            if matches!(self.peek(), Tok::Ident(s) if s == "default") {
+                self.advance();
+                self.expect(&Tok::Colon)?;
+                default = Some(self.case_body()?);
+                continue;
+            }
+            if !matches!(self.peek(), Tok::Ident(s) if s == "case") {
+                return Err(format!(
+                    "go-rs: expected `case` or `default` in switch on line {}",
+                    self.line()
+                ));
+            }
+            self.advance(); // `case`
+            let mut exprs = vec![self.expr()?];
+            while self.eat(&Tok::Comma) {
+                exprs.push(self.expr()?);
+            }
+            self.expect(&Tok::Colon)?;
+            let body = self.case_body()?;
+            cases.push(SwitchCase { exprs, body });
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Stmt::Switch {
+            init,
+            tag,
+            cases,
+            default,
+            line,
+        })
+    }
+
     /// Parse the communication clause of a select case (before the `:`).
     fn select_comm(&mut self) -> Result<SelectComm, String> {
         // `<-ch` (receive, no bind).
@@ -1040,6 +1121,22 @@ impl Parser {
                     chan: Box::new(self.unary()?),
                 })
             }
+            // `&x` — address-of (a no-copy reference on go-rs handles).
+            Tok::Amp => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnOp::Addr,
+                    rhs: Box::new(self.unary()?),
+                })
+            }
+            // `*p` — pointer dereference (identity on a go-rs handle).
+            Tok::Star => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnOp::Deref,
+                    rhs: Box::new(self.unary()?),
+                })
+            }
             _ => self.postfix(),
         }
     }
@@ -1075,12 +1172,32 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.advance();
-                    let index = self.expr()?;
-                    self.expect(&Tok::RBracket)?;
-                    e = Expr::Index {
-                        recv: Box::new(e),
-                        index: Box::new(index),
+                    // `recv[low:high]` slice expression, or `recv[index]`. Either
+                    // bound of a slice may be omitted (`s[:hi]`, `s[lo:]`, `s[:]`).
+                    let low = if matches!(self.peek(), Tok::Colon) {
+                        None
+                    } else {
+                        Some(self.expr()?)
                     };
+                    if self.eat(&Tok::Colon) {
+                        let high = if matches!(self.peek(), Tok::RBracket) {
+                            None
+                        } else {
+                            Some(self.expr()?)
+                        };
+                        self.expect(&Tok::RBracket)?;
+                        e = Expr::Slice {
+                            recv: Box::new(e),
+                            low: low.map(Box::new),
+                            high: high.map(Box::new),
+                        };
+                    } else {
+                        self.expect(&Tok::RBracket)?;
+                        e = Expr::Index {
+                            recv: Box::new(e),
+                            index: Box::new(low.expect("index expr present")),
+                        };
+                    }
                 }
                 Tok::LParen => {
                     let line = self.line();
@@ -1140,7 +1257,9 @@ impl Parser {
                 self.expect(&Tok::LParen)?;
                 let params = self.params()?;
                 self.expect(&Tok::RParen)?;
-                let results = self.results()?;
+                // Closures keep only result types (named results on a func literal
+                // are uncommon; the name is dropped).
+                let results = self.results()?.into_iter().map(|(_, t)| t).collect();
                 let body = self.block()?;
                 Ok(Expr::FuncLit {
                     params,

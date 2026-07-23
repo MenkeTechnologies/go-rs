@@ -97,11 +97,14 @@ impl Scope {
     }
 }
 
-/// Back-patch targets for one enclosing `for` loop.
+/// Back-patch targets for one enclosing breakable construct (`for` loop or
+/// `switch`). `break` targets the innermost; `continue` targets the innermost
+/// non-switch (loop), so a `continue` inside a switch reaches the enclosing loop.
 #[derive(Default)]
 struct LoopScope {
     breaks: Vec<usize>,
     continues: Vec<usize>,
+    is_switch: bool,
 }
 
 struct Compiler {
@@ -159,6 +162,11 @@ struct Compiler {
     /// While compiling a lambda: which of its captures are cells (captured by
     /// reference). A cell capture is dereferenced on read and written through.
     active_cell_captures: HashSet<String>,
+    /// The current function's named result variables (empty when results are
+    /// unnamed). They are zero-initialized locals; `return e…` assigns them, a
+    /// bare `return`/fall-off/recovered-panic returns their current values, and a
+    /// deferred closure may mutate them (they are boxed when captured).
+    named_results: Vec<String>,
 }
 
 /// Whether the program (a function body, recursing everywhere including nested
@@ -200,6 +208,20 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
             Stmt::Send { chan, val, .. } => ex(chan) || ex(val),
             Stmt::Select { cases, default, .. } => {
                 cases.iter().any(|c| body_uses_panic(&c.body))
+                    || default.as_deref().is_some_and(body_uses_panic)
+            }
+            Stmt::Switch {
+                init,
+                tag,
+                cases,
+                default,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || tag.as_ref().is_some_and(ex)
+                    || cases
+                        .iter()
+                        .any(|c| c.exprs.iter().any(ex) || body_uses_panic(&c.body))
                     || default.as_deref().is_some_and(body_uses_panic)
             }
             Stmt::Break(_) | Stmt::Continue(_) => false,
@@ -261,6 +283,14 @@ fn collect_loop_vars(s: &Stmt, out: &mut HashSet<String>) {
         }
         Stmt::Block(b) => b.iter().for_each(|s| collect_loop_vars(s, out)),
         Stmt::Select { cases, default, .. } => {
+            for c in cases {
+                c.body.iter().for_each(|s| collect_loop_vars(s, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| collect_loop_vars(s, out));
+            }
+        }
+        Stmt::Switch { cases, default, .. } => {
             for c in cases {
                 c.body.iter().for_each(|s| collect_loop_vars(s, out));
             }
@@ -363,6 +393,22 @@ fn collect_locals(s: &Stmt, out: &mut HashSet<String>) {
                 d.iter().for_each(|s| collect_locals(s, out));
             }
         }
+        Stmt::Switch {
+            init,
+            cases,
+            default,
+            ..
+        } => {
+            if let Some(i) = init {
+                collect_locals(i, out);
+            }
+            for c in cases {
+                c.body.iter().for_each(|s| collect_locals(s, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| collect_locals(s, out));
+            }
+        }
         _ => {}
     }
 }
@@ -452,6 +498,27 @@ fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
                         fe(val, bound, out);
                     }
                 }
+                c.body.iter().for_each(|s| free_stmt(s, bound, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| free_stmt(s, bound, out));
+            }
+        }
+        Stmt::Switch {
+            init,
+            tag,
+            cases,
+            default,
+            ..
+        } => {
+            if let Some(i) = init {
+                free_stmt(i, bound, out);
+            }
+            if let Some(t) = tag {
+                fe(t, bound, out);
+            }
+            for c in cases {
+                c.exprs.iter().for_each(|e| fe(e, bound, out));
                 c.body.iter().for_each(|s| free_stmt(s, bound, out));
             }
             if let Some(d) = default {
@@ -584,6 +651,27 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
                 d.iter().for_each(|s| walk_stmt_exprs(s, f));
             }
         }
+        Stmt::Switch {
+            init,
+            tag,
+            cases,
+            default,
+            ..
+        } => {
+            if let Some(i) = init {
+                walk_stmt_exprs(i, f);
+            }
+            if let Some(t) = tag {
+                f(t);
+            }
+            for c in cases {
+                c.exprs.iter().for_each(&mut *f);
+                c.body.iter().for_each(|s| walk_stmt_exprs(s, f));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| walk_stmt_exprs(s, f));
+            }
+        }
         Stmt::Block(b) => b.iter().for_each(|s| walk_stmt_exprs(s, f)),
         Stmt::Break(_) | Stmt::Continue(_) => {}
     }
@@ -602,6 +690,10 @@ fn stmt_has_defer(s: &Stmt) -> bool {
         Stmt::For { body, .. } | Stmt::ForRange { body, .. } => body_has_defer(body),
         Stmt::Block(b) => body_has_defer(b),
         Stmt::Select { cases, default, .. } => {
+            cases.iter().any(|c| body_has_defer(&c.body))
+                || default.as_deref().is_some_and(body_has_defer)
+        }
+        Stmt::Switch { cases, default, .. } => {
             cases.iter().any(|c| body_has_defer(&c.body))
                 || default.as_deref().is_some_and(body_has_defer)
         }
@@ -686,6 +778,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         panic_jumps: Vec::new(),
         boxed: HashSet::new(),
         active_cell_captures: HashSet::new(),
+        named_results: Vec::new(),
     };
 
     // ── main body (global scope) ──
@@ -766,20 +859,53 @@ impl Compiler {
         scope.next_slot = slot;
         self.scope = Some(scope);
 
+        // Named results become zero-initialized locals the body may read/assign.
+        self.named_results = if f.result_names.iter().any(|n| !n.is_empty()) {
+            f.result_names.clone()
+        } else {
+            Vec::new()
+        };
+
         // Params/locals captured by a nested closure are boxed (shared cells).
-        let mut all_params: Vec<Param> = Vec::new();
+        // Named results participate too (a deferred closure may capture them), so
+        // include them in the capture analysis.
+        let mut real_params: Vec<Param> = Vec::new();
         if let Some(r) = &f.receiver {
-            all_params.push(r.clone());
+            real_params.push(r.clone());
         }
-        all_params.extend(f.params.iter().cloned());
-        self.boxed = boxed_vars(&all_params, &f.body);
+        real_params.extend(f.params.iter().cloned());
+        let mut analysis_params = real_params.clone();
+        for (name, ty) in f.result_names.iter().zip(&f.results) {
+            if !name.is_empty() {
+                analysis_params.push(Param {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                });
+            }
+        }
+        self.boxed = boxed_vars(&analysis_params, &f.body);
 
         // Prologue: pop args into their slots. The last argument is on top of
         // the stack, so bind slots high-to-low (receiver deepest, at slot 0).
         for i in (0..slot).rev() {
             self.b.emit(Op::SetSlot(i), f.line);
         }
-        self.box_params(&all_params);
+        self.box_params(&real_params);
+
+        // Bind the named results to their zero values (boxed when captured).
+        for (name, ty) in f.result_names.iter().zip(&f.results) {
+            if name.is_empty() {
+                continue;
+            }
+            if self.structs.contains(&base_type(ty)) {
+                self.struct_lit(&base_type(ty), &[])?;
+            } else {
+                self.emit_default(numtype_of_ty(ty), f.line);
+            }
+            self.types.insert(name.clone(), numtype_of_ty(ty));
+            self.decl_types.insert(name.clone(), base_type(ty));
+            self.emit_declare(name, f.line);
+        }
 
         self.fn_has_defer = body_has_defer(&f.body);
         self.panic_jumps.clear();
@@ -791,13 +917,19 @@ impl Compiler {
         for s in &f.body {
             self.stmt(s)?;
         }
-        // Fall-off: a function with no explicit `return` yields nil.
-        self.b.emit(Op::LoadUndef, f.line);
-        self.emit_return(f.line);
+        // Fall-off: return the named results (their current values, possibly set
+        // by a deferred func) or nil for unnamed results.
+        if self.named_results.is_empty() {
+            self.b.emit(Op::LoadUndef, f.line);
+            self.emit_return(f.line);
+        } else {
+            self.emit_named_return(f.line);
+        }
         self.emit_panic_epilogue(&f.results, f.line);
 
         self.fn_has_defer = false;
         self.boxed = HashSet::new();
+        self.named_results = Vec::new();
         self.scope = None;
         Ok(())
     }
@@ -847,6 +979,31 @@ impl Compiler {
         self.b.emit(Op::ReturnValue, line);
     }
 
+    /// Return the current values of the named results. Deferred calls run *first*
+    /// (a deferred `recover()` may assign a named result), so the values are read
+    /// after the drain — this is why a named-result return can't reuse the
+    /// value-on-stack-then-drain shape of [`Self::emit_return`].
+    fn emit_named_return(&mut self, line: u32) {
+        if self.fn_has_defer {
+            self.emit_defer_drain();
+            self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 0), line);
+            self.b.emit(Op::Pop, line);
+        }
+        let names = self.named_results.clone();
+        if names.len() >= 2 {
+            for r in &names {
+                self.emit_get(r, line);
+            }
+            self.b
+                .emit(Op::CallBuiltin(host::GSLICE_LIT, names.len() as u8), line);
+        } else if let Some(r) = names.first() {
+            self.emit_get(r, line);
+        } else {
+            self.b.emit(Op::LoadUndef, line);
+        }
+        self.b.emit(Op::ReturnValue, line);
+    }
+
     /// Emit a function's panic epilogue (the target of its `panic` sites and
     /// post-call unwind checks): drain this frame's defers — a deferred
     /// `recover()` may clear the panic — drop the frame, and return nil. If the
@@ -861,9 +1018,14 @@ impl Compiler {
         for j in jumps {
             self.b.patch_jump(j, ep);
         }
-        // Return the function's zero values (int→0, string→"", …) so a recovered
-        // call still yields the right shape and values. (Deferred mutation of
-        // *named* results is a documented gap pending capture-by-reference.)
+        // A named-result function returns its results' current values (a deferred
+        // `recover()` may have assigned them). An unnamed-result function returns
+        // the result types' zero values so a recovered call still has the right
+        // shape.
+        if !self.named_results.is_empty() {
+            self.emit_named_return(line);
+            return;
+        }
         if results.len() >= 2 {
             for ty in results {
                 self.emit_default(numtype_of_ty(ty), line);
@@ -1223,6 +1385,33 @@ impl Compiler {
                     }
                 }
             }
+            Stmt::Switch {
+                init,
+                tag,
+                cases,
+                default,
+                ..
+            } => {
+                if let Some(i) = init {
+                    self.fv_stmt(i, bound, caps);
+                }
+                if let Some(t) = tag {
+                    self.fv_expr(t, bound, caps);
+                }
+                for c in cases {
+                    for e in &c.exprs {
+                        self.fv_expr(e, bound, caps);
+                    }
+                    for s in &c.body {
+                        self.fv_stmt(s, bound, caps);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.fv_stmt(s, bound, caps);
+                    }
+                }
+            }
             Stmt::Block(b) => {
                 for s in b {
                     self.fv_stmt(s, bound, caps);
@@ -1254,6 +1443,15 @@ impl Compiler {
             Expr::Index { recv, index } => {
                 self.fv_expr(recv, bound, caps);
                 self.fv_expr(index, bound, caps);
+            }
+            Expr::Slice { recv, low, high } => {
+                self.fv_expr(recv, bound, caps);
+                if let Some(e) = low {
+                    self.fv_expr(e, bound, caps);
+                }
+                if let Some(e) = high {
+                    self.fv_expr(e, bound, caps);
+                }
             }
             Expr::SliceLit { elems, .. } => {
                 for el in elems {
@@ -1490,6 +1688,20 @@ impl Compiler {
                 self.b.emit(Op::Pop, 0);
             }
             Stmt::Return(vals, line) => match self.scope {
+                // A named-result function: `return e…` assigns the named results
+                // (Go allows explicit values even with named results), a bare
+                // `return` keeps their current values; either way deferred calls
+                // run, then the named results are returned.
+                Some(_) if !self.named_results.is_empty() => {
+                    if !vals.is_empty() {
+                        let names = self.named_results.clone();
+                        for (name, e) in names.iter().zip(vals) {
+                            self.emit_value(e)?;
+                            self.emit_set(name, *line);
+                        }
+                    }
+                    self.emit_named_return(*line);
+                }
                 Some(_) => {
                     match vals.len() {
                         0 => {
@@ -1613,6 +1825,13 @@ impl Compiler {
                 default,
                 line,
             } => self.compile_select(cases, default, *line)?,
+            Stmt::Switch {
+                init,
+                tag,
+                cases,
+                default,
+                line,
+            } => self.compile_switch(init, tag, cases, default, *line)?,
             Stmt::Break(line) => {
                 let j = self.b.emit(Op::Jump(0), *line);
                 self.loops
@@ -1623,8 +1842,12 @@ impl Compiler {
             }
             Stmt::Continue(line) => {
                 let j = self.b.emit(Op::Jump(0), *line);
+                // `continue` targets the innermost enclosing loop, skipping any
+                // switch scopes in between.
                 self.loops
-                    .last_mut()
+                    .iter_mut()
+                    .rev()
+                    .find(|s| !s.is_switch)
                     .ok_or_else(|| format!("go-rs: `continue` outside a loop (line {line})"))?
                     .continues
                     .push(j);
@@ -1681,6 +1904,120 @@ impl Compiler {
     /// Lower a `select`: push each case's channel descriptor `(ch, is_recv,
     /// send_val)`, run `Op::Select`, then a jump table over the chosen case index
     /// the scheduler pushed (with the received value for a `case v := <-ch`).
+    /// Lower a `switch` to an if/else-if chain (no implicit fallthrough — the
+    /// first matching case runs, then jumps to the end). With a tag, each case
+    /// tests `tag == caseExpr` (any of a comma list); without one, each case
+    /// expression is itself the boolean condition.
+    fn compile_switch(
+        &mut self,
+        init: &Option<Box<Stmt>>,
+        tag: &Option<Expr>,
+        cases: &[SwitchCase],
+        default: &Option<Vec<Stmt>>,
+        line: u32,
+    ) -> Result<(), String> {
+        if let Some(init) = init {
+            self.stmt(init)?;
+        }
+
+        // Evaluate the tag once into a temp (if present).
+        let tag_tmp = if tag.is_some() {
+            let n = self.temp_counter;
+            self.temp_counter += 1;
+            let t = format!("$sw{n}");
+            Some(t)
+        } else {
+            None
+        };
+        if let (Some(t), Some(e)) = (&tag_tmp, tag) {
+            let nt = self.infer(e);
+            self.expr(e)?;
+            let t = t.clone();
+            self.types.insert(t.clone(), nt);
+            self.emit_set(&t, line);
+        }
+
+        // A switch is breakable (but transparent to `continue`).
+        self.loops.push(LoopScope {
+            is_switch: true,
+            ..Default::default()
+        });
+
+        let mut end_jumps = Vec::new();
+        for case in cases {
+            // Condition: OR of `tag == e` (tagged) or `e` (expression switch).
+            let mut next_jumps = Vec::new();
+            // Build: if none of the exprs match, jump to next case.
+            for (k, e) in case.exprs.iter().enumerate() {
+                match &tag_tmp {
+                    Some(t) => {
+                        let t = t.clone();
+                        self.emit_get(&t, line);
+                        self.expr(e)?;
+                        self.emit_eq(t.as_str(), e, line);
+                    }
+                    None => self.expr(e)?,
+                }
+                // If this expr matches, fall through to the body; else try next.
+                if k + 1 < case.exprs.len() {
+                    // matched → jump into body; not matched → check next expr.
+                    let to_body = self.b.emit(Op::JumpIfTrue(0), line);
+                    next_jumps.push((true, to_body));
+                } else {
+                    let skip = self.b.emit(Op::JumpIfFalse(0), line);
+                    next_jumps.push((false, skip));
+                }
+            }
+            // Patch the "matched → body" jumps to here (body start).
+            let body_start = self.b.current_pos();
+            for (is_true, j) in &next_jumps {
+                if *is_true {
+                    self.b.patch_jump(*j, body_start);
+                }
+            }
+            for s in &case.body {
+                self.stmt(s)?;
+            }
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            // The final "not matched → skip" jump lands on the next case.
+            let next = self.b.current_pos();
+            for (is_true, j) in next_jumps {
+                if !is_true {
+                    self.b.patch_jump(j, next);
+                }
+            }
+        }
+        if let Some(body) = default {
+            for s in body {
+                self.stmt(s)?;
+            }
+        }
+
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
+        let scope = self.loops.pop().unwrap();
+        for j in scope.breaks {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Emit an equality compare between a tag temp and a case expression, picking
+    /// string vs numeric comparison from the operand types.
+    fn emit_eq(&mut self, tag_tmp: &str, case_expr: &Expr, line: u32) {
+        // Both operands are already on the stack (tag, then case expr).
+        let op = if self.infer(&Expr::Ident(tag_tmp.to_string())) == NumType::Str
+            || self.infer(case_expr) == NumType::Str
+        {
+            Op::StrEq
+        } else {
+            Op::NumEq
+        };
+        self.b.emit(op, line);
+    }
+
     fn compile_select(
         &mut self,
         cases: &[SelectClause],
@@ -1916,14 +2253,22 @@ impl Compiler {
             }
             Expr::Ident(name) => self.emit_get(name, 0),
             Expr::Unary { op, rhs } => {
-                self.expr(rhs)?;
-                self.b.emit(
-                    match op {
-                        UnOp::Neg => Op::Negate,
-                        UnOp::Not => Op::LogNot,
-                    },
-                    0,
-                );
+                // `&x` / `*p` are reference/identity on go-rs's heap handles — no
+                // copy, no op. Emitting the operand yields the shared handle, so a
+                // pointer sees the same struct the original variable holds.
+                if matches!(op, UnOp::Addr | UnOp::Deref) {
+                    self.expr(rhs)?;
+                } else {
+                    self.expr(rhs)?;
+                    self.b.emit(
+                        match op {
+                            UnOp::Neg => Op::Negate,
+                            UnOp::Not => Op::LogNot,
+                            UnOp::Addr | UnOp::Deref => unreachable!(),
+                        },
+                        0,
+                    );
+                }
             }
             Expr::Binary { op, lhs, rhs } => {
                 // Constant float expression: evaluate exactly (rational) and round
@@ -1956,6 +2301,23 @@ impl Compiler {
                 self.expr(recv)?;
                 self.expr(index)?;
                 self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            }
+            Expr::Slice { recv, low, high } => {
+                // `recv[low:high]`: push recv, low (or -1), high (or -1).
+                self.expr(recv)?;
+                match low {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        self.b.emit(Op::LoadInt(-1), 0);
+                    }
+                }
+                match high {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        self.b.emit(Op::LoadInt(-1), 0);
+                    }
+                }
+                self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 3), 0);
             }
             Expr::SliceLit { elems, .. } => {
                 for e in elems {
@@ -2082,7 +2444,10 @@ impl Compiler {
     /// are reference types and pass through the copy unchanged).
     fn emit_value(&mut self, e: &Expr) -> Result<(), String> {
         self.expr(e)?;
-        if self.structs.contains(&self.type_name(e)) {
+        // Struct values are copied on assign/pass/return (Go value semantics) —
+        // but `&x` is a pointer (a reference), so it is never copied.
+        let is_pointer = matches!(e, Expr::Unary { op: UnOp::Addr, .. });
+        if !is_pointer && self.structs.contains(&self.type_name(e)) {
             self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
         }
         Ok(())
@@ -2193,6 +2558,12 @@ impl Compiler {
         match e {
             Expr::Ident(n) => self.decl_types.get(n).cloned().unwrap_or_default(),
             Expr::StructLit { type_name, .. } => type_name.clone(),
+            // `&x` / `*p` name the same type as their operand (a `*Point` handle
+            // dispatches methods and reads fields like a `Point`).
+            Expr::Unary {
+                op: UnOp::Addr | UnOp::Deref,
+                rhs,
+            } => self.type_name(rhs),
             Expr::Selector { recv, field } => {
                 // A field's declared type, looked up on the receiver's struct.
                 let rt = self.type_name(recv);
@@ -2292,6 +2663,9 @@ impl Compiler {
                         "Println" => host::GPRINTLN,
                         "Print" => host::GPRINT,
                         "Printf" => host::GPRINTF,
+                        "Sprintf" => host::GSPRINTF,
+                        "Sprint" => host::GSPRINT,
+                        "Sprintln" => host::GSPRINTLN,
                         _ => {
                             return Err(format!(
                                 "go-rs: unsupported call `fmt.{field}` (line {line})"
@@ -2445,7 +2819,35 @@ impl Compiler {
             return Err(format!("go-rs: undefined: {name} (line {line})"));
         }
 
-        Err(format!("go-rs: cannot call this expression (line {line})"))
+        // Any other callee expression yields a function value at runtime — e.g.
+        // an element of a slice/map of funcs (`fns[i](x)`), a field holding a
+        // closure, or the result of another call. Evaluate it and dispatch
+        // dynamically through the closure's stored subroutine name-index.
+        self.call_value(func, args, line)
+    }
+
+    /// Call a function *value* produced by an arbitrary expression: stash it,
+    /// read its subroutine name-index, then push `self`, the args, and the
+    /// name-index and issue `Op::CallDynamic`.
+    fn call_value(&mut self, func: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let cv = format!("$cv{n}");
+        let ni = format!("$cni{n}");
+        self.expr(func)?;
+        self.emit_set(&cv, line);
+        self.emit_get(&cv, line);
+        self.b
+            .emit(Op::CallBuiltin(host::GCLOSURE_NAMEIDX, 1), line);
+        self.emit_set(&ni, line);
+        self.emit_get(&cv, line); // self (the closure)
+        for a in args {
+            self.emit_value(a)?;
+        }
+        self.emit_get(&ni, line);
+        self.b.emit(Op::CallDynamic(args.len() as u8 + 1), line);
+        self.emit_panic_check(line);
+        Ok(())
     }
 
     // ── static type inference ──────────────────────────────────────────────
@@ -2460,6 +2862,9 @@ impl Compiler {
             Expr::Unary { op, rhs } => match op {
                 UnOp::Neg => self.infer(rhs),
                 UnOp::Not => NumType::Bool,
+                // `&x` / `*p` carry the operand's category (a struct handle stays
+                // a struct handle).
+                UnOp::Addr | UnOp::Deref => self.infer(rhs),
             },
             Expr::Binary { op, lhs, rhs } => match op {
                 BinOp::And
@@ -2512,6 +2917,7 @@ impl Compiler {
             // Composite literals, indexing, make, and channel ops have no
             // known numeric category.
             Expr::Index { .. }
+            | Expr::Slice { .. }
             | Expr::SliceLit { .. }
             | Expr::MapLit { .. }
             | Expr::StructLit { .. }
@@ -2700,6 +3106,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::Defer { line, .. }
         | Stmt::Send { line, .. }
         | Stmt::Select { line, .. }
+        | Stmt::Switch { line, .. }
         | Stmt::Break(line)
         | Stmt::Continue(line) => *line,
         Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
@@ -2722,6 +3129,10 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         Stmt::Go { call, .. } | Stmt::Defer { call, .. } => expr_has_ffi(call),
         Stmt::Send { chan, val, .. } => expr_has_ffi(chan) || expr_has_ffi(val),
         Stmt::Select { cases, default, .. } => {
+            cases.iter().any(|c| body_has_ffi(&c.body))
+                || default.as_ref().is_some_and(|d| body_has_ffi(d))
+        }
+        Stmt::Switch { cases, default, .. } => {
             cases.iter().any(|c| body_has_ffi(&c.body))
                 || default.as_ref().is_some_and(|d| body_has_ffi(d))
         }

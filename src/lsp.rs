@@ -156,6 +156,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "schedule a call to run at function return (LIFO); arguments are evaluated now",
         "defer f.Close()",
     ),
+    (
+        "switch",
+        "Keyword",
+        "multi-way branch: tagged (`switch x`) or expression (`switch`) form; first matching case runs, no implicit fallthrough",
+        "switch { case n < 0: neg(); default: pos() }",
+    ),
     // ── Type (declaration-position type names) ──
     (
         "int",
@@ -208,6 +214,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "IO",
         "fmt.Printf(format, a…): format with %v %d %s %f %t %q %%",
         "fmt.Printf(\"%d and %s\\n\", 42, \"hi\")",
+    ),
+    (
+        "Sprintf",
+        "IO",
+        "fmt.Sprintf(format, a…): like Printf but returns the string instead of printing (also Sprint / Sprintln)",
+        "s := fmt.Sprintf(\"%d-%s\", 42, \"go\")",
     ),
     (
         "fmt",

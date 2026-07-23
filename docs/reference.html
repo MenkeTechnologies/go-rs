@@ -168,6 +168,11 @@
           <p>schedule a call to run at function return (LIFO); arguments are evaluated now</p>
           <pre><code class="lang-go">defer f.Close()</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keyword-22">
+          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>switch</code></h3>
+          <p>multi-way branch: tagged (`switch x`) or expression (`switch`) form; first matching case runs, no implicit fallthrough</p>
+          <pre><code class="lang-go">switch { case n &lt; 0: neg(); default: pos() }</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-type">
@@ -232,17 +237,22 @@
           <pre><code class="lang-go">fmt.Printf("%d and %s\n", 42, "hi")</code></pre>
         </article>
         <article class="doc-entry" id="doc-io-4">
-          <h3><a class="doc-anchor" href="#doc-io-4">#</a> <code>fmt</code></h3>
+          <h3><a class="doc-anchor" href="#doc-io-4">#</a> <code>Sprintf</code></h3>
+          <p>fmt.Sprintf(format, a…): like Printf but returns the string instead of printing (also Sprint / Sprintln)</p>
+          <pre><code class="lang-go">s := fmt.Sprintf("%d-%s", 42, "go")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-5">
+          <h3><a class="doc-anchor" href="#doc-io-5">#</a> <code>fmt</code></h3>
           <p>the fmt package; go-rs wires Println / Print / Printf</p>
           <pre><code class="lang-go">import "fmt"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-io-5">
-          <h3><a class="doc-anchor" href="#doc-io-5">#</a> <code>println</code></h3>
+        <article class="doc-entry" id="doc-io-6">
+          <h3><a class="doc-anchor" href="#doc-io-6">#</a> <code>println</code></h3>
           <p>builtin println(a…): space-separated, trailing newline, to stderr</p>
           <pre><code class="lang-go">println("debug", x)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-io-6">
-          <h3><a class="doc-anchor" href="#doc-io-6">#</a> <code>print</code></h3>
+        <article class="doc-entry" id="doc-io-7">
+          <h3><a class="doc-anchor" href="#doc-io-7">#</a> <code>print</code></h3>
           <p>builtin print(a…): to stderr with no newline</p>
           <pre><code class="lang-go">print("debug")</code></pre>
         </article>

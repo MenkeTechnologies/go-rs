@@ -55,6 +55,7 @@ pub enum Tok {
     Go,
     Chan,
     Select,
+    Switch,
     Defer,
     // punctuation
     LBrace,
@@ -97,6 +98,8 @@ pub enum Tok {
     Pipe,
     /// `~` — the generic underlying-type constraint marker (`~int`); erased.
     Tilde,
+    /// `&` — the address-of operator (`&T{…}`, `&x`).
+    Amp,
     Eof,
 }
 
@@ -387,6 +390,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 '!' => (Tok::Not, 1),
                 '|' => (Tok::Pipe, 1),
                 '~' => (Tok::Tilde, 1),
+                // `&` — address-of (a single `&`; `&&` matched above).
+                '&' => (Tok::Amp, 1),
                 other => {
                     return Err(format!(
                         "go-rs: unexpected character `{other}` on line {line}"
@@ -451,6 +456,7 @@ fn keyword_or_ident(word: &str) -> Tok {
         "go" => Tok::Go,
         "chan" => Tok::Chan,
         "select" => Tok::Select,
+        "switch" => Tok::Switch,
         "defer" => Tok::Defer,
         _ => Tok::Ident(word.to_string()),
     }
