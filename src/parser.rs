@@ -556,6 +556,16 @@ impl Parser {
         match self.peek() {
             Tok::LBracket => {
                 self.advance();
+                // A fixed-size array type `[N]T` or `[...]T` — go-rs represents
+                // arrays as slices for the value model, so the size is consumed
+                // and the type erases to `[]T`.
+                if !matches!(self.peek(), Tok::RBracket) {
+                    if matches!(self.peek(), Tok::Ellipsis) {
+                        self.advance();
+                    } else {
+                        let _ = self.expr()?;
+                    }
+                }
                 self.expect(&Tok::RBracket)?;
                 Ok(format!("[]{}", self.type_name()?))
             }
@@ -696,13 +706,46 @@ impl Parser {
     /// One `name [type] [= init]` variable specification.
     fn var_spec(&mut self, line: u32) -> Result<Stmt, String> {
         let name = self.ident()?;
+        // A fixed-size array type `[N]T` is captured specially so a bare
+        // `var x [N]T` (no initializer) can be zero-filled to N elements — go-rs
+        // models arrays as slices, and the erased size would otherwise be lost.
+        let mut array_len: Option<usize> = None;
         let ty = if self.type_starts() && !matches!(self.peek(), Tok::Assign) {
-            Some(self.type_name()?)
+            if matches!(self.peek(), Tok::LBracket) && !matches!(self.peek2(), Tok::RBracket) {
+                self.advance(); // `[`
+                array_len = if matches!(self.peek(), Tok::Ellipsis) {
+                    self.advance();
+                    None
+                } else {
+                    const_int_of(&self.expr()?).map(|n| n as usize)
+                };
+                self.expect(&Tok::RBracket)?;
+                let elem = self.type_name()?;
+                Some(format!("[]{elem}"))
+            } else {
+                Some(self.type_name()?)
+            }
         } else {
             None
         };
         let init = if self.eat(&Tok::Assign) {
             Some(self.expr()?)
+        } else if let (Some(len), Some(t)) = (array_len, ty.as_ref()) {
+            // Bare `var x [N]T` → an N-element slice of the element zero value.
+            let elem = t.strip_prefix("[]").unwrap_or(t).to_string();
+            let zero = if self.struct_names.contains(&elem) {
+                Expr::StructLit {
+                    type_name: elem,
+                    fields: Vec::new(),
+                }
+            } else {
+                zero_expr(&elem)
+            };
+            Some(Expr::Make {
+                is_map: false,
+                len: Some(Box::new(Expr::Int(len as i64))),
+                elem_zero: Box::new(zero),
+            })
         } else {
             None
         };
@@ -1460,9 +1503,15 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr, String> {
         let line = self.line();
-        // `[]T{ … }` slice composite literal.
+        // `[]T{ … }` slice literal / `[]T(x)` conversion, or a fixed-size array
+        // literal `[N]T{ … }` / `[...]T{ … }`.
         if matches!(self.peek(), Tok::LBracket) {
-            return self.slice_literal();
+            // Peek past `[` to distinguish a slice (`[]`) from an array (`[N]`
+            // or `[...]`).
+            if matches!(self.peek2(), Tok::RBracket) {
+                return self.slice_literal();
+            }
+            return self.array_literal();
         }
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
@@ -1548,6 +1597,88 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace)?;
+        Ok(Expr::SliceLit { elem_ty, elems })
+    }
+
+    /// `[N]T{ … }` / `[...]T{ … }` fixed-size array literal. go-rs represents an
+    /// array as a slice, so this builds a `SliceLit` of the array's length.
+    /// Elements may be sequential (`v0, v1, …`) or index-keyed (`3: v`), the
+    /// latter zero-filling any gaps; a `[...]` array is sized by its elements.
+    fn array_literal(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LBracket)?;
+        // Size: `...` (element-sized) or a constant expression `[N]`.
+        let fixed_len: Option<usize> = if matches!(self.peek(), Tok::Ellipsis) {
+            self.advance();
+            None
+        } else {
+            let n = self.expr()?;
+            const_int_of(&n).map(|n| n as usize)
+        };
+        self.expect(&Tok::RBracket)?;
+        let elem_ty = self.type_name()?;
+        self.expect(&Tok::LBrace)?;
+        // Collect (index, value) placements; a sequential value takes the running
+        // index, an index-keyed value resets it.
+        let mut placed: Vec<(usize, Expr)> = Vec::new();
+        let mut next_idx = 0usize;
+        while !matches!(self.peek(), Tok::RBrace) {
+            // A bare `{ … }` is an elided composite of a struct element type
+            // (sequential, no index key).
+            let is_bare_struct =
+                matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&elem_ty);
+            if is_bare_struct {
+                let v = self.struct_literal(elem_ty.clone())?;
+                placed.push((next_idx, v));
+                next_idx += 1;
+            } else {
+                let first = self.expr()?;
+                if self.eat(&Tok::Colon) {
+                    // `idx: value` — an index-keyed element.
+                    let idx = const_int_of(&first).ok_or_else(|| {
+                        format!(
+                            "go-rs: array index in a composite literal must be a constant (line {})",
+                            self.line()
+                        )
+                    })? as usize;
+                    let v = if matches!(self.peek(), Tok::LBrace)
+                        && self.struct_names.contains(&elem_ty)
+                    {
+                        self.struct_literal(elem_ty.clone())?
+                    } else {
+                        self.expr()?
+                    };
+                    placed.push((idx, v));
+                    next_idx = idx + 1;
+                } else {
+                    placed.push((next_idx, first));
+                    next_idx += 1;
+                }
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        // Final length: the declared `[N]`, else one past the highest index.
+        let len = fixed_len.unwrap_or_else(|| placed.iter().map(|(i, _)| i + 1).max().unwrap_or(0));
+        // Zero value for any gap: an empty struct literal for a struct element
+        // type (the compiler zero-fills), else the scalar zero.
+        let zero = |ety: &str| -> Expr {
+            if self.struct_names.contains(ety) {
+                Expr::StructLit {
+                    type_name: ety.to_string(),
+                    fields: Vec::new(),
+                }
+            } else {
+                zero_expr(ety)
+            }
+        };
+        let mut elems: Vec<Expr> = (0..len).map(|_| zero(&elem_ty)).collect();
+        for (idx, v) in placed {
+            if idx < elems.len() {
+                elems[idx] = v;
+            }
+        }
         Ok(Expr::SliceLit { elem_ty, elems })
     }
 
@@ -1652,6 +1783,34 @@ impl Parser {
             len,
             elem_zero: Box::new(zero_expr(elem_ty)),
         })
+    }
+}
+
+/// The constant integer value of an expression, if it folds to one — used for
+/// array sizes and index-keyed array-literal elements. Handles literals and the
+/// simple unary/binary arithmetic that appears in array bounds.
+fn const_int_of(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(n) => Some(*n),
+        Expr::Unary {
+            op: crate::ast::UnOp::Neg,
+            rhs,
+        } => const_int_of(rhs).map(|n| -n),
+        Expr::Binary { op, lhs, rhs } => {
+            use crate::ast::BinOp;
+            let (a, b) = (const_int_of(lhs)?, const_int_of(rhs)?);
+            match op {
+                BinOp::Add => Some(a + b),
+                BinOp::Sub => Some(a - b),
+                BinOp::Mul => Some(a * b),
+                BinOp::Div if b != 0 => Some(a / b),
+                BinOp::Mod if b != 0 => Some(a % b),
+                BinOp::Shl => Some(a << b),
+                BinOp::Shr => Some(a >> b),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

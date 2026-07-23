@@ -1612,3 +1612,37 @@ func main() {
 ";
     assert_stdout(src, "tab\there\nA=A e=\u{e9} smile=\u{1F600}\noctal-A=A\n");
 }
+
+#[test]
+fn fixed_size_array_literals() {
+    // Arrays are modeled as slices: sequential [N]T, element-sized [...]T, sparse
+    // index-keyed [N]T{i: v} with zero-fill, struct elements, and range/index.
+    // Bare `var buf [N]scalar` zero-fills to N elements.
+    let src = "\
+package main
+import \"fmt\"
+type pair struct{ lo, hi int }
+func main() {
+	a := [3]int{10, 20, 30}
+	fmt.Println(a, len(a), a[1])
+	b := [...]int{1, 2, 3, 4}
+	fmt.Println(b, len(b))
+	c := [5]int{0: 100, 2: 300}
+	fmt.Println(c)
+	d := [4]pair{0: {1, 2}, 1: {3, 4}}
+	fmt.Println(d)
+	var buf [4]byte
+	buf[1] = 9
+	fmt.Println(buf)
+	sum := 0
+	for _, v := range c {
+		sum += v
+	}
+	fmt.Println(sum)
+}
+";
+    assert_stdout(
+        src,
+        "[10 20 30] 3 20\n[1 2 3 4] 4\n[100 0 300 0 0]\n[{1 2} {3 4} {0 0} {0 0}]\n[0 9 0 0]\n400\n",
+    );
+}
