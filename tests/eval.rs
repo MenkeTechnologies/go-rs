@@ -1282,3 +1282,31 @@ func main() {
 ";
     assert_stdout(src, "42 go\n6\n");
 }
+
+#[test]
+fn sub_slice_shares_backing_array() {
+    // A sub-slice `s[lo:hi]` shares the parent's backing array: element writes
+    // are visible through the parent (and via nested sub-slices), len/cap reflect
+    // the offset, and append writes in place when the backing has spare capacity.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	a := []int{5, 3, 8, 1, 9, 2}
+	mid := a[1:5]
+	fmt.Println(mid, len(mid), cap(mid))
+	mid[0] = 100
+	inner := mid[1:3]
+	inner[0] = 200
+	fmt.Println(a)
+	b := []int{1, 2, 3, 4, 5}
+	c := b[0:2]
+	c = append(c, 99)
+	fmt.Println(b, c)
+}
+";
+    assert_stdout(
+        src,
+        "[3 8 1 9] 4 5\n[5 100 200 1 9 2]\n[1 2 99 4 5] [1 2 99]\n",
+    );
+}

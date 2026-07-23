@@ -193,20 +193,23 @@ fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
     let lo_raw = args.get(1).map(Value::to_int).unwrap_or(-1);
     let hi_raw = args.get(2).map(Value::to_int).unwrap_or(-1);
     match recv {
-        Value::Obj(id) => HEAP.with(|h| {
-            let sub = match h.borrow().get(id as usize) {
-                Some(HostObj::Slice(a)) => {
-                    let len = a.len() as i64;
-                    let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, len) as usize;
-                    let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, len) as usize;
-                    a.get(lo..hi.max(lo))
-                        .map(|s| s.to_vec())
-                        .unwrap_or_default()
-                }
-                _ => return Value::Undef,
+        // A sub-slice shares the parent's backing array (so element writes are
+        // visible both ways), matching Go — collapse a view-of-a-view to the
+        // original backing.
+        Value::Obj(id) => {
+            let Some((backing, base, len)) = slice_backing(id) else {
+                return Value::Undef;
             };
-            Value::Obj(heap_alloc(HostObj::Slice(sub)))
-        }),
+            let len = len as i64;
+            let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, len) as usize;
+            let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, len) as usize;
+            let hi = hi.max(lo);
+            Value::Obj(heap_alloc(HostObj::SliceView {
+                backing,
+                offset: base + lo,
+                len: hi - lo,
+            }))
+        }
         Value::Str(s) => {
             // Byte-indexed substring, matching Go's string slicing.
             let bytes = s.as_bytes();
@@ -456,14 +459,16 @@ fn b_range_keys(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let keys: Vec<Value> = match args.first() {
         Some(Value::Str(s)) => (0..s.len() as i64).map(Value::Int).collect(),
-        Some(Value::Obj(id)) => HEAP.with(|h| {
-            let h = h.borrow();
-            match h.get(*id as usize) {
-                Some(HostObj::Slice(a)) => (0..a.len() as i64).map(Value::Int).collect(),
-                Some(HostObj::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
-                _ => Vec::new(),
+        Some(Value::Obj(id)) => {
+            if let Some((_, _, len)) = slice_backing(*id) {
+                (0..len as i64).map(Value::Int).collect()
+            } else {
+                HEAP.with(|h| match h.borrow().get(*id as usize) {
+                    Some(HostObj::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
+                    _ => Vec::new(),
+                })
             }
-        }),
+        }
         _ => Vec::new(),
     };
     Value::Obj(heap_alloc(HostObj::Slice(keys)))
@@ -478,8 +483,16 @@ fn b_range_keys(vm: &mut VM, argc: u8) -> Value {
 
 /// One object on the host-owned Go heap.
 pub(crate) enum HostObj {
-    /// A slice (also the backing array). Go slices are reference types.
+    /// A slice that owns its backing array. Go slices are reference types.
     Slice(Vec<Value>),
+    /// A sub-slice view `s[lo:hi]` sharing another slice's backing array at an
+    /// offset, so element writes are visible through the parent (and vice versa).
+    /// `backing` indexes a [`HostObj::Slice`]; `cap` is `backing.len() - offset`.
+    SliceView {
+        backing: u32,
+        offset: usize,
+        len: usize,
+    },
     /// A map, insertion-ordered for stable iteration; keys compared by value.
     Map(Vec<(Value, Value)>),
     /// A struct: its type name and ordered `(field, value)` pairs.
@@ -526,6 +539,33 @@ fn heap_alloc(obj: HostObj) -> u32 {
         let id = h.len() as u32;
         h.push(obj);
         id
+    })
+}
+
+/// Resolve a slice handle to `(backing slice id, offset, len)`. A plain
+/// [`HostObj::Slice`] is its own backing at offset 0; a [`HostObj::SliceView`]
+/// names the backing it shares. `None` if `id` is not a slice.
+fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Slice(a)) => Some((id, 0, a.len())),
+        Some(HostObj::SliceView {
+            backing,
+            offset,
+            len,
+        }) => Some((*backing, *offset, *len)),
+        _ => None,
+    })
+}
+
+/// Read element `i` of a slice-or-view (bounds-checked against its length).
+fn slice_get(id: u32, i: usize) -> Option<Value> {
+    let (backing, offset, len) = slice_backing(id)?;
+    if i >= len {
+        return None;
+    }
+    HEAP.with(|h| match h.borrow().get(backing as usize) {
+        Some(HostObj::Slice(a)) => a.get(offset + i).cloned(),
+        _ => None,
     })
 }
 
@@ -603,22 +643,20 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             return Value::Undef;
         }
     };
+    // A slice or sub-slice view: index into its backing (bounds-checked).
+    if let Some((_, _, len)) = slice_backing(id) {
+        let i = key.to_int();
+        return match usize::try_from(i).ok().filter(|&i| i < len) {
+            Some(i) => slice_get(id, i).unwrap_or(Value::Undef),
+            None => {
+                runtime_panic(vm, format!("index out of range [{i}] with length {len}"));
+                Value::Undef
+            }
+        };
+    }
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
-            Some(HostObj::Slice(a)) => {
-                let i = key.to_int();
-                match usize::try_from(i).ok().and_then(|i| a.get(i)) {
-                    Some(v) => v.clone(),
-                    None => {
-                        runtime_panic(
-                            vm,
-                            format!("index out of range [{i}] with length {}", a.len()),
-                        );
-                        Value::Undef
-                    }
-                }
-            }
             Some(HostObj::Map(m)) => m
                 .iter()
                 .find(|(k, _)| key_eq(k, &key))
@@ -647,19 +685,29 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
             return Value::Undef;
         }
     };
+    // A slice or sub-slice view: write through the backing array at `offset+i`.
+    if let Some((backing, offset, len)) = slice_backing(id) {
+        let i = key.to_int();
+        let err = match usize::try_from(i).ok().filter(|&i| i < len) {
+            Some(i) => HEAP.with(|h| {
+                if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+                    a[offset + i] = val.clone();
+                }
+                None::<String>
+            }),
+            None => Some(format!("index out of range [{i}] with length {len}")),
+        };
+        return match err {
+            None => val,
+            Some(msg) => {
+                runtime_panic(vm, msg);
+                Value::Undef
+            }
+        };
+    }
     let err = HEAP.with(|h| {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
-            Some(HostObj::Slice(a)) => {
-                let i = key.to_int();
-                match usize::try_from(i).ok().filter(|&i| i < a.len()) {
-                    Some(i) => {
-                        a[i] = val.clone();
-                        None
-                    }
-                    None => Some(format!("index out of range [{i}] with length {}", a.len())),
-                }
-            }
             Some(HostObj::Map(m)) => {
                 if let Some(slot) = m.iter_mut().find(|(k, _)| key_eq(k, &key)) {
                     slot.1 = val.clone();
@@ -691,21 +739,37 @@ fn b_len(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     match args.first() {
         Some(Value::Str(s)) => Value::Int(s.len() as i64),
-        Some(Value::Obj(id)) => HEAP.with(|h| {
-            let h = h.borrow();
-            match h.get(*id as usize) {
-                Some(HostObj::Slice(a)) => Value::Int(a.len() as i64),
+        Some(Value::Obj(id)) => {
+            if let Some((_, _, len)) = slice_backing(*id) {
+                return Value::Int(len as i64);
+            }
+            HEAP.with(|h| match h.borrow().get(*id as usize) {
                 Some(HostObj::Map(m)) => Value::Int(m.len() as i64),
                 _ => Value::Int(0),
-            }
-        }),
+            })
+        }
         _ => Value::Int(0),
     }
 }
 
-/// `cap(x)` — the capacity of a slice (its length in this model).
+/// `cap(x)` — a slice's capacity: `backing.len() - offset` (a sub-slice can grow
+/// into the remaining backing without reallocating, like Go).
 fn b_cap(vm: &mut VM, argc: u8) -> Value {
-    b_len(vm, argc)
+    let args = pop_args(vm, argc);
+    match args.first() {
+        Some(Value::Str(s)) => Value::Int(s.len() as i64),
+        Some(Value::Obj(id)) => {
+            if let Some((backing, offset, _)) = slice_backing(*id) {
+                let cap = HEAP.with(|h| match h.borrow().get(backing as usize) {
+                    Some(HostObj::Slice(a)) => a.len().saturating_sub(offset),
+                    _ => 0,
+                });
+                return Value::Int(cap as i64);
+            }
+            Value::Int(0)
+        }
+        _ => Value::Int(0),
+    }
 }
 
 /// `append(s, elems...)` — extend slice `s` in place and return its handle.
@@ -718,6 +782,45 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
     let recv = args.remove(0);
     match recv {
         Value::Obj(id) => {
+            // Appending to a sub-slice view reallocates into a fresh slice (its
+            // own backing), so it never clobbers the parent's elements.
+            let is_view = HEAP
+                .with(|h| matches!(h.borrow().get(id as usize), Some(HostObj::SliceView { .. })));
+            if is_view {
+                let (backing, offset, len) = match slice_backing(id) {
+                    Some(t) => t,
+                    None => return Value::Obj(heap_alloc(HostObj::Slice(args))),
+                };
+                let new_len = len + args.len();
+                // Go semantics: if the shared backing has spare capacity after the
+                // view, the new elements are written *in place* (clobbering the
+                // parent's data there); only a full backing forces a reallocation
+                // into a fresh, independent slice.
+                let cap = HEAP.with(|h| match h.borrow().get(backing as usize) {
+                    Some(HostObj::Slice(a)) => a.len().saturating_sub(offset),
+                    _ => 0,
+                });
+                if new_len <= cap {
+                    HEAP.with(|h| {
+                        if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+                            for (k, v) in args.into_iter().enumerate() {
+                                a[offset + len + k] = v;
+                            }
+                        }
+                    });
+                    return Value::Obj(heap_alloc(HostObj::SliceView {
+                        backing,
+                        offset,
+                        len: new_len,
+                    }));
+                }
+                let mut out = HEAP.with(|h| match h.borrow().get(backing as usize) {
+                    Some(HostObj::Slice(a)) => a[offset..offset + len].to_vec(),
+                    _ => Vec::new(),
+                });
+                out.extend(args);
+                return Value::Obj(heap_alloc(HostObj::Slice(out)));
+            }
             let ok = HEAP.with(|h| {
                 let mut h = h.borrow_mut();
                 if let Some(HostObj::Slice(a)) = h.get_mut(id as usize) {
@@ -999,6 +1102,19 @@ fn obj_str(id: u32) -> String {
         match h.get(id as usize) {
             Some(HostObj::Slice(a)) => {
                 let parts: Vec<String> = a.iter().map(go_str).collect();
+                format!("[{}]", parts.join(" "))
+            }
+            Some(HostObj::SliceView {
+                backing,
+                offset,
+                len,
+            }) => {
+                let parts: Vec<String> = match h.get(*backing as usize) {
+                    Some(HostObj::Slice(a)) => {
+                        a[*offset..*offset + *len].iter().map(go_str).collect()
+                    }
+                    _ => Vec::new(),
+                };
                 format!("[{}]", parts.join(" "))
             }
             Some(HostObj::Map(m)) => {
@@ -1445,12 +1561,15 @@ pub mod stdlib {
     ) -> Value {
         let args = pop_args(vm, argc);
         if let Some(Value::Obj(id)) = args.first() {
-            HEAP.with(|h| {
-                let mut h = h.borrow_mut();
-                if let Some(HostObj::Slice(a)) = h.get_mut(*id as usize) {
-                    a.sort_by(cmp);
-                }
-            });
+            // Sort the backing in place over the (sub-)slice's element range, so
+            // sorting a view (`sort.Ints(s[1:4])`) sorts through the parent.
+            if let Some((backing, offset, len)) = super::slice_backing(*id) {
+                HEAP.with(|h| {
+                    if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+                        a[offset..offset + len].sort_by(cmp);
+                    }
+                });
+            }
         }
         Value::Undef
     }
@@ -1586,10 +1705,19 @@ pub mod stdlib {
         let joined = match args.first() {
             Some(Value::Obj(id)) => HEAP.with(|h| {
                 let h = h.borrow();
-                match h.get(*id as usize) {
-                    Some(HostObj::Slice(a)) => a.iter().map(go_str).collect::<Vec<_>>().join(&sep),
-                    _ => String::new(),
-                }
+                let elems: &[Value] = match h.get(*id as usize) {
+                    Some(HostObj::Slice(a)) => a,
+                    Some(HostObj::SliceView {
+                        backing,
+                        offset,
+                        len,
+                    }) => match h.get(*backing as usize) {
+                        Some(HostObj::Slice(a)) => &a[*offset..*offset + *len],
+                        _ => &[],
+                    },
+                    _ => &[],
+                };
+                elems.iter().map(go_str).collect::<Vec<_>>().join(&sep)
             }),
             _ => String::new(),
         };

@@ -117,7 +117,7 @@ A single-file `package main` that runs real Go programs:
 | Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause), `break`, `continue`, `return` |
 | Expressions    | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
 | Types          | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
-| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` (also on strings), `len` / `cap` / `append`, `for i, v := range s` |
+| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` (also on strings) that **share the backing array** (writes alias the parent; `cap` reflects the offset; `append` writes in place when the backing has room, else reallocates), `len` / `cap` / `append`, `for i, v := range s` |
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m` |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
@@ -210,9 +210,11 @@ terms leave the `f64`-exact range falls back to runtime `f64`).
 
 **Known gaps** (documented rather than hidden):
 
-- **Sub-slices copy rather than alias** — `s[lo:hi]` returns a new slice, so
-  mutating an element of the sub-slice is not observed through the parent (Go
-  shares the backing array). Truncation/extraction (`s = s[:n]`) works.
+- **No module system** — a single-file `package main` only; `go get` / `go mod` /
+  third-party imports are out of scope, and the standard library is the curated
+  subset listed above.
+- **`switch` has no `fallthrough`, type switch, or `select`-style comm** — a plain
+  value/expression switch only.
 
 ## License
 
