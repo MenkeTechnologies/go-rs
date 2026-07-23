@@ -17,6 +17,8 @@ pub struct Program {
     pub imports: Vec<String>,
     /// `type T struct { … }` declarations.
     pub types: Vec<StructDecl>,
+    /// `type I interface { … }` declarations (method-set names).
+    pub interfaces: Vec<InterfaceDecl>,
     /// The body of `func main`, run in the global scope.
     pub main: Vec<Stmt>,
     /// Every top-level `func` other than `main` (including methods), lowered to
@@ -29,6 +31,13 @@ pub struct Program {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<Param>,
+}
+
+/// A `type I interface { m(...) ...; … }` declaration — its method-set names.
+#[derive(Debug, Clone)]
+pub struct InterfaceDecl {
+    pub name: String,
+    pub methods: Vec<String>,
 }
 
 /// A top-level function or method declaration.

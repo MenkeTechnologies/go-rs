@@ -349,3 +349,64 @@ fn slice_index_out_of_range_errors() {
     let (_stdout, ok) = run("package main\nfunc main() {\n\txs := []int{1}\n\t_ = xs[5]\n}\n");
     assert!(!ok, "out-of-range slice index should fail at runtime");
 }
+
+#[test]
+fn interface_dynamic_dispatch() {
+    let src = "\
+package main
+import \"fmt\"
+type Shape interface {
+	area() int
+}
+type Rect struct {
+	w int
+	h int
+}
+func (r Rect) area() int {
+	return r.w * r.h
+}
+type Square struct {
+	s int
+}
+func (sq Square) area() int {
+	return sq.s * sq.s
+}
+func describe(s Shape) {
+	fmt.Println(s.area())
+}
+func main() {
+	describe(Rect{w: 3, h: 4})
+	describe(Square{s: 5})
+}
+";
+    // Dispatch to the concrete type behind the interface at runtime.
+    assert_stdout(src, "12\n25\n");
+}
+
+#[test]
+fn interface_slice_polymorphism() {
+    let src = "\
+package main
+import \"fmt\"
+type Stringer interface {
+	label() string
+}
+type A struct{}
+func (a A) label() string {
+	return \"a\"
+}
+type B struct{}
+func (b B) label() string {
+	return \"b\"
+}
+func main() {
+	xs := []Stringer{A{}, B{}, A{}}
+	out := \"\"
+	for _, x := range xs {
+		out += x.label()
+	}
+	fmt.Println(out)
+}
+";
+    assert_stdout(src, "aba\n");
+}

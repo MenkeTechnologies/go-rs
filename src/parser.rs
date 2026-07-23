@@ -14,6 +14,12 @@ use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
 use std::collections::HashSet;
 
+/// The two kinds of `type` declaration the parser produces.
+enum TypeDecl {
+    Struct(StructDecl),
+    Interface(InterfaceDecl),
+}
+
 /// Parse Go source into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = lex(src)?;
@@ -124,6 +130,7 @@ impl Parser {
         }
 
         let mut types = Vec::new();
+        let mut interfaces = Vec::new();
         let mut main = Vec::new();
         let mut funcs = Vec::new();
         while !matches!(self.peek(), Tok::Eof) {
@@ -136,7 +143,10 @@ impl Parser {
                         funcs.push(f);
                     }
                 }
-                Tok::Type => types.push(self.type_decl()?),
+                Tok::Type => match self.type_decl()? {
+                    TypeDecl::Struct(s) => types.push(s),
+                    TypeDecl::Interface(i) => interfaces.push(i),
+                },
                 // Package-level `var`/`const` declarations run in `main`'s global
                 // scope (slice: no separate package-init phase).
                 Tok::Var | Tok::Const => main.push(self.stmt()?),
@@ -154,37 +164,73 @@ impl Parser {
             package,
             imports,
             types,
+            interfaces,
             main,
             funcs,
         })
     }
 
-    /// Parse `type T struct { field Type; … }`. Non-struct type declarations are
-    /// a later wave.
-    fn type_decl(&mut self) -> Result<StructDecl, String> {
+    /// Parse `type T struct { … }` or `type I interface { … }`.
+    fn type_decl(&mut self) -> Result<TypeDecl, String> {
         self.expect(&Tok::Type)?;
         let name = self.ident()?;
-        self.expect(&Tok::Struct)?;
-        self.expect(&Tok::LBrace)?;
-        self.skip_semis();
-        let mut fields = Vec::new();
-        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
-            // One or more field names sharing a type: `x, y int`.
-            let mut names = vec![self.ident()?];
-            while self.eat(&Tok::Comma) {
-                names.push(self.ident()?);
+        match self.peek() {
+            Tok::Interface => {
+                self.advance();
+                self.expect(&Tok::LBrace)?;
+                self.skip_semis();
+                let mut methods = Vec::new();
+                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    // `method(params) [results]` — record the name, skip the rest.
+                    methods.push(self.ident()?);
+                    self.expect(&Tok::LParen)?;
+                    self.skip_balanced_parens()?;
+                    while !matches!(self.peek(), Tok::Semi | Tok::RBrace) {
+                        self.advance();
+                    }
+                    self.skip_semis();
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(TypeDecl::Interface(InterfaceDecl { name, methods }))
             }
-            let ty = self.type_name()?;
-            for n in names {
-                fields.push(Param {
-                    name: n,
-                    ty: ty.clone(),
-                });
+            _ => {
+                self.expect(&Tok::Struct)?;
+                self.expect(&Tok::LBrace)?;
+                self.skip_semis();
+                let mut fields = Vec::new();
+                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    // One or more field names sharing a type: `x, y int`.
+                    let mut names = vec![self.ident()?];
+                    while self.eat(&Tok::Comma) {
+                        names.push(self.ident()?);
+                    }
+                    let ty = self.type_name()?;
+                    for n in names {
+                        fields.push(Param {
+                            name: n,
+                            ty: ty.clone(),
+                        });
+                    }
+                    self.skip_semis();
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(TypeDecl::Struct(StructDecl { name, fields }))
             }
-            self.skip_semis();
         }
-        self.expect(&Tok::RBrace)?;
-        Ok(StructDecl { name, fields })
+    }
+
+    /// Consume tokens through the closing `)` of an already-opened paren group.
+    fn skip_balanced_parens(&mut self) -> Result<(), String> {
+        let mut depth = 1;
+        while depth > 0 {
+            match self.advance() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Eof => return Err("go-rs: unterminated `(` in interface method".to_string()),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn parse_import(&mut self, imports: &mut Vec<String>) -> Result<(), String> {

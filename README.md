@@ -112,13 +112,17 @@ A single-file `package main` that runs real Go programs:
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m` |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
+| Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type (a compiled type-switch over the concrete implementors) |
 | Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`), `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/TrimSpace/Split/Join/Repeat/Index/ReplaceAll/Fields), `strconv` (Itoa/Atoi), builtin `println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
-Interfaces, channels, and goroutines land in later waves (the last needs a
-scheduler). Two documented simplifications this wave: a map read of a missing
-key returns the numeric zero (`0`) rather than the comma-ok form, and method
-receivers use reference semantics (a value receiver is not copied).
+**Channels and goroutines** are the remaining wave. They need a
+suspension/scheduling primitive `fusevm` does not yet expose (no VM-level
+yield/resume, no shareable synchronized heap) — a `fusevm`-level change, not a
+frontend one — and are deliberately not shipped as a wrong single-threaded
+stopgap. Two documented simplifications: a map read of a missing key returns the
+numeric zero (`0`) rather than the comma-ok form, and method receivers use
+reference semantics (a value receiver is not copied).
 
 ## Toolchain
 

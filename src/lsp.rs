@@ -78,6 +78,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "type Point struct { x, y int }",
     ),
     (
+        "interface",
+        "Keyword",
+        "an interface type: a method set; any type with those methods satisfies it (dynamic dispatch)",
+        "type Shape interface { area() int }",
+    ),
+    (
         "if",
         "Keyword",
         "conditional branch with an optional init clause: `if [init;] cond { … }`",

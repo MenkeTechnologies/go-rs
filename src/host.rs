@@ -54,6 +54,8 @@ pub const GSTRUCT_COPY: u16 = 823;
 /// The range keys of a value as a slice: `0..len` for a slice/string, the keys
 /// for a map. Lets `for … range` iterate slices and maps uniformly.
 pub const GRANGE_KEYS: u16 = 824;
+/// The runtime type name of a struct value (drives interface method dispatch).
+pub const GTYPEOF: u16 = 825;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -79,7 +81,24 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GFIELD_SET, b_field_set);
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
+    vm.register_builtin(GTYPEOF, b_typeof);
     stdlib::install(vm);
+}
+
+/// The runtime type name of a struct value, or `""` for a non-struct. Used by
+/// the compiler's interface method dispatch (a runtime type-switch).
+fn b_typeof(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    match args.first() {
+        Some(Value::Obj(id)) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Struct { type_name, .. }) => Value::str(type_name.clone()),
+                _ => Value::str(""),
+            }
+        }),
+        _ => Value::str(""),
+    }
 }
 
 /// The range keys of a value as a fresh slice: `0..len` for a slice or string,

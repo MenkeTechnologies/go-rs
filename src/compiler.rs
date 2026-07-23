@@ -782,28 +782,76 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         let ty = self.type_name(recv);
-        if ty.is_empty() {
-            return Err(format!(
-                "go-rs: cannot resolve receiver type for `.{method}` (line {line})"
-            ));
+
+        // Static dispatch: the receiver's concrete struct type is known and
+        // declares the method — a direct `Op::Call` to `T.method`.
+        if let Some(&arity) = self.methods.get(&(ty.clone(), method.to_string())) {
+            if arity != args.len() {
+                return Err(format!(
+                    "go-rs: `{ty}.{method}` takes {arity} argument(s), got {} (line {line})",
+                    args.len()
+                ));
+            }
+            self.expr(recv)?;
+            for a in args {
+                self.emit_value(a)?;
+            }
+            let idx = self.b.add_name(&format!("{ty}.{method}"));
+            self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+            return Ok(());
         }
-        let arity = self
+
+        // Dynamic dispatch (interface / unknown static type): a runtime
+        // type-switch over every concrete type that implements `method` with a
+        // matching arity, calling the one whose name matches the receiver's
+        // runtime type. Every struct heap object carries its type name.
+        let mut candidates: Vec<String> = self
             .methods
-            .get(&(ty.clone(), method.to_string()))
-            .copied()
-            .ok_or_else(|| format!("go-rs: type `{ty}` has no method `{method}` (line {line})"))?;
-        if arity != args.len() {
+            .iter()
+            .filter(|((_, m), &arity)| m == method && arity == args.len())
+            .map(|((t, _), _)| t.clone())
+            .collect();
+        candidates.sort();
+        if candidates.is_empty() {
             return Err(format!(
-                "go-rs: `{ty}.{method}` takes {arity} argument(s), got {} (line {line})",
+                "go-rs: no method `{method}` with {} argument(s) (line {line})",
                 args.len()
             ));
         }
+
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let recv_tmp = format!("$mrecv{n}");
+        let ty_tmp = format!("$mty{n}");
         self.expr(recv)?;
-        for a in args {
-            self.emit_value(a)?;
+        self.emit_set(&recv_tmp, line);
+        self.emit_get(&recv_tmp, line);
+        self.b.emit(Op::CallBuiltin(host::GTYPEOF, 1), line);
+        self.emit_set(&ty_tmp, line);
+
+        let mut end_jumps = Vec::new();
+        for t in &candidates {
+            self.emit_get(&ty_tmp, line);
+            let tc = self.b.add_constant(Value::str(t.clone()));
+            self.b.emit(Op::LoadConst(tc), line);
+            self.b.emit(Op::StrEq, line);
+            let jf = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_get(&recv_tmp, line);
+            for a in args {
+                self.emit_value(a)?;
+            }
+            let idx = self.b.add_name(&format!("{t}.{method}"));
+            self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
         }
-        let idx = self.b.add_name(&format!("{ty}.{method}"));
-        self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+        // No concrete type matched — a nil interface call; yield nil.
+        self.b.emit(Op::LoadUndef, line);
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
         Ok(())
     }
 

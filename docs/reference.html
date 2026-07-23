@@ -99,47 +99,52 @@
           <pre><code class="lang-go">type Point struct { x, y int }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-8">
-          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>if</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>interface</code></h3>
+          <p>an interface type: a method set; any type with those methods satisfies it (dynamic dispatch)</p>
+          <pre><code class="lang-go">type Shape interface { area() int }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-9">
+          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>if</code></h3>
           <p>conditional branch with an optional init clause: `if [init;] cond { … }`</p>
           <pre><code class="lang-go">if x := f(); x &gt; 0 { fmt.Println(x) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-9">
-          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>else</code></h3>
+        <article class="doc-entry" id="doc-keyword-10">
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>else</code></h3>
           <p>fallback branch of an `if`; chains as `else if`</p>
           <pre><code class="lang-go">if x &gt; 0 { } else { fmt.Println("non-pos") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-10">
-          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>for</code></h3>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>for</code></h3>
           <p>the loop: three-clause, condition-only, or infinite</p>
           <pre><code class="lang-go">for i := 0; i &lt; 3; i++ { fmt.Println(i) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>range</code></h3>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>range</code></h3>
           <p>iterate a collection in a `for … range` (reserved; next wave)</p>
           <pre><code class="lang-go">for i := range xs { }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>return</code></h3>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>return</code></h3>
           <p>return from the current function with an optional value</p>
           <pre><code class="lang-go">return a + b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>break</code></h3>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>break</code></h3>
           <p>exit the nearest `for` loop</p>
           <pre><code class="lang-go">for { if done { break } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>continue</code></h3>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>continue</code></h3>
           <p>skip to the next iteration of the nearest `for` loop</p>
           <pre><code class="lang-go">for i := 0; i &lt; 5; i++ { if i%2 == 0 { continue } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-15">
-          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>true</code></h3>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>true</code></h3>
           <p>the boolean literal true</p>
           <pre><code class="lang-go">ok := true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-16">
-          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>false</code></h3>
           <p>the boolean literal false</p>
           <pre><code class="lang-go">ok := false</code></pre>
         </article>
