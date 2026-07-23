@@ -60,6 +60,10 @@ pub const GTYPEOF: u16 = 825;
 pub const GMIN: u16 = 826;
 /// Go 1.21 builtin `max(a, b, …)` — the largest of the (ordered) arguments.
 pub const GMAX: u16 = 827;
+/// Build a closure: stack `[cap0, …, capN, lambda_id]`; pushes a closure value.
+pub const GCLOSURE_NEW: u16 = 828;
+/// Read a closure's captured value by index: stack `[closure, idx]`.
+pub const GCLOSURE_GET: u16 = 829;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -88,7 +92,38 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GTYPEOF, b_typeof);
     vm.register_builtin(GMIN, b_min);
     vm.register_builtin(GMAX, b_max);
+    vm.register_builtin(GCLOSURE_NEW, b_closure_new);
+    vm.register_builtin(GCLOSURE_GET, b_closure_get);
     stdlib::install(vm);
+}
+
+/// `[cap0, …, capN, lambda_id]` → a closure value carrying its captured values
+/// (by value — Go captures by reference, a documented gap). The trailing
+/// `lambda_id` is consumed but not stored (the compiler dispatches statically).
+fn b_closure_new(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc);
+    args.pop(); // discard the lambda id
+    Value::Obj(heap_alloc(HostObj::Closure { captures: args }))
+}
+
+/// `[closure, idx]` → the closure's captured value at `idx`.
+fn b_closure_get(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let idx = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+    match args.first() {
+        Some(Value::Obj(id)) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Closure { captures, .. }) => usize::try_from(idx)
+                    .ok()
+                    .and_then(|i| captures.get(i))
+                    .cloned()
+                    .unwrap_or(Value::Undef),
+                _ => Value::Undef,
+            }
+        }),
+        _ => Value::Undef,
+    }
 }
 
 /// `min(a, b, …)` — the smallest argument, preserving int vs float, compared
@@ -181,6 +216,10 @@ pub(crate) enum HostObj {
         type_name: String,
         fields: Vec<(String, Value)>,
     },
+    /// A closure's captured values (bound by value at creation). The target
+    /// lambda subroutine is resolved statically by the compiler, so only the
+    /// captures need to live at runtime.
+    Closure { captures: Vec<Value> },
 }
 
 thread_local! {
@@ -652,6 +691,8 @@ fn obj_str(id: u32) -> String {
                 let parts: Vec<String> = fields.iter().map(|(_, v)| go_str(v)).collect();
                 format!("{{{}}}", parts.join(" "))
             }
+            // Go prints a function value as a hex pointer; a fixed marker suffices.
+            Some(HostObj::Closure { .. }) => "<func>".to_string(),
             None => "<nil>".to_string(),
         }
     })

@@ -873,6 +873,19 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(e)
             }
+            // A function literal (closure): `func(params) results { body }`.
+            Tok::Func => {
+                self.expect(&Tok::LParen)?;
+                let params = self.params()?;
+                self.expect(&Tok::RParen)?;
+                let results = self.results()?;
+                let body = self.block()?;
+                Ok(Expr::FuncLit {
+                    params,
+                    results,
+                    body,
+                })
+            }
             other => Err(format!(
                 "go-rs: unexpected token `{other}` in expression on line {line}"
             )),

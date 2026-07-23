@@ -53,6 +53,14 @@ struct FuncSig {
     result_ty: String,
 }
 
+/// A collected function literal, compiled to a `$lambda_N` subroutine.
+struct LambdaInfo {
+    params: Vec<Param>,
+    body: Vec<Stmt>,
+    /// Free variables captured from the enclosing scope, in capture order.
+    captures: Vec<String>,
+}
+
 /// A lexical scope inside a subroutine: local/parameter name → frame slot.
 struct Scope {
     slots: HashMap<String, u16>,
@@ -109,6 +117,15 @@ struct Compiler {
     main_exits: Vec<usize>,
     /// Monotonic counter for compiler-generated temporaries (`for … range`).
     temp_counter: u32,
+    /// Function literals collected during lowering; each is compiled to a hidden
+    /// `$lambda_N` subroutine after the named functions.
+    lambdas: Vec<LambdaInfo>,
+    /// Variables statically known to hold a specific closure (name → lambda id),
+    /// so `f(args)` on such a variable dispatches directly.
+    closure_vars: HashMap<String, i64>,
+    /// While compiling a lambda body: its captured variables (name → index into
+    /// the closure's captures). `emit_get` reads these from the closure (slot 0).
+    active_captures: HashMap<String, u16>,
     /// When true, emit a per-statement `CallBuiltin(DBG_LINE)` marker so `--dap`
     /// can stop on statement lines. Normal runs leave this off (zero extra ops).
     debug: bool,
@@ -182,6 +199,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         loops: Vec::new(),
         main_exits: Vec::new(),
         temp_counter: 0,
+        lambdas: Vec::new(),
+        closure_vars: HashMap::new(),
+        active_captures: HashMap::new(),
         debug,
         has_ffi,
     };
@@ -197,10 +217,17 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
 
     // ── subroutine bodies, emitted after main and jumped over ──
-    if !prog.funcs.is_empty() {
+    if !prog.funcs.is_empty() || !c.lambdas.is_empty() {
         let skip = c.b.emit(Op::Jump(0), 0);
         for f in &prog.funcs {
             c.compile_func(f)?;
+        }
+        // Compile every collected lambda; compiling one may append more (a
+        // nested closure), so iterate by index until the list stops growing.
+        let mut i = 0;
+        while i < c.lambdas.len() {
+            c.compile_lambda(i)?;
+            i += 1;
         }
         let after = c.b.current_pos();
         c.b.patch_jump(skip, after);
@@ -253,9 +280,280 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower a function literal: emit its closure value (captured variables +
+    /// lambda id) and register the lambda for later subroutine compilation.
+    /// Returns the lambda id (for static closure-call dispatch).
+    fn emit_funclit(&mut self, params: &[Param], body: &[Stmt]) -> i64 {
+        let captures = self.free_vars(params, body);
+        let id = self.lambdas.len() as i64;
+        // Build the closure: push each captured value, then the lambda id.
+        for c in &captures {
+            self.emit_get(c, 0);
+        }
+        self.b.emit(Op::LoadInt(id), 0);
+        self.b.emit(
+            Op::CallBuiltin(host::GCLOSURE_NEW, captures.len() as u8 + 1),
+            0,
+        );
+        self.lambdas.push(LambdaInfo {
+            params: params.to_vec(),
+            body: body.to_vec(),
+            captures,
+        });
+        id
+    }
+
+    /// Emit a call to a closure whose value is already on the stack (as the
+    /// deepest argument, "self"): evaluate the args and call `$lambda_id`.
+    fn emit_closure_call(&mut self, id: i64, args: &[Expr], line: u32) -> Result<(), String> {
+        self.emit_closure_call_args(args)?;
+        let idx = self.b.add_name(&format!("$lambda_{id}"));
+        self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+        Ok(())
+    }
+
+    /// Evaluate the arguments of a closure call (struct-copied like any call).
+    fn emit_closure_call_args(&mut self, args: &[Expr]) -> Result<(), String> {
+        for a in args {
+            self.emit_value(a)?;
+        }
+        Ok(())
+    }
+
+    /// Compile a collected lambda to a `$lambda_N` subroutine. Slot 0 is the
+    /// closure itself (captured values read via `GCLOSURE_GET`); parameters take
+    /// slots `1..`.
+    fn compile_lambda(&mut self, id: usize) -> Result<(), String> {
+        let params = self.lambdas[id].params.clone();
+        let body = self.lambdas[id].body.clone();
+        let captures = self.lambdas[id].captures.clone();
+
+        let entry = self.b.current_pos();
+        let name_idx = self.b.add_name(&format!("$lambda_{id}"));
+        self.b.add_sub_entry(name_idx, entry);
+
+        let mut scope = Scope::new();
+        self.types.clear();
+        self.decl_types.clear();
+        let mut slot = 1u16; // slot 0 reserved for the closure ("self")
+        for p in &params {
+            scope.slots.insert(p.name.clone(), slot);
+            self.types.insert(p.name.clone(), numtype_of_ty(&p.ty));
+            self.decl_types.insert(p.name.clone(), base_type(&p.ty));
+            slot += 1;
+        }
+        scope.next_slot = slot;
+        self.active_captures = captures
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u16))
+            .collect();
+        self.scope = Some(scope);
+
+        // Prologue: bind the closure + params (closure deepest, at slot 0).
+        for i in (0..slot).rev() {
+            self.b.emit(Op::SetSlot(i), 0);
+        }
+        for s in &body {
+            self.stmt(s)?;
+        }
+        self.b.emit(Op::LoadUndef, 0);
+        self.b.emit(Op::ReturnValue, 0);
+
+        self.scope = None;
+        self.active_captures.clear();
+        Ok(())
+    }
+
+    /// The free variables of a lambda: names read in `body` that are neither its
+    /// parameters/locals nor top-level functions, but are variables of the
+    /// enclosing scope (captured by value).
+    fn free_vars(&self, params: &[Param], body: &[Stmt]) -> Vec<String> {
+        let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        let mut caps = Vec::new();
+        for s in body {
+            self.fv_stmt(s, &mut bound, &mut caps);
+        }
+        caps
+    }
+
+    /// True if `name` names a variable of the scope currently being compiled
+    /// (a local/param/global, or a capture of an enclosing lambda).
+    fn is_enclosing_var(&self, name: &str) -> bool {
+        self.types.contains_key(name)
+            || self.decl_types.contains_key(name)
+            || self.active_captures.contains_key(name)
+    }
+
+    fn fv_stmt(&self, s: &Stmt, bound: &mut HashSet<String>, caps: &mut Vec<String>) {
+        match s {
+            Stmt::Var { name, init, .. } => {
+                if let Some(e) = init {
+                    self.fv_expr(e, bound, caps);
+                }
+                bound.insert(name.clone());
+            }
+            Stmt::Short { names, values, .. } => {
+                for v in values {
+                    self.fv_expr(v, bound, caps);
+                }
+                for n in names {
+                    bound.insert(n.clone());
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                self.fv_expr(target, bound, caps);
+                self.fv_expr(value, bound, caps);
+            }
+            Stmt::IncDec { target, .. } => self.fv_expr(target, bound, caps),
+            Stmt::ExprStmt(e) => self.fv_expr(e, bound, caps),
+            Stmt::Return(v, _) => {
+                if let Some(e) = v {
+                    self.fv_expr(e, bound, caps);
+                }
+            }
+            Stmt::If {
+                init,
+                cond,
+                then,
+                els,
+                ..
+            } => {
+                if let Some(i) = init {
+                    self.fv_stmt(i, bound, caps);
+                }
+                self.fv_expr(cond, bound, caps);
+                for s in then.iter().chain(els) {
+                    self.fv_stmt(s, bound, caps);
+                }
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+                ..
+            } => {
+                if let Some(i) = init {
+                    self.fv_stmt(i, bound, caps);
+                }
+                if let Some(c) = cond {
+                    self.fv_expr(c, bound, caps);
+                }
+                if let Some(p) = post {
+                    self.fv_stmt(p, bound, caps);
+                }
+                for s in body {
+                    self.fv_stmt(s, bound, caps);
+                }
+            }
+            Stmt::ForRange {
+                key,
+                val,
+                iter,
+                body,
+                ..
+            } => {
+                self.fv_expr(iter, bound, caps);
+                if let Some(k) = key {
+                    bound.insert(k.clone());
+                }
+                if let Some(v) = val {
+                    bound.insert(v.clone());
+                }
+                for s in body {
+                    self.fv_stmt(s, bound, caps);
+                }
+            }
+            Stmt::Go { call, .. } => self.fv_expr(call, bound, caps),
+            Stmt::Send { chan, val, .. } => {
+                self.fv_expr(chan, bound, caps);
+                self.fv_expr(val, bound, caps);
+            }
+            Stmt::Block(b) => {
+                for s in b {
+                    self.fv_stmt(s, bound, caps);
+                }
+            }
+            Stmt::Break(_) | Stmt::Continue(_) => {}
+        }
+    }
+
+    fn fv_expr(&self, e: &Expr, bound: &HashSet<String>, caps: &mut Vec<String>) {
+        match e {
+            Expr::Ident(n) => {
+                if !bound.contains(n) && self.is_enclosing_var(n) && !caps.contains(n) {
+                    caps.push(n.clone());
+                }
+            }
+            Expr::Unary { rhs, .. } => self.fv_expr(rhs, bound, caps),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.fv_expr(lhs, bound, caps);
+                self.fv_expr(rhs, bound, caps);
+            }
+            Expr::Call { func, args, .. } => {
+                self.fv_expr(func, bound, caps);
+                for a in args {
+                    self.fv_expr(a, bound, caps);
+                }
+            }
+            Expr::Selector { recv, .. } => self.fv_expr(recv, bound, caps),
+            Expr::Index { recv, index } => {
+                self.fv_expr(recv, bound, caps);
+                self.fv_expr(index, bound, caps);
+            }
+            Expr::SliceLit { elems, .. } => {
+                for el in elems {
+                    self.fv_expr(el, bound, caps);
+                }
+            }
+            Expr::MapLit { pairs, .. } => {
+                for (k, v) in pairs {
+                    self.fv_expr(k, bound, caps);
+                    self.fv_expr(v, bound, caps);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, v) in fields {
+                    self.fv_expr(v, bound, caps);
+                }
+            }
+            Expr::Make { len, .. } => {
+                if let Some(l) = len {
+                    self.fv_expr(l, bound, caps);
+                }
+            }
+            Expr::MakeChan { cap } => {
+                if let Some(c) = cap {
+                    self.fv_expr(c, bound, caps);
+                }
+            }
+            Expr::Recv { chan } => self.fv_expr(chan, bound, caps),
+            // A nested function literal: its own params are bound; its remaining
+            // free vars that name our scope become our captures too (chaining).
+            Expr::FuncLit { params, body, .. } => {
+                let mut inner = bound.clone();
+                for p in params {
+                    inner.insert(p.name.clone());
+                }
+                for s in body {
+                    self.fv_stmt(s, &mut inner, caps);
+                }
+            }
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) => {}
+        }
+    }
+
     // ── variable access ────────────────────────────────────────────────────
 
     fn emit_get(&mut self, name: &str, line: u32) {
+        // Inside a lambda, a captured variable is read from the closure (slot 0).
+        if let Some(&idx) = self.active_captures.get(name) {
+            self.b.emit(Op::GetSlot(0), line);
+            self.b.emit(Op::LoadInt(idx as i64), line);
+            self.b.emit(Op::CallBuiltin(host::GCLOSURE_GET, 2), line);
+            return;
+        }
         match &mut self.scope {
             Some(scope) => {
                 let slot = scope.slot(name);
@@ -309,7 +607,7 @@ impl Compiler {
                     (None, None) => String::new(),
                 };
                 match init {
-                    Some(e) => self.emit_value(e)?,
+                    Some(e) => self.emit_rhs(name, e)?,
                     None => self.emit_default(nt, *line),
                 }
                 self.types.insert(name.clone(), nt);
@@ -331,7 +629,7 @@ impl Compiler {
                 for (name, e) in names.iter().zip(values) {
                     let nt = self.infer(e);
                     let dt = self.type_name(e);
-                    self.emit_value(e)?;
+                    self.emit_rhs(name, e)?;
                     self.types.insert(name.clone(), nt);
                     self.decl_types.insert(name.clone(), dt);
                     self.emit_set(name, *line);
@@ -417,27 +715,43 @@ impl Compiler {
                 ..
             } => self.compile_for_range(key, val, iter, body)?,
             Stmt::Go { call, line } => {
-                // `go f(args)` — only a direct call of a top-level function is
-                // spawnable in this slice (no method/closure goroutines yet).
-                match call {
-                    Expr::Call { func, args, .. } => match func.as_ref() {
-                        Expr::Ident(name) if self.funcs.contains_key(name) => {
-                            for a in args {
-                                self.emit_value(a)?;
-                            }
-                            let idx = self.b.add_name(name);
-                            self.b.emit(Op::Go(idx, args.len() as u8), *line);
+                let Expr::Call { func, args, .. } = call else {
+                    return Err(format!(
+                        "go-rs: `go` requires a function call (line {line})"
+                    ));
+                };
+                match func.as_ref() {
+                    // `go f(args)` — a top-level function.
+                    Expr::Ident(name) if self.funcs.contains_key(name) => {
+                        for a in args {
+                            self.emit_value(a)?;
                         }
-                        _ => {
-                            return Err(format!(
-                                "go-rs: `go` requires a top-level function call (line {line})"
-                            ))
+                        let idx = self.b.add_name(name);
+                        self.b.emit(Op::Go(idx, args.len() as u8), *line);
+                    }
+                    // `go f(args)` where `f` is a closure variable.
+                    Expr::Ident(name) if self.closure_vars.contains_key(name) => {
+                        let id = self.closure_vars[name];
+                        self.emit_get(name, *line);
+                        for a in args {
+                            self.emit_value(a)?;
                         }
-                    },
+                        let idx = self.b.add_name(&format!("$lambda_{id}"));
+                        self.b.emit(Op::Go(idx, args.len() as u8 + 1), *line);
+                    }
+                    // `go func(){ … }(args)` — an immediately-invoked closure.
+                    Expr::FuncLit { params, body, .. } => {
+                        let id = self.emit_funclit(params, body);
+                        for a in args {
+                            self.emit_value(a)?;
+                        }
+                        let idx = self.b.add_name(&format!("$lambda_{id}"));
+                        self.b.emit(Op::Go(idx, args.len() as u8 + 1), *line);
+                    }
                     _ => {
                         return Err(format!(
-                            "go-rs: `go` requires a function call (line {line})"
-                        ))
+                        "go-rs: `go` requires a top-level function or closure call (line {line})"
+                    ))
                     }
                 }
             }
@@ -523,7 +837,7 @@ impl Compiler {
         match target {
             Expr::Ident(name) => {
                 if op == AssignOp::Set {
-                    self.emit_value(value)?;
+                    self.emit_rhs(name, value)?;
                 } else {
                     self.emit_get(name, line);
                     self.expr(value)?;
@@ -764,6 +1078,9 @@ impl Compiler {
                 self.expr(chan)?;
                 self.b.emit(Op::ChanRecv, 0);
             }
+            Expr::FuncLit { params, body, .. } => {
+                self.emit_funclit(params, body);
+            }
         }
         Ok(())
     }
@@ -805,6 +1122,28 @@ impl Compiler {
             Op::CallBuiltin(host::GSTRUCT_NEW, (1 + decl.len() * 2) as u8),
             0,
         );
+        Ok(())
+    }
+
+    /// Emit the right-hand side of a binding to `name`, additionally tracking
+    /// when `name` becomes a statically-known closure (so a later `name(args)`
+    /// dispatches directly).
+    fn emit_rhs(&mut self, name: &str, e: &Expr) -> Result<(), String> {
+        match e {
+            Expr::FuncLit { params, body, .. } => {
+                let id = self.emit_funclit(params, body);
+                self.closure_vars.insert(name.to_string(), id);
+            }
+            Expr::Ident(src) if self.closure_vars.contains_key(src) => {
+                let id = self.closure_vars[src];
+                self.emit_value(e)?;
+                self.closure_vars.insert(name.to_string(), id);
+            }
+            _ => {
+                self.closure_vars.remove(name);
+                self.emit_value(e)?;
+            }
+        }
         Ok(())
     }
 
@@ -996,6 +1335,12 @@ impl Compiler {
     }
 
     fn call(&mut self, func: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
+        // An immediately-invoked function literal: `func(...){...}(args)`.
+        if let Expr::FuncLit { params, body, .. } = func {
+            let id = self.emit_funclit(params, body);
+            self.emit_closure_call(id, args, line)?;
+            return Ok(());
+        }
         if let Expr::Selector { recv, field } = func {
             if let Expr::Ident(pkg) = recv.as_ref() {
                 // `fmt.*` print family.
@@ -1065,6 +1410,12 @@ impl Compiler {
                     self.expr(a)?;
                 }
                 self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+                return Ok(());
+            }
+            // A variable statically known to hold a closure — dispatch directly.
+            if let Some(&id) = self.closure_vars.get(name) {
+                self.emit_get(name, line);
+                self.emit_closure_call(id, args, line)?;
                 return Ok(());
             }
             if let Some(sig) = self.funcs.get(name) {
@@ -1169,7 +1520,8 @@ impl Compiler {
             | Expr::StructLit { .. }
             | Expr::Make { .. }
             | Expr::MakeChan { .. }
-            | Expr::Recv { .. } => NumType::Unknown,
+            | Expr::Recv { .. }
+            | Expr::FuncLit { .. } => NumType::Unknown,
         }
     }
 }

@@ -351,6 +351,51 @@ fn slice_index_out_of_range_errors() {
 }
 
 #[test]
+fn closure_captures_local_by_value() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	factor := 3
+	triple := func(x int) int {
+		return x * factor
+	}
+	fmt.Println(triple(5), triple(10))
+}
+";
+    assert_stdout(src, "15 30\n");
+}
+
+#[test]
+fn immediately_invoked_function_literal() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	fmt.Println(func(a int, b int) int { return a + b }(10, 20))
+}
+";
+    assert_stdout(src, "30\n");
+}
+
+#[test]
+fn goroutine_closure_captures_channel() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	done := make(chan int)
+	msg := 42
+	go func() {
+		done <- msg
+	}()
+	fmt.Println(<-done)
+}
+";
+    assert_stdout(src, "42\n");
+}
+
+#[test]
 fn interface_dynamic_dispatch() {
     let src = "\
 package main

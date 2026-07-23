@@ -207,6 +207,13 @@ pub enum Expr {
     Recv {
         chan: Box<Expr>,
     },
+    /// A function literal `func(params) results { body }` — a closure. Captured
+    /// variables (free vars of the body) are bound by value at creation.
+    FuncLit {
+        params: Vec<Param>,
+        results: Vec<String>,
+        body: Vec<Stmt>,
+    },
 }
 
 /// Unary operators.
