@@ -1198,3 +1198,30 @@ func main() {
 ";
     assert_stdout(src, "3 2\n10\n5 \n0 recovered\n");
 }
+
+#[test]
+fn parallel_assignment() {
+    // Right-hand sides are evaluated before any assignment, so a swap and a
+    // rotate work; also multi-return into existing vars and index/map targets.
+    let src = "\
+package main
+import \"fmt\"
+func vals() (int, int) { return 8, 9 }
+func main() {
+	a, b := 1, 2
+	a, b = b, a
+	fmt.Println(a, b)
+	x, y, z := 10, 20, 30
+	x, y, z = z, x, y
+	fmt.Println(x, y, z)
+	p, q := 0, 0
+	p, q = vals()
+	fmt.Println(p, q)
+	m := map[string]int{\"k\": 1}
+	arr := []int{0, 0}
+	m[\"k\"], arr[1] = 5, 7
+	fmt.Println(m[\"k\"], arr[1])
+}
+";
+    assert_stdout(src, "2 1\n30 10 20\n8 9\n5 7\n");
+}

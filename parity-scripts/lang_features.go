@@ -44,8 +44,7 @@ func label(day int) string {
 }
 
 func minmax(xs []int) (lo, hi int) {
-	lo = xs[0]
-	hi = xs[0]
+	lo, hi = xs[0], xs[0]
 	for _, v := range xs {
 		if v < lo {
 			lo = v

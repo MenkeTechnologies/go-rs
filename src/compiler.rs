@@ -196,6 +196,9 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
             Stmt::Var { init, .. } => init.as_ref().is_some_and(ex),
             Stmt::Short { values, .. } => values.iter().any(ex),
             Stmt::Assign { target, value, .. } => ex(target) || ex(value),
+            Stmt::AssignMulti {
+                targets, values, ..
+            } => targets.iter().any(ex) || values.iter().any(ex),
             Stmt::IncDec { target, .. } => ex(target),
             Stmt::ExprStmt(e) => ex(e),
             Stmt::Return(vs, _) => vs.iter().any(ex),
@@ -432,6 +435,12 @@ fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
             fe(target, bound, out);
             fe(value, bound, out);
         }
+        Stmt::AssignMulti {
+            targets, values, ..
+        } => {
+            targets.iter().for_each(|e| fe(e, bound, out));
+            values.iter().for_each(|e| fe(e, bound, out));
+        }
         Stmt::IncDec { target, .. } => fe(target, bound, out),
         Stmt::ExprStmt(e) => fe(e, bound, out),
         Stmt::Return(vs, _) => vs.iter().for_each(|e| fe(e, bound, out)),
@@ -591,6 +600,12 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
         Stmt::Assign { target, value, .. } => {
             f(target);
             f(value);
+        }
+        Stmt::AssignMulti {
+            targets, values, ..
+        } => {
+            targets.iter().for_each(&mut *f);
+            values.iter().for_each(&mut *f);
         }
         Stmt::IncDec { target, .. } => f(target),
         Stmt::ExprStmt(e) => f(e),
@@ -1295,6 +1310,13 @@ impl Compiler {
                 self.fv_expr(target, bound, caps);
                 self.fv_expr(value, bound, caps);
             }
+            Stmt::AssignMulti {
+                targets, values, ..
+            } => {
+                for e in targets.iter().chain(values) {
+                    self.fv_expr(e, bound, caps);
+                }
+            }
             Stmt::IncDec { target, .. } => self.fv_expr(target, bound, caps),
             Stmt::ExprStmt(e) => self.fv_expr(e, bound, caps),
             Stmt::Return(vs, _) => {
@@ -1676,6 +1698,11 @@ impl Compiler {
                 value,
                 line,
             } => self.assign(target, *op, value, *line)?,
+            Stmt::AssignMulti {
+                targets,
+                values,
+                line,
+            } => self.assign_multi(targets, values, *line)?,
             Stmt::IncDec { target, inc, line } => {
                 let one = Expr::Int(1);
                 let op = if *inc { AssignOp::Add } else { AssignOp::Sub };
@@ -2078,6 +2105,57 @@ impl Compiler {
         let end = self.b.current_pos();
         for j in end_jumps {
             self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Lower a parallel assignment `t… = v…`. Right-hand sides are evaluated into
+    /// temporaries *first* (so `a, b = b, a` swaps), then each temp is assigned to
+    /// its target. Also handles `a, b = f()` where a call returns exactly as many
+    /// values as there are targets (destructuring the returned tuple).
+    fn assign_multi(&mut self, targets: &[Expr], values: &[Expr], line: u32) -> Result<(), String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+
+        // `a, b = f()` — one call yielding len(targets) values.
+        if targets.len() >= 2
+            && values.len() == 1
+            && self.call_result_count(&values[0]) == Some(targets.len())
+        {
+            let tup = format!("$am{n}");
+            self.expr(&values[0])?;
+            self.emit_set(&tup, line);
+            for (i, target) in targets.iter().enumerate() {
+                self.emit_get(&tup, line);
+                self.b.emit(Op::LoadInt(i as i64), line);
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+                let tmp = format!("$amv{n}_{i}");
+                self.types.insert(tmp.clone(), NumType::Unknown);
+                self.emit_set(&tmp, line);
+                self.assign(target, AssignOp::Set, &Expr::Ident(tmp), line)?;
+            }
+            return Ok(());
+        }
+
+        if targets.len() != values.len() {
+            return Err(format!(
+                "go-rs: assignment mismatch: {} targets but {} values (line {line})",
+                targets.len(),
+                values.len()
+            ));
+        }
+        // Evaluate every value into a temp, then assign to targets.
+        let mut tmps = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            let tmp = format!("$amv{n}_{i}");
+            self.types.insert(tmp.clone(), self.infer(v));
+            self.decl_types.insert(tmp.clone(), self.type_name(v));
+            self.emit_value(v)?;
+            self.emit_set(&tmp, line);
+            tmps.push(tmp);
+        }
+        for (target, tmp) in targets.iter().zip(tmps) {
+            self.assign(target, AssignOp::Set, &Expr::Ident(tmp), line)?;
         }
         Ok(())
     }
@@ -3097,6 +3175,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         Stmt::Var { line, .. }
         | Stmt::Short { line, .. }
         | Stmt::Assign { line, .. }
+        | Stmt::AssignMulti { line, .. }
         | Stmt::IncDec { line, .. }
         | Stmt::Return(_, line)
         | Stmt::If { line, .. }
@@ -3120,6 +3199,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         Stmt::Var { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
         Stmt::Short { values, .. } => values.iter().any(expr_has_ffi),
         Stmt::Assign { value, .. } => expr_has_ffi(value),
+        Stmt::AssignMulti { values, .. } => values.iter().any(expr_has_ffi),
         Stmt::ExprStmt(e) => expr_has_ffi(e),
         Stmt::Return(vs, _) => vs.iter().any(expr_has_ffi),
         Stmt::If { then, els, .. } => body_has_ffi(then) || body_has_ffi(els),

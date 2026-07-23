@@ -88,6 +88,14 @@ pub enum Stmt {
         value: Expr,
         line: u32,
     },
+    /// `t0, t1, … = v0, v1, …` — parallel assignment to existing lvalues. All
+    /// right-hand sides are evaluated before any assignment (so `a, b = b, a`
+    /// swaps).
+    AssignMulti {
+        targets: Vec<Expr>,
+        values: Vec<Expr>,
+        line: u32,
+    },
     /// `target++` / `target--` (target is an lvalue expression).
     IncDec { target: Expr, inc: bool, line: u32 },
     /// A bare expression evaluated for effect (e.g. a call).

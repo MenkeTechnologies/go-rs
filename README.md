@@ -113,7 +113,7 @@ A single-file `package main` that runs real Go programs:
 | Area           | Supported                                                              |
 | -------------- | --------------------------------------------------------------------- |
 | Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
-| Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), `+= -= *= /= %=`, `x++` / `x--` |
+| Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), parallel assignment `a, b = x, y` (swap/rotate; RHS evaluated first), `a, b = f()`, `+= -= *= /= %=`, `x++` / `x--` |
 | Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause), `break`, `continue`, `return` |
 | Expressions    | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
 | Types          | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
@@ -214,8 +214,6 @@ terms leave the `f64`-exact range falls back to runtime `f64`).
   `recover()`, but a *runtime* fault (integer divide-by-zero, nil dereference,
   index out of range) aborts the program rather than becoming a recoverable
   panic; integer `a / 0` currently yields `0` instead of panicking.
-- **Parallel assignment to existing lvalues** (`a, b = x, y`, `a, b = b, a`) is
-  not supported (`:=` multi-value destructuring and named results are).
 - **Sub-slices copy rather than alias** — `s[lo:hi]` returns a new slice, so
   mutating an element of the sub-slice is not observed through the parent (Go
   shares the backing array). Truncation/extraction (`s = s[:n]`) works.

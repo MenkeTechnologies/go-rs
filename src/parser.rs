@@ -984,6 +984,23 @@ impl Parser {
         }
 
         let target = self.expr()?;
+        // Parallel assignment `t0, t1, … = v0, v1, …`.
+        if matches!(self.peek(), Tok::Comma) {
+            let mut targets = vec![target];
+            while self.eat(&Tok::Comma) {
+                targets.push(self.expr()?);
+            }
+            self.expect(&Tok::Assign)?;
+            let mut values = vec![self.expr()?];
+            while self.eat(&Tok::Comma) {
+                values.push(self.expr()?);
+            }
+            return Ok(Stmt::AssignMulti {
+                targets,
+                values,
+                line,
+            });
+        }
         match self.peek() {
             // `ch <- val` — channel send.
             Tok::Arrow => {
