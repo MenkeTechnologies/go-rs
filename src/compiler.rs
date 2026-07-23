@@ -87,6 +87,11 @@ impl Scope {
         self.slots.insert(name.to_string(), s);
         s
     }
+
+    /// Whether `name` already has a slot (non-allocating).
+    fn has(&self, name: &str) -> bool {
+        self.slots.contains_key(name)
+    }
 }
 
 /// Back-patch targets for one enclosing `for` loop.
@@ -289,11 +294,13 @@ impl Compiler {
     fn emit_funclit(&mut self, params: &[Param], body: &[Stmt]) -> i64 {
         let captures = self.free_vars(params, body);
         let id = self.lambdas.len() as i64;
-        // Build the closure: push each captured value, then the lambda id.
+        // Build the closure: push each captured value, then the target lambda's
+        // subroutine name-index (so a dynamically-dispatched call can resolve it).
         for c in &captures {
             self.emit_get(c, 0);
         }
-        self.b.emit(Op::LoadInt(id), 0);
+        let nidx = self.b.add_name(&format!("$lambda_{id}"));
+        self.b.emit(Op::LoadInt(nidx as i64), 0);
         self.b.emit(
             Op::CallBuiltin(host::GCLOSURE_NEW, captures.len() as u8 + 1),
             0,
@@ -1576,6 +1583,37 @@ impl Compiler {
             if let Some(&id) = self.closure_vars.get(name) {
                 self.emit_get(name, line);
                 self.emit_closure_call(id, args, line)?;
+                return Ok(());
+            }
+            // A function value held in a variable — a func-typed parameter, a
+            // captured func value inside a lambda, or a local bound to a closure
+            // whose concrete target isn't known statically. Dispatch through the
+            // closure's stored subroutine name-index via `Op::CallDynamic`.
+            let is_value_call = self.active_captures.contains_key(name)
+                || self.scope.as_ref().is_some_and(|s| s.has(name))
+                || self
+                    .decl_types
+                    .get(name)
+                    .is_some_and(|t| t.starts_with("func"));
+            if is_value_call {
+                let n = self.temp_counter;
+                self.temp_counter += 1;
+                let cv = format!("$dc{n}");
+                let ni = format!("$dni{n}");
+                // Stash the closure value, then read its name-index.
+                self.emit_get(name, line);
+                self.emit_set(&cv, line);
+                self.emit_get(&cv, line);
+                self.b
+                    .emit(Op::CallBuiltin(host::GCLOSURE_NAMEIDX, 1), line);
+                self.emit_set(&ni, line);
+                // Push self (the closure), the args, then the name-index.
+                self.emit_get(&cv, line);
+                for a in args {
+                    self.emit_value(a)?;
+                }
+                self.emit_get(&ni, line);
+                self.b.emit(Op::CallDynamic(args.len() as u8 + 1), line);
                 return Ok(());
             }
             if let Some(sig) = self.funcs.get(name) {

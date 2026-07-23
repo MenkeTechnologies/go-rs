@@ -63,7 +63,7 @@ path = "src/bin/parity_fuzz.rs"
 # Go loops trace-compile and warm runs skip recompilation. `aot` enables the
 # ahead-of-time object emitter used by later `go build` work. `ffi` enables the
 # inline-Rust bridge shared by the other frontends.
-fusevm = { version = "0.14.15", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+fusevm = { version = "0.14.16", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
 

@@ -19,6 +19,9 @@ pub enum Command {
     Vet,
     /// `go env` — print the Go environment.
     Env,
+    /// `go doc [name]` — print reference docs for a keyword/type/builtin, or
+    /// the full index when no name is given.
+    Doc,
     Version,
     Help,
     Lsp,
@@ -67,6 +70,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "env" => {
                 cli.cmd = Command::Env;
                 idx = 1;
+            }
+            "doc" => {
+                // `go doc [name]` — the optional symbol name is the "file" slot.
+                cli.cmd = Command::Doc;
+                cli.file = args.get(1).cloned();
+                return Ok(cli);
             }
             "version" | "--version" | "-version" => return done(Command::Version),
             "help" | "--help" | "-h" | "-help" | "-?" => {
@@ -136,6 +145,7 @@ commands:
   build [-o out] <file.go> AOT-compile to a standalone native executable
   vet   <file.go>          parse and compile-check; report errors, do not run
   env                      print the Go environment
+  doc   [name]             print reference docs for a name (or the full index)
   version                  print the version banner
   help  [command]          print help (optionally for one command)
 
@@ -156,6 +166,7 @@ pub fn topic_help(topic: &str) -> Option<&'static str> {
         "build" => "usage: go build [-o output] <file.go>\n\nAOT-compile the file to a standalone native executable via fusevm's ahead-of-time object emitter, linked against the go-rs runtime. Without -o, the output is named after the source file. Note: programs using goroutines/channels/select require the scheduler and must use `go run`.\n",
         "vet" => "usage: go vet <file.go>\n\nParse and compile the file, reporting any lex/parse/compile error, without running it.\n",
         "env" => "usage: go env\n\nPrint the Go environment (GOOS, GOARCH, GOVERSION, …) as go-rs reports it.\n",
+        "doc" => "usage: go doc [name]\n\nPrint reference documentation for a keyword, type, or builtin (e.g. `go doc append`, `go doc func`). With no name, print the full index of documented surfaces. The corpus is the same one that drives `--lsp` hover/completion and docs/reference.html.\n",
         _ => return None,
     })
 }

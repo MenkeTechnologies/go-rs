@@ -699,3 +699,73 @@ func main() {
 ";
     assert_stdout(src, "3 2 second first\n");
 }
+
+#[test]
+fn function_typed_parameters_dispatch_dynamically() {
+    // A `func(int) int` parameter is called by value: `apply` doesn't know
+    // statically whether it holds `double` or `inc`, so the call goes through
+    // the closure's stored subroutine name-index (Op::CallDynamic).
+    let src = "\
+package main
+import \"fmt\"
+func apply(f func(int) int, x int) int {
+	return f(x)
+}
+func reduce(nums []int, acc int, op func(int, int) int) int {
+	for _, n := range nums {
+		acc = op(acc, n)
+	}
+	return acc
+}
+func main() {
+	double := func(n int) int { return n * 2 }
+	inc := func(n int) int { return n + 1 }
+	fmt.Println(apply(double, 21))
+	fmt.Println(apply(inc, 41))
+	add := func(a, b int) int { return a + b }
+	fmt.Println(reduce([]int{1, 2, 3, 4, 5}, 0, add))
+}
+";
+    assert_stdout(src, "42\n42\n15\n");
+}
+
+#[test]
+fn func_value_captured_inside_a_lambda_is_callable() {
+    // `compose` returns a closure that captures two func-typed params and calls
+    // them — the captured values must dispatch dynamically from inside the lambda.
+    let src = "\
+package main
+import \"fmt\"
+func compose(f func(int) int, g func(int) int) func(int) int {
+	return func(x int) int { return f(g(x)) }
+}
+func main() {
+	double := func(n int) int { return n * 2 }
+	inc := func(n int) int { return n + 1 }
+	h := compose(double, inc)
+	fmt.Println(h(10))
+}
+";
+    assert_stdout(src, "22\n");
+}
+
+#[test]
+fn go_doc_prints_reference_for_a_name() {
+    // `go doc append` renders the builtin's category, description and example
+    // from the same corpus that drives --lsp hover and docs/reference.html.
+    let out = Command::new(env!("CARGO_BIN_EXE_go"))
+        .args(["doc", "append"])
+        .output()
+        .expect("spawn go doc");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("append  (Builtin)"), "got: {text}");
+    assert!(text.contains("example:"), "got: {text}");
+
+    // An unknown name is an error on stderr with a non-zero exit.
+    let bad = Command::new(env!("CARGO_BIN_EXE_go"))
+        .args(["doc", "definitely-not-a-symbol"])
+        .output()
+        .expect("spawn go doc");
+    assert!(!bad.status.success());
+}

@@ -371,7 +371,11 @@ impl Parser {
     fn type_starts_at(&self, pos: usize) -> bool {
         matches!(
             self.tokens.get(pos).map(|t| &t.kind),
-            Some(Tok::Ident(_)) | Some(Tok::LBracket) | Some(Tok::Star) | Some(Tok::Chan)
+            Some(Tok::Ident(_))
+                | Some(Tok::LBracket)
+                | Some(Tok::Star)
+                | Some(Tok::Chan)
+                | Some(Tok::Func)
         )
     }
 
@@ -402,6 +406,23 @@ impl Parser {
             Tok::Chan => {
                 self.advance();
                 Ok(format!("chan {}", self.type_name()?))
+            }
+            // `func(params) results` — a function type (for function-typed
+            // parameters/fields). Consumed structurally; go-rs treats every
+            // function value uniformly, so only the `func` tag is retained.
+            Tok::Func => {
+                self.advance();
+                self.expect(&Tok::LParen)?;
+                self.skip_balanced_parens()?;
+                // Optional results: a single type or a `( … )` list, ending
+                // before the next `,`/`)`/`{`/`;`.
+                if matches!(self.peek(), Tok::LParen) {
+                    self.advance();
+                    self.skip_balanced_parens()?;
+                } else if self.type_starts() {
+                    let _ = self.type_name()?;
+                }
+                Ok("func".to_string())
             }
             Tok::Ident(_) => self.ident(),
             other => Err(format!(

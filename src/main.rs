@@ -30,6 +30,13 @@ fn main() -> ExitCode {
             print!("{}", gors::env_report());
             ExitCode::SUCCESS
         }
+        Command::Doc => match gors::lsp::doc(cli.file.as_deref()) {
+            Ok(s) => {
+                print!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Command::Lsp => match gors::lsp::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e),

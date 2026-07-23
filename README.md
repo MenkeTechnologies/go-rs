@@ -55,6 +55,7 @@ go file.go            # shorthand for `go run`
 go build -o bin f.go  # AOT-compile to a standalone native executable (no go toolchain)
 go vet file.go        # parse + compile-check; report errors, do not run
 go env                # print the Go environment (GOOS/GOARCH/GOVERSION/…)
+go doc [name]         # reference docs for a keyword/type/builtin (or the index)
 go version            # print the version banner
 go help [command]     # usage (optionally for one command)
 go --dump-tokens f.go # lexer token stream (with inserted semicolons)
@@ -122,6 +123,8 @@ A single-file `package main` that runs real Go programs:
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type (a compiled type-switch over the concrete implementors) |
 | Closures       | function literals `func(…){…}` with capture-by-value; `f := func(){…}; f()`, IIFE, `go func(){…}()` |
+| First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
+| Functions      | multiple parameters, `(T, U)` multi-value results, `return a, b`, and `x, y := f()` destructuring |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
 | Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
@@ -129,8 +132,7 @@ A single-file `package main` that runs real Go programs:
 Goroutines, channels, and `select` run on a **cooperative scheduler added to the
 shared `fusevm` VM** (`fusevm::sched`, v0.14.14–0.14.15): each goroutine is its
 own VM sharing the program and the single-threaded heap, yielding at channel
-operations. Function types as parameters (passing a closure to a function),
-`defer`, and generics are future waves. Documented
+operations. `defer` and generics are future waves. Documented
 simplifications: a map read of a missing key returns the numeric zero (`0`)
 rather than the comma-ok form; method receivers use reference semantics (a value
 receiver is not copied); and `go` targets a top-level function call (no closure
@@ -192,8 +194,6 @@ documented rather than hidden):
   variables to test that.
 - **Closures capture by value, not by reference** — a closure that *mutates* a
   captured variable does not propagate the change.
-- **No multi-value returns** — `v, err := f()` binds `v` and pads the rest with
-  nil (the common `(v, err)` idiom works; true 2-value returns do not).
 
 ## License
 

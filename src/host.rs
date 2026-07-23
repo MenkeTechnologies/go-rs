@@ -64,6 +64,8 @@ pub const GMAX: u16 = 827;
 pub const GCLOSURE_NEW: u16 = 828;
 /// Read a closure's captured value by index: stack `[closure, idx]`.
 pub const GCLOSURE_GET: u16 = 829;
+/// Read a closure's target subroutine name-index (for `Op::CallDynamic`).
+pub const GCLOSURE_NAMEIDX: u16 = 819;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -94,16 +96,36 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GMAX, b_max);
     vm.register_builtin(GCLOSURE_NEW, b_closure_new);
     vm.register_builtin(GCLOSURE_GET, b_closure_get);
+    vm.register_builtin(GCLOSURE_NAMEIDX, b_closure_nameidx);
     stdlib::install(vm);
 }
 
-/// `[cap0, …, capN, lambda_id]` → a closure value carrying its captured values
-/// (by value — Go captures by reference, a documented gap). The trailing
-/// `lambda_id` is consumed but not stored (the compiler dispatches statically).
+/// `[closure]` → the closure's target subroutine name-index (drives dynamic
+/// dispatch of a function value via `Op::CallDynamic`).
+fn b_closure_nameidx(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    match args.first() {
+        Some(Value::Obj(id)) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Closure { name_idx, .. }) => Value::Int(*name_idx),
+                _ => Value::Int(-1),
+            }
+        }),
+        _ => Value::Int(-1),
+    }
+}
+
+/// `[cap0, …, capN, name_idx]` → a closure value carrying its target subroutine
+/// name-index and captured values (by value — Go captures by reference, a
+/// documented gap).
 fn b_closure_new(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_args(vm, argc);
-    args.pop(); // discard the lambda id
-    Value::Obj(heap_alloc(HostObj::Closure { captures: args }))
+    let name_idx = args.pop().map(|v| v.to_int()).unwrap_or(-1);
+    Value::Obj(heap_alloc(HostObj::Closure {
+        name_idx,
+        captures: args,
+    }))
 }
 
 /// `[closure, idx]` → the closure's captured value at `idx`.
@@ -216,10 +238,9 @@ pub(crate) enum HostObj {
         type_name: String,
         fields: Vec<(String, Value)>,
     },
-    /// A closure's captured values (bound by value at creation). The target
-    /// lambda subroutine is resolved statically by the compiler, so only the
-    /// captures need to live at runtime.
-    Closure { captures: Vec<Value> },
+    /// A closure: the name-index of its compiled `$lambda_N` subroutine (for
+    /// dynamic dispatch when passed as a value) plus its captured values.
+    Closure { name_idx: i64, captures: Vec<Value> },
 }
 
 thread_local! {

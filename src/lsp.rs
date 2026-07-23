@@ -278,6 +278,46 @@ pub fn corpus() -> &'static [(&'static str, &'static str, &'static str, &'static
     CORPUS
 }
 
+/// Render `go doc [name]` from the corpus. With a name, print that one entry's
+/// category, description, and example (case-sensitive exact match first, then a
+/// case-insensitive fallback). Without a name, print the full index grouped by
+/// category. Returns the text to print, or an error string if `name` is unknown.
+pub fn doc(name: Option<&str>) -> Result<String, String> {
+    let Some(name) = name else {
+        // Full index, grouped by category in first-seen order.
+        let mut out = String::from("go-rs reference — documented surfaces\n");
+        let mut cats: Vec<&str> = Vec::new();
+        for (_, cat, _, _) in CORPUS {
+            if !cats.contains(cat) {
+                cats.push(cat);
+            }
+        }
+        for cat in cats {
+            out.push_str(&format!("\n{cat}\n"));
+            for (n, c, doc, _) in CORPUS {
+                if c == &cat {
+                    out.push_str(&format!("  {n:<10} {doc}\n"));
+                }
+            }
+        }
+        return Ok(out);
+    };
+
+    let entry = CORPUS.iter().find(|(n, _, _, _)| *n == name).or_else(|| {
+        CORPUS
+            .iter()
+            .find(|(n, _, _, _)| n.eq_ignore_ascii_case(name))
+    });
+    match entry {
+        Some((n, cat, doc, example)) => Ok(format!(
+            "{n}  ({cat})\n\n    {doc}\n\nexample:\n    {example}\n"
+        )),
+        None => Err(format!(
+            "go-rs: no documentation for `{name}` (try `go doc` for the index)"
+        )),
+    }
+}
+
 /// Open document text keyed by URI, kept current from the sync notifications so
 /// hover can look up the identifier under the cursor.
 type Docs = HashMap<String, String>;

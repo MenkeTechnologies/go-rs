@@ -67,6 +67,12 @@ Parse and compile\-check; report errors, do not run.
 .B env
 Print the Go environment (GOOS/GOARCH/GOVERSION).
 .TP
+.B doc \fR[\fINAME\fR]
+Print reference documentation for a keyword, type, or builtin (e.g.
+.BR "go doc append" ),
+or the full index of documented surfaces when no name is given. Draws on the
+same corpus as \fB\-\-lsp\fR hover/completion and \fBdocs/reference.html\fR.
+.TP
 .B version
 Print the version banner and exit.
 .TP
