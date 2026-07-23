@@ -650,6 +650,11 @@ impl Parser {
                 self.advance();
                 Ok(Stmt::Continue(line))
             }
+            Tok::Fallthrough => {
+                let line = self.line();
+                self.advance();
+                Ok(Stmt::Fallthrough(line))
+            }
             Tok::If => self.if_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Go => {

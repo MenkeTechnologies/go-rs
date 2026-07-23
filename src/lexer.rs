@@ -56,6 +56,7 @@ pub enum Tok {
     Chan,
     Select,
     Switch,
+    Fallthrough,
     Defer,
     // punctuation
     LBrace,
@@ -140,6 +141,7 @@ impl Tok {
                 | Tok::Return
                 | Tok::Break
                 | Tok::Continue
+                | Tok::Fallthrough
                 | Tok::RParen
                 | Tok::RBracket
                 | Tok::RBrace
@@ -523,6 +525,7 @@ fn keyword_or_ident(word: &str) -> Tok {
         "chan" => Tok::Chan,
         "select" => Tok::Select,
         "switch" => Tok::Switch,
+        "fallthrough" => Tok::Fallthrough,
         "defer" => Tok::Defer,
         _ => Tok::Ident(word.to_string()),
     }

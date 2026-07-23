@@ -246,7 +246,7 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
                         .any(|c| c.exprs.iter().any(ex) || body_uses_panic(&c.body))
                     || default.as_deref().is_some_and(body_uses_panic)
             }
-            Stmt::Break(_) | Stmt::Continue(_) => false,
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => false,
         }
     }
     body.iter().any(st)
@@ -554,7 +554,7 @@ fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
             }
         }
         Stmt::Block(b) => b.iter().for_each(|s| free_stmt(s, bound, out)),
-        Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
     }
 }
 
@@ -707,7 +707,7 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
             }
         }
         Stmt::Block(b) => b.iter().for_each(|s| walk_stmt_exprs(s, f)),
-        Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
     }
 }
 
@@ -1466,7 +1466,7 @@ impl Compiler {
                     self.fv_stmt(s, bound, caps);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
         }
     }
 
@@ -1871,6 +1871,9 @@ impl Compiler {
                     }
                 }
             }
+            // `fallthrough` is realized structurally by `compile_switch` (it
+            // detects a case body ending in one); here it emits nothing.
+            Stmt::Fallthrough(_) => {}
             Stmt::Defer { call, line } => self.compile_defer(call, *line)?,
             Stmt::Send { chan, val, line } => {
                 self.expr(chan)?;
@@ -2001,6 +2004,9 @@ impl Compiler {
         });
 
         let mut end_jumps = Vec::new();
+        // A `fallthrough` in the previous case jumps to this case's body,
+        // skipping its condition (patched when the body start is known).
+        let mut pending_ft: Option<usize> = None;
         for case in cases {
             // Condition: OR of `tag == e` (tagged) or `e` (expression switch).
             let mut next_jumps = Vec::new();
@@ -2025,17 +2031,26 @@ impl Compiler {
                     next_jumps.push((false, skip));
                 }
             }
-            // Patch the "matched → body" jumps to here (body start).
+            // Patch the "matched → body" jumps (and any pending fallthrough) here.
             let body_start = self.b.current_pos();
+            if let Some(j) = pending_ft.take() {
+                self.b.patch_jump(j, body_start);
+            }
             for (is_true, j) in &next_jumps {
                 if *is_true {
                     self.b.patch_jump(*j, body_start);
                 }
             }
+            let ends_ft = matches!(case.body.last(), Some(Stmt::Fallthrough(_)));
             for s in &case.body {
                 self.stmt(s)?;
             }
-            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            if ends_ft {
+                // Transfer to the next case's body instead of ending the switch.
+                pending_ft = Some(self.b.emit(Op::Jump(0), line));
+            } else {
+                end_jumps.push(self.b.emit(Op::Jump(0), line));
+            }
             // The final "not matched → skip" jump lands on the next case.
             let next = self.b.current_pos();
             for (is_true, j) in next_jumps {
@@ -2043,6 +2058,11 @@ impl Compiler {
                     self.b.patch_jump(j, next);
                 }
             }
+        }
+        // A `fallthrough` out of the last case falls into `default`.
+        if let Some(j) = pending_ft.take() {
+            let ds = self.b.current_pos();
+            self.b.patch_jump(j, ds);
         }
         if let Some(body) = default {
             for s in body {
@@ -3368,6 +3388,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::Send { line, .. }
         | Stmt::Select { line, .. }
         | Stmt::Switch { line, .. }
+        | Stmt::Fallthrough(line)
         | Stmt::Break(line)
         | Stmt::Continue(line) => *line,
         Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
@@ -3398,7 +3419,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
             cases.iter().any(|c| body_has_ffi(&c.body))
                 || default.as_ref().is_some_and(|d| body_has_ffi(d))
         }
-        Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) => false,
+        Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => false,
     })
 }
 

@@ -156,6 +156,8 @@ pub enum Stmt {
         default: Option<Vec<Stmt>>,
         line: u32,
     },
+    /// `fallthrough` — transfer to the next `switch` case's body.
+    Fallthrough(u32),
     /// `break`.
     Break(u32),
     /// `continue`.

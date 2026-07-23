@@ -1401,3 +1401,34 @@ func main() {
 ";
     assert_stdout(src, "15 0 10\n21\na a-b-c\np-x-y\n");
 }
+
+#[test]
+fn switch_fallthrough() {
+    let src = "\
+package main
+import \"fmt\"
+func describe(n int) string {
+	s := \"\"
+	switch n {
+	case 1:
+		s += \"one \"
+		fallthrough
+	case 2:
+		s += \"two \"
+		fallthrough
+	case 3:
+		s += \"three \"
+	default:
+		s += \"other \"
+	}
+	return s
+}
+func main() {
+	fmt.Println(describe(1))
+	fmt.Println(describe(2))
+	fmt.Println(describe(3))
+	fmt.Println(describe(9))
+}
+";
+    assert_stdout(src, "one two three \ntwo three \nthree \nother \n");
+}
