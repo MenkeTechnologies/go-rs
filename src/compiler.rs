@@ -185,6 +185,7 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
             Expr::Unary { rhs, .. } => ex(rhs),
             Expr::Binary { lhs, rhs, .. } => ex(lhs) || ex(rhs),
             Expr::Selector { recv, .. } => ex(recv),
+            Expr::TypeAssert { expr, .. } => ex(expr),
             Expr::Index { recv, index } => ex(recv) || ex(index),
             Expr::FuncLit { body, .. } => body_uses_panic(body),
             Expr::SliceLit { elems, .. } => elems.iter().any(ex),
@@ -244,6 +245,18 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
                     || cases
                         .iter()
                         .any(|c| c.exprs.iter().any(ex) || body_uses_panic(&c.body))
+                    || default.as_deref().is_some_and(body_uses_panic)
+            }
+            Stmt::TypeSwitch {
+                init,
+                expr,
+                cases,
+                default,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || ex(expr)
+                    || cases.iter().any(|c| body_uses_panic(&c.body))
                     || default.as_deref().is_some_and(body_uses_panic)
             }
             Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => false,
@@ -345,6 +358,7 @@ fn collect_captured(s: &Stmt, out: &mut HashSet<String>) {
                 args.iter().for_each(|a| ex(a, out));
             }
             Expr::Selector { recv, .. } => ex(recv, out),
+            Expr::TypeAssert { expr, .. } => ex(expr, out),
             Expr::Index { recv, index } => {
                 ex(recv, out);
                 ex(index, out);
@@ -553,6 +567,28 @@ fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
                 d.iter().for_each(|s| free_stmt(s, bound, out));
             }
         }
+        Stmt::TypeSwitch {
+            init,
+            bind,
+            expr,
+            cases,
+            default,
+            ..
+        } => {
+            if let Some(i) = init {
+                free_stmt(i, bound, out);
+            }
+            fe(expr, bound, out);
+            if let Some(b) = bind {
+                bound.insert(b.clone());
+            }
+            for c in cases {
+                c.body.iter().for_each(|s| free_stmt(s, bound, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| free_stmt(s, bound, out));
+            }
+        }
         Stmt::Block(b) => b.iter().for_each(|s| free_stmt(s, bound, out)),
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
     }
@@ -576,6 +612,7 @@ fn free_expr(e: &Expr, bound: &HashSet<String>, out: &mut HashSet<String>) {
             args.iter().for_each(|a| free_expr(a, bound, out));
         }
         Expr::Selector { recv, .. } => free_expr(recv, bound, out),
+        Expr::TypeAssert { expr, .. } => free_expr(expr, bound, out),
         Expr::Index { recv, index } => {
             free_expr(recv, bound, out);
             free_expr(index, bound, out);
@@ -700,6 +737,24 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
             }
             for c in cases {
                 c.exprs.iter().for_each(&mut *f);
+                c.body.iter().for_each(|s| walk_stmt_exprs(s, f));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| walk_stmt_exprs(s, f));
+            }
+        }
+        Stmt::TypeSwitch {
+            init,
+            expr,
+            cases,
+            default,
+            ..
+        } => {
+            if let Some(i) = init {
+                walk_stmt_exprs(i, f);
+            }
+            f(expr);
+            for c in cases {
                 c.body.iter().for_each(|s| walk_stmt_exprs(s, f));
             }
             if let Some(d) = default {
@@ -1461,6 +1516,32 @@ impl Compiler {
                     }
                 }
             }
+            Stmt::TypeSwitch {
+                init,
+                bind,
+                expr,
+                cases,
+                default,
+                ..
+            } => {
+                if let Some(i) = init {
+                    self.fv_stmt(i, bound, caps);
+                }
+                self.fv_expr(expr, bound, caps);
+                if let Some(b) = bind {
+                    bound.insert(b.clone());
+                }
+                for c in cases {
+                    for s in &c.body {
+                        self.fv_stmt(s, bound, caps);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.fv_stmt(s, bound, caps);
+                    }
+                }
+            }
             Stmt::Block(b) => {
                 for s in b {
                     self.fv_stmt(s, bound, caps);
@@ -1489,6 +1570,7 @@ impl Compiler {
                 }
             }
             Expr::Selector { recv, .. } => self.fv_expr(recv, bound, caps),
+            Expr::TypeAssert { expr, .. } => self.fv_expr(expr, bound, caps),
             Expr::Index { recv, index } => {
                 self.fv_expr(recv, bound, caps);
                 self.fv_expr(index, bound, caps);
@@ -1666,6 +1748,40 @@ impl Compiler {
                 values,
                 line,
             } => {
+                // `v, ok := x.(T)` — comma-ok type assertion: `ok` is whether the
+                // runtime type matches; `v` is the value (unchecked).
+                if names.len() == 2 && values.len() == 1 {
+                    if let Expr::TypeAssert { expr, ty } = &values[0] {
+                        let n = self.temp_counter;
+                        self.temp_counter += 1;
+                        let tmp = format!("$ta{n}");
+                        self.expr(expr)?;
+                        self.types.insert(tmp.clone(), NumType::Unknown);
+                        self.emit_set(&tmp, *line);
+                        // ok = typetag(tmp) == tag
+                        self.emit_get(&tmp, *line);
+                        self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), *line);
+                        let c = self.b.add_constant(Value::str(type_to_tag(ty)));
+                        self.b.emit(Op::LoadConst(c), *line);
+                        self.b.emit(Op::StrEq, *line);
+                        self.types.insert(names[1].clone(), NumType::Bool);
+                        self.emit_declare(&names[1], *line);
+                        // v = ok ? tmp : zero(T)  (Go zeroes v on a failed assert).
+                        self.emit_get(&names[1], *line);
+                        let to_zero = self.b.emit(Op::JumpIfFalse(0), *line);
+                        self.emit_get(&tmp, *line);
+                        let done = self.b.emit(Op::Jump(0), *line);
+                        let zpos = self.b.current_pos();
+                        self.b.patch_jump(to_zero, zpos);
+                        self.emit_default(numtype_of_ty(ty), *line);
+                        let end = self.b.current_pos();
+                        self.b.patch_jump(done, end);
+                        self.types.insert(names[0].clone(), numtype_of_ty(ty));
+                        self.decl_types.insert(names[0].clone(), base_type(ty));
+                        self.emit_declare(&names[0], *line);
+                        return Ok(());
+                    }
+                }
                 // `a, b := f()` where a user `func` returns exactly len(names)
                 // values: destructure the returned tuple (a slice heap value).
                 if names.len() >= 2
@@ -1892,6 +2008,14 @@ impl Compiler {
                 default,
                 line,
             } => self.compile_switch(init, tag, cases, default, *line)?,
+            Stmt::TypeSwitch {
+                init,
+                bind,
+                expr,
+                cases,
+                default,
+                line,
+            } => self.compile_type_switch(init, bind, expr, cases, default, *line)?,
             Stmt::Break(line) => {
                 let j = self.b.emit(Op::Jump(0), *line);
                 self.loops
@@ -2070,6 +2194,100 @@ impl Compiler {
             }
         }
 
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
+        let scope = self.loops.pop().unwrap();
+        for j in scope.breaks {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Lower a type switch `switch [v :=] x.(type) { case T: … }` to a runtime
+    /// type-tag dispatch: the value's tag is compared against each case type's
+    /// tag; the first match binds `v` and runs its body.
+    fn compile_type_switch(
+        &mut self,
+        init: &Option<Box<Stmt>>,
+        bind: &Option<String>,
+        expr: &Expr,
+        cases: &[TypeSwitchCase],
+        default: &Option<Vec<Stmt>>,
+        line: u32,
+    ) -> Result<(), String> {
+        if let Some(init) = init {
+            self.stmt(init)?;
+        }
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let val = format!("$ts{n}");
+        let tag = format!("$tstag{n}");
+        // Stash the value and its runtime type tag.
+        self.expr(expr)?;
+        self.types.insert(val.clone(), NumType::Unknown);
+        self.emit_set(&val, line);
+        self.emit_get(&val, line);
+        self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), line);
+        self.types.insert(tag.clone(), NumType::Str);
+        self.emit_set(&tag, line);
+
+        self.loops.push(LoopScope {
+            is_switch: true,
+            ..Default::default()
+        });
+        let mut end_jumps = Vec::new();
+        for case in cases {
+            let mut match_jumps = Vec::new();
+            let mut skip_jumps = Vec::new();
+            for (k, ty) in case.types.iter().enumerate() {
+                let ctag = type_to_tag(ty);
+                if ctag.is_empty() {
+                    // An interface type (`any`) matches unconditionally.
+                    match_jumps.push(self.b.emit(Op::Jump(0), line));
+                    break;
+                }
+                self.emit_get(&tag, line);
+                let c = self.b.add_constant(Value::str(ctag));
+                self.b.emit(Op::LoadConst(c), line);
+                self.b.emit(Op::StrEq, line);
+                if k + 1 < case.types.len() {
+                    match_jumps.push(self.b.emit(Op::JumpIfTrue(0), line));
+                } else {
+                    skip_jumps.push(self.b.emit(Op::JumpIfFalse(0), line));
+                }
+            }
+            let body_start = self.b.current_pos();
+            for j in &match_jumps {
+                self.b.patch_jump(*j, body_start);
+            }
+            // Bind the value to `v` inside the body.
+            if let Some(name) = bind {
+                self.emit_get(&val, line);
+                self.types.insert(name.clone(), NumType::Unknown);
+                self.decl_types.insert(name.clone(), String::new());
+                self.emit_declare(name, line);
+            }
+            for s in &case.body {
+                self.stmt(s)?;
+            }
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            for j in skip_jumps {
+                self.b.patch_jump(j, next);
+            }
+        }
+        if let Some(body) = default {
+            if let Some(name) = bind {
+                self.emit_get(&val, line);
+                self.types.insert(name.clone(), NumType::Unknown);
+                self.emit_declare(name, line);
+            }
+            for s in body {
+                self.stmt(s)?;
+            }
+        }
         let end = self.b.current_pos();
         for j in end_jumps {
             self.b.patch_jump(j, end);
@@ -2418,6 +2636,15 @@ impl Compiler {
                 spread,
                 line,
             } => self.call(func, args, *spread, *line)?,
+            // A single-result type assertion `x.(T)` — check and panic on
+            // mismatch. (The comma-ok form is handled in the `Short` statement.)
+            Expr::TypeAssert { expr, ty } => {
+                self.expr(expr)?;
+                let c = self.b.add_constant(Value::str(type_to_tag(ty)));
+                self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::CallBuiltin(host::GASSERT, 2), 0);
+                self.emit_panic_check(0);
+            }
             // A bare selector `x.f` is a package constant (`math.Pi`) or a
             // struct field read.
             Expr::Selector { recv, field } => {
@@ -2696,6 +2923,8 @@ impl Compiler {
         match e {
             Expr::Ident(n) => self.decl_types.get(n).cloned().unwrap_or_default(),
             Expr::StructLit { type_name, .. } => type_name.clone(),
+            // A type assertion `x.(T)` has static type T.
+            Expr::TypeAssert { ty, .. } => base_type(ty),
             // `&x` / `*p` name the same type as their operand (a `*Point` handle
             // dispatches methods and reads fields like a `Point`).
             Expr::Unary {
@@ -3166,6 +3395,8 @@ impl Compiler {
             }
             // Composite literals, indexing, make, and channel ops have no
             // known numeric category.
+            // A type assertion `x.(T)` is typed as T.
+            Expr::TypeAssert { ty, .. } => numtype_of_ty(ty),
             Expr::Index { .. }
             | Expr::Slice { .. }
             | Expr::SliceLit { .. }
@@ -3294,6 +3525,25 @@ fn is_package(name: &str) -> bool {
     matches!(name, "fmt" | "strings" | "strconv" | "math" | "sort" | "os")
 }
 
+/// Normalize a written type to the runtime tag [`host::GTYPETAG`] produces:
+/// pointers/named types → the base name, `[]T` → `[]`, `map[..]` → `map`,
+/// `func…` → `func`, and interface types (`any`, `interface{…}`, `error`) → `""`
+/// (which matches any value).
+fn type_to_tag(ty: &str) -> String {
+    let ty = ty.trim_start_matches('*');
+    if ty.starts_with("[]") {
+        "[]".to_string()
+    } else if ty.starts_with("map[") {
+        "map".to_string()
+    } else if ty.starts_with("func") {
+        "func".to_string()
+    } else if ty == "any" || ty == "interface{}" || ty == "interface{ }" || ty == "error" {
+        String::new()
+    } else {
+        ty.to_string()
+    }
+}
+
 /// Whether `name` is a builtin type usable as a conversion `T(x)`.
 fn is_conversion_type(name: &str) -> bool {
     matches!(
@@ -3388,6 +3638,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::Send { line, .. }
         | Stmt::Select { line, .. }
         | Stmt::Switch { line, .. }
+        | Stmt::TypeSwitch { line, .. }
         | Stmt::Fallthrough(line)
         | Stmt::Break(line)
         | Stmt::Continue(line) => *line,
@@ -3417,6 +3668,19 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         }
         Stmt::Switch { cases, default, .. } => {
             cases.iter().any(|c| body_has_ffi(&c.body))
+                || default.as_ref().is_some_and(|d| body_has_ffi(d))
+        }
+        Stmt::TypeSwitch {
+            init,
+            expr,
+            cases,
+            default,
+            ..
+        } => {
+            init.as_ref()
+                .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
+                || expr_has_ffi(expr)
+                || cases.iter().any(|c| body_has_ffi(&c.body))
                 || default.as_ref().is_some_and(|d| body_has_ffi(d))
         }
         Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => false,

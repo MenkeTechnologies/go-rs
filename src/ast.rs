@@ -156,6 +156,16 @@ pub enum Stmt {
         default: Option<Vec<Stmt>>,
         line: u32,
     },
+    /// `switch [init;] [v :=] x.(type) { case T: … }` — dispatch on the runtime
+    /// type of `x`. `bind` names the value (as `v`) inside each case body.
+    TypeSwitch {
+        init: Option<Box<Stmt>>,
+        bind: Option<String>,
+        expr: Expr,
+        cases: Vec<TypeSwitchCase>,
+        default: Option<Vec<Stmt>>,
+        line: u32,
+    },
     /// `fallthrough` — transfer to the next `switch` case's body.
     Fallthrough(u32),
     /// `break`.
@@ -171,6 +181,14 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub struct SwitchCase {
     pub exprs: Vec<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+/// One `case` clause of a type switch: the case types (`case int, string:`) and
+/// the statements to run.
+#[derive(Debug, Clone)]
+pub struct TypeSwitchCase {
+    pub types: Vec<String>,
     pub body: Vec<Stmt>,
 }
 
@@ -290,6 +308,11 @@ pub enum Expr {
         params: Vec<Param>,
         results: Vec<String>,
         body: Vec<Stmt>,
+    },
+    /// A type assertion `expr.(ty)` (`ty == "type"` marks the type-switch guard).
+    TypeAssert {
+        expr: Box<Expr>,
+        ty: String,
     },
 }
 

@@ -110,6 +110,12 @@ pub const GIMOD: u16 = 899;
 /// A Go type conversion `T(v)`: stack `[value, typeNameConstIdx]` — the compiler
 /// pushes the value then a constant naming the target type.
 pub const GCONV: u16 = 900;
+/// `[value]` → the runtime type name of a value (`int`/`string`/`bool`/`float64`,
+/// a struct type name, `[]`/`map`/`func`, or `nil`) for type switches/assertions.
+pub const GTYPETAG: u16 = 901;
+/// `[value, "tag"]` → a single-result type assertion `x.(T)`: `value` if its type
+/// matches, else a recoverable panic (`interface conversion`).
+pub const GASSERT: u16 = 902;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -161,7 +167,52 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GIDIV, b_idiv);
     vm.register_builtin(GIMOD, b_imod);
     vm.register_builtin(GCONV, b_conv);
+    vm.register_builtin(GTYPETAG, b_typetag);
+    vm.register_builtin(GASSERT, b_assert);
     stdlib::install(vm);
+}
+
+/// `[value, "tag"]` → a single-result type assertion. Returns the value when its
+/// runtime type matches; otherwise a recoverable panic. `tag` empty (an
+/// interface type like `any`) always matches.
+fn b_assert(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let want = args.get(1).map(go_str).unwrap_or_default();
+    let got = type_tag_of(&v);
+    if want.is_empty() || want == got {
+        v
+    } else {
+        runtime_panic(
+            vm,
+            format!("interface conversion: interface {{}} is {got}, not {want}"),
+        );
+        Value::Undef
+    }
+}
+
+/// The runtime type tag of a value (shared by [`b_typetag`] and [`b_assert`]).
+fn type_tag_of(v: &Value) -> String {
+    match v {
+        Value::Int(_) => "int".to_string(),
+        Value::Float(_) => "float64".to_string(),
+        Value::Str(_) => "string".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Struct { type_name, .. }) => type_name.clone(),
+            Some(HostObj::Slice(_)) | Some(HostObj::SliceView { .. }) => "[]".to_string(),
+            Some(HostObj::Map(_)) => "map".to_string(),
+            Some(HostObj::Closure { .. }) => "func".to_string(),
+            _ => "nil".to_string(),
+        }),
+        _ => "nil".to_string(),
+    }
+}
+
+/// `[value]` → the runtime type name used by type switches and assertions.
+fn b_typetag(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    Value::str(type_tag_of(args.first().unwrap_or(&Value::Undef)))
 }
 
 /// `[value, "type"]` → a Go type conversion `T(value)`. Integer types truncate

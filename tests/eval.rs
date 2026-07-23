@@ -1432,3 +1432,35 @@ func main() {
 ";
     assert_stdout(src, "one two three \ntwo three \nthree \nother \n");
 }
+
+#[test]
+fn type_switch_and_assertions() {
+    let src = "\
+package main
+import \"fmt\"
+type Point struct{ x int }
+func kind(v any) string {
+	switch t := v.(type) {
+	case int:
+		return fmt.Sprintf(\"int %d\", t)
+	case string:
+		return \"str \" + t
+	case Point:
+		return fmt.Sprintf(\"point %d\", t.x)
+	default:
+		return \"?\"
+	}
+}
+func main() {
+	fmt.Println(kind(5), kind(\"hi\"), kind(Point{x: 9}), kind(true))
+	var i any = \"go\"
+	s, ok := i.(string)
+	fmt.Println(s, ok)
+	n, ok2 := i.(int)
+	fmt.Println(n, ok2)
+	var j any = 7
+	fmt.Println(j.(int) + 1)
+}
+";
+    assert_stdout(src, "int 5 str hi point 9 ?\ngo true\n0 false\n8\n");
+}

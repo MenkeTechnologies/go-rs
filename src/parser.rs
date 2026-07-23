@@ -984,20 +984,30 @@ impl Parser {
         let line = self.line();
         self.expect(&Tok::Switch)?;
 
-        // Optional `init;` and optional tag expression before the `{`.
+        // Optional `init;` then the guard: a tag expression, or a type-switch
+        // guard `[v :=] x.(type)`.
         let mut init = None;
-        let mut tag = None;
+        let mut guard: Option<Stmt> = None;
         if !matches!(self.peek(), Tok::LBrace) {
             let first = self.simple_stmt()?;
             if self.eat(&Tok::Semi) {
                 init = Some(Box::new(first));
                 if !matches!(self.peek(), Tok::LBrace) {
-                    tag = Some(self.expr()?);
+                    guard = Some(self.simple_stmt()?);
                 }
             } else {
-                tag = Some(stmt_into_expr(first, line)?);
+                guard = Some(first);
             }
         }
+
+        // A type switch: the guard is `x.(type)` or `v := x.(type)`.
+        if let Some((bind, expr)) = guard.as_ref().and_then(type_switch_guard) {
+            return self.type_switch_body(init, bind, expr, line);
+        }
+        let tag = match guard {
+            Some(s) => Some(stmt_into_expr(s, line)?),
+            None => None,
+        };
 
         self.expect(&Tok::LBrace)?;
         self.skip_semis();
@@ -1029,6 +1039,52 @@ impl Parser {
         Ok(Stmt::Switch {
             init,
             tag,
+            cases,
+            default,
+            line,
+        })
+    }
+
+    /// Parse the body of a type switch (its guard already recognized): `{ case
+    /// T1, T2: … ; default: … }`, where each case names types.
+    fn type_switch_body(
+        &mut self,
+        init: Option<Box<Stmt>>,
+        bind: Option<String>,
+        expr: Expr,
+        line: u32,
+    ) -> Result<Stmt, String> {
+        self.expect(&Tok::LBrace)?;
+        self.skip_semis();
+        let mut cases = Vec::new();
+        let mut default = None;
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            if matches!(self.peek(), Tok::Ident(s) if s == "default") {
+                self.advance();
+                self.expect(&Tok::Colon)?;
+                default = Some(self.case_body()?);
+                continue;
+            }
+            if !matches!(self.peek(), Tok::Ident(s) if s == "case") {
+                return Err(format!(
+                    "go-rs: expected `case` or `default` in type switch on line {}",
+                    self.line()
+                ));
+            }
+            self.advance(); // `case`
+            let mut types = vec![self.type_name()?];
+            while self.eat(&Tok::Comma) {
+                types.push(self.type_name()?);
+            }
+            self.expect(&Tok::Colon)?;
+            let body = self.case_body()?;
+            cases.push(TypeSwitchCase { types, body });
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Stmt::TypeSwitch {
+            init,
+            bind,
+            expr,
             cases,
             default,
             line,
@@ -1323,11 +1379,25 @@ impl Parser {
             match self.peek() {
                 Tok::Dot => {
                     self.advance();
-                    let field = self.ident()?;
-                    e = Expr::Selector {
-                        recv: Box::new(e),
-                        field,
-                    };
+                    // Type assertion `x.(T)` / type-switch guard `x.(type)`.
+                    if self.eat(&Tok::LParen) {
+                        let ty = if self.eat(&Tok::Type) {
+                            "type".to_string()
+                        } else {
+                            self.type_name()?
+                        };
+                        self.expect(&Tok::RParen)?;
+                        e = Expr::TypeAssert {
+                            expr: Box::new(e),
+                            ty,
+                        };
+                    } else {
+                        let field = self.ident()?;
+                        e = Expr::Selector {
+                            recv: Box::new(e),
+                            field,
+                        };
+                    }
                 }
                 Tok::LBracket => {
                     self.advance();
@@ -1590,6 +1660,30 @@ fn subst_iota(e: Expr, idx: i64) -> Expr {
             field,
         },
         other => other,
+    }
+}
+
+/// If `s` is a type-switch guard (`x.(type)` or `v := x.(type)`), return the
+/// optional bound name and the asserted expression.
+fn type_switch_guard(s: &Stmt) -> Option<(Option<String>, Expr)> {
+    let is_type_assert = |e: &Expr| matches!(e, Expr::TypeAssert { ty, .. } if ty == "type");
+    match s {
+        Stmt::ExprStmt(e) if is_type_assert(e) => {
+            if let Expr::TypeAssert { expr, .. } = e {
+                Some((None, (**expr).clone()))
+            } else {
+                None
+            }
+        }
+        Stmt::Short { names, values, .. } if names.len() == 1 && values.len() == 1 => {
+            if let Expr::TypeAssert { expr, ty } = &values[0] {
+                if ty == "type" {
+                    return Some((Some(names[0].clone()), (**expr).clone()));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
