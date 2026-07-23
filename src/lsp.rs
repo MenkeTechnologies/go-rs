@@ -132,6 +132,18 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "the boolean literal false",
         "ok := false",
     ),
+    (
+        "go",
+        "Keyword",
+        "spawn a goroutine: run a function concurrently on the cooperative scheduler",
+        "go worker(jobs, results)",
+    ),
+    (
+        "chan",
+        "Keyword",
+        "a channel type: `chan T` carries values of type T between goroutines",
+        "ch := make(chan int, 8)",
+    ),
     // ── Type (declaration-position type names) ──
     (
         "int",
@@ -233,6 +245,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Builtin",
         "delete(m, k): remove key k from map m",
         "delete(m, \"a\")",
+    ),
+    (
+        "close",
+        "Builtin",
+        "close(ch): close a channel; further receives yield the zero value",
+        "close(done)",
     ),
     // ── Package (standard library) ──
     (

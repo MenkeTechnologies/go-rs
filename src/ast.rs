@@ -3,10 +3,10 @@
 //! Models a single-file `package main` program: a package clause, imports,
 //! `type T struct` declarations, and top-level `func` / method declarations.
 //! `func main` is the entry point; every other `func` (and every method)
-//! becomes a fusevm subroutine (see [`crate::compiler`]). The expression grammar
-//! covers arithmetic/control flow plus composite types — slices, maps, structs,
-//! indexing, `range`, and composite literals. Interfaces, channels, and
-//! goroutines grow in later waves.
+//! becomes a fusevm subroutine (see [`crate::compiler`]). The grammar covers
+//! arithmetic/control flow, composite types (slices, maps, structs, interfaces,
+//! indexing, `range`, composite literals), and concurrency (`go`, `chan`, `<-`,
+//! `close`) lowered onto fusevm's cooperative scheduler.
 
 /// A parsed Go source file.
 #[derive(Debug, Clone)]
@@ -118,6 +118,10 @@ pub enum Stmt {
         body: Vec<Stmt>,
         line: u32,
     },
+    /// `go f(args)` — spawn a goroutine running the named function.
+    Go { call: Expr, line: u32 },
+    /// `ch <- val` — send `val` on channel `ch`.
+    Send { chan: Expr, val: Expr, line: u32 },
     /// `break`.
     Break(u32),
     /// `continue`.
@@ -194,6 +198,14 @@ pub enum Expr {
         is_map: bool,
         len: Option<Box<Expr>>,
         elem_zero: Box<Expr>,
+    },
+    /// `make(chan T, cap)` — a channel with buffer capacity `cap` (0 if omitted).
+    MakeChan {
+        cap: Option<Box<Expr>>,
+    },
+    /// `<-ch` — receive a value from channel `ch`.
+    Recv {
+        chan: Box<Expr>,
     },
 }
 

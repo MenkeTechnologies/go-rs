@@ -384,6 +384,59 @@ func main() {
 }
 
 #[test]
+fn goroutine_unbuffered_channel_handshake() {
+    let src = "\
+package main
+import \"fmt\"
+func send(ch chan int) {
+	ch <- 42
+}
+func main() {
+	ch := make(chan int)
+	go send(ch)
+	fmt.Println(<-ch)
+}
+";
+    assert_stdout(src, "42\n");
+}
+
+#[test]
+fn goroutine_worker_over_buffered_channels() {
+    let src = "\
+package main
+import \"fmt\"
+func worker(jobs chan int, results chan int) {
+	for {
+		j := <-jobs
+		results <- j * 2
+	}
+}
+func main() {
+	jobs := make(chan int, 5)
+	results := make(chan int, 5)
+	go worker(jobs, results)
+	for i := 1; i <= 5; i++ {
+		jobs <- i
+	}
+	sum := 0
+	for i := 0; i < 5; i++ {
+		sum += <-results
+	}
+	fmt.Println(sum)
+}
+";
+    // (1+2+3+4+5)*2 = 30
+    assert_stdout(src, "30\n");
+}
+
+#[test]
+fn goroutine_deadlock_is_reported() {
+    // main receives on a channel nothing sends to.
+    let (_stdout, ok) = run("package main\nfunc main() {\n\tch := make(chan int)\n\t_ = <-ch\n}\n");
+    assert!(!ok, "a receive with no sender should deadlock and fail");
+}
+
+#[test]
 fn interface_slice_polymorphism() {
     let src = "\
 package main

@@ -148,6 +148,16 @@
           <p>the boolean literal false</p>
           <pre><code class="lang-go">ok := false</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>go</code></h3>
+          <p>spawn a goroutine: run a function concurrently on the cooperative scheduler</p>
+          <pre><code class="lang-go">go worker(jobs, results)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-19">
+          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>chan</code></h3>
+          <p>a channel type: `chan T` carries values of type T between goroutines</p>
+          <pre><code class="lang-go">ch := make(chan int, 8)</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-type">
@@ -254,6 +264,11 @@
           <h3><a class="doc-anchor" href="#doc-builtin-5">#</a> <code>delete</code></h3>
           <p>delete(m, k): remove key k from map m</p>
           <pre><code class="lang-go">delete(m, "a")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-6">
+          <h3><a class="doc-anchor" href="#doc-builtin-6">#</a> <code>close</code></h3>
+          <p>close(ch): close a channel; further receives yield the zero value</p>
+          <pre><code class="lang-go">close(done)</code></pre>
         </article>
       </section>
 

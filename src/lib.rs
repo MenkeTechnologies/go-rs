@@ -20,7 +20,7 @@ pub mod parser;
 pub mod rust_ffi;
 
 pub use banner::version_banner;
-use fusevm::{VMResult, Value, VM};
+use fusevm::{Op, Scheduler, VMResult, Value, VM};
 
 /// Parse Go `src` to an AST. Inline `rust { ... }` FFI blocks are desugared to
 /// `__rust_compile(...)` statements first (see [`rust_ffi`]), so every parse
@@ -37,14 +37,18 @@ pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
     compiler::compile(&prog)
 }
 
-/// Register the go-rs builtins + strict numeric hook on a fresh VM, enable the
-/// tracing JIT, and run the chunk. Returns the last top-of-stack value.
-fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
-    // A fresh object heap per run — no composite handles leak across programs.
-    host::heap_reset();
+/// Configure a fresh VM for running go-rs bytecode: install the builtins and the
+/// strict numeric hook. Used for the main VM and every goroutine VM.
+fn configure_vm(chunk: fusevm::Chunk) -> VM {
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
+    vm
+}
+
+/// Run a chunk on a single VM (no goroutines), with the tracing JIT enabled.
+fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
+    let mut vm = configure_vm(chunk);
     vm.enable_tracing_jit();
     let result = vm.run();
     // An inline-Rust FFI fault stashes its message and halts the VM; it must be
@@ -60,10 +64,43 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     }
 }
 
+/// Run a chunk that uses goroutines/channels under the cooperative scheduler.
+/// Every goroutine is its own VM sharing the program and the thread-local heap;
+/// the scheduler drives them and services channel operations.
+fn run_scheduled(chunk: fusevm::Chunk) -> Result<Value, String> {
+    let main_vm = configure_vm(chunk.clone());
+    let make_vm = move || configure_vm(chunk.clone());
+    match Scheduler::new(make_vm).run(main_vm) {
+        Ok(()) => match host::take_ffi_error() {
+            Some(e) => Err(e),
+            None => Ok(Value::Undef),
+        },
+        Err(e) => Err(format!("go-rs: {e}")),
+    }
+}
+
+/// True if the chunk uses any cooperative-concurrency op (so it must run under
+/// the scheduler rather than a single VM).
+fn uses_scheduler(chunk: &fusevm::Chunk) -> bool {
+    chunk.ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::Go(..) | Op::ChanMake | Op::ChanSend | Op::ChanRecv | Op::ChanClose
+        )
+    })
+}
+
 /// Compile and run a Go source string; return the last VM value.
 pub fn run_str(src: &str) -> Result<Value, String> {
     let chunk = compile(src)?;
-    run_chunk(chunk)
+    // A fresh object heap per run — no composite handles leak across programs.
+    // Goroutine VMs share this (single-threaded) thread-local heap.
+    host::heap_reset();
+    if uses_scheduler(&chunk) {
+        run_scheduled(chunk)
+    } else {
+        run_chunk(chunk)
+    }
 }
 
 /// Read and run a `.go` file.

@@ -416,6 +416,36 @@ impl Compiler {
                 body,
                 ..
             } => self.compile_for_range(key, val, iter, body)?,
+            Stmt::Go { call, line } => {
+                // `go f(args)` — only a direct call of a top-level function is
+                // spawnable in this slice (no method/closure goroutines yet).
+                match call {
+                    Expr::Call { func, args, .. } => match func.as_ref() {
+                        Expr::Ident(name) if self.funcs.contains_key(name) => {
+                            for a in args {
+                                self.emit_value(a)?;
+                            }
+                            let idx = self.b.add_name(name);
+                            self.b.emit(Op::Go(idx, args.len() as u8), *line);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "go-rs: `go` requires a top-level function call (line {line})"
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(format!(
+                            "go-rs: `go` requires a function call (line {line})"
+                        ))
+                    }
+                }
+            }
+            Stmt::Send { chan, val, line } => {
+                self.expr(chan)?;
+                self.expr(val)?;
+                self.b.emit(Op::ChanSend, *line);
+            }
             Stmt::Break(line) => {
                 let j = self.b.emit(Op::Jump(0), *line);
                 self.loops
@@ -714,6 +744,19 @@ impl Compiler {
                     self.b.emit(Op::CallBuiltin(host::GMAKE, 3), 0);
                 }
             }
+            Expr::MakeChan { cap } => {
+                match cap {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        self.b.emit(Op::LoadInt(0), 0);
+                    }
+                }
+                self.b.emit(Op::ChanMake, 0);
+            }
+            Expr::Recv { chan } => {
+                self.expr(chan)?;
+                self.b.emit(Op::ChanRecv, 0);
+            }
         }
         Ok(())
     }
@@ -984,6 +1027,18 @@ impl Compiler {
 
         // Bare-name call: a language builtin or a user function.
         if let Expr::Ident(name) = func {
+            // `close(ch)` lowers to the channel-close op, not a builtin.
+            if name == "close" {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.b.emit(Op::ChanClose, line);
+                // `close` is a statement; leave a value so ExprStmt's Pop is
+                // balanced (the op consumes the channel and pushes nothing, so
+                // synthesize an Undef result).
+                self.b.emit(Op::LoadUndef, line);
+                return Ok(());
+            }
             // Builtins that take a variable arg count.
             let simple_builtin = match name.as_str() {
                 "__rust_compile" => Some(host::GFFI_COMPILE),
@@ -1096,12 +1151,15 @@ impl Compiler {
                     .map(|(_, t)| numtype_of_ty(t))
                     .unwrap_or(NumType::Unknown)
             }
-            // Composite literals, indexing, and make have no numeric category.
+            // Composite literals, indexing, make, and channel ops have no
+            // known numeric category.
             Expr::Index { .. }
             | Expr::SliceLit { .. }
             | Expr::MapLit { .. }
             | Expr::StructLit { .. }
-            | Expr::Make { .. } => NumType::Unknown,
+            | Expr::Make { .. }
+            | Expr::MakeChan { .. }
+            | Expr::Recv { .. } => NumType::Unknown,
         }
     }
 }
@@ -1171,6 +1229,8 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::If { line, .. }
         | Stmt::For { line, .. }
         | Stmt::ForRange { line, .. }
+        | Stmt::Go { line, .. }
+        | Stmt::Send { line, .. }
         | Stmt::Break(line)
         | Stmt::Continue(line) => *line,
         Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
@@ -1190,6 +1250,8 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         Stmt::For { body, .. } | Stmt::ForRange { body, .. } | Stmt::Block(body) => {
             body_has_ffi(body)
         }
+        Stmt::Go { call, .. } => expr_has_ffi(call),
+        Stmt::Send { chan, val, .. } => expr_has_ffi(chan) || expr_has_ffi(val),
         Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) => false,
     })
 }

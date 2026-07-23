@@ -49,6 +49,8 @@ pub enum Tok {
     Continue,
     True,
     False,
+    Go,
+    Chan,
     // punctuation
     LBrace,
     RBrace,
@@ -75,6 +77,7 @@ pub enum Tok {
     Percent,
     PlusPlus,
     MinusMinus,
+    Arrow, // <- (channel send/receive)
     EqEq,
     NotEq,
     Lt,
@@ -345,6 +348,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             "%=" => (Tok::PercentAssign, 2),
             "++" => (Tok::PlusPlus, 2),
             "--" => (Tok::MinusMinus, 2),
+            "<-" => (Tok::Arrow, 2),
             "==" => (Tok::EqEq, 2),
             "!=" => (Tok::NotEq, 2),
             "<=" => (Tok::Le, 2),
@@ -411,6 +415,8 @@ fn keyword_or_ident(word: &str) -> Tok {
         "continue" => Tok::Continue,
         "true" => Tok::True,
         "false" => Tok::False,
+        "go" => Tok::Go,
+        "chan" => Tok::Chan,
         _ => Tok::Ident(word.to_string()),
     }
 }

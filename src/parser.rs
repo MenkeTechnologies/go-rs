@@ -371,7 +371,7 @@ impl Parser {
     fn type_starts_at(&self, pos: usize) -> bool {
         matches!(
             self.tokens.get(pos).map(|t| &t.kind),
-            Some(Tok::Ident(_)) | Some(Tok::LBracket) | Some(Tok::Star)
+            Some(Tok::Ident(_)) | Some(Tok::LBracket) | Some(Tok::Star) | Some(Tok::Chan)
         )
     }
 
@@ -397,6 +397,11 @@ impl Parser {
                 self.expect(&Tok::RBracket)?;
                 let v = self.type_name()?;
                 Ok(format!("map[{k}]{v}"))
+            }
+            // `chan T` — a channel type.
+            Tok::Chan => {
+                self.advance();
+                Ok(format!("chan {}", self.type_name()?))
             }
             Tok::Ident(_) => self.ident(),
             other => Err(format!(
@@ -445,6 +450,12 @@ impl Parser {
             }
             Tok::If => self.if_stmt(),
             Tok::For => self.for_stmt(),
+            Tok::Go => {
+                let line = self.line();
+                self.advance();
+                let call = self.expr()?;
+                Ok(Stmt::Go { call, line })
+            }
             Tok::LBrace => Ok(Stmt::Block(self.block()?)),
             _ => self.simple_stmt(),
         }
@@ -648,6 +659,16 @@ impl Parser {
 
         let target = self.expr()?;
         match self.peek() {
+            // `ch <- val` — channel send.
+            Tok::Arrow => {
+                self.advance();
+                let val = self.expr()?;
+                Ok(Stmt::Send {
+                    chan: target,
+                    val,
+                    line,
+                })
+            }
             Tok::PlusPlus => {
                 self.advance();
                 Ok(Stmt::IncDec {
@@ -766,6 +787,13 @@ impl Parser {
             Tok::Plus => {
                 self.advance();
                 self.unary()
+            }
+            // `<-ch` — channel receive.
+            Tok::Arrow => {
+                self.advance();
+                Ok(Expr::Recv {
+                    chan: Box::new(self.unary()?),
+                })
             }
             _ => self.postfix(),
         }
@@ -922,6 +950,16 @@ impl Parser {
     fn make_expr(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::LParen)?;
         let ty = self.type_name()?;
+        // `make(chan T, cap)` — a channel.
+        if ty.starts_with("chan ") {
+            let cap = if self.eat(&Tok::Comma) {
+                Some(Box::new(self.expr()?))
+            } else {
+                None
+            };
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::MakeChan { cap });
+        }
         let is_map = ty.starts_with("map[");
         let mut len = None;
         if self.eat(&Tok::Comma) {
