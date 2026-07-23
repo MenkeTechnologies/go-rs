@@ -144,6 +144,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "a channel type: `chan T` carries values of type T between goroutines",
         "ch := make(chan int, 8)",
     ),
+    (
+        "select",
+        "Keyword",
+        "wait on multiple channel operations; runs a ready case, else `default`, else blocks",
+        "select { case v := <-ch: use(v); default: }",
+    ),
     // ── Type (declaration-position type names) ──
     (
         "int",

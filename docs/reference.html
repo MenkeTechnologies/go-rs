@@ -158,6 +158,11 @@
           <p>a channel type: `chan T` carries values of type T between goroutines</p>
           <pre><code class="lang-go">ch := make(chan int, 8)</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keyword-20">
+          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>select</code></h3>
+          <p>wait on multiple channel operations; runs a ready case, else `default`, else blocks</p>
+          <pre><code class="lang-go">select { case v := &lt;-ch: use(v); default: }</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-type">

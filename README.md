@@ -113,14 +113,16 @@ A single-file `package main` that runs real Go programs:
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type (a compiled type-switch over the concrete implementors) |
-| Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close` — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
-| Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`), `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/TrimSpace/Split/Join/Repeat/Index/ReplaceAll/Fields), `strconv` (Itoa/Atoi), builtin `println`/`print` |
+| Closures       | function literals `func(…){…}` with capture-by-value; `f := func(){…}; f()`, IIFE, `go func(){…}()` |
+| Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
+| Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
-Goroutines and channels run on a **cooperative scheduler added to the shared
-`fusevm` VM** (v0.14.14, `fusevm::sched`): each goroutine is its own VM sharing
-the program and the single-threaded heap, yielding at channel operations. `select`,
-closures, and the wider standard library are future waves. Documented
+Goroutines, channels, and `select` run on a **cooperative scheduler added to the
+shared `fusevm` VM** (`fusevm::sched`, v0.14.14–0.14.15): each goroutine is its
+own VM sharing the program and the single-threaded heap, yielding at channel
+operations. Function types as parameters (passing a closure to a function),
+`defer`, and generics are future waves. Documented
 simplifications: a map read of a missing key returns the numeric zero (`0`)
 rather than the comma-ok form; method receivers use reference semantics (a value
 receiver is not copied); and `go` targets a top-level function call (no closure
