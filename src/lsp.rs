@@ -66,6 +66,18 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "const pi = 3.14159",
     ),
     (
+        "type",
+        "Keyword",
+        "declare a named type; `type T struct { … }` defines a struct",
+        "type Point struct { x int; y int }",
+    ),
+    (
+        "struct",
+        "Keyword",
+        "a struct type: a fixed set of named fields with value semantics",
+        "type Point struct { x, y int }",
+    ),
+    (
         "if",
         "Keyword",
         "conditional branch with an optional init clause: `if [init;] cond { … }`",
@@ -184,6 +196,50 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "IO",
         "builtin print(a…): to stderr with no newline",
         "print(\"debug\")",
+    ),
+    // ── Builtin (predeclared functions over composite types) ──
+    (
+        "make",
+        "Builtin",
+        "make([]T, n) allocates a zeroed slice; make(map[K]V) an empty map",
+        "xs := make([]int, 3); m := make(map[string]int)",
+    ),
+    (
+        "len",
+        "Builtin",
+        "len(x): the number of elements in a slice/map, or bytes in a string",
+        "n := len([]int{1, 2, 3})   // 3",
+    ),
+    (
+        "cap",
+        "Builtin",
+        "cap(x): the capacity of a slice (its length in go-rs)",
+        "c := cap(make([]int, 4))",
+    ),
+    (
+        "append",
+        "Builtin",
+        "append(s, elems…): extend a slice, returning the result",
+        "xs = append(xs, 4, 5)",
+    ),
+    (
+        "delete",
+        "Builtin",
+        "delete(m, k): remove key k from map m",
+        "delete(m, \"a\")",
+    ),
+    // ── Package (standard library) ──
+    (
+        "strings",
+        "Package",
+        "string helpers: ToUpper/ToLower/Contains/HasPrefix/HasSuffix/TrimSpace/Split/Join/Repeat/Index/ReplaceAll/Fields",
+        "strings.Join(strings.Split(\"a,b\", \",\"), \"-\")",
+    ),
+    (
+        "strconv",
+        "Package",
+        "string↔number conversions: Itoa (int→string), Atoi (string→int)",
+        "s := strconv.Itoa(42); n := strconv.Atoi(\"7\")",
     ),
 ];
 

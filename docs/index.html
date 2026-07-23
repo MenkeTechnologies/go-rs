@@ -206,9 +206,11 @@ func main() {
             <tr><td>LSP server (<code>--lsp</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Completion + hover from the keyword/type/IO corpus, parser-driven diagnostics (<code>src/lsp.rs</code>).</td></tr>
             <tr><td>DAP debugger (<code>--dap</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Line breakpoints, stepping, stack trace, and <code>main</code>-locals inspection via debug line markers (<code>src/dap.rs</code>).</td></tr>
             <tr><td>Dumps (<code>--dump-tokens</code>/<code>--dump-ast</code>/<code>--disasm</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Print an artifact and exit (<code>src/main.rs</code>).</td></tr>
-            <tr><td>Structs, methods, interfaces</td><td><span class="status-pill status-planned">Planned</span></td><td>User types, method sets, and interface dispatch are future waves.</td></tr>
-            <tr><td>Slices, maps, channels, goroutines</td><td><span class="status-pill status-planned">Planned</span></td><td>Composite types, the runtime data structures, and concurrency are future waves.</td></tr>
-            <tr><td>Standard library beyond <code>fmt</code></td><td><span class="status-pill status-planned">Planned</span></td><td><code>strings</code>, <code>strconv</code>, <code>os</code>, <code>errors</code>, and the rest of the stdlib pending.</td></tr>
+            <tr><td>Slices &amp; maps</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>[]T{…}</code> / <code>map[K]V{…}</code> / <code>make</code>, indexing, <code>len</code>/<code>cap</code>/<code>append</code>/<code>delete</code>, and <code>for … range</code> over both (host heap, reference semantics) (<code>src/host.rs</code>).</td></tr>
+            <tr><td>Structs &amp; methods</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>type T struct</code>, composite literals, field read/write, <strong>value-copy semantics</strong> on assign/pass/return, and <code>recv.m()</code> method dispatch (<code>src/compiler.rs</code>).</td></tr>
+            <tr><td><code>strings</code> / <code>strconv</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Common <code>strings</code> helpers and <code>strconv.Itoa</code>/<code>Atoi</code> as host builtins (<code>src/host.rs</code>).</td></tr>
+            <tr><td>Interfaces, channels, goroutines</td><td><span class="status-pill status-planned">Planned</span></td><td>Method-set interfaces and concurrency (the last needs a scheduler) are future waves.</td></tr>
+            <tr><td>Standard library beyond the above</td><td><span class="status-pill status-planned">Planned</span></td><td><code>os</code>, <code>errors</code>, <code>sort</code>, and the rest of the stdlib pending.</td></tr>
           </tbody>
         </table>
       </section>

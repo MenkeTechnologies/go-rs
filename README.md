@@ -99,20 +99,26 @@ More programs live in [`examples/`](examples).
 
 ## Language surface
 
-This is slice 1 — a single-file `package main` that runs real Go programs:
+A single-file `package main` that runs real Go programs:
 
-| Area          | Supported                                                              |
-| ------------- | --------------------------------------------------------------------- |
-| Declarations  | `package`, `import` (single + grouped), top-level `func` with params/results |
-| Variables     | `:=`, `var x [T] [= e]`, assignment, `+= -= *= /= %=`, `x++` / `x--`   |
-| Control flow  | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `break`, `continue`, `return` |
-| Expressions   | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
-| Types         | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
-| Printing      | `fmt.Println`, `fmt.Print`, `fmt.Printf` (`%v %d %s %f %t %q %%`), builtin `println` / `print` |
-| Inline FFI    | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
+| Area           | Supported                                                              |
+| -------------- | --------------------------------------------------------------------- |
+| Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
+| Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), `+= -= *= /= %=`, `x++` / `x--` |
+| Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `break`, `continue`, `return` |
+| Expressions    | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
+| Types          | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
+| Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, `len` / `cap` / `append`, `for i, v := range s` |
+| Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m` |
+| Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
+| Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
+| Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`), `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/TrimSpace/Split/Join/Repeat/Index/ReplaceAll/Fields), `strconv` (Itoa/Atoi), builtin `println`/`print` |
+| Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
-Structs, methods, interfaces, slices, maps, channels, and goroutines land in
-later waves.
+Interfaces, channels, and goroutines land in later waves (the last needs a
+scheduler). Two documented simplifications this wave: a map read of a missing
+key returns the numeric zero (`0`) rather than the comma-ok form, and method
+receivers use reference semantics (a value receiver is not copied).
 
 ## Toolchain
 

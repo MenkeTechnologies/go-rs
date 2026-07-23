@@ -18,7 +18,7 @@
 
 use crate::ast::*;
 use crate::host;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
@@ -49,6 +49,8 @@ fn numtype_of_ty(ty: &str) -> NumType {
 struct FuncSig {
     arity: usize,
     result: NumType,
+    /// The Go type name of the first result (for struct/method type inference).
+    result_ty: String,
 }
 
 /// A lexical scope inside a subroutine: local/parameter name → frame slot.
@@ -88,14 +90,25 @@ struct Compiler {
     b: ChunkBuilder,
     /// `None` while lowering `main` (global scope); `Some` inside a subroutine.
     scope: Option<Scope>,
-    /// Static types of the variables in the function currently being compiled.
+    /// Static numeric category of the variables in the current function.
     types: HashMap<String, NumType>,
-    /// Every top-level function, by name (for call resolution).
+    /// Static Go type name of each variable in the current function (for struct
+    /// value-copy and method dispatch).
+    decl_types: HashMap<String, String>,
+    /// Every top-level (non-method) function, by name (for call resolution).
     funcs: HashMap<String, FuncSig>,
+    /// Struct type names declared with `type T struct`.
+    structs: HashSet<String>,
+    /// Each struct type's fields, in declaration order: `(name, type)`.
+    struct_fields: HashMap<String, Vec<(String, String)>>,
+    /// Method arities keyed by `(receiver type, method name)`.
+    methods: HashMap<(String, String), usize>,
     /// The stack of enclosing `for` loops (innermost last).
     loops: Vec<LoopScope>,
     /// `return`/jump-outs emitted inside `main`, patched to the end of `main`.
     main_exits: Vec<usize>,
+    /// Monotonic counter for compiler-generated temporaries (`for … range`).
+    temp_counter: u32,
     /// When true, emit a per-statement `CallBuiltin(DBG_LINE)` marker so `--dap`
     /// can stop on statement lines. Normal runs leave this off (zero extra ops).
     debug: bool,
@@ -117,32 +130,58 @@ pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
 }
 
 fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
-    let funcs = prog
-        .funcs
+    let structs: HashSet<String> = prog.types.iter().map(|t| t.name.clone()).collect();
+    let struct_fields: HashMap<String, Vec<(String, String)>> = prog
+        .types
         .iter()
-        .map(|f| {
+        .map(|t| {
             (
-                f.name.clone(),
-                FuncSig {
-                    arity: f.params.len(),
-                    result: f
-                        .results
-                        .first()
-                        .map(|t| numtype_of_ty(t))
-                        .unwrap_or(NumType::Unknown),
-                },
+                t.name.clone(),
+                t.fields
+                    .iter()
+                    .map(|p| (p.name.clone(), p.ty.clone()))
+                    .collect(),
             )
         })
         .collect();
+
+    let mut funcs: HashMap<String, FuncSig> = HashMap::new();
+    let mut methods: HashMap<(String, String), usize> = HashMap::new();
+    for f in &prog.funcs {
+        match &f.receiver {
+            Some(r) => {
+                methods.insert((base_type(&r.ty), f.name.clone()), f.params.len());
+            }
+            None => {
+                funcs.insert(
+                    f.name.clone(),
+                    FuncSig {
+                        arity: f.params.len(),
+                        result: f
+                            .results
+                            .first()
+                            .map(|t| numtype_of_ty(t))
+                            .unwrap_or(NumType::Unknown),
+                        result_ty: f.results.first().cloned().unwrap_or_default(),
+                    },
+                );
+            }
+        }
+    }
 
     let has_ffi = body_has_ffi(&prog.main) || prog.funcs.iter().any(|f| body_has_ffi(&f.body));
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         scope: None,
         types: HashMap::new(),
+        decl_types: HashMap::new(),
         funcs,
+        structs,
+        struct_fields,
+        methods,
         loops: Vec::new(),
         main_exits: Vec::new(),
+        temp_counter: 0,
         debug,
         has_ffi,
     };
@@ -173,22 +212,34 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
 impl Compiler {
     fn compile_func(&mut self, f: &Func) -> Result<(), String> {
         let entry = self.b.current_pos();
-        let name_idx = self.b.add_name(&f.name);
+        let name_idx = self.b.add_name(&sub_name(f));
         self.b.add_sub_entry(name_idx, entry);
 
         let mut scope = Scope::new();
         self.types.clear();
-        for (i, p) in f.params.iter().enumerate() {
-            scope.slots.insert(p.name.clone(), i as u16);
-            self.types.insert(p.name.clone(), numtype_of_ty(&p.ty));
+        self.decl_types.clear();
+
+        // A method binds its receiver to slot 0; parameters follow.
+        let mut slot = 0u16;
+        if let Some(r) = &f.receiver {
+            scope.slots.insert(r.name.clone(), slot);
+            self.types.insert(r.name.clone(), numtype_of_ty(&r.ty));
+            self.decl_types.insert(r.name.clone(), base_type(&r.ty));
+            slot += 1;
         }
-        scope.next_slot = f.params.len() as u16;
+        for p in &f.params {
+            scope.slots.insert(p.name.clone(), slot);
+            self.types.insert(p.name.clone(), numtype_of_ty(&p.ty));
+            self.decl_types.insert(p.name.clone(), base_type(&p.ty));
+            slot += 1;
+        }
+        scope.next_slot = slot;
         self.scope = Some(scope);
 
         // Prologue: pop args into their slots. The last argument is on top of
-        // the stack, so bind slots high-to-low.
-        for i in (0..f.params.len()).rev() {
-            self.b.emit(Op::SetSlot(i as u16), f.line);
+        // the stack, so bind slots high-to-low (receiver deepest, at slot 0).
+        for i in (0..slot).rev() {
+            self.b.emit(Op::SetSlot(i), f.line);
         }
 
         for s in &f.body {
@@ -252,11 +303,17 @@ impl Compiler {
                     (None, Some(e)) => self.infer(e),
                     (None, None) => NumType::Unknown,
                 };
+                let decl_ty = match (ty, init) {
+                    (Some(t), _) => base_type(t),
+                    (None, Some(e)) => self.type_name(e),
+                    (None, None) => String::new(),
+                };
                 match init {
-                    Some(e) => self.expr(e)?,
+                    Some(e) => self.emit_value(e)?,
                     None => self.emit_default(nt, *line),
                 }
                 self.types.insert(name.clone(), nt);
+                self.decl_types.insert(name.clone(), decl_ty);
                 self.emit_set(name, *line);
             }
             Stmt::Short {
@@ -273,8 +330,10 @@ impl Compiler {
                 }
                 for (name, e) in names.iter().zip(values) {
                     let nt = self.infer(e);
-                    self.expr(e)?;
+                    let dt = self.type_name(e);
+                    self.emit_value(e)?;
                     self.types.insert(name.clone(), nt);
+                    self.decl_types.insert(name.clone(), dt);
                     self.emit_set(name, *line);
                 }
             }
@@ -283,23 +342,11 @@ impl Compiler {
                 op,
                 value,
                 line,
-            } => {
-                if *op == AssignOp::Set {
-                    self.expr(value)?;
-                } else {
-                    self.emit_get(target, *line);
-                    self.expr(value)?;
-                    let l = self.types.get(target).copied().unwrap_or(NumType::Unknown);
-                    let r = self.infer(value);
-                    self.emit_arith(assign_binop(*op), l, r, *line);
-                }
-                self.emit_set(target, *line);
-            }
+            } => self.assign(target, *op, value, *line)?,
             Stmt::IncDec { target, inc, line } => {
-                self.emit_get(target, *line);
-                self.b.emit(Op::LoadInt(1), *line);
-                self.b.emit(if *inc { Op::Add } else { Op::Sub }, *line);
-                self.emit_set(target, *line);
+                let one = Expr::Int(1);
+                let op = if *inc { AssignOp::Add } else { AssignOp::Sub };
+                self.assign(target, op, &one, *line)?;
             }
             Stmt::ExprStmt(e) => {
                 self.expr(e)?;
@@ -307,10 +354,10 @@ impl Compiler {
                 // statement discards it.
                 self.b.emit(Op::Pop, 0);
             }
-            Stmt::Return(val, line) => match &mut self.scope {
+            Stmt::Return(val, line) => match self.scope {
                 Some(_) => {
                     match val {
-                        Some(e) => self.expr(e)?,
+                        Some(e) => self.emit_value(e)?,
                         None => {
                             self.b.emit(Op::LoadUndef, *line);
                         }
@@ -362,6 +409,13 @@ impl Compiler {
                 body,
                 ..
             } => self.compile_for(init, cond, post, body)?,
+            Stmt::ForRange {
+                key,
+                val,
+                iter,
+                body,
+                ..
+            } => self.compile_for_range(key, val, iter, body)?,
             Stmt::Break(line) => {
                 let j = self.b.emit(Op::Jump(0), *line);
                 self.loops
@@ -427,6 +481,143 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower an assignment `target op= value` where `target` is an lvalue: a
+    /// bare identifier, an index (`x[i]`), or a struct field (`x.f`).
+    fn assign(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        match target {
+            Expr::Ident(name) => {
+                if op == AssignOp::Set {
+                    self.emit_value(value)?;
+                } else {
+                    self.emit_get(name, line);
+                    self.expr(value)?;
+                    let l = self.types.get(name).copied().unwrap_or(NumType::Unknown);
+                    let r = self.infer(value);
+                    self.emit_arith(assign_binop(op), l, r, line);
+                }
+                self.emit_set(name, line);
+            }
+            Expr::Index { recv, index } => {
+                self.expr(recv)?;
+                self.expr(index)?;
+                if op == AssignOp::Set {
+                    self.expr(value)?;
+                } else {
+                    self.b.emit(Op::Dup2, line);
+                    self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+                    self.expr(value)?;
+                    self.emit_arith(assign_binop(op), NumType::Unknown, self.infer(value), line);
+                }
+                self.b.emit(Op::CallBuiltin(host::GINDEX_SET, 3), line);
+                self.b.emit(Op::Pop, line);
+            }
+            Expr::Selector { recv, field } => {
+                self.expr(recv)?;
+                let c = self.b.add_constant(Value::str(field.clone()));
+                self.b.emit(Op::LoadConst(c), line);
+                if op == AssignOp::Set {
+                    self.expr(value)?;
+                } else {
+                    self.b.emit(Op::Dup2, line);
+                    self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), line);
+                    self.expr(value)?;
+                    self.emit_arith(assign_binop(op), NumType::Unknown, self.infer(value), line);
+                }
+                self.b.emit(Op::CallBuiltin(host::GFIELD_SET, 3), line);
+                self.b.emit(Op::Pop, line);
+            }
+            _ => {
+                return Err(format!(
+                    "go-rs: cannot assign to this expression (line {line})"
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower `for [k[, v]] := range iter { body }` over a slice, map, or string.
+    /// Iterates a host-computed key slice (`GRANGE_KEYS`) uniformly: `k` binds
+    /// each key (index for a slice/string, key for a map); `v` binds `iter[k]`.
+    fn compile_for_range(
+        &mut self,
+        key: &Option<String>,
+        val: &Option<String>,
+        iter: &Expr,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let it = format!("$it{n}");
+        let keys = format!("$keys{n}");
+        let i = format!("$i{n}");
+
+        // $it = iter; $keys = GRANGE_KEYS($it); $i = 0
+        self.expr(iter)?;
+        self.emit_set(&it, 0);
+        self.emit_get(&it, 0);
+        self.b.emit(Op::CallBuiltin(host::GRANGE_KEYS, 1), 0);
+        self.emit_set(&keys, 0);
+        self.b.emit(Op::LoadInt(0), 0);
+        self.emit_set(&i, 0);
+
+        self.loops.push(LoopScope::default());
+        let top = self.b.current_pos();
+        // if $i >= len($keys) break
+        self.emit_get(&i, 0);
+        self.emit_get(&keys, 0);
+        self.b.emit(Op::CallBuiltin(host::GLEN, 1), 0);
+        self.b.emit(Op::NumLt, 0);
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.loops.last_mut().unwrap().breaks.push(jf);
+
+        // key := $keys[$i]
+        if let Some(k) = key {
+            self.emit_get(&keys, 0);
+            self.emit_get(&i, 0);
+            self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            self.emit_set(k, 0);
+            self.types.insert(k.clone(), NumType::Unknown);
+        }
+        // val := $it[key]  — index by the current key value
+        if let Some(v) = val {
+            self.emit_get(&it, 0);
+            self.emit_get(&keys, 0);
+            self.emit_get(&i, 0);
+            self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            self.emit_set(v, 0);
+            self.types.insert(v.clone(), NumType::Unknown);
+        }
+
+        for s in body {
+            self.stmt(s)?;
+        }
+
+        // continue lands here: $i++ then re-test
+        let post_pos = self.b.current_pos();
+        self.emit_get(&i, 0);
+        self.b.emit(Op::LoadInt(1), 0);
+        self.b.emit(Op::Add, 0);
+        self.emit_set(&i, 0);
+        self.b.emit(Op::Jump(top), 0);
+        let end = self.b.current_pos();
+
+        let scope = self.loops.pop().unwrap();
+        for j in scope.continues {
+            self.b.patch_jump(j, post_pos);
+        }
+        for j in scope.breaks {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
     /// Emit the default zero value for a declared-without-initializer variable.
     fn emit_default(&mut self, nt: NumType, line: u32) {
         match nt {
@@ -472,11 +663,175 @@ impl Compiler {
             }
             Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
             Expr::Call { func, args, line } => self.call(func, args, *line)?,
-            Expr::Selector { field, .. } => {
-                return Err(format!("go-rs: unsupported selector `.{field}`"));
+            // A bare selector `x.f` is a struct field read (package selectors
+            // only ever appear as call targets, handled in `call`).
+            Expr::Selector { recv, field } => {
+                self.expr(recv)?;
+                let c = self.b.add_constant(Value::str(field.clone()));
+                self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), 0);
+            }
+            Expr::Index { recv, index } => {
+                self.expr(recv)?;
+                self.expr(index)?;
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            }
+            Expr::SliceLit { elems, .. } => {
+                for e in elems {
+                    self.expr(e)?;
+                }
+                self.b
+                    .emit(Op::CallBuiltin(host::GSLICE_LIT, elems.len() as u8), 0);
+            }
+            Expr::MapLit { pairs, .. } => {
+                for (k, v) in pairs {
+                    self.expr(k)?;
+                    self.expr(v)?;
+                }
+                self.b
+                    .emit(Op::CallBuiltin(host::GMAP_LIT, (pairs.len() * 2) as u8), 0);
+            }
+            Expr::StructLit { type_name, fields } => self.struct_lit(type_name, fields)?,
+            Expr::Make {
+                is_map,
+                len,
+                elem_zero,
+            } => {
+                if *is_map {
+                    let c = self.b.add_constant(Value::str("map"));
+                    self.b.emit(Op::LoadConst(c), 0);
+                    self.b.emit(Op::CallBuiltin(host::GMAKE, 1), 0);
+                } else {
+                    let c = self.b.add_constant(Value::str("slice"));
+                    self.b.emit(Op::LoadConst(c), 0);
+                    match len {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            self.b.emit(Op::LoadInt(0), 0);
+                        }
+                    }
+                    self.expr(elem_zero)?;
+                    self.b.emit(Op::CallBuiltin(host::GMAKE, 3), 0);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Lower a struct composite literal, filling every declared field in
+    /// declaration order (keyed elements matched by name, positional by order,
+    /// omitted fields defaulted to their type's zero value).
+    fn struct_lit(
+        &mut self,
+        type_name: &str,
+        given: &[(Option<String>, Expr)],
+    ) -> Result<(), String> {
+        let decl = self
+            .struct_fields
+            .get(type_name)
+            .cloned()
+            .ok_or_else(|| format!("go-rs: undefined struct type `{type_name}`"))?;
+        let keyed = given.iter().any(|(k, _)| k.is_some());
+
+        let tc = self.b.add_constant(Value::str(type_name.to_string()));
+        self.b.emit(Op::LoadConst(tc), 0);
+        for (i, (fname, fty)) in decl.iter().enumerate() {
+            let fc = self.b.add_constant(Value::str(fname.clone()));
+            self.b.emit(Op::LoadConst(fc), 0);
+            let value: Option<&Expr> = if keyed {
+                given
+                    .iter()
+                    .find(|(k, _)| k.as_deref() == Some(fname))
+                    .map(|(_, v)| v)
+            } else {
+                given.get(i).map(|(_, v)| v)
+            };
+            match value {
+                Some(e) => self.expr(e)?,
+                None => self.emit_default(numtype_of_ty(fty), 0),
+            }
+        }
+        self.b.emit(
+            Op::CallBuiltin(host::GSTRUCT_NEW, (1 + decl.len() * 2) as u8),
+            0,
+        );
+        Ok(())
+    }
+
+    /// Emit `value`, then a `GSTRUCT_COPY` if its static type is a struct — Go
+    /// copies a struct on assignment / parameter bind / return (slices and maps
+    /// are reference types and pass through the copy unchanged).
+    fn emit_value(&mut self, e: &Expr) -> Result<(), String> {
+        self.expr(e)?;
+        if self.structs.contains(&self.type_name(e)) {
+            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+        }
+        Ok(())
+    }
+
+    /// Lower a method call `recv.method(args)`. The receiver's static type names
+    /// the method set; the receiver is passed as the first (deepest) argument.
+    /// Receivers use reference semantics (the receiver struct is not copied), so
+    /// a method mutating a field is observed by the caller — matching Go's
+    /// pointer-receiver idiom.
+    fn method_call(
+        &mut self,
+        recv: &Expr,
+        method: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        let ty = self.type_name(recv);
+        if ty.is_empty() {
+            return Err(format!(
+                "go-rs: cannot resolve receiver type for `.{method}` (line {line})"
+            ));
+        }
+        let arity = self
+            .methods
+            .get(&(ty.clone(), method.to_string()))
+            .copied()
+            .ok_or_else(|| format!("go-rs: type `{ty}` has no method `{method}` (line {line})"))?;
+        if arity != args.len() {
+            return Err(format!(
+                "go-rs: `{ty}.{method}` takes {arity} argument(s), got {} (line {line})",
+                args.len()
+            ));
+        }
+        self.expr(recv)?;
+        for a in args {
+            self.emit_value(a)?;
+        }
+        let idx = self.b.add_name(&format!("{ty}.{method}"));
+        self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+        Ok(())
+    }
+
+    /// The static Go type name of an expression, or `""` when unknown. Drives
+    /// method dispatch and struct value-copy.
+    fn type_name(&self, e: &Expr) -> String {
+        match e {
+            Expr::Ident(n) => self.decl_types.get(n).cloned().unwrap_or_default(),
+            Expr::StructLit { type_name, .. } => type_name.clone(),
+            Expr::Selector { recv, field } => {
+                // A field's declared type, looked up on the receiver's struct.
+                let rt = self.type_name(recv);
+                self.struct_fields
+                    .get(&rt)
+                    .and_then(|fs| fs.iter().find(|(n, _)| n == field))
+                    .map(|(_, t)| base_type(t))
+                    .unwrap_or_default()
+            }
+            Expr::Call { func, .. } => match func.as_ref() {
+                Expr::Ident(name) => self
+                    .funcs
+                    .get(name)
+                    .map(|s| base_type(&s.result_ty))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
@@ -543,56 +898,61 @@ impl Compiler {
     }
 
     fn call(&mut self, func: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
-        // `pkg.Func(...)` — only `fmt` is wired in slice 1.
         if let Expr::Selector { recv, field } = func {
             if let Expr::Ident(pkg) = recv.as_ref() {
-                let id = match (pkg.as_str(), field.as_str()) {
-                    ("fmt", "Println") => host::GPRINTLN,
-                    ("fmt", "Print") => host::GPRINT,
-                    ("fmt", "Printf") => host::GPRINTF,
-                    _ => {
-                        return Err(format!(
-                            "go-rs: unsupported call `{pkg}.{field}` (line {line})"
-                        ))
+                // `fmt.*` print family.
+                if pkg == "fmt" {
+                    let id = match field.as_str() {
+                        "Println" => host::GPRINTLN,
+                        "Print" => host::GPRINT,
+                        "Printf" => host::GPRINTF,
+                        _ => {
+                            return Err(format!(
+                                "go-rs: unsupported call `fmt.{field}` (line {line})"
+                            ))
+                        }
+                    };
+                    for a in args {
+                        self.expr(a)?;
                     }
-                };
+                    self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+                    return Ok(());
+                }
+                // `strings.*` / `strconv.*` standard library.
+                if pkg == "strings" || pkg == "strconv" {
+                    let id = host::stdlib::resolve(pkg, field).ok_or_else(|| {
+                        format!("go-rs: unsupported call `{pkg}.{field}` (line {line})")
+                    })?;
+                    for a in args {
+                        self.expr(a)?;
+                    }
+                    self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+                    return Ok(());
+                }
+            }
+            // Otherwise a method call `recv.method(args)`.
+            return self.method_call(recv, field, args, line);
+        }
+
+        // Bare-name call: a language builtin or a user function.
+        if let Expr::Ident(name) = func {
+            // Builtins that take a variable arg count.
+            let simple_builtin = match name.as_str() {
+                "__rust_compile" => Some(host::GFFI_COMPILE),
+                "println" => Some(host::GEPRINTLN),
+                "print" => Some(host::GEPRINT),
+                "len" => Some(host::GLEN),
+                "cap" => Some(host::GCAP),
+                "append" => Some(host::GAPPEND),
+                "delete" => Some(host::GDELETE),
+                _ => None,
+            };
+            if let Some(id) = simple_builtin {
                 for a in args {
                     self.expr(a)?;
                 }
                 self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
                 return Ok(());
-            }
-        }
-
-        // Bare-name call: a language builtin or a user function.
-        if let Expr::Ident(name) = func {
-            match name.as_str() {
-                // Desugar target of an inline `rust {}` block.
-                "__rust_compile" => {
-                    for a in args {
-                        self.expr(a)?;
-                    }
-                    self.b
-                        .emit(Op::CallBuiltin(host::GFFI_COMPILE, args.len() as u8), line);
-                    return Ok(());
-                }
-                "println" => {
-                    for a in args {
-                        self.expr(a)?;
-                    }
-                    self.b
-                        .emit(Op::CallBuiltin(host::GEPRINTLN, args.len() as u8), line);
-                    return Ok(());
-                }
-                "print" => {
-                    for a in args {
-                        self.expr(a)?;
-                    }
-                    self.b
-                        .emit(Op::CallBuiltin(host::GEPRINT, args.len() as u8), line);
-                    return Ok(());
-                }
-                _ => {}
             }
             if let Some(sig) = self.funcs.get(name) {
                 if sig.arity != args.len() {
@@ -603,7 +963,7 @@ impl Compiler {
                     ));
                 }
                 for a in args {
-                    self.expr(a)?;
+                    self.emit_value(a)?;
                 }
                 let idx = self.b.add_name(name);
                 self.b.emit(Op::Call(idx, args.len() as u8), line);
@@ -663,17 +1023,54 @@ impl Compiler {
                     }
                 }
             },
-            Expr::Call { func, .. } => match func.as_ref() {
-                Expr::Ident(name) => self
-                    .funcs
-                    .get(name)
-                    .map(|s| s.result)
-                    .unwrap_or(NumType::Unknown),
+            Expr::Call { func, args, .. } => match func.as_ref() {
+                Expr::Ident(name) => match name.as_str() {
+                    "len" | "cap" => NumType::Int,
+                    _ => self
+                        .funcs
+                        .get(name)
+                        .map(|s| s.result)
+                        .unwrap_or(NumType::Unknown),
+                },
+                // A method call's result type is not tracked numerically yet.
+                Expr::Selector { .. } => {
+                    let _ = args;
+                    NumType::Unknown
+                }
                 _ => NumType::Unknown,
             },
-            Expr::Selector { .. } => NumType::Unknown,
+            // A struct field's numeric category, when the field type is known.
+            Expr::Selector { recv, field } => {
+                let rt = self.type_name(recv);
+                self.struct_fields
+                    .get(&rt)
+                    .and_then(|fs| fs.iter().find(|(n, _)| n == field))
+                    .map(|(_, t)| numtype_of_ty(t))
+                    .unwrap_or(NumType::Unknown)
+            }
+            // Composite literals, indexing, and make have no numeric category.
+            Expr::Index { .. }
+            | Expr::SliceLit { .. }
+            | Expr::MapLit { .. }
+            | Expr::StructLit { .. }
+            | Expr::Make { .. } => NumType::Unknown,
         }
     }
+}
+
+/// The fusevm subroutine name for a function or method. A method on receiver
+/// type `T` (or `*T`) is named `T.method`; a plain function keeps its own name.
+fn sub_name(f: &Func) -> String {
+    match &f.receiver {
+        Some(r) => format!("{}.{}", base_type(&r.ty), f.name),
+        None => f.name.clone(),
+    }
+}
+
+/// The base type name of a type string: strips a leading pointer `*`, so a
+/// value receiver `T` and pointer receiver `*T` mangle to the same method set.
+fn base_type(ty: &str) -> String {
+    ty.trim_start_matches('*').to_string()
 }
 
 fn assign_binop(op: AssignOp) -> BinOp {
@@ -725,6 +1122,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::Return(_, line)
         | Stmt::If { line, .. }
         | Stmt::For { line, .. }
+        | Stmt::ForRange { line, .. }
         | Stmt::Break(line)
         | Stmt::Continue(line) => *line,
         Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
@@ -741,7 +1139,9 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         Stmt::ExprStmt(e) => expr_has_ffi(e),
         Stmt::Return(v, _) => v.as_ref().is_some_and(expr_has_ffi),
         Stmt::If { then, els, .. } => body_has_ffi(then) || body_has_ffi(els),
-        Stmt::For { body, .. } | Stmt::Block(body) => body_has_ffi(body),
+        Stmt::For { body, .. } | Stmt::ForRange { body, .. } | Stmt::Block(body) => {
+            body_has_ffi(body)
+        }
         Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) => false,
     })
 }

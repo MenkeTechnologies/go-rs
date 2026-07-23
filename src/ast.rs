@@ -1,10 +1,12 @@
 //! The Go abstract syntax tree go-rs parses into and lowers from.
 //!
-//! Slice 1 models a single-file `package main` program: a package clause, a set
-//! of imports, and top-level `func` declarations. `func main` is the entry
-//! point; every other `func` becomes a fusevm subroutine (see
-//! [`crate::compiler`]). There are no structs, methods, interfaces, channels, or
-//! goroutines yet — those grow in later waves.
+//! Models a single-file `package main` program: a package clause, imports,
+//! `type T struct` declarations, and top-level `func` / method declarations.
+//! `func main` is the entry point; every other `func` (and every method)
+//! becomes a fusevm subroutine (see [`crate::compiler`]). The expression grammar
+//! covers arithmetic/control flow plus composite types — slices, maps, structs,
+//! indexing, `range`, and composite literals. Interfaces, channels, and
+//! goroutines grow in later waves.
 
 /// A parsed Go source file.
 #[derive(Debug, Clone)]
@@ -13,16 +15,28 @@ pub struct Program {
     pub package: String,
     /// Imported package paths, in source order (e.g. `"fmt"`).
     pub imports: Vec<String>,
+    /// `type T struct { … }` declarations.
+    pub types: Vec<StructDecl>,
     /// The body of `func main`, run in the global scope.
     pub main: Vec<Stmt>,
-    /// Every top-level `func` other than `main`, lowered to subroutines.
+    /// Every top-level `func` other than `main` (including methods), lowered to
+    /// subroutines.
     pub funcs: Vec<Func>,
 }
 
-/// A top-level function declaration.
+/// A `type T struct { field T; … }` declaration.
+#[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<Param>,
+}
+
+/// A top-level function or method declaration.
 #[derive(Debug, Clone)]
 pub struct Func {
     pub name: String,
+    /// The receiver for a method (`func (r T) m()`); `None` for a plain `func`.
+    pub receiver: Option<Param>,
     pub params: Vec<Param>,
     /// Result types in declaration order (names, if any, are dropped in slice 1).
     pub results: Vec<String>,
@@ -53,19 +67,16 @@ pub enum Stmt {
         values: Vec<Expr>,
         line: u32,
     },
-    /// `target op= value` (op = `=`, `+=`, `-=`, `*=`, `/=`, `%=`).
+    /// `target op= value` (op = `=`, `+=`, `-=`, `*=`, `/=`, `%=`). The target
+    /// is an lvalue: an identifier, an index (`x[i]`), or a field (`x.f`).
     Assign {
-        target: String,
+        target: Expr,
         op: AssignOp,
         value: Expr,
         line: u32,
     },
-    /// `target++` / `target--`.
-    IncDec {
-        target: String,
-        inc: bool,
-        line: u32,
-    },
+    /// `target++` / `target--` (target is an lvalue expression).
+    IncDec { target: Expr, inc: bool, line: u32 },
     /// A bare expression evaluated for effect (e.g. a call).
     ExprStmt(Expr),
     /// `return [expr]` — slice 1 supports a single result value.
@@ -84,6 +95,17 @@ pub enum Stmt {
         init: Option<Box<Stmt>>,
         cond: Option<Expr>,
         post: Option<Box<Stmt>>,
+        body: Vec<Stmt>,
+        line: u32,
+    },
+    /// `for [key[, val]] := range iter { body }` over a slice, map, or string.
+    /// `define` is true for `:=`, false for `=`; `key`/`val` are `None` for the
+    /// blank identifier `_` or an omitted value.
+    ForRange {
+        key: Option<String>,
+        val: Option<String>,
+        define: bool,
+        iter: Expr,
         body: Vec<Stmt>,
         line: u32,
     },
@@ -131,10 +153,38 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
-    /// A selector `recv.field` (e.g. `fmt.Println`).
+    /// A selector `recv.field` (e.g. `fmt.Println`, or a struct field read).
     Selector {
         recv: Box<Expr>,
         field: String,
+    },
+    /// An index `recv[index]` — slice element or map lookup.
+    Index {
+        recv: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// A slice composite literal `[]T{elems}`.
+    SliceLit {
+        elem_ty: String,
+        elems: Vec<Expr>,
+    },
+    /// A map composite literal `map[K]V{k: v, …}`.
+    MapLit {
+        key_ty: String,
+        val_ty: String,
+        pairs: Vec<(Expr, Expr)>,
+    },
+    /// A struct composite literal `T{…}` (positional or `field: value`).
+    StructLit {
+        type_name: String,
+        fields: Vec<(Option<String>, Expr)>,
+    },
+    /// `make([]T, len)` (a slice) or `make(map[K]V)` (a map). `elem_zero` is the
+    /// slice element's zero value.
+    Make {
+        is_map: bool,
+        len: Option<Box<Expr>>,
+        elem_zero: Box<Expr>,
     },
 }
 

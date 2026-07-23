@@ -89,47 +89,57 @@
           <pre><code class="lang-go">const pi = 3.14159</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-6">
-          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>if</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>type</code></h3>
+          <p>declare a named type; `type T struct { … }` defines a struct</p>
+          <pre><code class="lang-go">type Point struct { x int; y int }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-7">
+          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>struct</code></h3>
+          <p>a struct type: a fixed set of named fields with value semantics</p>
+          <pre><code class="lang-go">type Point struct { x, y int }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-8">
+          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>if</code></h3>
           <p>conditional branch with an optional init clause: `if [init;] cond { … }`</p>
           <pre><code class="lang-go">if x := f(); x &gt; 0 { fmt.Println(x) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-7">
-          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>else</code></h3>
+        <article class="doc-entry" id="doc-keyword-9">
+          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>else</code></h3>
           <p>fallback branch of an `if`; chains as `else if`</p>
           <pre><code class="lang-go">if x &gt; 0 { } else { fmt.Println("non-pos") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-8">
-          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>for</code></h3>
+        <article class="doc-entry" id="doc-keyword-10">
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>for</code></h3>
           <p>the loop: three-clause, condition-only, or infinite</p>
           <pre><code class="lang-go">for i := 0; i &lt; 3; i++ { fmt.Println(i) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-9">
-          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>range</code></h3>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>range</code></h3>
           <p>iterate a collection in a `for … range` (reserved; next wave)</p>
           <pre><code class="lang-go">for i := range xs { }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-10">
-          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>return</code></h3>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>return</code></h3>
           <p>return from the current function with an optional value</p>
           <pre><code class="lang-go">return a + b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>break</code></h3>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>break</code></h3>
           <p>exit the nearest `for` loop</p>
           <pre><code class="lang-go">for { if done { break } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>continue</code></h3>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>continue</code></h3>
           <p>skip to the next iteration of the nearest `for` loop</p>
           <pre><code class="lang-go">for i := 0; i &lt; 5; i++ { if i%2 == 0 { continue } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>true</code></h3>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>true</code></h3>
           <p>the boolean literal true</p>
           <pre><code class="lang-go">ok := true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>false</code></h3>
           <p>the boolean literal false</p>
           <pre><code class="lang-go">ok := false</code></pre>
         </article>
@@ -210,6 +220,49 @@
           <h3><a class="doc-anchor" href="#doc-io-6">#</a> <code>print</code></h3>
           <p>builtin print(a…): to stderr with no newline</p>
           <pre><code class="lang-go">print("debug")</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-builtin">
+        <h2>Builtin</h2>
+        <article class="doc-entry" id="doc-builtin-1">
+          <h3><a class="doc-anchor" href="#doc-builtin-1">#</a> <code>make</code></h3>
+          <p>make([]T, n) allocates a zeroed slice; make(map[K]V) an empty map</p>
+          <pre><code class="lang-go">xs := make([]int, 3); m := make(map[string]int)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-2">
+          <h3><a class="doc-anchor" href="#doc-builtin-2">#</a> <code>len</code></h3>
+          <p>len(x): the number of elements in a slice/map, or bytes in a string</p>
+          <pre><code class="lang-go">n := len([]int{1, 2, 3})   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-3">
+          <h3><a class="doc-anchor" href="#doc-builtin-3">#</a> <code>cap</code></h3>
+          <p>cap(x): the capacity of a slice (its length in go-rs)</p>
+          <pre><code class="lang-go">c := cap(make([]int, 4))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-4">
+          <h3><a class="doc-anchor" href="#doc-builtin-4">#</a> <code>append</code></h3>
+          <p>append(s, elems…): extend a slice, returning the result</p>
+          <pre><code class="lang-go">xs = append(xs, 4, 5)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-5">
+          <h3><a class="doc-anchor" href="#doc-builtin-5">#</a> <code>delete</code></h3>
+          <p>delete(m, k): remove key k from map m</p>
+          <pre><code class="lang-go">delete(m, "a")</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-package">
+        <h2>Package</h2>
+        <article class="doc-entry" id="doc-package-1">
+          <h3><a class="doc-anchor" href="#doc-package-1">#</a> <code>strings</code></h3>
+          <p>string helpers: ToUpper/ToLower/Contains/HasPrefix/HasSuffix/TrimSpace/Split/Join/Repeat/Index/ReplaceAll/Fields</p>
+          <pre><code class="lang-go">strings.Join(strings.Split("a,b", ","), "-")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-2">
+          <h3><a class="doc-anchor" href="#doc-package-2">#</a> <code>strconv</code></h3>
+          <p>string↔number conversions: Itoa (int→string), Atoi (string→int)</p>
+          <pre><code class="lang-go">s := strconv.Itoa(42); n := strconv.Atoi("7")</code></pre>
         </article>
       </section>
 

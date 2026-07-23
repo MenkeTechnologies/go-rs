@@ -188,3 +188,164 @@ fn undefined_function_is_a_compile_error() {
     let (_stdout, ok) = run("package main\nfunc main() {\n\tnope()\n}\n");
     assert!(!ok, "calling an undefined function should fail");
 }
+
+// ── composite types: slices, maps, structs, methods, range, stdlib ──────────
+
+#[test]
+fn slice_literal_index_len_append() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	xs := []int{3, 1, 2}
+	xs = append(xs, 4)
+	xs[0] = 9
+	fmt.Println(xs, len(xs), xs[3])
+}
+";
+    assert_stdout(src, "[9 1 2 4] 4 4\n");
+}
+
+#[test]
+fn make_slice_zero_filled() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	ys := make([]int, 3)
+	ys[1] = 5
+	fmt.Println(ys)
+}
+";
+    assert_stdout(src, "[0 5 0]\n");
+}
+
+#[test]
+fn range_over_slice_sums() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	xs := []int{10, 20, 30}
+	sum := 0
+	for i, v := range xs {
+		sum += i + v
+	}
+	fmt.Println(sum)
+}
+";
+    // (0+10)+(1+20)+(2+30) = 63
+    assert_stdout(src, "63\n");
+}
+
+#[test]
+fn map_literal_index_delete() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	m := map[string]int{\"a\": 1, \"b\": 2}
+	m[\"c\"] = 3
+	delete(m, \"a\")
+	fmt.Println(m, len(m), m[\"b\"])
+}
+";
+    // fmt sorts map keys.
+    assert_stdout(src, "map[b:2 c:3] 2 2\n");
+}
+
+#[test]
+fn range_over_map_sums_values() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	m := map[string]int{\"a\": 1, \"b\": 2, \"c\": 3}
+	sum := 0
+	for _, v := range m {
+		sum += v
+	}
+	fmt.Println(sum)
+}
+";
+    assert_stdout(src, "6\n");
+}
+
+#[test]
+fn struct_value_semantics_and_methods() {
+    let src = "\
+package main
+import \"fmt\"
+type Point struct {
+	x int
+	y int
+}
+func (p Point) sum() int {
+	return p.x + p.y
+}
+func main() {
+	p := Point{x: 3, y: 4}
+	q := p
+	q.x = 100
+	fmt.Println(p, q, p.sum())
+}
+";
+    // q is a copy — mutating q.x must not change p.
+    assert_stdout(src, "{3 4} {100 4} 7\n");
+}
+
+#[test]
+fn struct_positional_literal_and_field_update() {
+    let src = "\
+package main
+import \"fmt\"
+type Counter struct {
+	n int
+}
+func main() {
+	c := Counter{0}
+	c.n += 5
+	c.n++
+	fmt.Println(c.n)
+}
+";
+    assert_stdout(src, "6\n");
+}
+
+#[test]
+fn strings_stdlib() {
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"strings\"
+)
+func main() {
+	fmt.Println(strings.ToUpper(\"go\"), strings.Contains(\"golang\", \"lang\"))
+	parts := strings.Split(\"a,b,c\", \",\")
+	fmt.Println(strings.Join(parts, \"-\"), len(parts))
+}
+";
+    assert_stdout(src, "GO true\na-b-c 3\n");
+}
+
+#[test]
+fn strconv_stdlib() {
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"strconv\"
+)
+func main() {
+	fmt.Println(strconv.Itoa(42), strconv.Atoi(\"100\")+1)
+}
+";
+    assert_stdout(src, "42 101\n");
+}
+
+#[test]
+fn slice_index_out_of_range_errors() {
+    let (_stdout, ok) = run("package main\nfunc main() {\n\txs := []int{1}\n\t_ = xs[5]\n}\n");
+    assert!(!ok, "out-of-range slice index should fail at runtime");
+}

@@ -40,6 +40,8 @@ pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
 /// Register the go-rs builtins + strict numeric hook on a fresh VM, enable the
 /// tracing JIT, and run the chunk. Returns the last top-of-stack value.
 fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
+    // A fresh object heap per run — no composite handles leak across programs.
+    host::heap_reset();
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));

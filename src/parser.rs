@@ -3,24 +3,43 @@
 //! Consumes the [`crate::lexer`] token stream — already carrying Go's
 //! automatically-inserted semicolons — and builds a [`crate::ast::Program`].
 //! The grammar covers a single-file `package main`: the package clause, imports,
-//! and top-level `func` declarations whose bodies use `:=`/`var`, assignment,
-//! `if`/`else`, three-clause/condition/infinite `for`, `return`/`break`/
-//! `continue`, and the usual expression forms including `fmt.Println`-style
-//! selector calls.
+//! `type T struct` declarations, and top-level `func` / method declarations whose
+//! bodies use `:=`/`var`, assignment to lvalues (ident / index / field),
+//! `if`/`else`, three-clause/condition/infinite `for`, `for … range`,
+//! `return`/`break`/`continue`, and the usual expression forms including
+//! composite literals (`[]T{…}`, `map[K]V{…}`, `T{…}`), indexing, `make`, and
+//! `fmt.Println`-style selector calls.
 
 use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
+use std::collections::HashSet;
 
 /// Parse Go source into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = lex(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    // Pre-scan `type <IDENT> struct` so a `T{…}` composite literal can be told
+    // apart from an identifier `T` followed by a block `{`.
+    let mut struct_names = HashSet::new();
+    for w in tokens.windows(3) {
+        if matches!(w[0].kind, Tok::Type) && matches!(w[2].kind, Tok::Struct) {
+            if let Tok::Ident(n) = &w[1].kind {
+                struct_names.insert(n.clone());
+            }
+        }
+    }
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        struct_names,
+    };
     p.program()
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Names declared as `type T struct` — enables `T{…}` composite literals.
+    struct_names: HashSet<String>,
 }
 
 impl Parser {
@@ -28,6 +47,13 @@ impl Parser {
 
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].kind
+    }
+
+    fn peek2(&self) -> &Tok {
+        self.tokens
+            .get(self.pos + 1)
+            .map(|t| &t.kind)
+            .unwrap_or(&Tok::Eof)
     }
 
     fn line(&self) -> u32 {
@@ -97,21 +123,26 @@ impl Parser {
             self.skip_semis();
         }
 
+        let mut types = Vec::new();
         let mut main = Vec::new();
         let mut funcs = Vec::new();
         while !matches!(self.peek(), Tok::Eof) {
             match self.peek() {
                 Tok::Func => {
                     let f = self.func_decl()?;
-                    if f.name == "main" {
+                    if f.name == "main" && f.receiver.is_none() {
                         main = f.body;
                     } else {
                         funcs.push(f);
                     }
                 }
+                Tok::Type => types.push(self.type_decl()?),
+                // Package-level `var`/`const` declarations run in `main`'s global
+                // scope (slice: no separate package-init phase).
+                Tok::Var | Tok::Const => main.push(self.stmt()?),
                 other => {
                     return Err(format!(
-                        "go-rs: expected `func` at top level, found `{other}` on line {}",
+                        "go-rs: expected `func` or `type` at top level, found `{other}` on line {}",
                         self.line()
                     ))
                 }
@@ -122,9 +153,38 @@ impl Parser {
         Ok(Program {
             package,
             imports,
+            types,
             main,
             funcs,
         })
+    }
+
+    /// Parse `type T struct { field Type; … }`. Non-struct type declarations are
+    /// a later wave.
+    fn type_decl(&mut self) -> Result<StructDecl, String> {
+        self.expect(&Tok::Type)?;
+        let name = self.ident()?;
+        self.expect(&Tok::Struct)?;
+        self.expect(&Tok::LBrace)?;
+        self.skip_semis();
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            // One or more field names sharing a type: `x, y int`.
+            let mut names = vec![self.ident()?];
+            while self.eat(&Tok::Comma) {
+                names.push(self.ident()?);
+            }
+            let ty = self.type_name()?;
+            for n in names {
+                fields.push(Param {
+                    name: n,
+                    ty: ty.clone(),
+                });
+            }
+            self.skip_semis();
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(StructDecl { name, fields })
     }
 
     fn parse_import(&mut self, imports: &mut Vec<String>) -> Result<(), String> {
@@ -159,6 +219,19 @@ impl Parser {
     fn func_decl(&mut self) -> Result<Func, String> {
         let line = self.line();
         self.expect(&Tok::Func)?;
+        // Optional method receiver: `func (r T) name(...)`.
+        let receiver = if matches!(self.peek(), Tok::LParen) {
+            self.advance();
+            let rname = self.ident()?;
+            let rty = self.type_name()?;
+            self.expect(&Tok::RParen)?;
+            Some(Param {
+                name: rname,
+                ty: rty,
+            })
+        } else {
+            None
+        };
         let name = self.ident()?;
         self.expect(&Tok::LParen)?;
         let params = self.params()?;
@@ -167,6 +240,7 @@ impl Parser {
         let body = self.block()?;
         Ok(Func {
             name,
+            receiver,
             params,
             results,
             body,
@@ -255,8 +329,9 @@ impl Parser {
         )
     }
 
-    /// Parse a type name. Slice 1 handles named types (`int`, `string`, …),
-    /// slices (`[]T`), and pointers (`*T`) as opaque strings for later typing.
+    /// Parse a type name. Handles named types (`int`, `string`, `T`, …), slices
+    /// (`[]T`), maps (`map[K]V`), and pointers (`*T`) as opaque strings for later
+    /// typing.
     fn type_name(&mut self) -> Result<String, String> {
         match self.peek() {
             Tok::LBracket => {
@@ -267,6 +342,15 @@ impl Parser {
             Tok::Star => {
                 self.advance();
                 Ok(format!("*{}", self.type_name()?))
+            }
+            // `map[K]V` — `map` is a predeclared ident, not a keyword.
+            Tok::Ident(n) if n == "map" => {
+                self.advance();
+                self.expect(&Tok::LBracket)?;
+                let k = self.type_name()?;
+                self.expect(&Tok::RBracket)?;
+                let v = self.type_name()?;
+                Ok(format!("map[{k}]{v}"))
             }
             Tok::Ident(_) => self.ident(),
             other => Err(format!(
@@ -389,6 +473,12 @@ impl Parser {
             });
         }
 
+        // `for [k[, v] :=|= ] range iter { … }` — detected by a `range` keyword
+        // in the header (before the block `{`).
+        if self.header_has_range() {
+            return self.for_range(line);
+        }
+
         // Otherwise a condition-only or three-clause header.
         let first = if matches!(self.peek(), Tok::Semi) {
             None
@@ -434,6 +524,63 @@ impl Parser {
         }
     }
 
+    /// True if a `range` keyword appears in the current `for` header (before the
+    /// block-opening `{`).
+    fn header_has_range(&self) -> bool {
+        let mut i = self.pos;
+        while let Some(t) = self.tokens.get(i) {
+            match t.kind {
+                Tok::Range => return true,
+                Tok::LBrace | Tok::Semi | Tok::Eof => return false,
+                _ => i += 1,
+            }
+        }
+        false
+    }
+
+    /// Parse a `for … range` loop header and body.
+    fn for_range(&mut self, line: u32) -> Result<Stmt, String> {
+        let mut key = None;
+        let mut val = None;
+        let mut define = false;
+        if !matches!(self.peek(), Tok::Range) {
+            // `k` or `k, v` then `:=` or `=`.
+            let mut names = vec![self.range_name()?];
+            if self.eat(&Tok::Comma) {
+                names.push(self.range_name()?);
+            }
+            if self.eat(&Tok::Define) {
+                define = true;
+            } else if self.eat(&Tok::Assign) {
+                define = false;
+            } else {
+                return Err(format!(
+                    "go-rs: expected `:=` or `=` in range clause on line {}",
+                    self.line()
+                ));
+            }
+            key = names.first().cloned().flatten();
+            val = names.get(1).cloned().flatten();
+        }
+        self.expect(&Tok::Range)?;
+        let iter = self.expr()?;
+        let body = self.block()?;
+        Ok(Stmt::ForRange {
+            key,
+            val,
+            define,
+            iter,
+            body,
+            line,
+        })
+    }
+
+    /// A range key/value name: an identifier, or `None` for the blank `_`.
+    fn range_name(&mut self) -> Result<Option<String>, String> {
+        let n = self.ident()?;
+        Ok(if n == "_" { None } else { Some(n) })
+    }
+
     /// Parse a simple statement: short decl, assignment, inc/dec, or a bare
     /// expression.
     fn simple_stmt(&mut self) -> Result<Stmt, String> {
@@ -458,7 +605,7 @@ impl Parser {
             Tok::PlusPlus => {
                 self.advance();
                 Ok(Stmt::IncDec {
-                    target: expr_into_ident(target, line)?,
+                    target,
                     inc: true,
                     line,
                 })
@@ -466,7 +613,7 @@ impl Parser {
             Tok::MinusMinus => {
                 self.advance();
                 Ok(Stmt::IncDec {
-                    target: expr_into_ident(target, line)?,
+                    target,
                     inc: false,
                     line,
                 })
@@ -488,7 +635,7 @@ impl Parser {
                 };
                 let value = self.expr()?;
                 Ok(Stmt::Assign {
-                    target: expr_into_ident(target, line)?,
+                    target,
                     op,
                     value,
                     line,
@@ -590,6 +737,15 @@ impl Parser {
                         field,
                     };
                 }
+                Tok::LBracket => {
+                    self.advance();
+                    let index = self.expr()?;
+                    self.expect(&Tok::RBracket)?;
+                    e = Expr::Index {
+                        recv: Box::new(e),
+                        index: Box::new(index),
+                    };
+                }
                 Tok::LParen => {
                     let line = self.line();
                     self.advance();
@@ -615,13 +771,29 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr, String> {
         let line = self.line();
+        // `[]T{ … }` slice composite literal.
+        if matches!(self.peek(), Tok::LBracket) {
+            return self.slice_literal();
+        }
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
             Tok::Float(f) => Ok(Expr::Float(f)),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
-            Tok::Ident(s) => Ok(Expr::Ident(s)),
+            Tok::Ident(s) => {
+                match s.as_str() {
+                    // `map[K]V{ … }` map composite literal.
+                    "map" if matches!(self.peek(), Tok::LBracket) => self.map_literal(),
+                    // `make([]T, n)` / `make(map[K]V)`.
+                    "make" if matches!(self.peek(), Tok::LParen) => self.make_expr(),
+                    // `T{ … }` struct composite literal (T declared as a struct).
+                    _ if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&s) => {
+                        self.struct_literal(s)
+                    }
+                    _ => Ok(Expr::Ident(s)),
+                }
+            }
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;
@@ -631,6 +803,105 @@ impl Parser {
                 "go-rs: unexpected token `{other}` in expression on line {line}"
             )),
         }
+    }
+
+    /// `[]T{ e0, e1, … }`.
+    fn slice_literal(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LBracket)?;
+        self.expect(&Tok::RBracket)?;
+        let elem_ty = self.type_name()?;
+        self.expect(&Tok::LBrace)?;
+        let mut elems = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace) {
+            elems.push(self.expr()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::SliceLit { elem_ty, elems })
+    }
+
+    /// `map[K]V{ k0: v0, … }` (already consumed the `map` ident).
+    fn map_literal(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LBracket)?;
+        let key_ty = self.type_name()?;
+        self.expect(&Tok::RBracket)?;
+        let val_ty = self.type_name()?;
+        self.expect(&Tok::LBrace)?;
+        let mut pairs = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace) {
+            let k = self.expr()?;
+            self.expect(&Tok::Colon)?;
+            let v = self.expr()?;
+            pairs.push((k, v));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::MapLit {
+            key_ty,
+            val_ty,
+            pairs,
+        })
+    }
+
+    /// `T{ … }` — positional `T{a, b}` or keyed `T{x: a, y: b}`.
+    fn struct_literal(&mut self, type_name: String) -> Result<Expr, String> {
+        self.expect(&Tok::LBrace)?;
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace) {
+            // Keyed element: `ident :` (but not `::`); otherwise positional.
+            let key = if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::Colon)
+            {
+                let n = self.ident()?;
+                self.expect(&Tok::Colon)?;
+                Some(n)
+            } else {
+                None
+            };
+            let val = self.expr()?;
+            fields.push((key, val));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::StructLit { type_name, fields })
+    }
+
+    /// `make([]T, len)` (slice) or `make(map[K]V)` (map). The first argument is a
+    /// type; a slice may carry a length (and an ignored capacity).
+    fn make_expr(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let ty = self.type_name()?;
+        let is_map = ty.starts_with("map[");
+        let mut len = None;
+        if self.eat(&Tok::Comma) {
+            len = Some(Box::new(self.expr()?));
+            // An optional capacity argument is accepted and ignored.
+            if self.eat(&Tok::Comma) {
+                let _ = self.expr()?;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        let elem_ty = ty.strip_prefix("[]").unwrap_or("");
+        Ok(Expr::Make {
+            is_map,
+            len,
+            elem_zero: Box::new(zero_expr(elem_ty)),
+        })
+    }
+}
+
+/// The zero-value expression for a Go element type (drives `make([]T, n)` fill).
+fn zero_expr(ty: &str) -> Expr {
+    match ty {
+        "float32" | "float64" => Expr::Float(0.0),
+        "string" => Expr::Str(String::new()),
+        "bool" => Expr::Bool(false),
+        _ => Expr::Int(0),
     }
 }
 
@@ -662,17 +933,6 @@ fn stmt_into_expr(s: Stmt, line: u32) -> Result<Expr, String> {
         Stmt::ExprStmt(e) => Ok(e),
         _ => Err(format!(
             "go-rs: expected a boolean expression on line {line}"
-        )),
-    }
-}
-
-/// Require an assignment/inc-dec target to be a bare identifier (slice 1 has no
-/// index/field lvalues).
-fn expr_into_ident(e: Expr, line: u32) -> Result<String, String> {
-    match e {
-        Expr::Ident(s) => Ok(s),
-        _ => Err(format!(
-            "go-rs: cannot assign to non-identifier on line {line}"
         )),
     }
 }
