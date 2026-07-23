@@ -76,6 +76,12 @@ pub enum Tok {
     StarAssign,
     SlashAssign,
     PercentAssign,
+    AmpAssign,
+    PipeAssign,
+    CaretAssign,
+    ShlAssign,
+    ShrAssign,
+    AndNotAssign,
     Plus,
     Minus,
     Star,
@@ -98,8 +104,16 @@ pub enum Tok {
     Pipe,
     /// `~` — the generic underlying-type constraint marker (`~int`); erased.
     Tilde,
-    /// `&` — the address-of operator (`&T{…}`, `&x`).
+    /// `&` — the address-of operator (`&T{…}`, `&x`) or bitwise AND (`a & b`).
     Amp,
+    /// `^` — bitwise XOR (`a ^ b`) or complement (`^x`).
+    Caret,
+    /// `<<` — left shift.
+    Shl,
+    /// `>>` — right shift.
+    Shr,
+    /// `&^` — bit clear (AND NOT).
+    AndNot,
     Eof,
 }
 
@@ -224,15 +238,44 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         // numbers (int or float)
         if c.is_ascii_digit() {
             let start = i;
+            // Base-prefixed integer literals: `0x1F`, `0o17`, `0b1010` (with `_`
+            // digit separators). Parsed here; decimal/float handled below.
+            if c == '0' && i + 1 < bytes.len() {
+                let (base, allowed): (Option<u32>, &str) = match bytes[i + 1] {
+                    b'x' | b'X' => (Some(16), "0123456789abcdefABCDEF_"),
+                    b'o' | b'O' => (Some(8), "01234567_"),
+                    b'b' | b'B' => (Some(2), "01_"),
+                    _ => (None, ""),
+                };
+                if let Some(radix) = base {
+                    i += 2;
+                    let ds = i;
+                    while i < bytes.len() && allowed.contains(bytes[i] as char) {
+                        i += 1;
+                    }
+                    let digits = src[ds..i].replace('_', "");
+                    let v = i64::from_str_radix(&digits, radix).map_err(|_| {
+                        format!(
+                            "go-rs: bad integer literal `{}` on line {line}",
+                            &src[start..i]
+                        )
+                    })?;
+                    out.push(Token {
+                        kind: Tok::Int(v),
+                        line,
+                    });
+                    continue;
+                }
+            }
             let mut is_float = false;
-            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+            while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
                 i += 1;
             }
             if i < bytes.len() && bytes[i] == b'.' && !(i + 1 < bytes.len() && bytes[i + 1] == b'.')
             {
                 is_float = true;
                 i += 1;
-                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
                     i += 1;
                 }
             }
@@ -248,16 +291,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
             }
             let text = &src[start..i];
+            // `_` digit separators (`1_000`, `3.141_592`) are stripped for parsing.
+            let clean = text.replace('_', "");
             if is_float {
-                let v: f64 = text
+                let v: f64 = clean
                     .parse()
                     .map_err(|_| format!("go-rs: bad float literal `{text}` on line {line}"))?;
                 out.push(Token {
-                    kind: Tok::Float(v, exact_decimal(text)),
+                    kind: Tok::Float(v, exact_decimal(&clean)),
                     line,
                 });
             } else {
-                let v: i64 = text
+                let v: i64 = clean
                     .parse()
                     .map_err(|_| format!("go-rs: bad integer literal `{text}` on line {line}"))?;
                 out.push(Token {
@@ -347,56 +392,74 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         }
 
         // operators & punctuation (longest match first)
+        let three = if i + 2 < bytes.len() {
+            &src[i..i + 3]
+        } else {
+            ""
+        };
         let two = if i + 1 < bytes.len() {
             &src[i..i + 2]
         } else {
             ""
         };
-        let (kind, adv) = match two {
-            ":=" => (Tok::Define, 2),
-            "+=" => (Tok::PlusAssign, 2),
-            "-=" => (Tok::MinusAssign, 2),
-            "*=" => (Tok::StarAssign, 2),
-            "/=" => (Tok::SlashAssign, 2),
-            "%=" => (Tok::PercentAssign, 2),
-            "++" => (Tok::PlusPlus, 2),
-            "--" => (Tok::MinusMinus, 2),
-            "<-" => (Tok::Arrow, 2),
-            "==" => (Tok::EqEq, 2),
-            "!=" => (Tok::NotEq, 2),
-            "<=" => (Tok::Le, 2),
-            ">=" => (Tok::Ge, 2),
-            "&&" => (Tok::AndAnd, 2),
-            "||" => (Tok::OrOr, 2),
-            _ => match c {
-                '{' => (Tok::LBrace, 1),
-                '}' => (Tok::RBrace, 1),
-                '(' => (Tok::LParen, 1),
-                ')' => (Tok::RParen, 1),
-                '[' => (Tok::LBracket, 1),
-                ']' => (Tok::RBracket, 1),
-                ';' => (Tok::Semi, 1),
-                ',' => (Tok::Comma, 1),
-                '.' => (Tok::Dot, 1),
-                ':' => (Tok::Colon, 1),
-                '=' => (Tok::Assign, 1),
-                '+' => (Tok::Plus, 1),
-                '-' => (Tok::Minus, 1),
-                '*' => (Tok::Star, 1),
-                '/' => (Tok::Slash, 1),
-                '%' => (Tok::Percent, 1),
-                '<' => (Tok::Lt, 1),
-                '>' => (Tok::Gt, 1),
-                '!' => (Tok::Not, 1),
-                '|' => (Tok::Pipe, 1),
-                '~' => (Tok::Tilde, 1),
-                // `&` — address-of (a single `&`; `&&` matched above).
-                '&' => (Tok::Amp, 1),
-                other => {
-                    return Err(format!(
-                        "go-rs: unexpected character `{other}` on line {line}"
-                    ))
-                }
+        let (kind, adv) = match three {
+            "<<=" => (Tok::ShlAssign, 3),
+            ">>=" => (Tok::ShrAssign, 3),
+            "&^=" => (Tok::AndNotAssign, 3),
+            _ => match two {
+                ":=" => (Tok::Define, 2),
+                "+=" => (Tok::PlusAssign, 2),
+                "-=" => (Tok::MinusAssign, 2),
+                "*=" => (Tok::StarAssign, 2),
+                "/=" => (Tok::SlashAssign, 2),
+                "%=" => (Tok::PercentAssign, 2),
+                "++" => (Tok::PlusPlus, 2),
+                "--" => (Tok::MinusMinus, 2),
+                "<-" => (Tok::Arrow, 2),
+                "==" => (Tok::EqEq, 2),
+                "!=" => (Tok::NotEq, 2),
+                "<=" => (Tok::Le, 2),
+                ">=" => (Tok::Ge, 2),
+                "&&" => (Tok::AndAnd, 2),
+                "||" => (Tok::OrOr, 2),
+                "<<" => (Tok::Shl, 2),
+                ">>" => (Tok::Shr, 2),
+                "&^" => (Tok::AndNot, 2),
+                "&=" => (Tok::AmpAssign, 2),
+                "|=" => (Tok::PipeAssign, 2),
+                "^=" => (Tok::CaretAssign, 2),
+                _ => match c {
+                    '{' => (Tok::LBrace, 1),
+                    '}' => (Tok::RBrace, 1),
+                    '(' => (Tok::LParen, 1),
+                    ')' => (Tok::RParen, 1),
+                    '[' => (Tok::LBracket, 1),
+                    ']' => (Tok::RBracket, 1),
+                    ';' => (Tok::Semi, 1),
+                    ',' => (Tok::Comma, 1),
+                    '.' => (Tok::Dot, 1),
+                    ':' => (Tok::Colon, 1),
+                    '=' => (Tok::Assign, 1),
+                    '+' => (Tok::Plus, 1),
+                    '-' => (Tok::Minus, 1),
+                    '*' => (Tok::Star, 1),
+                    '/' => (Tok::Slash, 1),
+                    '%' => (Tok::Percent, 1),
+                    '<' => (Tok::Lt, 1),
+                    '>' => (Tok::Gt, 1),
+                    '!' => (Tok::Not, 1),
+                    '|' => (Tok::Pipe, 1),
+                    '~' => (Tok::Tilde, 1),
+                    // `&` — address-of (a single `&`; `&&` matched above).
+                    '&' => (Tok::Amp, 1),
+                    // `^` — bitwise XOR (binary) / complement (unary).
+                    '^' => (Tok::Caret, 1),
+                    other => {
+                        return Err(format!(
+                            "go-rs: unexpected character `{other}` on line {line}"
+                        ))
+                    }
+                },
             },
         };
         out.push(Token { kind, line });

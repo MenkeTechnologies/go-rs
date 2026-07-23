@@ -2369,6 +2369,7 @@ impl Compiler {
                         match op {
                             UnOp::Neg => Op::Negate,
                             UnOp::Not => Op::LogNot,
+                            UnOp::BitNot => Op::BitNot,
                             UnOp::Addr | UnOp::Deref => unreachable!(),
                         },
                         0,
@@ -2765,6 +2766,27 @@ impl Compiler {
                     self.b.emit(Op::Div, line);
                 }
             }
+            // Bitwise operators (integer-only in Go).
+            BinOp::BitAnd => {
+                self.b.emit(Op::BitAnd, line);
+            }
+            BinOp::BitOr => {
+                self.b.emit(Op::BitOr, line);
+            }
+            BinOp::BitXor => {
+                self.b.emit(Op::BitXor, line);
+            }
+            BinOp::Shl => {
+                self.b.emit(Op::Shl, line);
+            }
+            BinOp::Shr => {
+                self.b.emit(Op::Shr, line);
+            }
+            // `a &^ b` (bit clear) is `a & (^b)`.
+            BinOp::AndNot => {
+                self.b.emit(Op::BitNot, line);
+                self.b.emit(Op::BitAnd, line);
+            }
             other => unreachable!("emit_arith on non-arithmetic op {other:?}"),
         };
     }
@@ -2843,6 +2865,15 @@ impl Compiler {
 
         // Bare-name call: a language builtin or a user function.
         if let Expr::Ident(name) = func {
+            // A type conversion `T(x)` — a builtin numeric/string/bool type name
+            // applied to a single value.
+            if args.len() == 1 && is_conversion_type(name) {
+                self.expr(&args[0])?;
+                let c = self.b.add_constant(Value::str(name.clone()));
+                self.b.emit(Op::LoadConst(c), line);
+                self.b.emit(Op::CallBuiltin(host::GCONV, 2), line);
+                return Ok(());
+            }
             // `panic(v)` records the panic then unwinds to the function's defer
             // drain (jump patched to the panic epilogue).
             if name == "panic" {
@@ -3009,6 +3040,7 @@ impl Compiler {
             Expr::Unary { op, rhs } => match op {
                 UnOp::Neg => self.infer(rhs),
                 UnOp::Not => NumType::Bool,
+                UnOp::BitNot => NumType::Int,
                 // `&x` / `*p` carry the operand's category (a struct handle stays
                 // a struct handle).
                 UnOp::Addr | UnOp::Deref => self.infer(rhs),
@@ -3022,6 +3054,13 @@ impl Compiler {
                 | BinOp::Gt
                 | BinOp::Le
                 | BinOp::Ge => NumType::Bool,
+                // Bitwise/shift operators are integer-typed.
+                BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::AndNot => NumType::Int,
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     let l = self.infer(lhs);
                     let r = self.infer(rhs);
@@ -3039,6 +3078,8 @@ impl Compiler {
             Expr::Call { func, args, .. } => match func.as_ref() {
                 Expr::Ident(name) => match name.as_str() {
                     "len" | "cap" => NumType::Int,
+                    // A conversion `T(x)` is typed as T.
+                    n if args.len() == 1 && is_conversion_type(n) => numtype_of_ty(n),
                     _ => self
                         .funcs
                         .get(name)
@@ -3191,6 +3232,30 @@ fn is_package(name: &str) -> bool {
     matches!(name, "fmt" | "strings" | "strconv" | "math" | "sort" | "os")
 }
 
+/// Whether `name` is a builtin type usable as a conversion `T(x)`.
+fn is_conversion_type(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "byte"
+            | "rune"
+            | "float32"
+            | "float64"
+            | "string"
+            | "bool"
+    )
+}
+
 /// Whether `name` is a predeclared builtin call (referenced by name, not a value).
 fn is_builtin_call(name: &str) -> bool {
     matches!(
@@ -3206,6 +3271,12 @@ fn assign_binop(op: AssignOp) -> BinOp {
         AssignOp::Mul => BinOp::Mul,
         AssignOp::Div => BinOp::Div,
         AssignOp::Mod => BinOp::Mod,
+        AssignOp::BitAnd => BinOp::BitAnd,
+        AssignOp::BitOr => BinOp::BitOr,
+        AssignOp::BitXor => BinOp::BitXor,
+        AssignOp::Shl => BinOp::Shl,
+        AssignOp::Shr => BinOp::Shr,
+        AssignOp::AndNot => BinOp::AndNot,
         AssignOp::Set => unreachable!("plain `=` is not an arithmetic assignment"),
     }
 }

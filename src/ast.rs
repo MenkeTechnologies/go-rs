@@ -194,6 +194,12 @@ pub enum AssignOp {
     Mul,
     Div,
     Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    AndNot,
 }
 
 /// An expression.
@@ -285,6 +291,8 @@ pub enum Expr {
 pub enum UnOp {
     Neg,
     Not,
+    /// `^x` — bitwise complement.
+    BitNot,
     /// `&x` — address-of. go-rs composite values are heap handles (reference
     /// types), so this is a no-copy reference.
     Addr,
@@ -308,4 +316,11 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// Bitwise `&` `|` `^` `<<` `>>` `&^` (integer operations).
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    AndNot,
 }

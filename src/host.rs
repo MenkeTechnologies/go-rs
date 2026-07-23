@@ -107,6 +107,9 @@ pub const GSET_PANIC_MODE: u16 = 897;
 pub const GIDIV: u16 = 898;
 /// Integer `a % b` with a divide-by-zero panic: stack `[a, b]`.
 pub const GIMOD: u16 = 899;
+/// A Go type conversion `T(v)`: stack `[value, typeNameConstIdx]` — the compiler
+/// pushes the value then a constant naming the target type.
+pub const GCONV: u16 = 900;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -157,7 +160,66 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GSET_PANIC_MODE, b_set_panic_mode);
     vm.register_builtin(GIDIV, b_idiv);
     vm.register_builtin(GIMOD, b_imod);
+    vm.register_builtin(GCONV, b_conv);
     stdlib::install(vm);
+}
+
+/// `[value, "type"]` → a Go type conversion `T(value)`. Integer types truncate
+/// and wrap to their width; float types widen/narrow; `string(n)` is the UTF-8
+/// encoding of code point `n`, and `string([]byte/[]rune)` joins the elements.
+fn b_conv(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let ty = args.get(1).map(go_str).unwrap_or_default();
+    match ty.as_str() {
+        "int" | "int64" | "uint" | "uint64" | "uintptr" => Value::Int(to_int_wide(&v)),
+        "int8" => Value::Int(to_int_wide(&v) as i8 as i64),
+        "int16" => Value::Int(to_int_wide(&v) as i16 as i64),
+        "int32" | "rune" => Value::Int(to_int_wide(&v) as i32 as i64),
+        "uint8" | "byte" => Value::Int(to_int_wide(&v) as u8 as i64),
+        "uint16" => Value::Int(to_int_wide(&v) as u16 as i64),
+        "uint32" => Value::Int(to_int_wide(&v) as u32 as i64),
+        "float32" => Value::Float(v.to_float() as f32 as f64),
+        "float64" => Value::Float(v.to_float()),
+        "bool" => Value::bool(v.is_truthy()),
+        "string" => conv_string(&v),
+        // An unknown/named type conversion is the identity (dynamic value model).
+        _ => v,
+    }
+}
+
+/// The integer value of `v` for a conversion (a float truncates toward zero).
+fn to_int_wide(v: &Value) -> i64 {
+    match v {
+        Value::Float(f) => *f as i64,
+        other => other.to_int(),
+    }
+}
+
+/// `string(v)`: a code point becomes its UTF-8 char; a `[]byte`/`[]rune` slice
+/// joins its elements; a string is unchanged.
+fn conv_string(v: &Value) -> Value {
+    match v {
+        Value::Str(_) => v.clone(),
+        Value::Int(n) => {
+            let s = char::from_u32(*n as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "\u{FFFD}".to_string());
+            Value::str(s)
+        }
+        Value::Obj(id) => {
+            if let Some((_, _, len)) = slice_backing(*id) {
+                let s: String = (0..len)
+                    .filter_map(|i| slice_get(*id, i))
+                    .filter_map(|e| char::from_u32(e.to_int() as u32))
+                    .collect();
+                Value::str(s)
+            } else {
+                v.clone()
+            }
+        }
+        _ => Value::str(go_str(v)),
+    }
 }
 
 /// `[a, b]` → `a / b` (integer), panicking on divide-by-zero like Go.

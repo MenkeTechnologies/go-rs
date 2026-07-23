@@ -219,6 +219,10 @@ impl Parser {
         let mut types = Vec::new();
         let mut interfaces = Vec::new();
         let mut main = Vec::new();
+        // Package-level `var`/`const` declarations, collected separately so
+        // `func main` (which sets the main body) does not overwrite them; they
+        // are prepended to the main body to run first (no separate init phase).
+        let mut globals = Vec::new();
         let mut funcs = Vec::new();
         while !matches!(self.peek(), Tok::Eof) {
             match self.peek() {
@@ -230,13 +234,15 @@ impl Parser {
                         funcs.push(f);
                     }
                 }
-                Tok::Type => match self.type_decl()? {
-                    TypeDecl::Struct(s) => types.push(s),
-                    TypeDecl::Interface(i) => interfaces.push(i),
-                },
-                // Package-level `var`/`const` declarations run in `main`'s global
-                // scope (slice: no separate package-init phase).
-                Tok::Var | Tok::Const => main.push(self.stmt()?),
+                Tok::Type => {
+                    if let Some(td) = self.type_decl()? {
+                        match td {
+                            TypeDecl::Struct(s) => types.push(s),
+                            TypeDecl::Interface(i) => interfaces.push(i),
+                        }
+                    }
+                }
+                Tok::Var | Tok::Const => globals.push(self.stmt()?),
                 other => {
                     return Err(format!(
                         "go-rs: expected `func` or `type` at top level, found `{other}` on line {}",
@@ -246,6 +252,10 @@ impl Parser {
             }
             self.skip_semis();
         }
+
+        // Globals run before the main body.
+        globals.extend(main);
+        let main = globals;
 
         Ok(Program {
             package,
@@ -257,13 +267,22 @@ impl Parser {
         })
     }
 
-    /// Parse `type T struct { … }` or `type I interface { … }`.
-    fn type_decl(&mut self) -> Result<TypeDecl, String> {
+    /// Parse `type T struct { … }`, `type I interface { … }`, or a defined type
+    /// `type T <base>` (an alias in go-rs's dynamic model — parsed and discarded,
+    /// so `Weekday` in `type Weekday int` is transparent). Returns `None` for a
+    /// discarded defined type.
+    fn type_decl(&mut self) -> Result<Option<TypeDecl>, String> {
         self.expect(&Tok::Type)?;
         let name = self.ident()?;
         // Erase a generic type-parameter list: `type Stack[T any] struct{…}`.
         if matches!(self.peek(), Tok::LBracket) {
             self.skip_type_brackets()?;
+        }
+        // A defined type over a non-struct base: `type Weekday int`,
+        // `type Celsius float64`, `type ID string`. Consume the base and discard.
+        if !matches!(self.peek(), Tok::Struct | Tok::Interface) {
+            let _ = self.type_name()?;
+            return Ok(None);
         }
         match self.peek() {
             Tok::Interface => {
@@ -289,7 +308,7 @@ impl Parser {
                     self.skip_semis();
                 }
                 self.expect(&Tok::RBrace)?;
-                Ok(TypeDecl::Interface(InterfaceDecl { name, methods }))
+                Ok(Some(TypeDecl::Interface(InterfaceDecl { name, methods })))
             }
             _ => {
                 self.expect(&Tok::Struct)?;
@@ -312,7 +331,7 @@ impl Parser {
                     self.skip_semis();
                 }
                 self.expect(&Tok::RBrace)?;
-                Ok(TypeDecl::Struct(StructDecl { name, fields }))
+                Ok(Some(TypeDecl::Struct(StructDecl { name, fields })))
             }
         }
     }
@@ -601,6 +620,7 @@ impl Parser {
     fn stmt(&mut self) -> Result<Stmt, String> {
         match self.peek() {
             Tok::Var => self.var_stmt(),
+            Tok::Const => self.const_stmt(),
             Tok::Return => {
                 let line = self.line();
                 self.advance();
@@ -647,6 +667,22 @@ impl Parser {
     fn var_stmt(&mut self) -> Result<Stmt, String> {
         let line = self.line();
         self.expect(&Tok::Var)?;
+        // Grouped form `var ( … )` → a block of single declarations.
+        if self.eat(&Tok::LParen) {
+            self.skip_semis();
+            let mut decls = Vec::new();
+            while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
+                decls.push(self.var_spec(line)?);
+                self.skip_semis();
+            }
+            self.expect(&Tok::RParen)?;
+            return Ok(Stmt::Block(decls));
+        }
+        self.var_spec(line)
+    }
+
+    /// One `name [type] [= init]` variable specification.
+    fn var_spec(&mut self, line: u32) -> Result<Stmt, String> {
         let name = self.ident()?;
         let ty = if self.type_starts() && !matches!(self.peek(), Tok::Assign) {
             Some(self.type_name()?)
@@ -664,6 +700,80 @@ impl Parser {
             init,
             line,
         })
+    }
+
+    /// `const NAME [type] = expr` or a grouped `const ( … )` block with `iota`.
+    /// A constant is modeled as an (immutable-by-convention) `var`; `iota` is the
+    /// spec's index within the block, substituted into the expression, and a spec
+    /// with no `= …` inherits the previous spec's expression list.
+    fn const_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.line();
+        self.expect(&Tok::Const)?;
+        if self.eat(&Tok::LParen) {
+            self.skip_semis();
+            let mut decls = Vec::new();
+            let mut prev: Option<(Option<String>, Vec<Expr>)> = None;
+            let mut idx: i64 = 0;
+            while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
+                let names = self.ident_list()?;
+                let ty = if self.type_starts() && !matches!(self.peek(), Tok::Assign) {
+                    Some(self.type_name()?)
+                } else {
+                    None
+                };
+                let (ty, exprs) = if self.eat(&Tok::Assign) {
+                    let mut es = vec![self.expr()?];
+                    while self.eat(&Tok::Comma) {
+                        es.push(self.expr()?);
+                    }
+                    (ty, es)
+                } else {
+                    // Inherit the previous spec's type + expressions (Go's `iota`
+                    // repetition rule); `iota` is re-substituted with this index.
+                    match &prev {
+                        Some((pty, pes)) => (pty.clone(), pes.clone()),
+                        None => return Err(format!("go-rs: missing const value on line {line}")),
+                    }
+                };
+                for (name, expr) in names.iter().zip(&exprs) {
+                    decls.push(Stmt::Var {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        init: Some(subst_iota(expr.clone(), idx)),
+                        line,
+                    });
+                }
+                prev = Some((ty, exprs));
+                idx += 1;
+                self.skip_semis();
+            }
+            self.expect(&Tok::RParen)?;
+            return Ok(Stmt::Block(decls));
+        }
+        // Single const: `const NAME [type] = expr` (iota == 0).
+        let name = self.ident()?;
+        let ty = if self.type_starts() && !matches!(self.peek(), Tok::Assign) {
+            Some(self.type_name()?)
+        } else {
+            None
+        };
+        self.expect(&Tok::Assign)?;
+        let init = subst_iota(self.expr()?, 0);
+        Ok(Stmt::Var {
+            name,
+            ty,
+            init: Some(init),
+            line,
+        })
+    }
+
+    /// Parse `ident {, ident}` — a comma-separated name list.
+    fn ident_list(&mut self) -> Result<Vec<String>, String> {
+        let mut names = vec![self.ident()?];
+        while self.eat(&Tok::Comma) {
+            names.push(self.ident()?);
+        }
+        Ok(names)
     }
 
     fn if_stmt(&mut self) -> Result<Stmt, String> {
@@ -1033,7 +1143,13 @@ impl Parser {
             | Tok::MinusAssign
             | Tok::StarAssign
             | Tok::SlashAssign
-            | Tok::PercentAssign => {
+            | Tok::PercentAssign
+            | Tok::AmpAssign
+            | Tok::PipeAssign
+            | Tok::CaretAssign
+            | Tok::ShlAssign
+            | Tok::ShrAssign
+            | Tok::AndNotAssign => {
                 let op = match self.advance() {
                     Tok::Assign => AssignOp::Set,
                     Tok::PlusAssign => AssignOp::Add,
@@ -1041,6 +1157,12 @@ impl Parser {
                     Tok::StarAssign => AssignOp::Mul,
                     Tok::SlashAssign => AssignOp::Div,
                     Tok::PercentAssign => AssignOp::Mod,
+                    Tok::AmpAssign => AssignOp::BitAnd,
+                    Tok::PipeAssign => AssignOp::BitOr,
+                    Tok::CaretAssign => AssignOp::BitXor,
+                    Tok::ShlAssign => AssignOp::Shl,
+                    Tok::ShrAssign => AssignOp::Shr,
+                    Tok::AndNotAssign => AssignOp::AndNot,
                     _ => unreachable!(),
                 };
                 let value = self.expr()?;
@@ -1143,6 +1265,14 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Unary {
                     op: UnOp::Addr,
+                    rhs: Box::new(self.unary()?),
+                })
+            }
+            // `^x` — bitwise complement.
+            Tok::Caret => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnOp::BitNot,
                     rhs: Box::new(self.unary()?),
                 })
             }
@@ -1408,6 +1538,35 @@ fn zero_expr(ty: &str) -> Expr {
 
 /// The binary operator and its precedence for a token, or `None` if the token
 /// is not a binary operator. Higher binds tighter (Go's five levels).
+/// Replace every `iota` identifier in a constant expression with its integer
+/// value `idx` (the const spec's index within its block).
+fn subst_iota(e: Expr, idx: i64) -> Expr {
+    let b = |e: Box<Expr>| Box::new(subst_iota(*e, idx));
+    match e {
+        Expr::Ident(n) if n == "iota" => Expr::Int(idx),
+        Expr::Unary { op, rhs } => Expr::Unary { op, rhs: b(rhs) },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op,
+            lhs: b(lhs),
+            rhs: b(rhs),
+        },
+        Expr::Call { func, args, line } => Expr::Call {
+            func: b(func),
+            args: args.into_iter().map(|a| subst_iota(a, idx)).collect(),
+            line,
+        },
+        Expr::Index { recv, index } => Expr::Index {
+            recv: b(recv),
+            index: b(index),
+        },
+        Expr::Selector { recv, field } => Expr::Selector {
+            recv: b(recv),
+            field,
+        },
+        other => other,
+    }
+}
+
 fn binop_of(t: &Tok) -> Option<(BinOp, u8)> {
     Some(match t {
         Tok::OrOr => (BinOp::Or, 1),
@@ -1418,11 +1577,19 @@ fn binop_of(t: &Tok) -> Option<(BinOp, u8)> {
         Tok::Gt => (BinOp::Gt, 3),
         Tok::Le => (BinOp::Le, 3),
         Tok::Ge => (BinOp::Ge, 3),
+        // Additive level (4): `+ - | ^`.
         Tok::Plus => (BinOp::Add, 4),
         Tok::Minus => (BinOp::Sub, 4),
+        Tok::Pipe => (BinOp::BitOr, 4),
+        Tok::Caret => (BinOp::BitXor, 4),
+        // Multiplicative level (5): `* / % << >> & &^`.
         Tok::Star => (BinOp::Mul, 5),
         Tok::Slash => (BinOp::Div, 5),
         Tok::Percent => (BinOp::Mod, 5),
+        Tok::Shl => (BinOp::Shl, 5),
+        Tok::Shr => (BinOp::Shr, 5),
+        Tok::Amp => (BinOp::BitAnd, 5),
+        Tok::AndNot => (BinOp::AndNot, 5),
         _ => return None,
     })
 }

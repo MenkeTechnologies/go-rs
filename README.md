@@ -115,8 +115,9 @@ A single-file `package main` that runs real Go programs:
 | Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
 | Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), parallel assignment `a, b = x, y` (swap/rotate; RHS evaluated first), `a, b = f()`, `+= -= *= /= %=`, `x++` / `x--` |
 | Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause), `break`, `continue`, `return` |
-| Expressions    | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
-| Types          | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
+| Expressions    | int / float / string / bool literals (incl. `0x` / `0o` / `0b` bases and `_` separators), arithmetic, bitwise `& \| ^ << >> &^` (+ `^x` complement, compound `&= \|= ^= <<= >>= &^=`), comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
+| Types          | `int` family, `float32/64`, `string`, `bool`, defined types (`type Celsius float64`) — tracked statically so `int / int` truncates and `float / float` stays exact; conversions `T(x)` (`int(f)`, `float64(n)`, `string(rune)`, `byte`/`rune`/…) |
+| Constants      | `const x = …` and grouped `const ( … )` blocks with `iota` (auto-increment, expression repetition, `1 << iota` flag patterns) |
 | Slices         | `[]T{…}`, `make([]T, n)`, `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` (also on strings) that **share the backing array** (writes alias the parent; `cap` reflects the offset; `append` writes in place when the backing has room, else reallocates), `len` / `cap` / `append`, `for i, v := range s` |
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m` |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |

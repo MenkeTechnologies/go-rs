@@ -1310,3 +1310,63 @@ func main() {
         "[3 8 1 9] 4 5\n[5 100 200 1 9 2]\n[1 2 99 4 5] [1 2 99]\n",
     );
 }
+
+#[test]
+fn bitwise_operators_and_base_literals() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	a, b := 12, 10
+	fmt.Println(a&b, a|b, a^b, a&^b, ^a)
+	fmt.Println(1<<4, 256>>2, 1|2&3)
+	fmt.Println(0xFF, 0o17, 0b1010, 1_000_000)
+	x := 1
+	x |= 6
+	x <<= 2
+	fmt.Println(x)
+}
+";
+    assert_stdout(src, "8 14 6 4 -13\n16 64 3\n255 15 10 1000000\n28\n");
+}
+
+#[test]
+fn type_conversions() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	f := 3.9
+	fmt.Println(int(f), float64(10)/4)
+	n := 65
+	fmt.Println(string(rune(n)))
+}
+";
+    assert_stdout(src, "3 2.5\nA\n");
+}
+
+#[test]
+fn const_blocks_and_iota() {
+    let src = "\
+package main
+import \"fmt\"
+type Flag int
+const (
+	Read Flag = 1 << iota
+	Write
+	Exec
+)
+const (
+	_  = iota
+	KB = 1 << (10 * iota)
+	MB
+)
+func main() {
+	fmt.Println(Read, Write, Exec)
+	fmt.Println(KB, MB)
+	const local = 42
+	fmt.Println(local)
+}
+";
+    assert_stdout(src, "1 2 4\n1024 1048576\n42\n");
+}
