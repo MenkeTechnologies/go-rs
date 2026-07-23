@@ -126,6 +126,8 @@ A single-file `package main` that runs real Go programs:
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
 | Functions      | multiple parameters, `(T, U)` multi-value results, `return a, b`, and `x, y := f()` destructuring |
 | Generics       | type parameters on funcs, types, and methods (`func F[T Number]`, `type Stack[T any]`, `Pair[K, V]{…}`), constraint interfaces (`~int \| ~float64`), inferred + explicit instantiation — **erased** onto the dynamic value model (no monomorphization) |
+| defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
+| panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; an unrecovered panic prints `panic: <value>` and exits non-zero |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
 | Standard lib   | `fmt` (Println/Print/Printf `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
@@ -137,10 +139,18 @@ operations. **Generics are handled by erasure** — type-parameter and
 type-argument brackets are consumed and dropped, and the dynamically-typed value
 model runs one erased body for every instantiation (the zero value of a
 type-parameter-typed `var` is nil, treated as the additive identity so a generic
-accumulator matches Go for int/float/string). Documented simplifications: a map
-read of a missing key returns the numeric zero (`0`) rather than the comma-ok
-form; method receivers use reference semantics (a value receiver is not copied);
-and `go` targets a top-level function call (no closure goroutines yet).
+accumulator matches Go for int/float/string). **`defer`/`panic`/`recover`** run
+on a host-side defer stack drained before every return: `defer` snapshots the
+call's arguments (and, for a method, its receiver by reference) and pushes a
+closure; a `panic` jumps to the function's defer drain and, if unrecovered,
+propagates up the call chain (a compile-time check after each call, active only
+in programs that panic). Documented simplifications: a map read of a missing key
+returns the numeric zero (`0`) rather than the comma-ok form; method receivers
+use reference semantics (a value receiver is not copied); `go` targets a
+top-level function call (no closure goroutines yet); a deferred closure that
+mutates a **named** return value does not propagate that change (pending
+capture-by-reference), and an unrecovered panic prints its message but not Go's
+goroutine stack trace.
 
 ## Toolchain
 

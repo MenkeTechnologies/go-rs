@@ -163,6 +163,11 @@
           <p>wait on multiple channel operations; runs a ready case, else `default`, else blocks</p>
           <pre><code class="lang-go">select { case v := &lt;-ch: use(v); default: }</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keyword-21">
+          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>defer</code></h3>
+          <p>schedule a call to run at function return (LIFO); arguments are evaluated now</p>
+          <pre><code class="lang-go">defer f.Close()</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-type">
@@ -274,6 +279,16 @@
           <h3><a class="doc-anchor" href="#doc-builtin-6">#</a> <code>close</code></h3>
           <p>close(ch): close a channel; further receives yield the zero value</p>
           <pre><code class="lang-go">close(done)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-7">
+          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>panic</code></h3>
+          <p>panic(v): stop normal flow and unwind, running deferred calls; a recover() may stop it</p>
+          <pre><code class="lang-go">panic("unreachable")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-8">
+          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>recover</code></h3>
+          <p>recover(): inside a deferred call, stop a panic and return its value (nil if none)</p>
+          <pre><code class="lang-go">defer func() { recover() }()</code></pre>
         </article>
       </section>
 

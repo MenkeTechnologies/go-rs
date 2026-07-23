@@ -66,6 +66,26 @@ pub const GCLOSURE_NEW: u16 = 828;
 pub const GCLOSURE_GET: u16 = 829;
 /// Read a closure's target subroutine name-index (for `Op::CallDynamic`).
 pub const GCLOSURE_NAMEIDX: u16 = 819;
+/// Push a new (empty) defer frame — one per invocation of a function that has
+/// `defer` statements. (IDs 830–880 belong to the `stdlib` submodule.)
+pub const GDEFER_ENTER: u16 = 881;
+/// `[closure]` → push a deferred closure onto the current defer frame.
+pub const GDEFER_PUSH: u16 = 882;
+/// → `Int` count of deferred closures in the current frame (drives the drain).
+pub const GDEFER_LEN: u16 = 883;
+/// → pop and return the most-recently-deferred closure of the current frame.
+pub const GDEFER_POP: u16 = 884;
+/// Pop the (drained) defer frame.
+pub const GDEFER_LEAVE: u16 = 885;
+/// `[value]` → record a panic; execution unwinds to the current function's
+/// defer drain (a deferred `recover()` may cancel it).
+pub const GPANIC: u16 = 886;
+/// → `Bool` whether a panic is currently propagating (drives unwind checks).
+pub const GPANIC_ACTIVE: u16 = 887;
+/// → the propagating panic value and clear it (nil if none) — Go's `recover()`.
+pub const GRECOVER: u16 = 888;
+/// If a panic is still propagating at program end, print it and exit non-zero.
+pub const GPANIC_FINISH: u16 = 889;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -97,7 +117,91 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GCLOSURE_NEW, b_closure_new);
     vm.register_builtin(GCLOSURE_GET, b_closure_get);
     vm.register_builtin(GCLOSURE_NAMEIDX, b_closure_nameidx);
+    vm.register_builtin(GDEFER_ENTER, b_defer_enter);
+    vm.register_builtin(GDEFER_PUSH, b_defer_push);
+    vm.register_builtin(GDEFER_LEN, b_defer_len);
+    vm.register_builtin(GDEFER_POP, b_defer_pop);
+    vm.register_builtin(GDEFER_LEAVE, b_defer_leave);
+    vm.register_builtin(GPANIC, b_panic);
+    vm.register_builtin(GPANIC_ACTIVE, b_panic_active);
+    vm.register_builtin(GRECOVER, b_recover);
+    vm.register_builtin(GPANIC_FINISH, b_panic_finish);
     stdlib::install(vm);
+}
+
+/// `[value]` → begin a panic: store the value; unwinding is driven by the
+/// compiler (jump to the defer drain, propagate past calls while active).
+fn b_panic(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.into_iter().next().unwrap_or(Value::Undef);
+    PANIC.with(|p| *p.borrow_mut() = Some(v));
+    Value::Undef
+}
+
+/// → whether a panic is propagating (an unwind check after each call).
+fn b_panic_active(_vm: &mut VM, _argc: u8) -> Value {
+    Value::bool(PANIC.with(|p| p.borrow().is_some()))
+}
+
+/// Go's `recover()`: return the propagating panic value and stop the panic, or
+/// nil when nothing is panicking.
+fn b_recover(_vm: &mut VM, _argc: u8) -> Value {
+    PANIC
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or(Value::Undef)
+}
+
+/// At program end, a still-propagating panic is fatal: print it like Go's first
+/// line (`panic: <value>`) on stderr and exit with status 2. (The goroutine
+/// stack trace Go prints below that line is not reproduced.)
+fn b_panic_finish(_vm: &mut VM, _argc: u8) -> Value {
+    if let Some(v) = PANIC.with(|p| p.borrow_mut().take()) {
+        eprintln!("panic: {}", go_str(&v));
+        std::process::exit(2);
+    }
+    Value::Undef
+}
+
+/// Push a fresh defer frame at the start of a function that has `defer`s.
+fn b_defer_enter(_vm: &mut VM, _argc: u8) -> Value {
+    DEFERS.with(|d| d.borrow_mut().push(Vec::new()));
+    Value::Undef
+}
+
+/// `[closure]` → record a deferred closure in the current frame (LIFO order).
+fn b_defer_push(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    if let Some(c) = args.into_iter().next() {
+        DEFERS.with(|d| {
+            if let Some(frame) = d.borrow_mut().last_mut() {
+                frame.push(c);
+            }
+        });
+    }
+    Value::Undef
+}
+
+/// → the number of deferred closures still to run in the current frame.
+fn b_defer_len(_vm: &mut VM, _argc: u8) -> Value {
+    Value::Int(DEFERS.with(|d| d.borrow().last().map(|f| f.len()).unwrap_or(0)) as i64)
+}
+
+/// → pop the most-recently-deferred closure of the current frame (LIFO).
+fn b_defer_pop(_vm: &mut VM, _argc: u8) -> Value {
+    DEFERS.with(|d| {
+        d.borrow_mut()
+            .last_mut()
+            .and_then(|f| f.pop())
+            .unwrap_or(Value::Undef)
+    })
+}
+
+/// Drop the drained defer frame on function exit.
+fn b_defer_leave(_vm: &mut VM, _argc: u8) -> Value {
+    DEFERS.with(|d| {
+        d.borrow_mut().pop();
+    });
+    Value::Undef
 }
 
 /// `[closure]` → the closure's target subroutine name-index (drives dynamic
@@ -248,11 +352,22 @@ thread_local! {
     /// grows per run and is cleared by [`heap_reset`] at the start of every
     /// program so handles never leak across runs.
     static HEAP: RefCell<Vec<HostObj>> = const { RefCell::new(Vec::new()) };
+
+    /// A stack of defer frames, one per in-flight function invocation that has
+    /// `defer` statements. Each frame holds its deferred closures in push order;
+    /// the drain loop pops them LIFO before the function returns.
+    static DEFERS: RefCell<Vec<Vec<Value>>> = const { RefCell::new(Vec::new()) };
+
+    /// The value of an in-flight `panic`, or `None`. Set by `panic()`, cleared by
+    /// `recover()`; the compiler unwinds through defer drains while it is `Some`.
+    static PANIC: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
-/// Clear the object heap. Called at the start of each program run.
+/// Clear the object heap, defer stack, and panic state. Called at each run start.
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
+    DEFERS.with(|d| d.borrow_mut().clear());
+    PANIC.with(|p| *p.borrow_mut() = None);
 }
 
 /// Allocate `obj` on the heap and return its handle.

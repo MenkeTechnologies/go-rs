@@ -838,3 +838,107 @@ func main() {
 ";
     assert_stdout(src, "2 [10 20]\n1 one\nage 42\n");
 }
+
+#[test]
+fn defer_runs_lifo_with_snapshotted_args() {
+    // Deferred calls run in LIFO order at function return; each `defer` snapshots
+    // its arguments at defer time (so the loop prints 2, 1, 0 after the body).
+    let src = "\
+package main
+import \"fmt\"
+func work() {
+	for i := 0; i < 3; i++ {
+		defer fmt.Println(\"deferred\", i)
+	}
+	fmt.Println(\"body\")
+}
+func main() {
+	work()
+}
+";
+    assert_stdout(src, "body\ndeferred 2\ndeferred 1\ndeferred 0\n");
+}
+
+#[test]
+fn defer_pointer_receiver_sees_later_mutations() {
+    // A deferred pointer-receiver method captures the receiver by reference, so
+    // it observes mutations made after the `defer` (Go captures the pointer).
+    let src = "\
+package main
+import \"fmt\"
+type Counter struct{ n int }
+func (c *Counter) Inc()    { c.n++ }
+func (c *Counter) Report() { fmt.Println(\"count:\", c.n) }
+func run() {
+	var c Counter
+	defer c.Report()
+	c.Inc()
+	c.Inc()
+	c.Inc()
+}
+func main() {
+	run()
+}
+";
+    assert_stdout(src, "count: 3\n");
+}
+
+#[test]
+fn panic_recover_across_a_call_frame() {
+    // A panic unwinds through a call, is caught by `recover()` in a deferred
+    // closure of an enclosing function, and execution continues normally.
+    let src = "\
+package main
+import \"fmt\"
+func mightPanic(n int) {
+	if n > 5 {
+		panic(\"too big\")
+	}
+	fmt.Println(\"ok:\", n)
+}
+func guarded(n int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println(\"caught:\", r)
+		}
+	}()
+	mightPanic(n)
+	fmt.Println(\"after\", n)
+}
+func main() {
+	guarded(3)
+	guarded(9)
+	fmt.Println(\"done\")
+}
+";
+    assert_stdout(src, "ok: 3\nafter 3\ncaught: too big\ndone\n");
+}
+
+#[test]
+fn recovered_multi_value_call_returns_zero_values() {
+    // A recovered call returns its result's zero values (the recover is observed
+    // via a side effect). Deferred mutation of *named* results is a documented
+    // gap pending capture-by-reference, so this asserts the zero-value return.
+    let src = "\
+package main
+import \"fmt\"
+func safe(a, b int) (int, string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println(\"recovered:\", r)
+		}
+	}()
+	if b == 0 {
+		panic(\"div by zero\")
+	}
+	return a / b, \"ok\"
+}
+func main() {
+	q, s := safe(10, 2)
+	fmt.Println(q, s)
+	q2, s2 := safe(1, 0)
+	fmt.Println(q2, s2 == \"\")
+}
+";
+    assert_stdout(src, "5 ok\nrecovered: div by zero\n0 true\n");
+}

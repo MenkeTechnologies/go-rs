@@ -150,6 +150,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "wait on multiple channel operations; runs a ready case, else `default`, else blocks",
         "select { case v := <-ch: use(v); default: }",
     ),
+    (
+        "defer",
+        "Keyword",
+        "schedule a call to run at function return (LIFO); arguments are evaluated now",
+        "defer f.Close()",
+    ),
     // ── Type (declaration-position type names) ──
     (
         "int",
@@ -257,6 +263,18 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Builtin",
         "close(ch): close a channel; further receives yield the zero value",
         "close(done)",
+    ),
+    (
+        "panic",
+        "Builtin",
+        "panic(v): stop normal flow and unwind, running deferred calls; a recover() may stop it",
+        "panic(\"unreachable\")",
+    ),
+    (
+        "recover",
+        "Builtin",
+        "recover(): inside a deferred call, stop a panic and return its value (nil if none)",
+        "defer func() { recover() }()",
     ),
     // ── Package (standard library) ──
     (

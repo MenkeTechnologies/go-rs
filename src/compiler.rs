@@ -139,6 +139,83 @@ struct Compiler {
     /// True when the program contains an inline `rust {}` block (a
     /// `__rust_compile(...)` call), so a bare-name call may be an FFI export.
     has_ffi: bool,
+    /// True while compiling a function/lambda/`main` whose body has `defer`
+    /// statements — gates the defer-frame prologue and the return-time drain.
+    fn_has_defer: bool,
+    /// True when the program calls `panic`/`recover` anywhere — gates the panic
+    /// unwind machinery (post-call checks + a per-function panic epilogue) so
+    /// programs that never panic pay nothing.
+    uses_panic: bool,
+    /// Forward jumps (from `panic` sites and post-call unwind checks) to the
+    /// current function's panic epilogue; patched when that epilogue is emitted.
+    panic_jumps: Vec<usize>,
+}
+
+/// Whether the program (a function body, recursing everywhere including nested
+/// literals) calls `panic` or `recover` — the gate for the unwind machinery.
+fn body_uses_panic(body: &[Stmt]) -> bool {
+    fn ex(e: &Expr) -> bool {
+        match e {
+            Expr::Call { func, args, .. } => {
+                matches!(func.as_ref(), Expr::Ident(n) if n == "panic" || n == "recover")
+                    || ex(func)
+                    || args.iter().any(ex)
+            }
+            Expr::Unary { rhs, .. } => ex(rhs),
+            Expr::Binary { lhs, rhs, .. } => ex(lhs) || ex(rhs),
+            Expr::Selector { recv, .. } => ex(recv),
+            Expr::Index { recv, index } => ex(recv) || ex(index),
+            Expr::FuncLit { body, .. } => body_uses_panic(body),
+            Expr::SliceLit { elems, .. } => elems.iter().any(ex),
+            Expr::MapLit { pairs, .. } => pairs.iter().any(|(k, v)| ex(k) || ex(v)),
+            Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| ex(v)),
+            Expr::Recv { chan } => ex(chan),
+            _ => false,
+        }
+    }
+    fn st(s: &Stmt) -> bool {
+        match s {
+            Stmt::Var { init, .. } => init.as_ref().is_some_and(ex),
+            Stmt::Short { values, .. } => values.iter().any(ex),
+            Stmt::Assign { target, value, .. } => ex(target) || ex(value),
+            Stmt::IncDec { target, .. } => ex(target),
+            Stmt::ExprStmt(e) => ex(e),
+            Stmt::Return(vs, _) => vs.iter().any(ex),
+            Stmt::If {
+                then, els, cond, ..
+            } => ex(cond) || body_uses_panic(then) || body_uses_panic(els),
+            Stmt::For { body, .. } | Stmt::ForRange { body, .. } => body_uses_panic(body),
+            Stmt::Block(b) => body_uses_panic(b),
+            Stmt::Go { call, .. } | Stmt::Defer { call, .. } => ex(call),
+            Stmt::Send { chan, val, .. } => ex(chan) || ex(val),
+            Stmt::Select { cases, default, .. } => {
+                cases.iter().any(|c| body_uses_panic(&c.body))
+                    || default.as_deref().is_some_and(body_uses_panic)
+            }
+            Stmt::Break(_) | Stmt::Continue(_) => false,
+        }
+    }
+    body.iter().any(st)
+}
+
+/// Whether `body` contains a `defer` at this function level (not descending into
+/// nested function literals, whose defers belong to their own invocation).
+fn body_has_defer(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_has_defer)
+}
+
+fn stmt_has_defer(s: &Stmt) -> bool {
+    match s {
+        Stmt::Defer { .. } => true,
+        Stmt::If { then, els, .. } => body_has_defer(then) || body_has_defer(els),
+        Stmt::For { body, .. } | Stmt::ForRange { body, .. } => body_has_defer(body),
+        Stmt::Block(b) => body_has_defer(b),
+        Stmt::Select { cases, default, .. } => {
+            cases.iter().any(|c| body_has_defer(&c.body))
+                || default.as_deref().is_some_and(body_has_defer)
+        }
+        _ => false,
+    }
 }
 
 /// Lower a whole program to a runnable chunk.
@@ -212,16 +289,39 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         active_captures: HashMap::new(),
         debug,
         has_ffi,
+        fn_has_defer: false,
+        uses_panic: body_uses_panic(&prog.main)
+            || prog.funcs.iter().any(|f| body_uses_panic(&f.body)),
+        panic_jumps: Vec::new(),
     };
 
     // ── main body (global scope) ──
+    c.fn_has_defer = body_has_defer(&prog.main);
+    if c.fn_has_defer {
+        c.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), 0);
+        c.b.emit(Op::Pop, 0);
+    }
     for s in &prog.main {
         c.stmt(s)?;
     }
+    // `return` inside `main`, and any panic unwind, jump here; run any deferred
+    // calls (a deferred `recover()` may clear the panic), then fall off.
     let end = c.b.current_pos();
     let exits = std::mem::take(&mut c.main_exits);
-    for op in exits {
+    let panics = std::mem::take(&mut c.panic_jumps);
+    for op in exits.into_iter().chain(panics) {
         c.b.patch_jump(op, end);
+    }
+    if c.fn_has_defer {
+        c.emit_defer_drain();
+        c.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 0), 0);
+        c.b.emit(Op::Pop, 0);
+        c.fn_has_defer = false;
+    }
+    // A panic that reached `main` unrecovered is fatal (prints + exits non-zero).
+    if c.uses_panic {
+        c.b.emit(Op::CallBuiltin(host::GPANIC_FINISH, 0), 0);
+        c.b.emit(Op::Pop, 0);
     }
 
     // ── subroutine bodies, emitted after main and jumped over ──
@@ -277,13 +377,22 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i), f.line);
         }
 
+        self.fn_has_defer = body_has_defer(&f.body);
+        self.panic_jumps.clear();
+        if self.fn_has_defer {
+            self.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), f.line);
+            self.b.emit(Op::Pop, f.line);
+        }
+
         for s in &f.body {
             self.stmt(s)?;
         }
         // Fall-off: a function with no explicit `return` yields nil.
         self.b.emit(Op::LoadUndef, f.line);
-        self.b.emit(Op::ReturnValue, f.line);
+        self.emit_return(f.line);
+        self.emit_panic_epilogue(&f.results, f.line);
 
+        self.fn_has_defer = false;
         self.scope = None;
         Ok(())
     }
@@ -313,12 +422,171 @@ impl Compiler {
         id
     }
 
+    /// Return from the current function: run any deferred calls (LIFO), drop the
+    /// defer frame, then `ReturnValue`. The return value is already on the stack;
+    /// the drain is stack-neutral above it.
+    fn emit_return(&mut self, line: u32) {
+        if self.fn_has_defer {
+            self.emit_defer_drain();
+            self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 0), line);
+            self.b.emit(Op::Pop, line);
+        }
+        self.b.emit(Op::ReturnValue, line);
+    }
+
+    /// Emit a function's panic epilogue (the target of its `panic` sites and
+    /// post-call unwind checks): drain this frame's defers — a deferred
+    /// `recover()` may clear the panic — drop the frame, and return nil. If the
+    /// panic is still live, the caller's post-call check propagates it. Emitted
+    /// after the normal fall-off, so it is only reachable by an unwind jump.
+    fn emit_panic_epilogue(&mut self, results: &[String], line: u32) {
+        if self.panic_jumps.is_empty() {
+            return;
+        }
+        let ep = self.b.current_pos();
+        let jumps = std::mem::take(&mut self.panic_jumps);
+        for j in jumps {
+            self.b.patch_jump(j, ep);
+        }
+        // Return the function's zero values (int→0, string→"", …) so a recovered
+        // call still yields the right shape and values. (Deferred mutation of
+        // *named* results is a documented gap pending capture-by-reference.)
+        if results.len() >= 2 {
+            for ty in results {
+                self.emit_default(numtype_of_ty(ty), line);
+            }
+            self.b
+                .emit(Op::CallBuiltin(host::GSLICE_LIT, results.len() as u8), line);
+        } else if let Some(ty) = results.first() {
+            self.emit_default(numtype_of_ty(ty), line);
+        } else {
+            self.b.emit(Op::LoadUndef, line);
+        }
+        self.emit_return(line);
+    }
+
+    /// After a user-function call, if a panic is now propagating, jump to the
+    /// current function's panic epilogue (which drains defers and returns),
+    /// carrying the unwind up the call chain. No-op unless the program panics.
+    fn emit_panic_check(&mut self, line: u32) {
+        if !self.uses_panic {
+            return;
+        }
+        self.b.emit(Op::CallBuiltin(host::GPANIC_ACTIVE, 0), line);
+        let j = self.b.emit(Op::JumpIfTrue(0), line);
+        self.panic_jumps.push(j);
+    }
+
+    /// Emit the deferred-call drain loop: `while GDEFER_LEN() > 0 { c := pop; c() }`.
+    /// Each deferred closure takes no arguments (its call was snapshotted at
+    /// `defer` time), so it is invoked as `c(self=c)` via `Op::CallDynamic`.
+    fn emit_defer_drain(&mut self) {
+        let start = self.b.current_pos();
+        self.b.emit(Op::CallBuiltin(host::GDEFER_LEN, 0), 0);
+        let done = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.b.emit(Op::CallBuiltin(host::GDEFER_POP, 0), 0);
+        self.emit_set("$dcpop", 0);
+        self.emit_get("$dcpop", 0); // the closure, as its own "self"
+        self.emit_get("$dcpop", 0);
+        self.b.emit(Op::CallBuiltin(host::GCLOSURE_NAMEIDX, 1), 0);
+        self.b.emit(Op::CallDynamic(1), 0);
+        self.b.emit(Op::Pop, 0); // discard the deferred call's result
+        self.b.emit(Op::Jump(start), 0);
+        let end = self.b.current_pos();
+        self.b.patch_jump(done, end);
+    }
+
+    /// Lower `defer <call>`: snapshot the callee value (a method receiver or a
+    /// func-valued variable) and every argument into temporaries *now*, then push
+    /// a zero-argument closure that re-invokes the call over those snapshots. The
+    /// closure runs at function return via [`Self::emit_defer_drain`].
+    fn compile_defer(&mut self, call: &Expr, line: u32) -> Result<(), String> {
+        let Expr::Call { func, args, .. } = call else {
+            return Err(format!(
+                "go-rs: `defer` requires a function call (line {line})"
+            ));
+        };
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+
+        // Snapshot list: (temp name, expression, by_ref). `by_ref` snapshots keep
+        // reference semantics (no struct copy) — a method receiver, so a deferred
+        // pointer-receiver call sees mutations made after the `defer` (Go captures
+        // the receiver pointer). Arguments are copied (Go evaluates them now).
+        let mut temps: Vec<(String, Expr, bool)> = Vec::new();
+
+        // Classify the callee. Package calls (`fmt.Println`), top-level funcs, and
+        // builtins are referenced by name (they don't change); a method receiver
+        // or a func-valued variable is snapshotted.
+        let new_func: Expr = match func.as_ref() {
+            Expr::Selector { recv, field } => {
+                if matches!(recv.as_ref(), Expr::Ident(p) if is_package(p)) {
+                    (**func).clone()
+                } else {
+                    let rt = format!("$dfr{n}");
+                    temps.push((rt.clone(), (**recv).clone(), true));
+                    Expr::Selector {
+                        recv: Box::new(Expr::Ident(rt)),
+                        field: field.clone(),
+                    }
+                }
+            }
+            Expr::Ident(name)
+                if self.funcs.contains_key(name) || is_builtin_call(name) || name == "close" =>
+            {
+                (**func).clone()
+            }
+            Expr::Ident(name) => {
+                let ft = format!("$dff{n}");
+                temps.push((ft.clone(), Expr::Ident(name.clone()), true));
+                Expr::Ident(ft)
+            }
+            other => other.clone(),
+        };
+
+        // Snapshot the arguments (by value).
+        let mut new_args = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let at = format!("$dfa{n}_{i}");
+            temps.push((at.clone(), a.clone(), false));
+            new_args.push(Expr::Ident(at));
+        }
+
+        // Evaluate each snapshot into its temporary local (recording types so the
+        // deferred closure's body dispatches methods/func-values correctly).
+        for (tname, texpr, by_ref) in &temps {
+            let nt = self.infer(texpr);
+            let dt = self.type_name(texpr);
+            if *by_ref {
+                self.expr(texpr)?;
+            } else {
+                self.emit_value(texpr)?;
+            }
+            self.types.insert(tname.clone(), nt);
+            self.decl_types.insert(tname.clone(), dt);
+            self.emit_set(tname, line);
+        }
+
+        // Build `func() { new_func(new_args) }`, capturing the snapshots by value,
+        // and push it onto the current defer frame.
+        let body = vec![Stmt::ExprStmt(Expr::Call {
+            func: Box::new(new_func),
+            args: new_args,
+            line,
+        })];
+        self.emit_funclit(&[], &body);
+        self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 1), line);
+        self.b.emit(Op::Pop, line);
+        Ok(())
+    }
+
     /// Emit a call to a closure whose value is already on the stack (as the
     /// deepest argument, "self"): evaluate the args and call `$lambda_id`.
     fn emit_closure_call(&mut self, id: i64, args: &[Expr], line: u32) -> Result<(), String> {
         self.emit_closure_call_args(args)?;
         let idx = self.b.add_name(&format!("$lambda_{id}"));
         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+        self.emit_panic_check(line);
         Ok(())
     }
 
@@ -364,12 +632,23 @@ impl Compiler {
         for i in (0..slot).rev() {
             self.b.emit(Op::SetSlot(i), 0);
         }
+
+        self.fn_has_defer = body_has_defer(&body);
+        let saved_panic_jumps = std::mem::take(&mut self.panic_jumps);
+        if self.fn_has_defer {
+            self.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), 0);
+            self.b.emit(Op::Pop, 0);
+        }
+
         for s in &body {
             self.stmt(s)?;
         }
         self.b.emit(Op::LoadUndef, 0);
-        self.b.emit(Op::ReturnValue, 0);
+        self.emit_return(0);
+        self.emit_panic_epilogue(&[], 0);
 
+        self.panic_jumps = saved_panic_jumps;
+        self.fn_has_defer = false;
         self.scope = None;
         self.active_captures.clear();
         Ok(())
@@ -476,6 +755,7 @@ impl Compiler {
                 }
             }
             Stmt::Go { call, .. } => self.fv_expr(call, bound, caps),
+            Stmt::Defer { call, .. } => self.fv_expr(call, bound, caps),
             Stmt::Send { chan, val, .. } => {
                 self.fv_expr(chan, bound, caps);
                 self.fv_expr(val, bound, caps);
@@ -747,7 +1027,7 @@ impl Compiler {
                                 .emit(Op::CallBuiltin(host::GSLICE_LIT, n as u8), *line);
                         }
                     }
-                    self.b.emit(Op::ReturnValue, *line);
+                    self.emit_return(*line);
                 }
                 None => {
                     // `return` in `main` — evaluate for effect, then jump to end.
@@ -843,6 +1123,7 @@ impl Compiler {
                     }
                 }
             }
+            Stmt::Defer { call, line } => self.compile_defer(call, *line)?,
             Stmt::Send { chan, val, line } => {
                 self.expr(chan)?;
                 self.expr(val)?;
@@ -1347,6 +1628,7 @@ impl Compiler {
             }
             let idx = self.b.add_name(&format!("{ty}.{method}"));
             self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+            self.emit_panic_check(line);
             return Ok(());
         }
 
@@ -1401,6 +1683,7 @@ impl Compiler {
         for j in end_jumps {
             self.b.patch_jump(j, end);
         }
+        self.emit_panic_check(line);
         Ok(())
     }
 
@@ -1550,6 +1833,23 @@ impl Compiler {
 
         // Bare-name call: a language builtin or a user function.
         if let Expr::Ident(name) = func {
+            // `panic(v)` records the panic then unwinds to the function's defer
+            // drain (jump patched to the panic epilogue).
+            if name == "panic" {
+                for a in args {
+                    self.emit_value(a)?;
+                }
+                self.b
+                    .emit(Op::CallBuiltin(host::GPANIC, args.len() as u8), line);
+                let j = self.b.emit(Op::Jump(0), line);
+                self.panic_jumps.push(j);
+                return Ok(());
+            }
+            // `recover()` returns the in-flight panic value (or nil) and stops it.
+            if name == "recover" {
+                self.b.emit(Op::CallBuiltin(host::GRECOVER, 0), line);
+                return Ok(());
+            }
             // `close(ch)` lowers to the channel-close op, not a builtin.
             if name == "close" {
                 for a in args {
@@ -1618,6 +1918,7 @@ impl Compiler {
                 }
                 self.emit_get(&ni, line);
                 self.b.emit(Op::CallDynamic(args.len() as u8 + 1), line);
+                self.emit_panic_check(line);
                 return Ok(());
             }
             if let Some(sig) = self.funcs.get(name) {
@@ -1633,6 +1934,7 @@ impl Compiler {
                 }
                 let idx = self.b.add_name(name);
                 self.b.emit(Op::Call(idx, args.len() as u8), line);
+                self.emit_panic_check(line);
                 return Ok(());
             }
             // With an inline `rust {}` block present, an otherwise-unresolved
@@ -1743,6 +2045,20 @@ fn base_type(ty: &str) -> String {
     ty.trim_start_matches('*').to_string()
 }
 
+/// Whether `name` is an imported package go-rs dispatches by name (so a `defer
+/// pkg.Fn(...)` needn't snapshot the callee).
+fn is_package(name: &str) -> bool {
+    matches!(name, "fmt" | "strings" | "strconv" | "math" | "sort" | "os")
+}
+
+/// Whether `name` is a predeclared builtin call (referenced by name, not a value).
+fn is_builtin_call(name: &str) -> bool {
+    matches!(
+        name,
+        "len" | "cap" | "append" | "delete" | "make" | "min" | "max" | "println" | "print"
+    )
+}
+
 fn assign_binop(op: AssignOp) -> BinOp {
     match op {
         AssignOp::Add => BinOp::Add,
@@ -1794,6 +2110,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::For { line, .. }
         | Stmt::ForRange { line, .. }
         | Stmt::Go { line, .. }
+        | Stmt::Defer { line, .. }
         | Stmt::Send { line, .. }
         | Stmt::Select { line, .. }
         | Stmt::Break(line)
@@ -1815,7 +2132,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         Stmt::For { body, .. } | Stmt::ForRange { body, .. } | Stmt::Block(body) => {
             body_has_ffi(body)
         }
-        Stmt::Go { call, .. } => expr_has_ffi(call),
+        Stmt::Go { call, .. } | Stmt::Defer { call, .. } => expr_has_ffi(call),
         Stmt::Send { chan, val, .. } => expr_has_ffi(chan) || expr_has_ffi(val),
         Stmt::Select { cases, default, .. } => {
             cases.iter().any(|c| body_has_ffi(&c.body))

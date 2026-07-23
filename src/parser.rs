@@ -606,6 +606,12 @@ impl Parser {
                 let call = self.expr()?;
                 Ok(Stmt::Go { call, line })
             }
+            Tok::Defer => {
+                let line = self.line();
+                self.advance();
+                let call = self.expr()?;
+                Ok(Stmt::Defer { call, line })
+            }
             Tok::Select => self.select_stmt(),
             Tok::LBrace => Ok(Stmt::Block(self.block()?)),
             _ => self.simple_stmt(),

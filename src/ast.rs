@@ -120,6 +120,9 @@ pub enum Stmt {
     },
     /// `go f(args)` — spawn a goroutine running the named function.
     Go { call: Expr, line: u32 },
+    /// `defer f(args)` — evaluate `f` and `args` now, call at function return in
+    /// LIFO order.
+    Defer { call: Expr, line: u32 },
     /// `ch <- val` — send `val` on channel `ch`.
     Send { chan: Expr, val: Expr, line: u32 },
     /// `select { case …: …; default: … }` over channel operations.

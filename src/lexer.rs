@@ -52,6 +52,7 @@ pub enum Tok {
     Go,
     Chan,
     Select,
+    Defer,
     // punctuation
     LBrace,
     RBrace,
@@ -426,6 +427,7 @@ fn keyword_or_ident(word: &str) -> Tok {
         "go" => Tok::Go,
         "chan" => Tok::Chan,
         "select" => Tok::Select,
+        "defer" => Tok::Defer,
         _ => Tok::Ident(word.to_string()),
     }
 }
