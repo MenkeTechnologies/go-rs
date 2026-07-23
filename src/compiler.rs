@@ -470,6 +470,30 @@ impl Compiler {
                 self.fv_expr(chan, bound, caps);
                 self.fv_expr(val, bound, caps);
             }
+            Stmt::Select { cases, default, .. } => {
+                for c in cases {
+                    match &c.comm {
+                        SelectComm::Recv { bind, chan } => {
+                            self.fv_expr(chan, bound, caps);
+                            if let Some(v) = bind {
+                                bound.insert(v.clone());
+                            }
+                        }
+                        SelectComm::Send { chan, val } => {
+                            self.fv_expr(chan, bound, caps);
+                            self.fv_expr(val, bound, caps);
+                        }
+                    }
+                    for s in &c.body {
+                        self.fv_stmt(s, bound, caps);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.fv_stmt(s, bound, caps);
+                    }
+                }
+            }
             Stmt::Block(b) => {
                 for s in b {
                     self.fv_stmt(s, bound, caps);
@@ -760,6 +784,11 @@ impl Compiler {
                 self.expr(val)?;
                 self.b.emit(Op::ChanSend, *line);
             }
+            Stmt::Select {
+                cases,
+                default,
+                line,
+            } => self.compile_select(cases, default, *line)?,
             Stmt::Break(line) => {
                 let j = self.b.emit(Op::Jump(0), *line);
                 self.loops
@@ -820,6 +849,73 @@ impl Compiler {
             self.b.patch_jump(j, post_pos);
         }
         for j in scope.breaks {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Lower a `select`: push each case's channel descriptor `(ch, is_recv,
+    /// send_val)`, run `Op::Select`, then a jump table over the chosen case index
+    /// the scheduler pushed (with the received value for a `case v := <-ch`).
+    fn compile_select(
+        &mut self,
+        cases: &[SelectClause],
+        default: &Option<Vec<Stmt>>,
+        line: u32,
+    ) -> Result<(), String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let si = format!("$si{n}");
+        let sv = format!("$sv{n}");
+
+        for c in cases {
+            match &c.comm {
+                SelectComm::Recv { chan, .. } => {
+                    self.expr(chan)?;
+                    self.b.emit(Op::LoadInt(1), line); // is_recv = 1
+                    self.b.emit(Op::LoadInt(0), line); // (no send value)
+                }
+                SelectComm::Send { chan, val } => {
+                    self.expr(chan)?;
+                    self.b.emit(Op::LoadInt(0), line); // is_recv = 0
+                    self.expr(val)?;
+                }
+            }
+        }
+        let has_default = if default.is_some() { 1 } else { 0 };
+        self.b
+            .emit(Op::Select(cases.len() as u8, has_default), line);
+        // Stack: [recv_value, case_index] — index on top.
+        self.emit_set(&si, line);
+        self.emit_set(&sv, line);
+        self.types.insert(si.clone(), NumType::Int);
+
+        let mut end_jumps = Vec::new();
+        for (i, c) in cases.iter().enumerate() {
+            self.emit_get(&si, line);
+            self.b.emit(Op::LoadInt(i as i64), line);
+            self.b.emit(Op::NumEq, line);
+            let jf = self.b.emit(Op::JumpIfFalse(0), line);
+            if let SelectComm::Recv { bind: Some(v), .. } = &c.comm {
+                self.emit_get(&sv, line);
+                self.emit_set(v, line);
+                self.types.insert(v.clone(), NumType::Unknown);
+            }
+            for s in &c.body {
+                self.stmt(s)?;
+            }
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        // The `default` case runs when no real case index matched.
+        if let Some(dbody) = default {
+            for s in dbody {
+                self.stmt(s)?;
+            }
+        }
+        let end = self.b.current_pos();
+        for j in end_jumps {
             self.b.patch_jump(j, end);
         }
         Ok(())
@@ -1593,6 +1689,7 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::ForRange { line, .. }
         | Stmt::Go { line, .. }
         | Stmt::Send { line, .. }
+        | Stmt::Select { line, .. }
         | Stmt::Break(line)
         | Stmt::Continue(line) => *line,
         Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
@@ -1614,6 +1711,10 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         }
         Stmt::Go { call, .. } => expr_has_ffi(call),
         Stmt::Send { chan, val, .. } => expr_has_ffi(chan) || expr_has_ffi(val),
+        Stmt::Select { cases, default, .. } => {
+            cases.iter().any(|c| body_has_ffi(&c.body))
+                || default.as_ref().is_some_and(|d| body_has_ffi(d))
+        }
         Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) => false,
     })
 }

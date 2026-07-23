@@ -456,6 +456,7 @@ impl Parser {
                 let call = self.expr()?;
                 Ok(Stmt::Go { call, line })
             }
+            Tok::Select => self.select_stmt(),
             Tok::LBrace => Ok(Stmt::Block(self.block()?)),
             _ => self.simple_stmt(),
         }
@@ -636,6 +637,94 @@ impl Parser {
     fn range_name(&mut self) -> Result<Option<String>, String> {
         let n = self.ident()?;
         Ok(if n == "_" { None } else { Some(n) })
+    }
+
+    /// Parse a `select { case …: …; default: … }` statement.
+    fn select_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.line();
+        self.expect(&Tok::Select)?;
+        self.expect(&Tok::LBrace)?;
+        self.skip_semis();
+        let mut cases = Vec::new();
+        let mut default = None;
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            let ident_kw = matches!(self.peek(), Tok::Ident(s) if s == "default");
+            if ident_kw {
+                self.advance();
+                self.expect(&Tok::Colon)?;
+                default = Some(self.case_body()?);
+                continue;
+            }
+            // `case COMM:`
+            if !matches!(self.peek(), Tok::Ident(s) if s == "case") {
+                return Err(format!(
+                    "go-rs: expected `case` or `default` in select on line {}",
+                    self.line()
+                ));
+            }
+            self.advance(); // `case`
+            let comm = self.select_comm()?;
+            self.expect(&Tok::Colon)?;
+            let body = self.case_body()?;
+            cases.push(SelectClause { comm, body });
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Stmt::Select {
+            cases,
+            default,
+            line,
+        })
+    }
+
+    /// Parse the communication clause of a select case (before the `:`).
+    fn select_comm(&mut self) -> Result<SelectComm, String> {
+        // `<-ch` (receive, no bind).
+        if matches!(self.peek(), Tok::Arrow) {
+            self.advance();
+            return Ok(SelectComm::Recv {
+                bind: None,
+                chan: self.expr()?,
+            });
+        }
+        let first = self.expr()?;
+        match self.peek() {
+            // `v := <-ch` / `v = <-ch` (receive with bind).
+            Tok::Define | Tok::Assign => {
+                self.advance();
+                self.expect(&Tok::Arrow)?;
+                let chan = self.expr()?;
+                let bind = match first {
+                    Expr::Ident(n) if n != "_" => Some(n),
+                    _ => None,
+                };
+                Ok(SelectComm::Recv { bind, chan })
+            }
+            // `ch <- val` (send).
+            Tok::Arrow => {
+                self.advance();
+                Ok(SelectComm::Send {
+                    chan: first,
+                    val: self.expr()?,
+                })
+            }
+            other => Err(format!(
+                "go-rs: expected a channel operation in select case, found `{other}`"
+            )),
+        }
+    }
+
+    /// Parse the statements of a select case/default body (up to the next
+    /// `case`/`default`/`}`).
+    fn case_body(&mut self) -> Result<Vec<Stmt>, String> {
+        self.skip_semis();
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof)
+            && !matches!(self.peek(), Tok::Ident(s) if s == "case" || s == "default")
+        {
+            body.push(self.stmt()?);
+            self.skip_semis();
+        }
+        Ok(body)
     }
 
     /// Parse a simple statement: short decl, assignment, inc/dec, or a bare

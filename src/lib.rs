@@ -85,7 +85,12 @@ fn uses_scheduler(chunk: &fusevm::Chunk) -> bool {
     chunk.ops.iter().any(|op| {
         matches!(
             op,
-            Op::Go(..) | Op::ChanMake | Op::ChanSend | Op::ChanRecv | Op::ChanClose
+            Op::Go(..)
+                | Op::ChanMake
+                | Op::ChanSend
+                | Op::ChanRecv
+                | Op::ChanClose
+                | Op::Select(..)
         )
     })
 }

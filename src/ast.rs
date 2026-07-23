@@ -122,12 +122,34 @@ pub enum Stmt {
     Go { call: Expr, line: u32 },
     /// `ch <- val` — send `val` on channel `ch`.
     Send { chan: Expr, val: Expr, line: u32 },
+    /// `select { case …: …; default: … }` over channel operations.
+    Select {
+        cases: Vec<SelectClause>,
+        default: Option<Vec<Stmt>>,
+        line: u32,
+    },
     /// `break`.
     Break(u32),
     /// `continue`.
     Continue(u32),
     /// A `{ ... }` block.
     Block(Vec<Stmt>),
+}
+
+/// One `case` clause of a `select`.
+#[derive(Debug, Clone)]
+pub struct SelectClause {
+    pub comm: SelectComm,
+    pub body: Vec<Stmt>,
+}
+
+/// The communication operation of a `select` case.
+#[derive(Debug, Clone)]
+pub enum SelectComm {
+    /// `case [v :=] <-ch:` — receive, optionally binding the value.
+    Recv { bind: Option<String>, chan: Expr },
+    /// `case ch <- val:` — send.
+    Send { chan: Expr, val: Expr },
 }
 
 /// Compound-assignment operators.

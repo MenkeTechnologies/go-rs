@@ -351,6 +351,63 @@ fn slice_index_out_of_range_errors() {
 }
 
 #[test]
+fn select_picks_ready_channel() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	ch1 := make(chan int, 1)
+	ch2 := make(chan int, 1)
+	ch2 <- 7
+	select {
+	case v := <-ch1:
+		fmt.Println(\"ch1\", v)
+	case v := <-ch2:
+		fmt.Println(\"ch2\", v)
+	}
+}
+";
+    assert_stdout(src, "ch2 7\n");
+}
+
+#[test]
+fn select_default_when_nothing_ready() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	ch := make(chan int)
+	select {
+	case v := <-ch:
+		fmt.Println(v)
+	default:
+		fmt.Println(\"none\")
+	}
+}
+";
+    assert_stdout(src, "none\n");
+}
+
+#[test]
+fn select_blocks_until_a_goroutine_sends() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	done := make(chan int)
+	go func() {
+		done <- 99
+	}()
+	select {
+	case v := <-done:
+		fmt.Println(v)
+	}
+}
+";
+    assert_stdout(src, "99\n");
+}
+
+#[test]
 fn closure_captures_local_by_value() {
     let src = "\
 package main
