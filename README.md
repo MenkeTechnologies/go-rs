@@ -168,10 +168,24 @@ cargo run --bin parity-fuzz -- --seed 1234 --once   # replay one divergence
 
 The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
 slices/maps, structs/methods, interfaces, closures, goroutines/channels, and
-`select`. The fuzzer generates arithmetic / float / boolean / string expressions
-and diffs both interpreters. go-rs runs single-file `package main` against its
-built-in stdlib subset — it has no module system, so `go get` / third-party
-imports are out of scope.
+`select`. The fuzzer generates arithmetic / float / boolean / string / slice /
+map / control-flow / stdlib blocks and diffs both interpreters. go-rs runs
+single-file `package main` against its built-in stdlib subset — it has no module
+system, so `go get` / third-party imports are out of scope.
+
+**Known, characterized divergences** (the harness surfaced these; they are
+documented rather than hidden):
+
+- **Constant folding of float arithmetic.** Go evaluates a *constant* float
+  expression (`1.950 * 10.187`) with arbitrary precision and rounds once; go-rs
+  evaluates it as runtime `f64` (double-rounded, like Rust), so the last digit of
+  a `%f` can differ. go-rs matches Go's *variable/runtime* float semantics
+  (`a := 1.950; a * b`) exactly — the fuzzer routes float operands through
+  variables to test that.
+- **Closures capture by value, not by reference** — a closure that *mutates* a
+  captured variable does not propagate the change.
+- **No multi-value returns** — `v, err := f()` binds `v` and pads the rest with
+  nil (the common `(v, err)` idiom works; true 2-value returns do not).
 
 ## License
 
