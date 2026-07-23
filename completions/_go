@@ -10,7 +10,7 @@ _go() {
     '--disasm[print the lowered fusevm bytecode and exit]' \
     '--lsp[speak the Language Server Protocol over stdio]' \
     '--dap[speak the Debug Adapter Protocol over stdio]' \
-    '1: :(run build vet env doc version help)' \
+    '1: :(run build vet env doc install-std version help)' \
     '*:go file:_files -g "*.go"'
 }
 

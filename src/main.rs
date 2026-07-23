@@ -37,6 +37,16 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e),
         },
+        Command::InstallStd => match gors::pkg::install_stdlib() {
+            Ok(n) => {
+                let home = gors::pkg::gors_home()
+                    .map(|h| h.display().to_string())
+                    .unwrap_or_else(|| "~/.go-rs".into());
+                println!("installed {n} package(s) into {home}/src");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Command::Lsp => match gors::lsp::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e),

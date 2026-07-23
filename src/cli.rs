@@ -22,6 +22,8 @@ pub enum Command {
     /// `go doc [name]` — print reference docs for a keyword/type/builtin, or
     /// the full index when no name is given.
     Doc,
+    /// `go install-std` — install the vendored standard library into `~/.go-rs`.
+    InstallStd,
     Version,
     Help,
     Lsp,
@@ -77,6 +79,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
                 cli.file = args.get(1).cloned();
                 return Ok(cli);
             }
+            "install-std" => return done(Command::InstallStd),
             "version" | "--version" | "-version" => return done(Command::Version),
             "help" | "--help" | "-h" | "-help" | "-?" => {
                 cli.cmd = Command::Help;
@@ -146,6 +149,7 @@ commands:
   vet   <file.go>          parse and compile-check; report errors, do not run
   env                      print the Go environment
   doc   [name]             print reference docs for a name (or the full index)
+  install-std              install the vendored standard library into ~/.go-rs
   version                  print the version banner
   help  [command]          print help (optionally for one command)
 

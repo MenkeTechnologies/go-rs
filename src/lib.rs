@@ -18,7 +18,9 @@ pub mod host;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod pkg;
 pub mod rust_ffi;
+pub mod stdlib_vendor;
 
 pub use banner::version_banner;
 use fusevm::{Op, Scheduler, VMResult, Value, VM};
@@ -32,10 +34,13 @@ pub fn parse(src: &str) -> Result<ast::Program, String> {
     parser::parse(&src)
 }
 
-/// Parse and lower Go `src` to a runnable fusevm chunk.
+/// Parse and lower Go `src` to a runnable fusevm chunk. Imported (non-native)
+/// packages are resolved to source, linked in, and compiled together (see
+/// [`pkg`]) — the standard library is executed, not reimplemented.
 pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
     let prog = parse(src)?;
-    compiler::compile(&prog)
+    let linked = pkg::link(prog)?;
+    compiler::compile(&linked)
 }
 
 /// Configure a fresh VM for running go-rs bytecode: install the builtins and the

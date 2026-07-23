@@ -67,7 +67,10 @@ go --lsp / --dap      # Language Server / Debug Adapter Protocol over stdio
 `go build` emits a native binary via fusevm's AOT object emitter linked against
 the go-rs runtime — it runs with no `go` toolchain and no go-rs. (Concurrency
 programs need the scheduler, so goroutine/channel/`select` code uses `go run`.)
-There is no module system, so `go get` / `go mod` are out of scope.
+go-rs is an **executor swap**: it runs Go on fusevm instead of the `go`
+toolchain's runtime. The standard library is implemented **natively in Rust**
+(host builtins) and grows package by package; importing a package go-rs hasn't
+implemented yet is a clear error rather than a silent miss.
 
 ### Example
 
@@ -108,7 +111,7 @@ More programs live in [`examples/`](examples).
 
 ## Language surface
 
-A single-file `package main` that runs real Go programs:
+Real Go, executed on fusevm:
 
 | Area           | Supported                                                              |
 | -------------- | --------------------------------------------------------------------- |
@@ -199,9 +202,15 @@ cargo run --bin parity-fuzz -- --seed 1234 --once   # replay one divergence
 The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
 slices/maps, structs/methods, interfaces, closures, generics, goroutines/channels,
 and `select`. The fuzzer generates arithmetic / float / boolean / string / slice /
-map / control-flow / stdlib blocks and diffs both interpreters. go-rs runs
-single-file `package main` against its built-in stdlib subset — it has no module
-system, so `go get` / third-party imports are out of scope.
+map / control-flow / stdlib blocks and diffs both interpreters.
+
+**Packages are run from source.** An `import` of a non-native package is resolved
+to its Go source, parsed, name-qualified (`errors.New` → the linked `errors.New`),
+and compiled into the same unit as `main` (see [`src/pkg.rs`]) — the standard
+library is *executed*, not reimplemented. A small native layer stays as host
+builtins for the irreducible runtime/I-O boundary (`fmt` writes stdout, `os`
+touches the OS). The vendored stdlib ([`goroot/`]) grows as go-rs gains the
+language features each package needs; a not-yet-supported import is a clear error.
 
 Constant float expressions are **folded exactly** — go-rs evaluates a
 compile-time-constant float expression (`1.950 * 10.187`, `0.1 + 0.2`) with exact
@@ -211,11 +220,13 @@ terms leave the `f64`-exact range falls back to runtime `f64`).
 
 **Known gaps** (documented rather than hidden):
 
-- **No module system** — a single-file `package main` only; `go get` / `go mod` /
-  third-party imports are out of scope, and the standard library is the curated
-  subset listed above.
-- **`switch` has no `fallthrough`, type switch, or `select`-style comm** — a plain
-  value/expression switch only.
+- **Standard-library coverage is incremental.** Packages run from their real Go
+  source, but a package only works once go-rs supports every language feature it
+  (transitively) uses — packages needing `unsafe`, assembly, `cgo`, `reflect`, or
+  runtime internals don't load yet. `fmt`/`strings`/`strconv`/`math`/`sort`/`os`
+  are provided by the native runtime layer.
+- **No fixed-width integer overflow wrapping** — all integers are 64-bit, so code
+  relying on `uint8`/`uint16`/`uint32` wraparound (some hashes) diverges.
 
 ## License
 

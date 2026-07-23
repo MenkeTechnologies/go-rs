@@ -1464,3 +1464,23 @@ func main() {
 ";
     assert_stdout(src, "int 5 str hi point 9 ?\ngo true\n0 false\n8\n");
 }
+
+#[test]
+fn imports_errors_package_from_source() {
+    // The `errors` package is not a native builtin — it is loaded from its real
+    // Go source (vendored), name-qualified, and linked into the program.
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"errors\"
+)
+func main() {
+	err := errors.New(\"boom\")
+	fmt.Println(err.Error())
+	var e error = err
+	fmt.Println(e.Error())
+}
+";
+    assert_stdout(src, "boom\nboom\n");
+}
