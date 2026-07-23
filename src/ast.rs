@@ -88,8 +88,8 @@ pub enum Stmt {
     IncDec { target: Expr, inc: bool, line: u32 },
     /// A bare expression evaluated for effect (e.g. a call).
     ExprStmt(Expr),
-    /// `return [expr]` — slice 1 supports a single result value.
-    Return(Option<Expr>, u32),
+    /// `return [expr [, expr …]]` — zero, one, or multiple result values.
+    Return(Vec<Expr>, u32),
     /// `if [init;] cond { then } [else els]`.
     If {
         init: Option<Box<Stmt>>,

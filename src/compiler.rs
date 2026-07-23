@@ -51,6 +51,8 @@ struct FuncSig {
     result: NumType,
     /// The Go type name of the first result (for struct/method type inference).
     result_ty: String,
+    /// Number of declared result values (for multi-value-return destructuring).
+    nresults: usize,
 }
 
 /// A collected function literal, compiled to a `$lambda_N` subroutine.
@@ -180,6 +182,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                             .map(|t| numtype_of_ty(t))
                             .unwrap_or(NumType::Unknown),
                         result_ty: f.results.first().cloned().unwrap_or_default(),
+                        nresults: f.results.len(),
                     },
                 );
             }
@@ -407,8 +410,8 @@ impl Compiler {
             }
             Stmt::IncDec { target, .. } => self.fv_expr(target, bound, caps),
             Stmt::ExprStmt(e) => self.fv_expr(e, bound, caps),
-            Stmt::Return(v, _) => {
-                if let Some(e) = v {
+            Stmt::Return(vs, _) => {
+                for e in vs {
                     self.fv_expr(e, bound, caps);
                 }
             }
@@ -643,11 +646,30 @@ impl Compiler {
                 values,
                 line,
             } => {
-                // `a, b := f()` where `f` returns a single value in go-rs (e.g.
-                // `n, err := strconv.Atoi(s)`): bind the first name to the call
-                // result and the rest to nil. Go's multi-value returns are a
-                // future wave; this covers the common comma-ok / (v, err) idiom.
-                if names.len() > values.len()
+                // `a, b := f()` where a user `func` returns exactly len(names)
+                // values: destructure the returned tuple (a slice heap value).
+                if names.len() >= 2
+                    && values.len() == 1
+                    && self.call_result_count(&values[0]) == Some(names.len())
+                {
+                    let n = self.temp_counter;
+                    self.temp_counter += 1;
+                    let tup = format!("$tup{n}");
+                    self.expr(&values[0])?;
+                    self.emit_set(&tup, *line);
+                    for (i, name) in names.iter().enumerate() {
+                        self.emit_get(&tup, *line);
+                        self.b.emit(Op::LoadInt(i as i64), *line);
+                        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
+                        self.types.insert(name.clone(), NumType::Unknown);
+                        self.decl_types.insert(name.clone(), String::new());
+                        self.emit_set(name, *line);
+                    }
+                }
+                // `n, _ := strconv.Atoi(s)` — a single-value call (in go-rs) with
+                // extra names: bind the first, pad the rest with nil (the common
+                // comma-ok / (v, err) idiom over a builtin-backed call).
+                else if names.len() > values.len()
                     && values.len() == 1
                     && matches!(&values[0], Expr::Call { .. })
                 {
@@ -697,18 +719,28 @@ impl Compiler {
                 // statement discards it.
                 self.b.emit(Op::Pop, 0);
             }
-            Stmt::Return(val, line) => match self.scope {
+            Stmt::Return(vals, line) => match self.scope {
                 Some(_) => {
-                    match val {
-                        Some(e) => self.emit_value(e)?,
-                        None => {
+                    match vals.len() {
+                        0 => {
                             self.b.emit(Op::LoadUndef, *line);
+                        }
+                        1 => self.emit_value(&vals[0])?,
+                        // Multiple results are returned as one tuple (a slice
+                        // heap value), destructured at the call site.
+                        n => {
+                            for e in vals {
+                                self.expr(e)?;
+                            }
+                            self.b
+                                .emit(Op::CallBuiltin(host::GSLICE_LIT, n as u8), *line);
                         }
                     }
                     self.b.emit(Op::ReturnValue, *line);
                 }
                 None => {
-                    if let Some(e) = val {
+                    // `return` in `main` — evaluate for effect, then jump to end.
+                    for e in vals {
                         self.expr(e)?;
                         self.b.emit(Op::Pop, *line);
                     }
@@ -1361,6 +1393,17 @@ impl Compiler {
         Ok(())
     }
 
+    /// The number of result values a call expression yields, if it targets a
+    /// known top-level function (for multi-value-return destructuring).
+    fn call_result_count(&self, e: &Expr) -> Option<usize> {
+        if let Expr::Call { func, .. } = e {
+            if let Expr::Ident(name) = func.as_ref() {
+                return self.funcs.get(name).map(|s| s.nresults);
+            }
+        }
+        None
+    }
+
     /// The static Go type name of an expression, or `""` when unknown. Drives
     /// method dispatch and struct value-copy.
     fn type_name(&self, e: &Expr) -> String {
@@ -1725,7 +1768,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         Stmt::Short { values, .. } => values.iter().any(expr_has_ffi),
         Stmt::Assign { value, .. } => expr_has_ffi(value),
         Stmt::ExprStmt(e) => expr_has_ffi(e),
-        Stmt::Return(v, _) => v.as_ref().is_some_and(expr_has_ffi),
+        Stmt::Return(vs, _) => vs.iter().any(expr_has_ffi),
         Stmt::If { then, els, .. } => body_has_ffi(then) || body_has_ffi(els),
         Stmt::For { body, .. } | Stmt::ForRange { body, .. } | Stmt::Block(body) => {
             body_has_ffi(body)

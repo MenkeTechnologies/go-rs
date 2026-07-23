@@ -668,9 +668,34 @@ fn cli_build_produces_a_runnable_native_binary() {
     src.write_all(b"package main\nimport \"fmt\"\nfunc main() { fmt.Println(6 * 7) }\n")
         .unwrap();
     let out = std::env::temp_dir().join(format!("gors_test_build_{}", std::process::id()));
-    let (_o, ok) = run_args(&["build", "-o", out.to_str().unwrap(), src.path().to_str().unwrap()]);
+    let (_o, ok) = run_args(&[
+        "build",
+        "-o",
+        out.to_str().unwrap(),
+        src.path().to_str().unwrap(),
+    ]);
     assert!(ok, "go build should succeed");
     let run = Command::new(&out).output().expect("run native binary");
     assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn multi_value_return_and_destructure() {
+    let src = "\
+package main
+import \"fmt\"
+func divmod(a int, b int) (int, int) {
+	return a / b, a % b
+}
+func swap(a string, b string) (string, string) {
+	return b, a
+}
+func main() {
+	q, r := divmod(17, 5)
+	x, y := swap(\"first\", \"second\")
+	fmt.Println(q, r, x, y)
+}
+";
+    assert_stdout(src, "3 2 second first\n");
 }

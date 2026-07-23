@@ -431,12 +431,14 @@ impl Parser {
             Tok::Return => {
                 let line = self.line();
                 self.advance();
-                let val = if matches!(self.peek(), Tok::Semi | Tok::RBrace) {
-                    None
-                } else {
-                    Some(self.expr()?)
-                };
-                Ok(Stmt::Return(val, line))
+                let mut vals = Vec::new();
+                if !matches!(self.peek(), Tok::Semi | Tok::RBrace) {
+                    vals.push(self.expr()?);
+                    while self.eat(&Tok::Comma) {
+                        vals.push(self.expr()?);
+                    }
+                }
+                Ok(Stmt::Return(vals, line))
             }
             Tok::Break => {
                 let line = self.line();
