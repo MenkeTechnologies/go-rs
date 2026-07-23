@@ -2533,13 +2533,15 @@ impl Compiler {
             self.emit_set(k, 0);
             self.types.insert(k.clone(), NumType::Unknown);
         }
-        // val := $it[key]  — index by the current key value
+        // val := GRANGE_VAL($it, key)  — the loop value for the current key. This
+        // indexes a slice/map element but decodes the rune of a string (Go ranges
+        // strings by rune, so the value is a code point, not a byte).
         if let Some(v) = val {
             self.emit_get(&it, 0);
             self.emit_get(&keys, 0);
             self.emit_get(&i, 0);
             self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
-            self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            self.b.emit(Op::CallBuiltin(host::GRANGE_VAL, 2), 0);
             self.emit_set(v, 0);
             self.types.insert(v.clone(), NumType::Unknown);
         }

@@ -1662,3 +1662,24 @@ func main() {
 ";
     assert_stdout(src, "[2 3] 2\n[1 2]\n");
 }
+
+#[test]
+fn range_over_string_yields_runes() {
+    // Go ranges a string by rune: the index is each rune's start byte offset and
+    // the value is the code point, so a multibyte string iterates once per rune.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	for i, c := range \"h\\u00e9llo\" {
+		fmt.Println(i, c)
+	}
+	n := 0
+	for range \"h\\u00e9llo\" {
+		n++
+	}
+	fmt.Println(\"count\", n)
+}
+";
+    assert_stdout(src, "0 104\n1 233\n3 108\n4 108\n5 111\ncount 5\n");
+}

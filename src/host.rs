@@ -116,6 +116,10 @@ pub const GTYPETAG: u16 = 901;
 /// `[value, "tag"]` → a single-result type assertion `x.(T)`: `value` if its type
 /// matches, else a recoverable panic (`interface conversion`).
 pub const GASSERT: u16 = 902;
+/// `[iter, key]` → the loop value for `for key := range iter`. A string decodes
+/// the rune (code point) starting at byte offset `key` (Go ranges strings by
+/// rune); a slice/map indexes normally.
+pub const GRANGE_VAL: u16 = 903;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -169,6 +173,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GCONV, b_conv);
     vm.register_builtin(GTYPETAG, b_typetag);
     vm.register_builtin(GASSERT, b_assert);
+    vm.register_builtin(GRANGE_VAL, b_range_val);
     stdlib::install(vm);
 }
 
@@ -606,7 +611,12 @@ fn b_typeof(vm: &mut VM, argc: u8) -> Value {
 fn b_range_keys(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let keys: Vec<Value> = match args.first() {
-        Some(Value::Str(s)) => (0..s.len() as i64).map(Value::Int).collect(),
+        // Go ranges a string by rune: the keys are the byte offsets where each
+        // rune starts (its index in `range`), not every byte offset.
+        Some(Value::Str(s)) => s
+            .char_indices()
+            .map(|(i, _)| Value::Int(i as i64))
+            .collect(),
         Some(Value::Obj(id)) => {
             if let Some((_, _, len)) = slice_backing(*id) {
                 (0..len as i64).map(Value::Int).collect()
@@ -620,6 +630,30 @@ fn b_range_keys(vm: &mut VM, argc: u8) -> Value {
         _ => Vec::new(),
     };
     Value::Obj(heap_alloc(HostObj::Slice(keys)))
+}
+
+/// `[iter, key]` → the loop value for `for key := range iter`. A string yields
+/// the rune (code point) starting at byte offset `key`; anything else indexes
+/// by the key (slice element or map value).
+fn b_range_val(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let iter = args.first().cloned().unwrap_or(Value::Undef);
+    let key = args.get(1).cloned().unwrap_or(Value::Undef);
+    match &iter {
+        Value::Str(s) => {
+            let off = key.to_int().max(0) as usize;
+            match s.get(off..).and_then(|rest| rest.chars().next()) {
+                Some(c) => Value::Int(c as i64),
+                None => Value::Int(0),
+            }
+        }
+        _ => {
+            // Slice/map: index normally.
+            vm.push(iter);
+            vm.push(key);
+            b_index_get(vm, 2)
+        }
+    }
 }
 
 // ── host-owned heap for Go composite types ─────────────────────────────────
