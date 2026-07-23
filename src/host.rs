@@ -1215,8 +1215,14 @@ pub mod stdlib {
         let old = args.get(1).map(go_str).unwrap_or_default();
         let new = args.get(2).map(go_str).unwrap_or_default();
         let n = args.get(3).map(|v| v.to_int()).unwrap_or(-1);
-        if old.is_empty() { return Value::str(s); }
-        Value::str(if n < 0 { s.replace(&old, &new) } else { s.replacen(&old, &new, n as usize) })
+        if old.is_empty() {
+            return Value::str(s);
+        }
+        Value::str(if n < 0 {
+            s.replace(&old, &new)
+        } else {
+            s.replacen(&old, &new, n as usize)
+        })
     }
 
     fn b_replace_all(vm: &mut VM, argc: u8) -> Value {

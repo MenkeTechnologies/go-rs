@@ -152,6 +152,27 @@ cargo test
 CI enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 and `cargo doc` with `-D warnings`.
 
+## Differential parity vs the reference `go`
+
+Two dev harnesses check go-rs output **byte-for-byte against the real `go`
+toolchain** (needs `go` on `PATH`; not run in CI):
+
+```sh
+# 1. curated corpus of idiomatic programs
+bash parity-scripts/run.sh          # BYTE PARITY: N / N match
+
+# 2. grammar-driven fuzzer — thousands of deterministic-output snippets
+cargo run --bin parity-fuzz -- --count 2000
+cargo run --bin parity-fuzz -- --seed 1234 --once   # replay one divergence
+```
+
+The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
+slices/maps, structs/methods, interfaces, closures, goroutines/channels, and
+`select`. The fuzzer generates arithmetic / float / boolean / string expressions
+and diffs both interpreters. go-rs runs single-file `package main` against its
+built-in stdlib subset — it has no module system, so `go get` / third-party
+imports are out of scope.
+
 ## License
 
 MIT.

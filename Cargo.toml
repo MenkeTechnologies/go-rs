@@ -22,6 +22,7 @@ exclude = [
     "/tests/",
     "/examples/",
     "/docs/",
+    "/parity-scripts/",
 ]
 
 # go-rs is a standalone crate, not a workspace member. An explicit empty
@@ -41,6 +42,12 @@ path = "src/main.rs"
 [[bin]]
 name = "gen-docs"
 path = "src/bin/gen_docs.rs"
+
+# Differential parity fuzzer: generates deterministic-output Go snippets and
+# diffs the built `go` binary against the reference `go` toolchain. Dev tool.
+[[bin]]
+name = "parity-fuzz"
+path = "src/bin/parity_fuzz.rs"
 
 [dependencies]
 # Go executes on fusevm. go-rs is a pure frontend: it lexes/parses Go and lowers

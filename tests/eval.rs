@@ -565,3 +565,54 @@ func main() {
 ";
     assert_stdout(src, "aba\n");
 }
+
+// ── regressions found by the parity harness ─────────────────────────────────
+
+#[test]
+fn printf_width_and_precision() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	fmt.Printf(\"%.4f|%8.2f|%-8.2f|%05d|%x|%-6s|end\\n\", 3.14159, 1.5, 1.5, 42, 255, \"hi\")
+}
+";
+    assert_stdout(src, "3.1416|    1.50|1.50    |00042|ff|hi    |end\n");
+}
+
+#[test]
+fn elided_struct_literals_in_slice() {
+    let src = "\
+package main
+import \"fmt\"
+type P struct {
+	x int
+	y int
+}
+func main() {
+	ps := []P{{x: 1, y: 2}, {x: 3, y: 4}}
+	sum := 0
+	for _, p := range ps {
+		sum += p.x + p.y
+	}
+	fmt.Println(sum, ps[1])
+}
+";
+    assert_stdout(src, "10 {3 4}\n");
+}
+
+#[test]
+fn multi_value_assign_from_call() {
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"strconv\"
+)
+func main() {
+	n, _ := strconv.Atoi(\"42\")
+	fmt.Println(n + 8)
+}
+";
+    assert_stdout(src, "50\n");
+}
