@@ -1646,3 +1646,19 @@ func main() {
         "[10 20 30] 3 20\n[1 2 3 4] 4\n[100 0 300 0 0]\n[{1 2} {3 4} {0 0} {0 0}]\n[0 9 0 0]\n400\n",
     );
 }
+
+#[test]
+fn three_index_slice_expression() {
+    // A full slice expression s[low:high:max] — the capacity bound is accepted
+    // (and ignored, since go-rs sub-slices copy).
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	s := []int{1, 2, 3, 4, 5}
+	fmt.Println(s[1:3:4], len(s[1:3:4]))
+	fmt.Println(s[:2:5])
+}
+";
+    assert_stdout(src, "[2 3] 2\n[1 2]\n");
+}

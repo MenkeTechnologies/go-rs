@@ -1452,11 +1452,17 @@ impl Parser {
                         Some(self.expr()?)
                     };
                     if self.eat(&Tok::Colon) {
-                        let high = if matches!(self.peek(), Tok::RBracket) {
+                        let high = if matches!(self.peek(), Tok::RBracket | Tok::Colon) {
                             None
                         } else {
                             Some(self.expr()?)
                         };
+                        // A three-index (full) slice `s[low:high:max]` — the
+                        // capacity bound is parsed and ignored (go-rs sub-slices
+                        // copy, so capacity has no effect).
+                        if self.eat(&Tok::Colon) {
+                            let _ = self.expr()?;
+                        }
                         self.expect(&Tok::RBracket)?;
                         e = Expr::Slice {
                             recv: Box::new(e),
