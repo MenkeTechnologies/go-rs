@@ -8,6 +8,7 @@
 //! codegen live in fusevm, the same engine behind zshrs, strykelang, awkrs,
 //! vimlrs, elisprs, rubylang, javars, kotlinrs, and scalars.
 
+pub mod aot_native;
 pub mod ast;
 pub mod banner;
 pub mod cli;
@@ -119,4 +120,38 @@ pub fn run_file(path: &str) -> Result<Value, String> {
 /// (for `go --disasm`).
 pub fn disassemble(src: &str) -> Result<String, String> {
     Ok(compile(src)?.disassemble())
+}
+
+/// `go vet`: parse and compile `src`, returning `Ok(())` if it is well-formed
+/// (no lex/parse/compile error) without running it.
+pub fn vet(src: &str) -> Result<(), String> {
+    compile(src).map(|_| ())
+}
+
+/// `go env`: the Go environment as go-rs reports it. A curated, deterministic
+/// subset (no `go` toolchain paths — go-rs has no module system).
+pub fn env_report() -> String {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    [
+        ("GOOS", os.to_string()),
+        ("GOARCH", arch.to_string()),
+        ("GOVERSION", format!("go{}", banner::GO_COMPAT_VERSION)),
+        ("GOENGINE", format!("go-rs {}", env!("CARGO_PKG_VERSION"))),
+        ("CGO_ENABLED", "0".to_string()),
+        ("GOROOT", String::new()),
+        ("GOPATH", String::new()),
+    ]
+    .iter()
+    .map(|(k, v)| format!("{k}=\"{v}\""))
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n"
 }

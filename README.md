@@ -52,13 +52,21 @@ output
 ```sh
 go run file.go        # compile and run a Go program on fusevm
 go file.go            # shorthand for `go run`
+go build -o bin f.go  # AOT-compile to a standalone native executable (no go toolchain)
+go vet file.go        # parse + compile-check; report errors, do not run
+go env                # print the Go environment (GOOS/GOARCH/GOVERSION/…)
 go version            # print the version banner
+go help [command]     # usage (optionally for one command)
 go --dump-tokens f.go # lexer token stream (with inserted semicolons)
 go --dump-ast f.go    # parsed AST
 go --disasm f.go      # lowered fusevm bytecode
-go --lsp              # Language Server Protocol over stdio
-go --dap              # Debug Adapter Protocol over stdio
+go --lsp / --dap      # Language Server / Debug Adapter Protocol over stdio
 ```
+
+`go build` emits a native binary via fusevm's AOT object emitter linked against
+the go-rs runtime — it runs with no `go` toolchain and no go-rs. (Concurrency
+programs need the scheduler, so goroutine/channel/`select` code uses `go run`.)
+There is no module system, so `go get` / `go mod` are out of scope.
 
 ### Example
 

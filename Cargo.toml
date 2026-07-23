@@ -32,6 +32,9 @@ exclude = [
 [lib]
 name = "gors"
 path = "src/lib.rs"
+# `staticlib` produces libgors.a so `go build` can link an AOT-compiled object
+# (fusevm::aot) against the go-rs runtime into a standalone native executable.
+crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "go"

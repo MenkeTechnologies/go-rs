@@ -616,3 +616,61 @@ func main() {
 ";
     assert_stdout(src, "50\n");
 }
+
+// ── go CLI subcommands ───────────────────────────────────────────────────────
+
+/// Run the `go` binary with arbitrary args; return (stdout, success).
+fn run_args(args: &[&str]) -> (String, bool) {
+    let out = Command::new(env!("CARGO_BIN_EXE_go"))
+        .args(args)
+        .output()
+        .expect("spawn go binary");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+#[test]
+fn cli_env_reports_goos_goarch() {
+    let (out, ok) = run_args(&["env"]);
+    assert!(ok);
+    assert!(out.contains("GOARCH="), "env missing GOARCH: {out}");
+    assert!(out.contains("GOVERSION="), "env missing GOVERSION: {out}");
+}
+
+#[test]
+fn cli_vet_passes_clean_and_fails_broken() {
+    let mut good = tempfile::Builder::new().suffix(".go").tempfile().unwrap();
+    good.write_all(b"package main\nimport \"fmt\"\nfunc main() { fmt.Println(1) }\n")
+        .unwrap();
+    let (_o, ok) = run_args(&["vet", good.path().to_str().unwrap()]);
+    assert!(ok, "vet should pass a clean program");
+
+    let mut bad = tempfile::Builder::new().suffix(".go").tempfile().unwrap();
+    bad.write_all(b"package main\nfunc main() { undefinedThing() }\n")
+        .unwrap();
+    let (_o, ok) = run_args(&["vet", bad.path().to_str().unwrap()]);
+    assert!(!ok, "vet should fail an ill-formed program");
+}
+
+#[test]
+fn cli_build_produces_a_runnable_native_binary() {
+    // Needs a C compiler + libgors.a next to the binary; skip if either is absent.
+    let lib = std::path::Path::new(env!("CARGO_BIN_EXE_go"))
+        .parent()
+        .unwrap()
+        .join("libgors.a");
+    if !lib.exists() || Command::new("cc").arg("--version").output().is_err() {
+        return; // environment can't link; not a go-rs failure
+    }
+    let mut src = tempfile::Builder::new().suffix(".go").tempfile().unwrap();
+    src.write_all(b"package main\nimport \"fmt\"\nfunc main() { fmt.Println(6 * 7) }\n")
+        .unwrap();
+    let out = std::env::temp_dir().join(format!("gors_test_build_{}", std::process::id()));
+    let (_o, ok) = run_args(&["build", "-o", out.to_str().unwrap(), src.path().to_str().unwrap()]);
+    assert!(ok, "go build should succeed");
+    let run = Command::new(&out).output().expect("run native binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
+    let _ = std::fs::remove_file(&out);
+}

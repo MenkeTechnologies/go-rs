@@ -55,6 +55,18 @@ Compile and run a Go program on fusevm. A bare \fIFILE.go\fR (no
 .BR run )
 is accepted as shorthand.
 .TP
+.B build [\fB\-o\fR \fIout\fR] \fIFILE.go\fR
+AOT\-compile to a standalone native executable via fusevm's object emitter (no
+.B go
+toolchain needed). Concurrency programs need
+.BR run .
+.TP
+.B vet \fIFILE.go\fR
+Parse and compile\-check; report errors, do not run.
+.TP
+.B env
+Print the Go environment (GOOS/GOARCH/GOVERSION).
+.TP
 .B version
 Print the version banner and exit.
 .TP
