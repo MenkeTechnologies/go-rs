@@ -1507,3 +1507,24 @@ func main() {
 ";
     assert_stdout(src, "#ff8000\n#ff8000 #ff8000\nnope\nplain 42 true\n");
 }
+
+#[test]
+fn new_builtin_allocates_zero_pointer() {
+    // `new(T)` allocates a zero value of T and returns a pointer to it: a struct
+    // lowers to `&T{}` (zero-filled), a scalar to a pointer to its zero value.
+    let src = "\
+package main
+import \"fmt\"
+type P struct{ x, y int }
+func (p *P) Bump() { p.x++ }
+func main() {
+	p := new(P)
+	p.Bump()
+	p.Bump()
+	fmt.Println(p.x, p.y)
+	n := new(int)
+	fmt.Println(*n)
+}
+";
+    assert_stdout(src, "2 0\n0\n");
+}

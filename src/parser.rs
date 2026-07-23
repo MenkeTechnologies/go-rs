@@ -1476,6 +1476,10 @@ impl Parser {
                     "map" if matches!(self.peek(), Tok::LBracket) => self.map_literal(),
                     // `make([]T, n)` / `make(map[K]V)`.
                     "make" if matches!(self.peek(), Tok::LParen) => self.make_expr(),
+                    // `new(T)` — a pointer to a zero value of T. Faithful lowering:
+                    // `&T{}` for a struct (the compiler zero-fills missing fields),
+                    // and address-of the scalar zero value otherwise.
+                    "new" if matches!(self.peek(), Tok::LParen) => self.new_expr(),
                     // `T{ … }` struct composite literal (T declared as a struct).
                     _ if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&s) => {
                         self.struct_literal(s)
@@ -1580,6 +1584,27 @@ impl Parser {
         }
         self.expect(&Tok::RBrace)?;
         Ok(Expr::StructLit { type_name, fields })
+    }
+
+    /// `new(T)` — allocate a zero value of `T` and return a pointer to it. A
+    /// struct `T` lowers to `&T{}` (the compiler zero-fills missing fields); a
+    /// scalar `T` lowers to the address of its zero value.
+    fn new_expr(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let ty = self.type_name()?;
+        self.expect(&Tok::RParen)?;
+        let inner = if self.struct_names.contains(&ty) {
+            Expr::StructLit {
+                type_name: ty,
+                fields: Vec::new(),
+            }
+        } else {
+            zero_expr(&ty)
+        };
+        Ok(Expr::Unary {
+            op: crate::ast::UnOp::Addr,
+            rhs: Box::new(inner),
+        })
     }
 
     /// `make([]T, len)` (slice) or `make(map[K]V)` (map). The first argument is a
