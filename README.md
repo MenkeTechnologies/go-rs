@@ -210,9 +210,6 @@ terms leave the `f64`-exact range falls back to runtime `f64`).
 
 **Known gaps** (documented rather than hidden):
 
-- **Multi-value spread into a call** — passing a multi-value call directly as the
-  arguments of another call (`fmt.Println(f())` where `f` returns two values)
-  isn't expanded; destructure first (`a, b := f(); fmt.Println(a, b)`).
 - **Sub-slices copy rather than alias** — `s[lo:hi]` returns a new slice, so
   mutating an element of the sub-slice is not observed through the parent (Go
   shares the backing array). Truncation/extraction (`s = s[:n]`) works.

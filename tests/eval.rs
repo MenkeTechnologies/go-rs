@@ -1265,3 +1265,20 @@ fn unrecovered_runtime_panic_aborts() {
     assert!(!ok, "unrecovered runtime panic should exit non-zero");
     assert_eq!(stdout, "before\n");
 }
+
+#[test]
+fn multi_value_spread_into_call() {
+    // `f(g())` where g returns multiple values passes them as f's arguments.
+    let src = "\
+package main
+import \"fmt\"
+func pair() (int, string) { return 42, \"go\" }
+func triple() (int, int, int) { return 1, 2, 3 }
+func add(a, b, c int) int { return a + b + c }
+func main() {
+	fmt.Println(pair())
+	fmt.Println(add(triple()))
+}
+";
+    assert_stdout(src, "42 go\n6\n");
+}

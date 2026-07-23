@@ -2770,6 +2770,32 @@ impl Compiler {
     }
 
     fn call(&mut self, func: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
+        // Multi-value spread: `f(g())` where `g` returns N>1 values passes them
+        // as N arguments. Evaluate `g` into a tuple, extract each element into a
+        // temporary, and recurse with those temporaries as the arguments.
+        if args.len() == 1 {
+            if let Some(n) = self.call_result_count(&args[0]) {
+                if n >= 2 {
+                    let base = self.temp_counter;
+                    self.temp_counter += 1;
+                    let tup = format!("$sp{base}");
+                    self.expr(&args[0])?;
+                    self.emit_set(&tup, line);
+                    let mut spread = Vec::with_capacity(n);
+                    for i in 0..n {
+                        self.emit_get(&tup, line);
+                        self.b.emit(Op::LoadInt(i as i64), line);
+                        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+                        let t = format!("$spv{base}_{i}");
+                        self.types.insert(t.clone(), NumType::Unknown);
+                        self.decl_types.insert(t.clone(), String::new());
+                        self.emit_set(&t, line);
+                        spread.push(Expr::Ident(t));
+                    }
+                    return self.call(func, &spread, line);
+                }
+            }
+        }
         // An immediately-invoked function literal: `func(...){...}(args)`.
         if let Expr::FuncLit { params, body, .. } = func {
             let id = self.emit_funclit(params, body);
