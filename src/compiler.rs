@@ -203,9 +203,25 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
             Stmt::ExprStmt(e) => ex(e),
             Stmt::Return(vs, _) => vs.iter().any(ex),
             Stmt::If {
-                then, els, cond, ..
-            } => ex(cond) || body_uses_panic(then) || body_uses_panic(els),
-            Stmt::For { body, .. } | Stmt::ForRange { body, .. } => body_uses_panic(body),
+                init,
+                then,
+                els,
+                cond,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || ex(cond)
+                    || body_uses_panic(then)
+                    || body_uses_panic(els)
+            }
+            Stmt::For {
+                init, cond, body, ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || cond.as_ref().is_some_and(ex)
+                    || body_uses_panic(body)
+            }
+            Stmt::ForRange { body, .. } => body_uses_panic(body),
             Stmt::Block(b) => body_uses_panic(b),
             Stmt::Go { call, .. } | Stmt::Defer { call, .. } => ex(call),
             Stmt::Send { chan, val, .. } => ex(chan) || ex(val),
@@ -797,6 +813,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     };
 
     // ── main body (global scope) ──
+    // A program that uses panic/recover routes runtime faults (divide-by-zero,
+    // index-out-of-range, nil dereference) through the recoverable panic path.
+    if c.uses_panic {
+        c.b.emit(Op::CallBuiltin(host::GSET_PANIC_MODE, 0), 0);
+        c.b.emit(Op::Pop, 0);
+    }
     // main's globals captured by a closure are boxed (shared cells) too.
     c.boxed = boxed_vars(&[], &prog.main);
     c.fn_has_defer = body_has_defer(&prog.main);
@@ -1619,12 +1641,15 @@ impl Compiler {
                     (None, Some(e)) => self.type_name(e),
                     (None, None) => String::new(),
                 };
+                // `var s T` where T is a *value* struct type → its zero value is a
+                // struct with every field zeroed (so `s.f` and methods work). A
+                // pointer `var p *T` is nil, not a zero struct.
+                let is_pointer = ty.as_ref().is_some_and(|t| t.starts_with('*'));
                 match init {
                     Some(e) => self.emit_rhs(name, e)?,
-                    // `var s T` where T is a struct → its zero value is a struct
-                    // with every field zeroed, not nil (so `s.f` reads/writes and
-                    // methods work). Other types use the scalar/nil default.
-                    None if self.structs.contains(&decl_ty) => self.struct_lit(&decl_ty, &[])?,
+                    None if !is_pointer && self.structs.contains(&decl_ty) => {
+                        self.struct_lit(&decl_ty, &[])?
+                    }
                     None => self.emit_default(nt, *line),
                 }
                 self.types.insert(name.clone(), nt);
@@ -2195,6 +2220,7 @@ impl Compiler {
                 }
                 self.b.emit(Op::CallBuiltin(host::GINDEX_SET, 3), line);
                 self.b.emit(Op::Pop, line);
+                self.emit_panic_check(line); // index out of range is recoverable
             }
             Expr::Selector { recv, field } => {
                 self.expr(recv)?;
@@ -2210,6 +2236,7 @@ impl Compiler {
                 }
                 self.b.emit(Op::CallBuiltin(host::GFIELD_SET, 3), line);
                 self.b.emit(Op::Pop, line);
+                self.emit_panic_check(line); // nil dereference is recoverable
             }
             _ => {
                 return Err(format!(
@@ -2374,11 +2401,13 @@ impl Compiler {
                 let c = self.b.add_constant(Value::str(field.clone()));
                 self.b.emit(Op::LoadConst(c), 0);
                 self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), 0);
+                self.emit_panic_check(0); // nil dereference is recoverable
             }
             Expr::Index { recv, index } => {
                 self.expr(recv)?;
                 self.expr(index)?;
                 self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+                self.emit_panic_check(0); // index out of range is recoverable
             }
             Expr::Slice { recv, low, high } => {
                 // `recv[low:high]`: push recv, low (or -1), high (or -1).
@@ -2710,16 +2739,30 @@ impl Compiler {
     /// `TruncInt` for integer division (Go truncates `int / int` toward zero).
     fn emit_arith(&mut self, op: BinOp, l: NumType, r: NumType, line: u32) {
         match op {
-            BinOp::Add => self.b.emit(Op::Add, line),
-            BinOp::Sub => self.b.emit(Op::Sub, line),
-            BinOp::Mul => self.b.emit(Op::Mul, line),
-            BinOp::Mod => self.b.emit(Op::Mod, line),
+            BinOp::Add => {
+                self.b.emit(Op::Add, line);
+            }
+            BinOp::Sub => {
+                self.b.emit(Op::Sub, line);
+            }
+            BinOp::Mul => {
+                self.b.emit(Op::Mul, line);
+            }
+            // `%` is integer-only in Go; route through the builtin so a zero
+            // divisor panics (`runtime error: integer divide by zero`).
+            BinOp::Mod => {
+                self.b.emit(Op::CallBuiltin(host::GIMOD, 2), line);
+                self.emit_panic_check(line);
+            }
             BinOp::Div => {
-                self.b.emit(Op::Div, line);
                 if l == NumType::Int && r == NumType::Int {
-                    self.b.emit(Op::TruncInt, line)
+                    // Integer division panics on a zero divisor (and truncates
+                    // toward zero, which GIDIV does).
+                    self.b.emit(Op::CallBuiltin(host::GIDIV, 2), line);
+                    self.emit_panic_check(line);
                 } else {
-                    0
+                    // Float division: `x / 0.0` yields ±Inf like Go, no panic.
+                    self.b.emit(Op::Div, line);
                 }
             }
             other => unreachable!("emit_arith on non-arithmetic op {other:?}"),

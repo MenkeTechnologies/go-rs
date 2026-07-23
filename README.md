@@ -128,7 +128,7 @@ A single-file `package main` that runs real Go programs:
 | Functions      | multiple parameters, `(T, U)` multi-value results, named results (`func f() (n int, err error)` — zero-initialized, bare `return`, deferred/`recover` mutation), `return a, b`, `x, y := f()` destructuring, calling a function value from an index (`fns[i](x)`, `ops["k"](a, b)`) |
 | Generics       | type parameters on funcs, types, and methods (`func F[T Number]`, `type Stack[T any]`, `Pair[K, V]{…}`), constraint interfaces (`~int \| ~float64`), inferred + explicit instantiation — **erased** onto the dynamic value model (no monomorphization) |
 | defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
-| panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; an unrecovered panic prints `panic: <value>` and exits non-zero |
+| panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; **runtime faults** (integer divide-by-zero, index-out-of-range, nil dereference) are recoverable too — `recover()` returns the `runtime error: …` value; an unrecovered panic prints `panic: <value>` and exits non-zero (matching Go, minus the goroutine trace) |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
 | Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %d %s %f %t %q %%`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
@@ -210,10 +210,9 @@ terms leave the `f64`-exact range falls back to runtime `f64`).
 
 **Known gaps** (documented rather than hidden):
 
-- **Runtime panics are not catchable.** An explicit `panic(v)` is caught by
-  `recover()`, but a *runtime* fault (integer divide-by-zero, nil dereference,
-  index out of range) aborts the program rather than becoming a recoverable
-  panic; integer `a / 0` currently yields `0` instead of panicking.
+- **Multi-value spread into a call** — passing a multi-value call directly as the
+  arguments of another call (`fmt.Println(f())` where `f` returns two values)
+  isn't expanded; destructure first (`a, b := f(); fmt.Println(a, b)`).
 - **Sub-slices copy rather than alias** — `s[lo:hi]` returns a new slice, so
   mutating an element of the sub-slice is not observed through the parent (Go
   shares the backing array). Truncation/extraction (`s = s[:n]`) works.

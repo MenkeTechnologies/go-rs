@@ -1225,3 +1225,43 @@ func main() {
 ";
     assert_stdout(src, "2 1\n30 10 20\n8 9\n5 7\n");
 }
+
+#[test]
+fn runtime_panics_are_recoverable() {
+    // A runtime fault (divide-by-zero, index-out-of-range, nil dereference) in a
+    // program that uses recover() becomes a catchable panic; recover() returns
+    // the Go runtime-error string.
+    let src = "\
+package main
+import \"fmt\"
+func try(f func()) (msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg = fmt.Sprint(r)
+		}
+	}()
+	f()
+	return \"ok\"
+}
+func main() {
+	fmt.Println(try(func() { xs := []int{1}; _ = xs[9] }))
+	fmt.Println(try(func() { a, b := 1, 0; _ = a / b }))
+	fmt.Println(try(func() { fmt.Print(\"\") }))
+}
+";
+    assert_stdout(
+        src,
+        "runtime error: index out of range [9] with length 1\nruntime error: integer divide by zero\nok\n",
+    );
+}
+
+#[test]
+fn unrecovered_runtime_panic_aborts() {
+    // Without recover, a runtime fault aborts (non-zero exit); output before the
+    // fault is still produced.
+    let (stdout, ok) = run(
+        "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Println(\"before\")\n\ta, b := 1, 0\n\tfmt.Println(a / b)\n\tfmt.Println(\"after\")\n}\n",
+    );
+    assert!(!ok, "unrecovered runtime panic should exit non-zero");
+    assert_eq!(stdout, "before\n");
+}

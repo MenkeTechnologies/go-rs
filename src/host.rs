@@ -100,6 +100,13 @@ pub const GSPRINT: u16 = 894;
 pub const GSPRINTLN: u16 = 895;
 /// `s[low:high]` — a sub-slice/substring: stack `[recv, low, high]`.
 pub const GSLICE_SUB: u16 = 896;
+/// Enable recoverable runtime faults (emitted at program start when `recover` is
+/// used).
+pub const GSET_PANIC_MODE: u16 = 897;
+/// Integer `a / b` with a divide-by-zero panic: stack `[a, b]`.
+pub const GIDIV: u16 = 898;
+/// Integer `a % b` with a divide-by-zero panic: stack `[a, b]`.
+pub const GIMOD: u16 = 899;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -147,7 +154,34 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GSPRINT, b_sprint);
     vm.register_builtin(GSPRINTLN, b_sprintln);
     vm.register_builtin(GSLICE_SUB, b_slice_sub);
+    vm.register_builtin(GSET_PANIC_MODE, b_set_panic_mode);
+    vm.register_builtin(GIDIV, b_idiv);
+    vm.register_builtin(GIMOD, b_imod);
     stdlib::install(vm);
+}
+
+/// `[a, b]` → `a / b` (integer), panicking on divide-by-zero like Go.
+fn b_idiv(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().map(Value::to_int).unwrap_or(0);
+    let b = args.get(1).map(Value::to_int).unwrap_or(0);
+    if b == 0 {
+        runtime_panic(vm, "integer divide by zero");
+        return Value::Int(0);
+    }
+    Value::Int(a.wrapping_div(b))
+}
+
+/// `[a, b]` → `a % b` (integer), panicking on divide-by-zero like Go.
+fn b_imod(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().map(Value::to_int).unwrap_or(0);
+    let b = args.get(1).map(Value::to_int).unwrap_or(0);
+    if b == 0 {
+        runtime_panic(vm, "integer divide by zero");
+        return Value::Int(0);
+    }
+    Value::Int(a.wrapping_rem(b))
 }
 
 /// `s[low:high]` on a slice or string: stack `[recv, low, high]`. Returns a new
@@ -482,6 +516,7 @@ pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
     DEFERS.with(|d| d.borrow_mut().clear());
     PANIC.with(|p| *p.borrow_mut() = None);
+    PANIC_MODE.with(|m| *m.borrow_mut() = false);
 }
 
 /// Allocate `obj` on the heap and return its handle.
@@ -554,10 +589,11 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
         // Indexing a string yields the byte at that position (Go: byte value).
         Value::Str(ref s) => {
             let i = key.to_int();
+            let len = s.len();
             return match usize::try_from(i).ok().and_then(|i| s.as_bytes().get(i)) {
                 Some(b) => Value::Int(*b as i64),
                 None => {
-                    ffi_fault(vm, format!("go-rs: index out of range [{i}]"));
+                    runtime_panic(vm, format!("index out of range [{i}] with length {len}"));
                     Value::Undef
                 }
             };
@@ -575,9 +611,9 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
                 match usize::try_from(i).ok().and_then(|i| a.get(i)) {
                     Some(v) => v.clone(),
                     None => {
-                        ffi_fault(
+                        runtime_panic(
                             vm,
-                            format!("go-rs: index out of range [{i}] with length {}", a.len()),
+                            format!("index out of range [{i}] with length {}", a.len()),
                         );
                         Value::Undef
                     }
@@ -621,10 +657,7 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
                         a[i] = val.clone();
                         None
                     }
-                    None => Some(format!(
-                        "go-rs: index out of range [{i}] with length {}",
-                        a.len()
-                    )),
+                    None => Some(format!("index out of range [{i}] with length {}", a.len())),
                 }
             }
             Some(HostObj::Map(m)) => {
@@ -641,7 +674,13 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
     match err {
         None => val,
         Some(msg) => {
-            ffi_fault(vm, msg);
+            // A Go runtime fault (index OOB) is recoverable; an internal type
+            // error keeps its `go-rs:` prefix and aborts.
+            if msg.starts_with("go-rs:") {
+                ffi_fault(vm, msg);
+            } else {
+                runtime_panic(vm, msg);
+            }
             Value::Undef
         }
     }
@@ -738,7 +777,7 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
     let id = match recv {
         Value::Obj(id) => id,
         _ => {
-            ffi_fault(vm, format!("go-rs: nil dereference reading `{name}`"));
+            runtime_panic(vm, "invalid memory address or nil pointer dereference");
             return Value::Undef;
         }
     };
@@ -767,7 +806,7 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
     let id = match recv {
         Value::Obj(id) => id,
         _ => {
-            ffi_fault(vm, format!("go-rs: nil dereference assigning `{name}`"));
+            runtime_panic(vm, "invalid memory address or nil pointer dereference");
             return Value::Undef;
         }
     };
@@ -833,6 +872,12 @@ thread_local! {
     /// message here and halts the VM; [`crate::run_str`] reads it after
     /// `VM::run` returns and surfaces it as a `go-rs:` error.
     static FFI_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Whether the running program uses `recover`, so a runtime fault (divide by
+    /// zero, index out of range, nil dereference) should become a *recoverable*
+    /// panic (set `PANIC` and let the compiler's unwind machinery run) rather than
+    /// aborting the VM. Set once at program start by `GSET_PANIC_MODE`.
+    static PANIC_MODE: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Take and clear any pending FFI-fault message.
@@ -844,6 +889,33 @@ pub fn take_ffi_error() -> Option<String> {
 fn ffi_fault(vm: &mut VM, msg: impl Into<String>) {
     FFI_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
     vm.request_halt();
+}
+
+/// A Go runtime fault. When the program uses `recover` (panic mode), record it as
+/// a catchable panic whose value is `runtime error: <msg>` (what Go's `recover()`
+/// yields) and let the compiler-emitted unwind checks handle it. Otherwise abort
+/// the run with a terse `go-rs:` diagnostic, as before.
+fn runtime_panic(vm: &mut VM, msg: impl Into<String>) {
+    let full = format!("runtime error: {}", msg.into());
+    if PANIC_MODE.with(|m| *m.borrow()) {
+        // Recoverable: record it and let the compiler's unwind checks run.
+        PANIC.with(|p| *p.borrow_mut() = Some(Value::str(full)));
+    } else {
+        // Unrecovered: print like Go's first line and exit 2. Halt the VM too so
+        // no further ops run before the process exits (stdout is flushed first).
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        eprintln!("panic: {full}");
+        vm.request_halt();
+        std::process::exit(2);
+    }
+}
+
+/// `GSET_PANIC_MODE`: enable recoverable runtime faults (the program uses
+/// `recover`). Emitted once at program start.
+fn b_set_panic_mode(_vm: &mut VM, _argc: u8) -> Value {
+    PANIC_MODE.with(|m| *m.borrow_mut() = true);
+    Value::Undef
 }
 
 /// `__rust_compile("<base64>", line)` builtin: pop the base64-encoded
