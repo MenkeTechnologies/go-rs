@@ -21,6 +21,10 @@ pub struct Cli {
     pub dump_ast: bool,
     /// `--disasm` — print the lowered fusevm bytecode and exit.
     pub disasm: bool,
+    /// `--lsp` — speak the Language Server Protocol over stdio.
+    pub lsp: bool,
+    /// `--dap` — speak the Debug Adapter Protocol over stdio.
+    pub dap: bool,
 }
 
 /// Parse process args (excluding `argv[0]`).
@@ -36,6 +40,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--dump-tokens" => cli.dump_tokens = true,
             "--dump-ast" => cli.dump_ast = true,
             "--disasm" => cli.disasm = true,
+            "--lsp" => cli.lsp = true,
+            "--dap" => cli.dap = true,
             _ if a.starts_with('-') && cli.file.is_none() => {
                 return Err(format!("go-rs: unrecognized option `{a}`"))
             }
@@ -64,4 +70,6 @@ options:
   --dump-tokens         print the lexer token stream and exit
   --dump-ast            print the parsed AST and exit
   --disasm              print the lowered fusevm bytecode and exit
+  --lsp                 speak the Language Server Protocol over stdio
+  --dap                 speak the Debug Adapter Protocol over stdio
 ";

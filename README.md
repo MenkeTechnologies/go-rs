@@ -56,6 +56,8 @@ go version            # print the version banner
 go --dump-tokens f.go # lexer token stream (with inserted semicolons)
 go --dump-ast f.go    # parsed AST
 go --disasm f.go      # lowered fusevm bytecode
+go --lsp              # Language Server Protocol over stdio
+go --dap              # Debug Adapter Protocol over stdio
 ```
 
 ### Example
@@ -107,9 +109,24 @@ This is slice 1 — a single-file `package main` that runs real Go programs:
 | Expressions   | int / float / string / bool literals, arithmetic, comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
 | Types         | `int` family, `float32/64`, `string`, `bool` — tracked statically so `int / int` truncates and `float / float` stays exact |
 | Printing      | `fmt.Println`, `fmt.Print`, `fmt.Printf` (`%v %d %s %f %t %q %%`), builtin `println` / `print` |
+| Inline FFI    | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
 Structs, methods, interfaces, slices, maps, channels, and goroutines land in
 later waves.
+
+## Toolchain
+
+The full editor/tooling surface ships in the one `go` binary, at parity with the
+other `fusevm` frontends:
+
+- **LSP** (`go --lsp`) — completion, hover, and parser-driven diagnostics over stdio.
+- **DAP** (`go --dap`) — line breakpoints, stepping, stack trace, and locals inspection.
+- **zsh completion** — `completions/_go`.
+- **man pages** — `man/man1/go.1` and `man/man1/goall.1`.
+- **HTML docs** — [`docs/`](docs) (index, engineering report, and a `reference.html`
+  generated from the LSP corpus by the `gen-docs` binary).
+- **Inline Rust FFI** — `rust {}` blocks via the shared `fusevm` FFI runtime.
+- **Introspection** — `--dump-tokens` / `--dump-ast` / `--disasm`.
 
 ## Build & test
 

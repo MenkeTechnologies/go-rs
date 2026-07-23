@@ -1,0 +1,103 @@
+.\" Manpage for go-rs (the `go` binary).
+.\" Contact https://github.com/MenkeTechnologies/go-rs to correct errors or omissions.
+.TH GO 1 "2026-07-23" "go-rs 0.1.0" "User Commands"
+.SH NAME
+go \- Go on fusevm, a Go frontend lowered to bytecode and run on a Cranelift JIT (no go toolchain)
+.SH SYNOPSIS
+.B go
+[\fBrun\fR] \fIFILE.go\fR [\fIARGS\fR...]
+.br
+.B go
+\fB\-\-lsp\fR | \fB\-\-dap\fR
+.SH DESCRIPTION
+.B go-rs
+lexes and parses Go source (with Go's automatic semicolon insertion) and lowers
+it to
+.B fusevm
+bytecode executed on a three\-tier Cranelift JIT \(em the same shared engine
+behind
+.BR zshrs ,
+.BR stryke ,
+.BR awkrs ,
+vimlrs, elisprs, rubylang, javars, kotlinrs, and scalars. There is no bespoke VM
+and no Go runtime; execution and codegen live in fusevm, with no goroutine
+scheduler and no garbage collector.
+.PP
+The current slice runs a single\-file
+.BR "package main" :
+go\-rs executes the body of
+.B func main
+and lowers every other top\-level
+.B func
+to a fusevm subroutine (recursion supported). Statements cover
+.BR ":=" " / " var
+declarations, assignment and compound assignment, post\-increment/decrement,
+.BR if / else ,
+the three\-clause / condition / infinite
+.BR for ,
+and
+.BR break / continue / return .
+Printing is
+.BR fmt.Println / Print / Printf
+plus the builtins
+.BR println / print .
+Static
+.BR int / float
+typing makes
+.B int / int
+truncate toward zero; Go's
+.B +
+concatenates when either operand is a string.
+.SH COMMANDS
+.TP
+.B run \fIFILE.go\fR
+Compile and run a Go program on fusevm. A bare \fIFILE.go\fR (no
+.BR run )
+is accepted as shorthand.
+.TP
+.B version
+Print the version banner and exit.
+.TP
+.B help
+Print usage and exit.
+.SH OPTIONS
+.TP
+.BR \-\-version ", " \-version
+Print the version banner and exit.
+.TP
+.BR \-h ", " \-\-help ", " \-help
+Print usage and exit.
+.TP
+.B \-\-dump\-tokens
+Print the lexer token stream (with inserted semicolons) for the file and exit.
+.TP
+.B \-\-dump\-ast
+Print the parsed AST for the file and exit.
+.TP
+.B \-\-disasm
+Print a fusevm bytecode disassembly listing for the file and exit.
+.TP
+.B \-\-lsp
+Speak the Language Server Protocol over stdio (completion, hover, and
+diagnostics from the same parser the runtime uses).
+.TP
+.B \-\-dap
+Speak the Debug Adapter Protocol over stdio (breakpoints, single\-stepping, and
+locals inspection).
+.SH INLINE RUST FFI
+A
+.B rust { pub extern "C" fn ... }
+block inside a function compiles to a cached
+.B cdylib
+on first run (via the shared fusevm FFI runtime); its exports become callable by
+name from Go.
+.SH EXIT STATUS
+.B 0
+on success;
+.B 1
+on a lex, parse, compile, or runtime error (reported to stderr as
+.BR "go-rs: <reason>" ).
+.SH SEE ALSO
+.BR goall (1)
+.br
+Project: https://github.com/MenkeTechnologies/go-rs

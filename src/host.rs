@@ -7,6 +7,7 @@
 //! ordering. Values render with Go's `fmt` `%v` rules ([`go_str`]).
 
 use fusevm::{NumOp, Value, VM};
+use std::cell::RefCell;
 
 /// `fmt.Println` — space-separated operands, trailing newline, to stdout.
 pub const GPRINTLN: u16 = 800;
@@ -18,6 +19,12 @@ pub const GPRINTF: u16 = 802;
 pub const GEPRINTLN: u16 = 803;
 /// Go builtin `print` — no spacing, to stderr.
 pub const GEPRINT: u16 = 804;
+/// `__rust_compile("<base64>", line)` — compile an inline `rust {}` block.
+pub const GFFI_COMPILE: u16 = 805;
+/// FFI dispatch: call an exported inline-Rust symbol by name.
+pub const GFFI_CALL: u16 = 806;
+/// `--dap` per-statement line marker (only emitted by `compile_debug`).
+pub const DBG_LINE: u16 = 807;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -27,6 +34,82 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GPRINTF, b_printf);
     vm.register_builtin(GEPRINTLN, b_eprintln);
     vm.register_builtin(GEPRINT, b_eprint);
+    vm.register_builtin(GFFI_COMPILE, b_ffi_compile);
+    vm.register_builtin(GFFI_CALL, b_ffi_call);
+}
+
+/// Install the builtins plus the debug line-marker used by `go --dap`. The
+/// marker fires synchronously at each statement and delegates to the DAP server,
+/// which pauses in place on a breakpoint or step target.
+pub fn install_debug(vm: &mut VM) {
+    install(vm);
+    vm.register_builtin(DBG_LINE, b_dbg_line);
+}
+
+thread_local! {
+    /// Set by an inline-Rust FFI fault (compile error, call error, or an
+    /// unresolved export). A builtin cannot return a `Result`, so it stashes the
+    /// message here and halts the VM; [`crate::run_str`] reads it after
+    /// `VM::run` returns and surfaces it as a `go-rs:` error.
+    static FFI_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Take and clear any pending FFI-fault message.
+pub fn take_ffi_error() -> Option<String> {
+    FFI_ERROR.with(|e| e.borrow_mut().take())
+}
+
+/// Record an FFI fault and halt the VM; the message surfaces after the run.
+fn ffi_fault(vm: &mut VM, msg: impl Into<String>) {
+    FFI_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
+    vm.request_halt();
+}
+
+/// `__rust_compile("<base64>", line)` builtin: pop the base64-encoded
+/// `rust { ... }` block body, compile it to a cdylib, and register its exports.
+fn b_ffi_compile(vm: &mut VM, argc: u8) -> Value {
+    // The compiler emits `(base64, line)`; the base64 body is the deepest arg.
+    let args = pop_args(vm, argc);
+    let b64 = args.first().map(go_str).unwrap_or_default();
+    if let Err(e) = fusevm::ffi::compile_and_register(&b64) {
+        ffi_fault(vm, format!("go-rs: rust {{}} block: {e}"));
+    }
+    Value::Undef
+}
+
+/// `name(args...)` FFI dispatch: pop the function name (top of stack) and its
+/// `argc - 1` arguments, call the exported symbol via `fusevm::ffi`, and return
+/// its result.
+fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
+    let name = vm
+        .stack
+        .pop()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let n = argc.saturating_sub(1) as usize;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    args.reverse();
+    match fusevm::ffi::try_call(&name, &args) {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => {
+            ffi_fault(vm, format!("go-rs: rust FFI call {name}: {e}"));
+            Value::Undef
+        }
+        None => {
+            ffi_fault(vm, format!("go-rs: undefined: {name}"));
+            Value::Undef
+        }
+    }
+}
+
+/// The `DBG_LINE` marker builtin: hand control to the DAP server for this line,
+/// then return nil (popped by the trailing `Op::Pop` the compiler emits).
+fn b_dbg_line(vm: &mut VM, _argc: u8) -> Value {
+    crate::dap::on_debug_line(vm);
+    Value::Undef
 }
 
 /// Pop `argc` values off the VM stack, restoring source (left-to-right) order.

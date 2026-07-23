@@ -1,0 +1,17 @@
+#compdef go
+# Zsh completion for the go-rs `go` binary.
+
+_go() {
+  _arguments -s \
+    '(-version --version)'{-version,--version}'[print the version banner and exit]' \
+    '(-h --help -help)'{-h,--help,-help}'[print usage and exit]' \
+    '--dump-tokens[print the lexer token stream and exit]' \
+    '--dump-ast[print the parsed AST and exit]' \
+    '--disasm[print the lowered fusevm bytecode and exit]' \
+    '--lsp[speak the Language Server Protocol over stdio]' \
+    '--dap[speak the Debug Adapter Protocol over stdio]' \
+    '1: :(run version help)' \
+    '*:go file:_files -g "*.go"'
+}
+
+_go "$@"

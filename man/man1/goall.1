@@ -1,0 +1,71 @@
+.\" Companion overview manpage for go-rs.
+.\" Contact https://github.com/MenkeTechnologies/go-rs to correct errors or omissions.
+.TH GOALL 1 "2026-07-23" "go-rs 0.1.0" "User Commands"
+.SH NAME
+goall \- go-rs overview: architecture, language surface, and toolchain
+.SH DESCRIPTION
+.B go-rs
+is a pure Go frontend for the
+.B fusevm
+bytecode VM. The pipeline is
+.IR "lexer \(-> parser \(-> compiler \(-> fusevm::Chunk" ,
+after which fusevm runs the chunk on its three\-tier Cranelift JIT. No component
+interprets Go directly; there is no goroutine runtime and no garbage collector.
+.SH ARCHITECTURE
+.TP
+.B lexer.rs
+Hand\-written lexer implementing Go's automatic semicolon insertion (ASI).
+.TP
+.B parser.rs
+Recursive\-descent parser building a Go AST.
+.TP
+.B compiler.rs
+Lowers the AST to fusevm ops; tracks a static numeric type so
+.B int / int
+truncates while
+.B float / float
+stays exact, and dispatches string
+.B +
+and ordering through the fusevm numeric hook.
+.TP
+.B host.rs
+The
+.B fmt
+print family and builtin
+.BR println / print ,
+plus the inline\-Rust FFI compile/call builtins.
+.SH LANGUAGE SURFACE (SLICE 1)
+Single\-file
+.BR "package main" ;
+top\-level
+.B func
+with parameters, results, and recursion;
+.BR ":=" " / " var ;
+assignment and compound assignment;
+.BR if / else ;
+three\-clause / condition / infinite
+.BR for ;
+.BR break / continue / return ;
+arithmetic, comparisons, and short\-circuit
+.BR "&&" " / " "||" ;
+.BR fmt.Println / Print / Printf .
+Structs, methods, interfaces, slices, maps, channels, and goroutines are future
+waves.
+.SH TOOLCHAIN
+Standalone
+.B go
+binary;
+.BR \-\-lsp " / " \-\-dap
+servers over stdio; a
+.B _go
+zsh completion; this man page and
+.BR go (1);
+an HTML docs/report site with a generated
+.BR reference.html ;
+inline
+.B rust {}
+FFI; and
+.BR \-\-dump\-tokens " / " \-\-dump\-ast " / " \-\-disasm
+introspection.
+.SH SEE ALSO
+.BR go (1)

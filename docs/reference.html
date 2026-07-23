@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="go-rs — Language reference. Keywords, operators, builtins, and the Go subset available in the current go-rs build. Go without a GC, on fusevm. MIT licensed.">
+  <meta name="description" content="go-rs — Language reference. Keywords, declaration types, and console IO recognized by the current go-rs build. MIT licensed.">
   <title>go-rs &mdash; Language Reference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,16 +13,7 @@
   <link rel="stylesheet" href="tutorial.css">
   <style>
     .tutorial-main { max-width: 76rem; }
-    .file-table { width:100%;border-collapse:collapse;margin:0.6rem 0;font-size:12px; }
-    .file-table th { background:var(--bg-secondary);color:var(--cyan);font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;text-align:left;padding:7px 10px;border:1px solid var(--border); }
-    .file-table td { padding:6px 10px;border:1px solid var(--border);color:var(--text-dim);vertical-align:middle; }
-    .file-table tr:hover td { background:var(--bg-hover); }
-    .file-table td:first-child { font-family:'Share Tech Mono',monospace;color:var(--accent-light);font-weight:600;white-space:nowrap; }
-    .file-table code { font-size:11px;color:var(--accent-light);background:var(--bg-primary);padding:1px 4px;border-radius:2px; }
     .section-rule { border:none;border-top:1px dashed var(--border);margin:2rem 0; }
-    .status-pill { display:inline-block;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:2px 7px;border-radius:2px;border:1px solid var(--border); }
-    .status-implemented { color:var(--green);border-color:var(--green); }
-    .status-planned { color:var(--text-muted); }
     .hub-scheme-strip { border-bottom:1px dashed var(--border);background:color-mix(in srgb, var(--bg-secondary) 85%, transparent);padding:0.55rem 1.5rem 0.65rem;position:relative; }
     .hub-scheme-strip-inner { max-width:76rem;margin:0 auto;display:flex;align-items:center;gap:0.85rem; }
     .hub-scheme-strip .hud-scheme-label { flex:0 0 auto;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--accent);text-align:left; }
@@ -47,7 +38,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/go-rs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">go-rs v0.1.0 · Go on fusevm · lex (with ASI) / parse → AST → bytecode → Cranelift JIT · no GC · no goroutine runtime · MIT · in active development</p>
+          <p class="docs-build-line">go-rs v0.1.0 · Go on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM · no go toolchain · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -68,103 +59,170 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Keywords, operators, and builtins recognised by the current <code>go-rs</code> build. The grammar follows the <a href="https://go.dev/ref/spec">Go language specification</a>; entries below are marked <span class="status-pill status-implemented">Implemented</span> when they lower to fusevm bytecode today and <span class="status-pill status-planned">Planned</span> when they are on the roadmap. Unsupported constructs are rejected at parse or compile time — never silently mis-run.</p>
+      <p class="tutorial-subtitle">Every reserved keyword, declaration-position type name, and console-IO surface the current go-rs build recognizes, grouped by keyword then type then IO. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; types mirror the compiler's numeric-type table; the <code>fmt</code> methods mirror the print builtins in <code>host.rs</code>.</p>
 
-      <section class="tutorial-section">
-        <h2>Keywords</h2>
-        <table class="file-table">
-          <thead><tr><th>Keyword</th><th>Status</th><th>Meaning</th></tr></thead>
-          <tbody>
-            <tr><td>package</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Package clause; single-package programs.</td></tr>
-            <tr><td>import</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Import declaration (parsed).</td></tr>
-            <tr><td>func</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Function declaration. <code>main</code> is the entry point.</td></tr>
-            <tr><td>var</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Variable declaration.</td></tr>
-            <tr><td>const</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Constant declaration.</td></tr>
-            <tr><td>if / else</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Conditional; lowers to fusevm jumps.</td></tr>
-            <tr><td>for</td><td><span class="status-pill status-implemented">Implemented</span></td><td>The single Go loop keyword (three-clause, condition-only, infinite).</td></tr>
-            <tr><td>range</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Range clause in <code>for</code>.</td></tr>
-            <tr><td>return</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Return from a function.</td></tr>
-            <tr><td>break / continue</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Loop control.</td></tr>
-            <tr><td>true / false</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Boolean literals.</td></tr>
-            <tr><td>type / struct / interface</td><td><span class="status-pill status-planned">Planned</span></td><td>User-defined types via fusevm extension handles.</td></tr>
-            <tr><td>map / chan</td><td><span class="status-pill status-planned">Planned</span></td><td>Composite / channel types.</td></tr>
-            <tr><td>switch / case / default / fallthrough</td><td><span class="status-pill status-planned">Planned</span></td><td>Switch statement.</td></tr>
-            <tr><td>go / defer / select</td><td><span class="status-pill status-planned">Planned</span></td><td>No goroutine runtime today.</td></tr>
-            <tr><td>goto</td><td><span class="status-pill status-planned">Planned</span></td><td>Unconditional jump.</td></tr>
-          </tbody>
-        </table>
+      <section class="tutorial-section" id="ch-keyword">
+        <h2>Keyword</h2>
+        <article class="doc-entry" id="doc-keyword-1">
+          <h3><a class="doc-anchor" href="#doc-keyword-1">#</a> <code>package</code></h3>
+          <p>declare the package; go-rs runs `func main` of `package main`</p>
+          <pre><code class="lang-go">package main</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-2">
+          <h3><a class="doc-anchor" href="#doc-keyword-2">#</a> <code>import</code></h3>
+          <p>import a package; single (`import "fmt"`) or grouped `( … )`</p>
+          <pre><code class="lang-go">import "fmt"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-3">
+          <h3><a class="doc-anchor" href="#doc-keyword-3">#</a> <code>func</code></h3>
+          <p>declare a function; `func main()` is the entry point</p>
+          <pre><code class="lang-go">func add(a int, b int) int { return a + b }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-4">
+          <h3><a class="doc-anchor" href="#doc-keyword-4">#</a> <code>var</code></h3>
+          <p>declare a variable with an optional type and initializer</p>
+          <pre><code class="lang-go">var n int = 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-5">
+          <h3><a class="doc-anchor" href="#doc-keyword-5">#</a> <code>const</code></h3>
+          <p>declare a constant (recognized by the lexer)</p>
+          <pre><code class="lang-go">const pi = 3.14159</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-6">
+          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>if</code></h3>
+          <p>conditional branch with an optional init clause: `if [init;] cond { … }`</p>
+          <pre><code class="lang-go">if x := f(); x &gt; 0 { fmt.Println(x) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-7">
+          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>else</code></h3>
+          <p>fallback branch of an `if`; chains as `else if`</p>
+          <pre><code class="lang-go">if x &gt; 0 { } else { fmt.Println("non-pos") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-8">
+          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>for</code></h3>
+          <p>the loop: three-clause, condition-only, or infinite</p>
+          <pre><code class="lang-go">for i := 0; i &lt; 3; i++ { fmt.Println(i) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-9">
+          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>range</code></h3>
+          <p>iterate a collection in a `for … range` (reserved; next wave)</p>
+          <pre><code class="lang-go">for i := range xs { }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-10">
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>return</code></h3>
+          <p>return from the current function with an optional value</p>
+          <pre><code class="lang-go">return a + b</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>break</code></h3>
+          <p>exit the nearest `for` loop</p>
+          <pre><code class="lang-go">for { if done { break } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>continue</code></h3>
+          <p>skip to the next iteration of the nearest `for` loop</p>
+          <pre><code class="lang-go">for i := 0; i &lt; 5; i++ { if i%2 == 0 { continue } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>true</code></h3>
+          <p>the boolean literal true</p>
+          <pre><code class="lang-go">ok := true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>false</code></h3>
+          <p>the boolean literal false</p>
+          <pre><code class="lang-go">ok := false</code></pre>
+        </article>
       </section>
 
-      <hr class="section-rule">
-
-      <section class="tutorial-section">
-        <h2>Operators</h2>
-        <table class="file-table">
-          <thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr><td>+ - * /</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Native fusevm ops. <code>/</code> truncates for <code>int ÷ int</code> (<code>Op::TruncInt</code>), floating-point otherwise.</td></tr>
-            <tr><td>%</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Integer remainder.</td></tr>
-            <tr><td>== != &lt; &lt;= &gt; &gt;=</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Numeric and string comparison (string ordering via the strict numeric hook).</td></tr>
-            <tr><td>&amp;&amp; || !</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Short-circuit boolean logic.</td></tr>
-            <tr><td>+ (string)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>String concatenation, runtime-dispatched.</td></tr>
-            <tr><td>= := </td><td><span class="status-pill status-implemented">Implemented</span></td><td>Assignment and short variable declaration.</td></tr>
-            <tr><td>+= -= *= /= %=</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Compound assignment.</td></tr>
-            <tr><td>++ --</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Increment / decrement statements.</td></tr>
-            <tr><td>&amp; | ^ &amp;^ &lt;&lt; &gt;&gt;</td><td><span class="status-pill status-planned">Planned</span></td><td>Bitwise / shift operators.</td></tr>
-            <tr><td>&amp; * (pointers)</td><td><span class="status-pill status-planned">Planned</span></td><td>Address-of / dereference.</td></tr>
-            <tr><td>&lt;- (channel)</td><td><span class="status-pill status-planned">Planned</span></td><td>Channel send / receive.</td></tr>
-          </tbody>
-        </table>
+      <section class="tutorial-section" id="ch-type">
+        <h2>Type</h2>
+        <article class="doc-entry" id="doc-type-1">
+          <h3><a class="doc-anchor" href="#doc-type-1">#</a> <code>int</code></h3>
+          <p>machine integer; `int / int` truncates toward zero</p>
+          <pre><code class="lang-go">var n int = 7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-2">
+          <h3><a class="doc-anchor" href="#doc-type-2">#</a> <code>int64</code></h3>
+          <p>64-bit signed integer</p>
+          <pre><code class="lang-go">var big int64 = 9000000000</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-3">
+          <h3><a class="doc-anchor" href="#doc-type-3">#</a> <code>float64</code></h3>
+          <p>64-bit float; `%v` prints whole values without a fraction (3, not 3.0)</p>
+          <pre><code class="lang-go">var d float64 = 3.0   // fmt.Println(d) =&gt; 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-4">
+          <h3><a class="doc-anchor" href="#doc-type-4">#</a> <code>float32</code></h3>
+          <p>32-bit float</p>
+          <pre><code class="lang-go">var f float32 = 1.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-5">
+          <h3><a class="doc-anchor" href="#doc-type-5">#</a> <code>string</code></h3>
+          <p>string; `+` concatenates, `&lt;`/`==` order lexicographically (host numeric hook)</p>
+          <pre><code class="lang-go">s := "go" + "-rs"   // =&gt; 'go-rs'</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-6">
+          <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>bool</code></h3>
+          <p>boolean (`true` / `false`)</p>
+          <pre><code class="lang-go">ok := 3 &lt; 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-7">
+          <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>byte</code></h3>
+          <p>alias for uint8</p>
+          <pre><code class="lang-go">var b byte = 65</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-8">
+          <h3><a class="doc-anchor" href="#doc-type-8">#</a> <code>rune</code></h3>
+          <p>alias for int32; a Unicode code point</p>
+          <pre><code class="lang-go">var r rune = 'A'</code></pre>
+        </article>
       </section>
 
-      <hr class="section-rule">
-
-      <section class="tutorial-section">
-        <h2>Builtins</h2>
-        <p>Go's predeclared builtins. Availability tracks the value kinds the current build supports.</p>
-        <table class="file-table">
-          <thead><tr><th>Builtin</th><th>Status</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr><td>len</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Length of a string.</td></tr>
-            <tr><td>print / println</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Predeclared debug output.</td></tr>
-            <tr><td>fmt.Println / fmt.Print / fmt.Printf</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Served natively (host ops <code>800</code>–<code>802</code>): space-separated / formatted output with Go <code>%v</code> rendering.</td></tr>
-            <tr><td>fmt.Eprintln / fmt.Eprint</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Stderr variants (host ops <code>803</code>–<code>804</code>).</td></tr>
-            <tr><td>make / append / copy / cap</td><td><span class="status-pill status-planned">Planned</span></td><td>Require slices / maps (roadmap).</td></tr>
-            <tr><td>new / delete</td><td><span class="status-pill status-planned">Planned</span></td><td>Heap allocation / map deletion.</td></tr>
-            <tr><td>panic / recover</td><td><span class="status-pill status-planned">Planned</span></td><td>Runtime panic machinery.</td></tr>
-            <tr><td>complex / real / imag</td><td><span class="status-pill status-planned">Planned</span></td><td>Complex numbers.</td></tr>
-          </tbody>
-        </table>
+      <section class="tutorial-section" id="ch-io">
+        <h2>IO</h2>
+        <article class="doc-entry" id="doc-io-1">
+          <h3><a class="doc-anchor" href="#doc-io-1">#</a> <code>Println</code></h3>
+          <p>fmt.Println(a…): print operands space-separated, then a newline, to stdout</p>
+          <pre><code class="lang-go">fmt.Println("hello", 42)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-2">
+          <h3><a class="doc-anchor" href="#doc-io-2">#</a> <code>Print</code></h3>
+          <p>fmt.Print(a…): print operands (space between non-strings) with no newline</p>
+          <pre><code class="lang-go">fmt.Print("x = ", 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-3">
+          <h3><a class="doc-anchor" href="#doc-io-3">#</a> <code>Printf</code></h3>
+          <p>fmt.Printf(format, a…): format with %v %d %s %f %t %q %%</p>
+          <pre><code class="lang-go">fmt.Printf("%d and %s\n", 42, "hi")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-4">
+          <h3><a class="doc-anchor" href="#doc-io-4">#</a> <code>fmt</code></h3>
+          <p>the fmt package; go-rs wires Println / Print / Printf</p>
+          <pre><code class="lang-go">import "fmt"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-5">
+          <h3><a class="doc-anchor" href="#doc-io-5">#</a> <code>println</code></h3>
+          <p>builtin println(a…): space-separated, trailing newline, to stderr</p>
+          <pre><code class="lang-go">println("debug", x)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-6">
+          <h3><a class="doc-anchor" href="#doc-io-6">#</a> <code>print</code></h3>
+          <p>builtin print(a…): to stderr with no newline</p>
+          <pre><code class="lang-go">print("debug")</code></pre>
+        </article>
       </section>
 
-      <hr class="section-rule">
-
       <section class="tutorial-section">
-        <h2>Types</h2>
-        <table class="file-table">
-          <thead><tr><th>Type</th><th>Status</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr><td>int / int64</td><td><span class="status-pill status-implemented">Implemented</span></td><td>fusevm integer values; static category drives <code>/</code> truncation.</td></tr>
-            <tr><td>float64</td><td><span class="status-pill status-implemented">Implemented</span></td><td>fusevm float values.</td></tr>
-            <tr><td>bool</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Go truthiness (no implicit numeric coercion).</td></tr>
-            <tr><td>string</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Concatenation and ordering via the strict numeric hook.</td></tr>
-            <tr><td>slice / array / map</td><td><span class="status-pill status-planned">Planned</span></td><td>Heap aggregates (roadmap).</td></tr>
-            <tr><td>struct / interface / pointer</td><td><span class="status-pill status-planned">Planned</span></td><td>fusevm extension handles (roadmap).</td></tr>
-          </tbody>
-        </table>
-      </section>
-
-      <hr class="section-rule">
-
-      <section class="tutorial-section">
-        <h2>Notes</h2>
+        <h2>More</h2>
         <ul>
-          <li><strong>Automatic semicolon insertion</strong> — the lexer inserts semicolons per the Go spec, so idiomatic brace placement works without explicit terminators.</li>
-          <li><strong>No garbage collector</strong> — values live on the fusevm value stack and in call-frame slots; the tracing GC of the reference toolchain is absent by design.</li>
-          <li><strong>Errors, not surprises</strong> — anything not yet implemented is a parse or compile error. The reference above is the contract for what a program may use today.</li>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a> (overview, architecture, examples)</li>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (value model, status, dependencies)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/go-rs">github.com/MenkeTechnologies/go-rs</a></li>
         </ul>
       </section>
     </main>
+
   </div>
 
   <script src="hud-theme.js"></script>

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="go-rs — Engineering report. Go as a fusevm frontend: lexer with automatic semicolon insertion, parser, and a compiler that lowers Go to fusevm::Chunk, run on the shared three-tier Cranelift JIT. No GC, no goroutine runtime, no `go` toolchain. MIT licensed.">
+  <meta name="description" content="go-rs — Engineering report. A Go frontend in Rust, hosted on the fusevm bytecode VM with a three-tier Cranelift JIT. No bespoke VM, no go toolchain: architecture, value model, tooling, roadmap, and dependency posture. MIT licensed.">
   <title>go-rs &mdash; Engineering Report</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,22 +12,30 @@
   <link rel="stylesheet" href="hud-static.css">
   <link rel="stylesheet" href="tutorial.css">
   <style>
-    .tutorial-main { max-width: 72rem; }
+    .tutorial-main { max-width: 76rem; }
     .file-table { width:100%;border-collapse:collapse;margin:0.6rem 0;font-size:12px; }
     .file-table th { background:var(--bg-secondary);color:var(--cyan);font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;text-align:left;padding:7px 10px;border:1px solid var(--border); }
-    .file-table td { padding:6px 10px;border:1px solid var(--border);color:var(--text-dim);vertical-align:top; }
+    .file-table td { padding:6px 10px;border:1px solid var(--border);color:var(--text-dim);vertical-align:middle; }
+    .file-table tr:hover td { background:var(--bg-hover); }
     .file-table td:first-child { font-family:'Share Tech Mono',monospace;color:var(--accent-light);font-weight:600;white-space:nowrap; }
     .file-table code { font-size:11px;color:var(--accent-light);background:var(--bg-primary);padding:1px 4px;border-radius:2px; }
-    .feature-card { border:1px solid var(--border);border-left:2px solid var(--cyan);padding:0.7rem 0.9rem;background:color-mix(in srgb, var(--bg-card) 92%, transparent);border-radius:2px;margin:0.5rem 0; }
-    .feature-card h4 { font-family:'Orbitron',sans-serif;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--cyan);margin:0 0 0.4rem; }
-    .feature-card p { margin:0;font-size:12px;color:var(--text-dim);line-height:1.55; }
+    .stat-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:0.75rem;margin:1.2rem 0; }
+    .stat-card { border:1px solid var(--border);border-top:3px solid var(--cyan);background:var(--bg-card);padding:1rem 1.2rem;border-radius:2px;text-align:center; }
+    .stat-card .stat-val { font-family:'Orbitron',sans-serif;font-size:28px;font-weight:900;color:var(--cyan);line-height:1.1;text-shadow:0 0 20px var(--cyan-glow); }
+    .stat-card .stat-val.accent { color:var(--accent);text-shadow:0 0 20px var(--accent-glow); }
+    .stat-card .stat-label { font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-top:0.5rem; }
+    .feature-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(22rem,1fr));gap:0.65rem;margin:0.8rem 0; }
+    .feature-card { border:1px solid var(--border);border-left:3px solid var(--cyan);background:var(--bg-card);padding:0.7rem 1rem;border-radius:2px; }
+    .feature-card h4 { font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--cyan);margin:0 0 0.3rem; }
+    .feature-card p { margin:0;font-size:11px;color:var(--text-dim);line-height:1.55; }
+    .feature-card code { font-size:10.5px;color:var(--accent-light);background:var(--bg-primary);padding:1px 4px;border-radius:2px; }
     .section-rule { border:none;border-top:1px dashed var(--border);margin:2rem 0; }
     .hub-scheme-strip { border-bottom:1px dashed var(--border);background:color-mix(in srgb, var(--bg-secondary) 85%, transparent);padding:0.55rem 1.5rem 0.65rem;position:relative; }
-    .hub-scheme-strip-inner { max-width:72rem;margin:0 auto;display:flex;align-items:center;gap:0.85rem; }
+    .hub-scheme-strip-inner { max-width:76rem;margin:0 auto;display:flex;align-items:center;gap:0.85rem; }
     .hub-scheme-strip .hud-scheme-label { flex:0 0 auto;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--accent);text-align:left; }
     .hub-scheme-strip .scheme-grid { flex:1 1 auto;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px; }
     @media (max-width:720px){ .hub-scheme-strip-inner{flex-direction:column;align-items:stretch}.hub-scheme-strip .scheme-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
-    .docs-build-line { margin:0.35rem 0 0;font-family:'Share Tech Mono',ui-monospace,monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;max-width:52rem;opacity:0.75; }
+    .docs-build-line { margin:0.35rem 0 0;font-family:'Share Tech Mono',ui-monospace,monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;max-width:42rem;opacity:0.75; }
   </style>
 </head>
 <body>
@@ -44,17 +52,16 @@
             <span class="sep">/</span>
             <span class="current">Engineering Report</span>
             <span class="sep">/</span>
-            <a href="reference.html">Reference</a>
-            <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/go-rs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">go-rs v0.1.0 · Go on fusevm · lex (with ASI) / parse → AST → bytecode → Cranelift JIT · no GC · no goroutine runtime · MIT · in active development</p>
+          <p class="docs-build-line">go-rs v0.1.0 · Go on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM · no go toolchain · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
           <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
           <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
           <a class="btn btn-secondary" href="index.html">Docs</a>
+          <a class="btn btn-secondary" href="reference.html">Reference</a>
           <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/go-rs" target="_blank" rel="noopener noreferrer">GitHub</a>
         </div>
       </div>
@@ -69,77 +76,67 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>ENGINEERING REPORT</h2>
-      <p class="tutorial-subtitle">go-rs is a Go frontend for <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a>. It lexes and parses Go, lowers the AST to a <code>fusevm::Chunk</code>, and runs it on the shared bytecode VM and three-tier Cranelift JIT. It carries no VM, no JIT, and no Go runtime of its own — <strong>no GC, no goroutine runtime, no <code>go</code> toolchain.</strong> This report describes the architecture and the current scope. <strong>go-rs is in active development; the sections below track what is implemented today versus planned.</strong></p>
+      <p class="tutorial-subtitle">go-rs is a Go frontend in Rust, hosted on the <code>fusevm</code> bytecode VM and its three-tier Cranelift JIT. This report describes the architecture, the value model, the current state of the tree, and the dependency posture. The statements below are facts about the design and the manifest, not aspirational metrics.</p>
+
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-val accent">Go</div><div class="stat-label">fusevm language host</div></div>
+        <div class="stat-card"><div class="stat-val">3</div><div class="stat-label">Cranelift JIT tiers</div></div>
+        <div class="stat-card"><div class="stat-val">v0.1.0</div><div class="stat-label">version</div></div>
+        <div class="stat-card"><div class="stat-val">MIT</div><div class="stat-label">license · free / OSS</div></div>
+      </div>
 
       <section class="tutorial-section">
-        <h2>Position: a fusevm frontend</h2>
-        <p>fusevm is a language-agnostic bytecode VM: any frontend compiles to the same <code>Op</code> enum and gets fused hot-loop dispatch, extension opcode tables, stack + slot execution, and an optional three-tier Cranelift JIT — for free. go-rs is one of those frontends, alongside <code>zshrs</code>, <code>strykelang</code>, <code>awkrs</code>, <code>vimlrs</code>, <code>elisprs</code>, <code>rubylang</code>, <code>arb</code>, <code>pythonrs</code>, <code>phplang</code>, <code>node-js</code>, <code>rlang</code>, and the JVM-language frontends. Every perf improvement in fusevm compounds across all of them, go-rs included.</p>
-        <div class="feature-card">
-          <h4>Pure frontend, no runtime</h4>
-          <p>go-rs owns the Go-specific front half — lexer, parser, compiler — and delegates all execution to fusevm. There is no tree-walking interpreter and no bespoke bytecode format. Arithmetic and comparisons lower to native fusevm ops, so the Cranelift JIT can block- and trace-compile hot loops without go-rs writing a single line of codegen.</p>
+        <h2>Summary</h2>
+        <p>The reference <code>go</code> toolchain compiles Go to a native binary with a goroutine scheduler and garbage collector. go-rs takes a different path: it lexes and parses Go to an AST — implementing Go's automatic semicolon insertion in the lexer — lowers that to <code>fusevm</code> bytecode, and runs it on a compiled VM with a Cranelift JIT. Arithmetic and comparison operators lower to native VM ops so the JIT can trace hot loops; Go-specific behaviour — the <code>string</code> <code>+</code> concatenation overload, lexicographic string ordering, and Go's <code>%v</code> value formatting — is served through the host numeric hook and a set of numbered print builtins. It joins <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> alongside <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisprs</code>, and <code>rubylang</code>, and reuses that shared bytecode VM and JIT rather than shipping its own. There is no goroutine runtime and no garbage collector.</p>
+        <p>The current tree is a single-file <code>package main</code> slice: the lexer (with ASI) / parser, AST-to-bytecode lowering, <code>:=</code> and <code>var</code> declarations, plain and compound assignment, three-clause / condition / infinite <code>for</code> with <code>break</code>/<code>continue</code>, <code>if</code>/<code>else</code> with an init clause, top-level <code>func</code> with recursion, post-increment/decrement, short-circuiting <code>&amp;&amp;</code>/<code>||</code>, <code>string</code> concatenation, and <code>fmt.Println</code>/<code>Print</code>/<code>Printf</code>. Static <code>int</code>/<code>float</code> typing makes <code>int / int</code> truncate while <code>float / float</code> stays exact. On top of the runtime it ships editor tooling: a read-only LSP (<code>--lsp</code>) with completion, hover, and parser-driven diagnostics; a DAP debugger (<code>--dap</code>) with line breakpoints, stepping, a stack trace, and local-variable inspection; and inline <code>rust { }</code> FFI. Structs, methods, interfaces, slices, maps, channels, and goroutines are future waves.</p>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Hosting on fusevm</h2>
+        <p>go-rs contains no virtual machine or JIT of its own. The execution path is:</p>
+<pre>Go source  →  lexer (+ ASI)  →  parser → AST  →  lower to fusevm bytecode  →  fusevm VM + Cranelift JIT
+                                                    │
+                                       host: string + concat, Go value formatting, fmt builtins</pre>
+        <div class="feature-grid">
+          <div class="feature-card"><h4>Shared engine</h4><p>fusevm is pulled from crates.io with the <code>jit</code>, <code>jit-disk-cache</code>, <code>aot</code>, and <code>ffi</code> features. JIT and VM improvements land once and benefit zshrs, stryke, awkrs, elisprs, rubylang, and go-rs together.</p></div>
+          <div class="feature-card"><h4>Native arithmetic</h4><p>Operators lower to native fusevm ops; a strict numeric hook supplies Go's <code>string</code> <code>+</code> concatenation and ordering only for the non-numeric operand cases the VM does not compute natively (<code>src/host.rs</code>).</p></div>
+          <div class="feature-card"><h4>Persistent native code</h4><p><code>jit-disk-cache</code> persists compiled machine code across runs, keyed by chunk hash, so hot Go loops trace-compile once and warm runs skip recompilation.</p></div>
+          <div class="feature-card"><h4>Editor tooling in-binary</h4><p>The same <code>go</code> binary speaks LSP (<code>--lsp</code>) and DAP (<code>--dap</code>) over stdio, so completion, diagnostics, and a stepping debugger work from any editor that speaks the protocols.</p></div>
         </div>
       </section>
 
       <hr class="section-rule">
 
       <section class="tutorial-section">
-        <h2>Pipeline</h2>
-        <pre>Go source
-   │  lexer.rs   — tokeniser with Go automatic semicolon insertion (ASI)
-   ▼
-tokens
-   │  parser.rs  — recursive-descent parser → AST (ast.rs)
-   ▼
-AST
-   │  compiler.rs — lower to fusevm ops via ChunkBuilder
-   ▼
-fusevm::Chunk ──► fusevm VM + three-tier Cranelift JIT
-   │
-   └─ host.rs   — fmt print family (Println/Print/Printf/Eprint*) + strict numeric
-                  hook: string `+` (concat) and string ordering</pre>
-        <p><code>func main</code>'s body runs in the global scope, with variables addressed by name through <code>GetVar</code>/<code>SetVar</code>. Every other <code>func</code> is lowered to a subroutine, emitted after <code>main</code> and jumped over; its locals live in call-frame slots (<code>GetSlot</code>/<code>SetSlot</code>) so recursion never clobbers a caller's variables. Calls resolve by name index through <code>Op::Call</code>.</p>
+        <h2>Value model</h2>
+        <p>The current slice runs directly on the fusevm value model — there is no go-rs object heap yet. Immediate values (<code>int</code>, <code>float64</code>, <code>bool</code>) ride through the VM as <code>fusevm::Value</code>; a string literal is a heap string value, and a rune literal is modeled as a one-character string. <code>func main</code> runs in the global scope, so its locals are addressed by name through <code>GetVar</code>/<code>SetVar</code> into the VM's global slot table — which is also what the <code>--dap</code> debugger reads to list a frame's locals. Every other <code>func</code> is lowered to a fusevm subroutine whose locals live in call-frame slots (<code>GetSlot</code>/<code>SetSlot</code>), so recursion never clobbers a caller's variables.</p>
+        <p>Two places need Go semantics the VM's default flavour does not supply. Printing lowers <code>fmt.Println</code>/<code>Print</code>/<code>Printf</code> to registered builtins that format through Go's <code>%v</code> rules — <code>true</code>/<code>false</code>, a whole <code>float64</code> as <code>3</code> (not <code>3.0</code>), <code>+Inf</code>/<code>-Inf</code>/<code>NaN</code> — rather than the shell-flavoured default. And Go's <code>+</code> is string concatenation when an operand is a <code>string</code>: once the strict numeric hook is installed, any operation with a non-numeric operand delegates to it, where <code>+</code> concatenates and <code>&lt;</code>/<code>==</code> order lexicographically, while non-<code>+</code> arithmetic on a string is reported as a type error.</p>
       </section>
 
       <hr class="section-rule">
 
       <section class="tutorial-section">
-        <h2>Module map</h2>
+        <h2>Component status</h2>
         <table class="file-table">
-          <thead><tr><th>Module</th><th>Role</th></tr></thead>
+          <thead><tr><th>Component</th><th>State</th><th>Notes</th></tr></thead>
           <tbody>
-            <tr><td>src/lexer.rs</td><td>Tokeniser with Go automatic semicolon insertion.</td></tr>
-            <tr><td>src/parser.rs</td><td>Recursive-descent parser producing the AST.</td></tr>
-            <tr><td>src/ast.rs</td><td>AST node definitions.</td></tr>
-            <tr><td>src/compiler.rs</td><td>Lowers the AST to a <code>fusevm::Chunk</code> (functions, control flow, arithmetic, Go <code>/</code> truncation).</td></tr>
-            <tr><td>src/host.rs</td><td>Native host ops: the <code>fmt</code> print family (<code>Println</code>/<code>Print</code>/<code>Printf</code> and the <code>Eprint</code> stderr variants, IDs <code>800</code>–<code>804</code>, Go <code>%v</code> rendering) plus the strict numeric hook for string concatenation and string ordering at runtime.</td></tr>
-            <tr><td>src/cli.rs / src/main.rs</td><td>The <code>go</code> binary: argument handling and program entry.</td></tr>
-            <tr><td>src/lib.rs</td><td>The <code>gors</code> library crate surface.</td></tr>
-            <tr><td>tests/eval.rs</td><td>End-to-end evaluation tests over the implemented subset.</td></tr>
-          </tbody>
-        </table>
-      </section>
-
-      <hr class="section-rule">
-
-      <section class="tutorial-section">
-        <h2>Numeric semantics</h2>
-        <p>Go's <code>/</code> truncates for integer operands and divides as floating point otherwise. The compiler tracks each value's static numeric category and appends <code>Op::TruncInt</code> only for <code>int&nbsp;÷&nbsp;int</code>; mixed and float operands divide directly. Integer and float arithmetic, comparisons, and boolean logic all lower to native fusevm ops. String <code>+</code> and string ordering are dispatched at runtime through the strict numeric hook in <code>host.rs</code>, so a string operand never silently coerces to a number.</p>
-      </section>
-
-      <hr class="section-rule">
-
-      <section class="tutorial-section">
-        <h2>Roadmap</h2>
-        <p>go-rs currently covers a core imperative subset: <code>package</code>/<code>import</code>, <code>func</code> declarations and calls, <code>var</code>/<code>const</code>/<code>:=</code>, <code>if</code>/<code>else</code>, <code>for</code>/<code>range</code>, <code>break</code>/<code>continue</code>/<code>return</code>, integer/float/string arithmetic, and comparisons. On the roadmap, in rough order:</p>
-        <table class="file-table">
-          <thead><tr><th>Area</th><th>Plan</th></tr></thead>
-          <tbody>
-            <tr><td>switch / case</td><td>Statement-level switch lowering to jump tables.</td></tr>
-            <tr><td>Composite types</td><td>Slices, arrays, and maps as fusevm extension handles — reached without a tracing GC.</td></tr>
-            <tr><td>struct / interface / methods</td><td>User-defined types and method dispatch over extension handles.</td></tr>
-            <tr><td>Pointers</td><td>Address-of / dereference with an escape-free value model.</td></tr>
-            <tr><td>Concurrency</td><td><code>go</code>/<code>chan</code>/<code>select</code>/<code>defer</code> — a design open question given the no-goroutine-runtime constraint.</td></tr>
-            <tr><td>Standard library</td><td>A curated subset (<code>fmt</code>, <code>strings</code>, <code>strconv</code>, …) served natively.</td></tr>
+            <tr><td>lexer (ASI) / parser → AST</td><td>Implemented</td><td>Hand-written tokenizer with automatic semicolon insertion + recursive-descent parser with precedence climbing (<code>src/lexer.rs</code>, <code>src/parser.rs</code>).</td></tr>
+            <tr><td>AST → fusevm bytecode</td><td>Implemented</td><td>Native arithmetic, <code>int / int</code> truncation, <code>CallBuiltin</code> print dispatch, backpatched control flow; no local VM (<code>src/compiler.rs</code>).</td></tr>
+            <tr><td><code>package main</code> + <code>func main</code></td><td>Implemented</td><td>Single-file program; <code>main</code> in the global scope, other <code>func</code>s as subroutines called by name (<code>src/compiler.rs</code>).</td></tr>
+            <tr><td><code>:=</code> / <code>var</code> / assignment / compound</td><td>Implemented</td><td><code>x := e</code>, <code>var x T = e</code>, <code>x += e</code>, post-inc/dec; static numeric type retained for <code>/</code> and comparisons.</td></tr>
+            <tr><td>control flow</td><td>Implemented</td><td><code>if</code>/<code>else</code> with init clause, three-clause / condition / infinite <code>for</code>, <code>break</code>/<code>continue</code>/<code>return</code>, short-circuiting <code>&amp;&amp;</code>/<code>||</code>.</td></tr>
+            <tr><td><code>string</code> <code>+</code> &amp; Go formatting</td><td>Implemented</td><td>Host numeric hook concat + ordering; <code>%v</code> float (<code>3</code>, not <code>3.0</code>), <code>true</code>/<code>false</code> (<code>src/host.rs</code>).</td></tr>
+            <tr><td>console IO</td><td>Implemented</td><td><code>fmt.Println</code>/<code>Print</code>/<code>Printf</code> (<code>%v %d %s %f %t %q %%</code>) + builtin <code>println</code>/<code>print</code>.</td></tr>
+            <tr><td>inline <code>rust { }</code> FFI</td><td>Implemented</td><td>A <code>rust {}</code> block desugars to <code>__rust_compile</code>, compiles to a cached <code>cdylib</code>, and its exports dispatch by name (<code>src/rust_ffi.rs</code>, <code>src/host.rs</code>).</td></tr>
+            <tr><td>LSP server (<code>--lsp</code>)</td><td>Implemented</td><td>Completion + hover from the keyword/type/IO corpus, parser-driven diagnostics on syntax errors (<code>src/lsp.rs</code>).</td></tr>
+            <tr><td>DAP debugger (<code>--dap</code>)</td><td>Implemented</td><td>Line breakpoints, stepping, stack trace, <code>main</code>-locals inspection via per-statement debug line markers (<code>src/dap.rs</code>).</td></tr>
+            <tr><td>reference doc generator</td><td>Implemented</td><td><code>gen-docs</code> renders <code>docs/reference.html</code> from the LSP corpus (<code>src/bin/gen_docs.rs</code>).</td></tr>
+            <tr><td>dumps (<code>--dump-tokens</code>/<code>--dump-ast</code>/<code>--disasm</code>)</td><td>Implemented</td><td>Print an artifact and exit (<code>src/main.rs</code>).</td></tr>
+            <tr><td>structs / methods / interfaces</td><td>Planned</td><td>User types, method sets, and interface dispatch are future waves.</td></tr>
+            <tr><td>slices / maps / channels / goroutines</td><td>Planned</td><td>Composite types, runtime data structures, and concurrency are future waves.</td></tr>
+            <tr><td>standard library beyond <code>fmt</code></td><td>Planned</td><td><code>strings</code>, <code>strconv</code>, <code>os</code>, <code>errors</code>, and the rest of the stdlib pending.</td></tr>
           </tbody>
         </table>
       </section>
@@ -148,14 +145,43 @@ fusevm::Chunk ──► fusevm VM + three-tier Cranelift JIT
 
       <section class="tutorial-section">
         <h2>Dependency posture</h2>
-        <p>go-rs depends on <code>fusevm</code> (pulled from crates.io with the <code>jit</code>, <code>jit-disk-cache</code>, <code>aot</code>, and <code>ffi</code> features) and a small set of durable, widely-vetted crates. There is no dependency on the <code>go</code> toolchain, no cgo, and no goroutine runtime. The published crate excludes CI config, the integration-test corpus, and example programs; consumers get the source and the <code>go</code> binary.</p>
+        <p>Dependencies are kept foundational and durable — the goal is a crate that still builds cleanly years from now. Direct dependencies from <code>Cargo.toml</code>:</p>
+        <table class="file-table">
+          <thead><tr><th>Crate</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td>fusevm</td><td>Language-agnostic bytecode VM + three-tier Cranelift JIT (<code>jit</code>, <code>jit-disk-cache</code>, <code>aot</code>, <code>ffi</code>)</td></tr>
+            <tr><td>thiserror</td><td>Error type derivation</td></tr>
+            <tr><td>lsp-server / lsp-types</td><td>LSP transport + protocol types (<code>--lsp</code> server)</td></tr>
+            <tr><td>serde / serde_json</td><td>DAP JSON-RPC message plumbing</td></tr>
+            <tr><td>libc</td><td>DAP pipe + dup2 to capture the debuggee's stdout as <code>output</code> events</td></tr>
+          </tbody>
+        </table>
       </section>
 
       <hr class="section-rule">
 
       <section class="tutorial-section">
-        <h2>License</h2>
-        <p>go-rs is <strong>MIT licensed</strong> — free and open source. See <a href="https://github.com/MenkeTechnologies/go-rs/blob/main/LICENSE">LICENSE</a>. The shared VM, <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a>, is likewise MIT.</p>
+        <h2>Compatibility &amp; longevity</h2>
+        <div class="feature-grid">
+          <div class="feature-card"><h4>Reference semantics</h4><p>Behaviour tracks <code>go</code> where the slice is implemented — <code>string</code> <code>+</code> concatenation, <code>int / int</code> truncation, a whole <code>float64</code> printed as <code>3</code> — with expected outputs frozen in the integration tests, which run the built <code>go</code> binary and assert stdout.</p></div>
+          <div class="feature-card"><h4>Corpus-driven docs</h4><p>The LSP completion/hover corpus is the single source of truth for <code>docs/reference.html</code>, so the static page and the language server never drift.</p></div>
+          <div class="feature-card"><h4>Cross-architecture</h4><p>macOS aarch64 and Linux x86_64 / aarch64 via the Cranelift JIT; portable bytecode underneath.</p></div>
+          <div class="feature-card"><h4>Standalone crate</h4><p>An explicit empty <code>[workspace]</code> keeps go-rs buildable on its own, independent of the meta repo.</p></div>
+        </div>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Links</h2>
+        <ul>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a></li>
+          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a></li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/go-rs">github.com/MenkeTechnologies/go-rs</a></li>
+          <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/go-rs/issues">github.com/MenkeTechnologies/go-rs/issues</a></li>
+          <li><strong>fusevm</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">github.com/MenkeTechnologies/fusevm</a> (the shared VM)</li>
+          <li><strong>License</strong> — MIT (<a href="https://github.com/MenkeTechnologies/go-rs/blob/main/LICENSE">LICENSE</a>)</li>
+        </ul>
       </section>
     </main>
   </div>

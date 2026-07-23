@@ -36,6 +36,12 @@ path = "src/lib.rs"
 name = "go"
 path = "src/main.rs"
 
+# Offline generator for docs/reference.html — renders the keyword/type/IO
+# reference (src/lsp.rs corpus) as a static page. Run before publishing Pages.
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen_docs.rs"
+
 [dependencies]
 # Go executes on fusevm. go-rs is a pure frontend: it lexes/parses Go and lowers
 # it to fusevm bytecode (src/compiler.rs). There is no local vm.rs/jit.rs and no
@@ -50,6 +56,15 @@ path = "src/main.rs"
 fusevm = { version = "0.14.13", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
+
+# LSP (`go --lsp`) + DAP (`go --dap`) over stdio. libc gives the DAP server a
+# pipe + dup2 to capture the debuggee's stdout (fmt.Print[ln]) so program output
+# streams as `output` events instead of corrupting the JSON-RPC channel.
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -12,16 +12,23 @@ pub mod ast;
 pub mod banner;
 pub mod cli;
 pub mod compiler;
+pub mod dap;
 pub mod host;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
+pub mod rust_ffi;
 
 pub use banner::version_banner;
 use fusevm::{VMResult, Value, VM};
 
-/// Parse Go `src` to an AST.
+/// Parse Go `src` to an AST. Inline `rust { ... }` FFI blocks are desugared to
+/// `__rust_compile(...)` statements first (see [`rust_ffi`]), so every parse
+/// path — run, `--dump-ast`, `--disasm`, `--dap` — sees the same rewritten
+/// source. No-op when the source has no `rust` block.
 pub fn parse(src: &str) -> Result<ast::Program, String> {
-    parser::parse(src)
+    let src = rust_ffi::desugar(src);
+    parser::parse(&src)
 }
 
 /// Parse and lower Go `src` to a runnable fusevm chunk.
@@ -37,7 +44,14 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
     vm.enable_tracing_jit();
-    match vm.run() {
+    let result = vm.run();
+    // An inline-Rust FFI fault stashes its message and halts the VM; it must be
+    // checked on both the `Halted` and `Ok` paths (a fault mid-expression can
+    // leave a value on the stack), so surface it before reporting success.
+    if let Some(e) = host::take_ffi_error() {
+        return Err(e);
+    }
+    match result {
         VMResult::Ok(v) => Ok(v),
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),

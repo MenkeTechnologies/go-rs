@@ -96,10 +96,27 @@ struct Compiler {
     loops: Vec<LoopScope>,
     /// `return`/jump-outs emitted inside `main`, patched to the end of `main`.
     main_exits: Vec<usize>,
+    /// When true, emit a per-statement `CallBuiltin(DBG_LINE)` marker so `--dap`
+    /// can stop on statement lines. Normal runs leave this off (zero extra ops).
+    debug: bool,
+    /// True when the program contains an inline `rust {}` block (a
+    /// `__rust_compile(...)` call), so a bare-name call may be an FFI export.
+    has_ffi: bool,
 }
 
 /// Lower a whole program to a runnable chunk.
 pub fn compile(prog: &Program) -> Result<Chunk, String> {
+    compile_with(prog, false)
+}
+
+/// Compile with per-statement `DBG_LINE` line markers for the `--dap` debugger.
+/// Identical to [`compile`] except each statement is preceded by a marker
+/// carrying its source line (see [`crate::host::DBG_LINE`]).
+pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
+    compile_with(prog, true)
+}
+
+fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let funcs = prog
         .funcs
         .iter()
@@ -118,6 +135,7 @@ pub fn compile(prog: &Program) -> Result<Chunk, String> {
         })
         .collect();
 
+    let has_ffi = body_has_ffi(&prog.main) || prog.funcs.iter().any(|f| body_has_ffi(&f.body));
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         scope: None,
@@ -125,6 +143,8 @@ pub fn compile(prog: &Program) -> Result<Chunk, String> {
         funcs,
         loops: Vec::new(),
         main_exits: Vec::new(),
+        debug,
+        has_ffi,
     };
 
     // ── main body (global scope) ──
@@ -213,6 +233,13 @@ impl Compiler {
     // ── statements ─────────────────────────────────────────────────────────
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        // In debug mode, emit a line marker before the statement so `--dap` can
+        // stop on it. `CallBuiltin` always pushes its return value, so pop it.
+        let line = stmt_line(s);
+        if self.debug && line != 0 {
+            self.b.emit(Op::CallBuiltin(crate::host::DBG_LINE, 0), line);
+            self.b.emit(Op::Pop, line);
+        }
         match s {
             Stmt::Var {
                 name,
@@ -540,6 +567,15 @@ impl Compiler {
         // Bare-name call: a language builtin or a user function.
         if let Expr::Ident(name) = func {
             match name.as_str() {
+                // Desugar target of an inline `rust {}` block.
+                "__rust_compile" => {
+                    for a in args {
+                        self.expr(a)?;
+                    }
+                    self.b
+                        .emit(Op::CallBuiltin(host::GFFI_COMPILE, args.len() as u8), line);
+                    return Ok(());
+                }
                 "println" => {
                     for a in args {
                         self.expr(a)?;
@@ -571,6 +607,18 @@ impl Compiler {
                 }
                 let idx = self.b.add_name(name);
                 self.b.emit(Op::Call(idx, args.len() as u8), line);
+                return Ok(());
+            }
+            // With an inline `rust {}` block present, an otherwise-unresolved
+            // bare name may be an FFI export — dispatch it by name at runtime.
+            if self.has_ffi {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let c = self.b.add_constant(Value::str(name.clone()));
+                self.b.emit(Op::LoadConst(c), line);
+                self.b
+                    .emit(Op::CallBuiltin(host::GFFI_CALL, args.len() as u8 + 1), line);
                 return Ok(());
             }
             return Err(format!("go-rs: undefined: {name} (line {line})"));
@@ -663,5 +711,50 @@ fn num_compare_op(op: BinOp) -> Op {
         BinOp::Le => Op::NumLe,
         BinOp::Ge => Op::NumGe,
         _ => unreachable!("num_compare_op on non-comparison op"),
+    }
+}
+
+/// The source line a statement reports for the `--dap` marker, or 0 for
+/// statements that carry no line of their own (blocks, bare expressions).
+fn stmt_line(s: &Stmt) -> u32 {
+    match s {
+        Stmt::Var { line, .. }
+        | Stmt::Short { line, .. }
+        | Stmt::Assign { line, .. }
+        | Stmt::IncDec { line, .. }
+        | Stmt::Return(_, line)
+        | Stmt::If { line, .. }
+        | Stmt::For { line, .. }
+        | Stmt::Break(line)
+        | Stmt::Continue(line) => *line,
+        Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
+    }
+}
+
+/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
+/// call — the desugar target of an inline `rust {}` block.
+fn body_has_ffi(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::Var { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
+        Stmt::Short { values, .. } => values.iter().any(expr_has_ffi),
+        Stmt::Assign { value, .. } => expr_has_ffi(value),
+        Stmt::ExprStmt(e) => expr_has_ffi(e),
+        Stmt::Return(v, _) => v.as_ref().is_some_and(expr_has_ffi),
+        Stmt::If { then, els, .. } => body_has_ffi(then) || body_has_ffi(els),
+        Stmt::For { body, .. } | Stmt::Block(body) => body_has_ffi(body),
+        Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) => false,
+    })
+}
+
+/// True if `e` contains a `__rust_compile(...)` call.
+fn expr_has_ffi(e: &Expr) -> bool {
+    match e {
+        Expr::Call { func, args, .. } => {
+            matches!(func.as_ref(), Expr::Ident(n) if n == "__rust_compile")
+                || args.iter().any(expr_has_ffi)
+        }
+        Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
+        Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
+        _ => false,
     }
 }
