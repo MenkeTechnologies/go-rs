@@ -693,9 +693,16 @@ impl Compiler {
             }
             Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
             Expr::Call { func, args, line } => self.call(func, args, *line)?,
-            // A bare selector `x.f` is a struct field read (package selectors
-            // only ever appear as call targets, handled in `call`).
+            // A bare selector `x.f` is a package constant (`math.Pi`) or a
+            // struct field read.
             Expr::Selector { recv, field } => {
+                if let Expr::Ident(pkg) = recv.as_ref() {
+                    if let Some(v) = host::stdlib::resolve_const(pkg, field) {
+                        let c = self.b.add_constant(v);
+                        self.b.emit(Op::LoadConst(c), 0);
+                        return Ok(());
+                    }
+                }
                 self.expr(recv)?;
                 let c = self.b.add_constant(Value::str(field.clone()));
                 self.b.emit(Op::LoadConst(c), 0);
@@ -1009,8 +1016,8 @@ impl Compiler {
                     self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
                     return Ok(());
                 }
-                // `strings.*` / `strconv.*` standard library.
-                if pkg == "strings" || pkg == "strconv" {
+                // Standard-library package calls.
+                if matches!(pkg.as_str(), "strings" | "strconv" | "math" | "sort" | "os") {
                     let id = host::stdlib::resolve(pkg, field).ok_or_else(|| {
                         format!("go-rs: unsupported call `{pkg}.{field}` (line {line})")
                     })?;
@@ -1048,6 +1055,9 @@ impl Compiler {
                 "cap" => Some(host::GCAP),
                 "append" => Some(host::GAPPEND),
                 "delete" => Some(host::GDELETE),
+                // Go 1.21 ordered builtins.
+                "min" => Some(host::GMIN),
+                "max" => Some(host::GMAX),
                 _ => None,
             };
             if let Some(id) = simple_builtin {

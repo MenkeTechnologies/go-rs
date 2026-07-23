@@ -56,6 +56,10 @@ pub const GSTRUCT_COPY: u16 = 823;
 pub const GRANGE_KEYS: u16 = 824;
 /// The runtime type name of a struct value (drives interface method dispatch).
 pub const GTYPEOF: u16 = 825;
+/// Go 1.21 builtin `min(a, b, …)` — the smallest of the (ordered) arguments.
+pub const GMIN: u16 = 826;
+/// Go 1.21 builtin `max(a, b, …)` — the largest of the (ordered) arguments.
+pub const GMAX: u16 = 827;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -82,7 +86,46 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
+    vm.register_builtin(GMIN, b_min);
+    vm.register_builtin(GMAX, b_max);
     stdlib::install(vm);
+}
+
+/// `min(a, b, …)` — the smallest argument, preserving int vs float, compared
+/// numerically (or lexicographically when all arguments are strings).
+fn b_min(vm: &mut VM, argc: u8) -> Value {
+    fold_extreme(vm, argc, true)
+}
+
+/// `max(a, b, …)` — the largest argument (see [`b_min`]).
+fn b_max(vm: &mut VM, argc: u8) -> Value {
+    fold_extreme(vm, argc, false)
+}
+
+fn fold_extreme(vm: &mut VM, argc: u8, want_min: bool) -> Value {
+    let args = pop_args(vm, argc);
+    let all_str = args.iter().all(|v| matches!(v, Value::Str(_)));
+    args.into_iter()
+        .reduce(|a, b| {
+            let pick_b = if all_str {
+                let (x, y) = (go_str(&a), go_str(&b));
+                if want_min {
+                    y < x
+                } else {
+                    y > x
+                }
+            } else if want_min {
+                b.to_float() < a.to_float()
+            } else {
+                b.to_float() > a.to_float()
+            };
+            if pick_b {
+                b
+            } else {
+                a
+            }
+        })
+        .unwrap_or(Value::Undef)
 }
 
 /// The runtime type name of a struct value, or `""` for a non-struct. Used by
@@ -750,9 +793,38 @@ pub mod stdlib {
     pub const INDEX: u16 = 839;
     pub const REPLACE_ALL: u16 = 840;
     pub const FIELDS: u16 = 841;
+    pub const COUNT: u16 = 842;
+    pub const TRIM_PREFIX: u16 = 843;
+    pub const TRIM_SUFFIX: u16 = 844;
+    pub const TRIM: u16 = 845;
+    pub const TITLE: u16 = 846;
+    pub const EQUAL_FOLD: u16 = 847;
+    pub const LAST_INDEX: u16 = 848;
     // strconv.*
     pub const ITOA: u16 = 850;
     pub const ATOI: u16 = 851;
+    pub const PARSE_INT: u16 = 852;
+    pub const PARSE_FLOAT: u16 = 853;
+    pub const FORMAT_INT: u16 = 854;
+    pub const QUOTE: u16 = 855;
+    // math.*
+    pub const ABS: u16 = 860;
+    pub const SQRT: u16 = 861;
+    pub const POW: u16 = 862;
+    pub const FLOOR: u16 = 863;
+    pub const CEIL: u16 = 864;
+    pub const ROUND: u16 = 865;
+    pub const TRUNC: u16 = 866;
+    pub const MOD_F: u16 = 867;
+    pub const HYPOT: u16 = 868;
+    pub const MAX_F: u16 = 869;
+    pub const MIN_F: u16 = 870;
+    // sort.*
+    pub const SORT_INTS: u16 = 875;
+    pub const SORT_STRINGS: u16 = 876;
+    pub const SORT_FLOAT64S: u16 = 877;
+    // os.*
+    pub const GETENV: u16 = 880;
 
     /// Resolve `pkg.func` to a stdlib builtin id, or `None` if unknown.
     pub fn resolve(pkg: &str, func: &str) -> Option<u16> {
@@ -769,8 +841,49 @@ pub mod stdlib {
             ("strings", "Index") => INDEX,
             ("strings", "ReplaceAll") => REPLACE_ALL,
             ("strings", "Fields") => FIELDS,
+            ("strings", "Count") => COUNT,
+            ("strings", "TrimPrefix") => TRIM_PREFIX,
+            ("strings", "TrimSuffix") => TRIM_SUFFIX,
+            ("strings", "Trim") => TRIM,
+            ("strings", "Title") => TITLE,
+            ("strings", "EqualFold") => EQUAL_FOLD,
+            ("strings", "LastIndex") => LAST_INDEX,
             ("strconv", "Itoa") => ITOA,
             ("strconv", "Atoi") => ATOI,
+            ("strconv", "ParseInt") => PARSE_INT,
+            ("strconv", "ParseFloat") => PARSE_FLOAT,
+            ("strconv", "FormatInt") => FORMAT_INT,
+            ("strconv", "Quote") => QUOTE,
+            ("math", "Abs") => ABS,
+            ("math", "Sqrt") => SQRT,
+            ("math", "Pow") => POW,
+            ("math", "Floor") => FLOOR,
+            ("math", "Ceil") => CEIL,
+            ("math", "Round") => ROUND,
+            ("math", "Trunc") => TRUNC,
+            ("math", "Mod") => MOD_F,
+            ("math", "Hypot") => HYPOT,
+            ("math", "Max") => MAX_F,
+            ("math", "Min") => MIN_F,
+            ("sort", "Ints") => SORT_INTS,
+            ("sort", "Strings") => SORT_STRINGS,
+            ("sort", "Float64s") => SORT_FLOAT64S,
+            ("os", "Getenv") => GETENV,
+            _ => return None,
+        })
+    }
+
+    /// Resolve a package constant `pkg.NAME` (e.g. `math.Pi`) to its value, or
+    /// `None` if unknown. Used by the compiler for bare selector values.
+    pub fn resolve_const(pkg: &str, name: &str) -> Option<Value> {
+        Some(match (pkg, name) {
+            ("math", "Pi") => Value::Float(std::f64::consts::PI),
+            ("math", "E") => Value::Float(std::f64::consts::E),
+            ("math", "Sqrt2") => Value::Float(std::f64::consts::SQRT_2),
+            ("math", "MaxInt64") => Value::Int(i64::MAX),
+            ("math", "MinInt64") => Value::Int(i64::MIN),
+            ("math", "MaxInt") => Value::Int(i64::MAX),
+            ("math", "MinInt") => Value::Int(i64::MIN),
             _ => return None,
         })
     }
@@ -790,6 +903,161 @@ pub mod stdlib {
         vm.register_builtin(JOIN, b_join);
         vm.register_builtin(ITOA, b_itoa);
         vm.register_builtin(ATOI, b_atoi);
+        // extra strings.*
+        vm.register_builtin(COUNT, b_count);
+        vm.register_builtin(TRIM_PREFIX, |vm, a| {
+            two_str(vm, a, |s, p| s.strip_prefix(p).unwrap_or(s).to_string())
+        });
+        vm.register_builtin(TRIM_SUFFIX, |vm, a| {
+            two_str(vm, a, |s, p| s.strip_suffix(p).unwrap_or(s).to_string())
+        });
+        vm.register_builtin(TRIM, |vm, a| {
+            two_str(vm, a, |s, cut| {
+                s.trim_matches(|c| cut.contains(c)).to_string()
+            })
+        });
+        vm.register_builtin(TITLE, |vm, a| s1(vm, a, title_case));
+        vm.register_builtin(EQUAL_FOLD, |vm, a| {
+            b2(vm, a, |s, t| s.eq_ignore_ascii_case(t))
+        });
+        vm.register_builtin(LAST_INDEX, b_last_index);
+        // extra strconv.*
+        vm.register_builtin(PARSE_INT, b_parse_int);
+        vm.register_builtin(PARSE_FLOAT, |vm, a| {
+            let args = pop_args(vm, a);
+            Value::Float(
+                args.first()
+                    .map(go_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .parse()
+                    .unwrap_or(0.0),
+            )
+        });
+        vm.register_builtin(FORMAT_INT, b_format_int);
+        vm.register_builtin(QUOTE, |vm, a| s1(vm, a, |s| format!("\"{s}\"")));
+        // math.*
+        vm.register_builtin(ABS, |vm, a| math1(vm, a, f64::abs));
+        vm.register_builtin(SQRT, |vm, a| math1(vm, a, f64::sqrt));
+        vm.register_builtin(FLOOR, |vm, a| math1(vm, a, f64::floor));
+        vm.register_builtin(CEIL, |vm, a| math1(vm, a, f64::ceil));
+        vm.register_builtin(ROUND, |vm, a| math1(vm, a, f64::round));
+        vm.register_builtin(TRUNC, |vm, a| math1(vm, a, f64::trunc));
+        vm.register_builtin(POW, |vm, a| math2(vm, a, f64::powf));
+        vm.register_builtin(MOD_F, |vm, a| math2(vm, a, |x, y| x % y));
+        vm.register_builtin(HYPOT, |vm, a| math2(vm, a, f64::hypot));
+        vm.register_builtin(MAX_F, |vm, a| math2(vm, a, f64::max));
+        vm.register_builtin(MIN_F, |vm, a| math2(vm, a, f64::min));
+        // sort.*
+        vm.register_builtin(SORT_INTS, |vm, a| {
+            sort_slice(vm, a, |x, y| x.to_int().cmp(&y.to_int()))
+        });
+        vm.register_builtin(SORT_FLOAT64S, |vm, a| {
+            sort_slice(vm, a, |x, y| {
+                x.to_float()
+                    .partial_cmp(&y.to_float())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        vm.register_builtin(SORT_STRINGS, |vm, a| {
+            sort_slice(vm, a, |x, y| go_str(x).cmp(&go_str(y)))
+        });
+        // os.*
+        vm.register_builtin(GETENV, |vm, a| {
+            let args = pop_args(vm, a);
+            let k = args.first().map(go_str).unwrap_or_default();
+            Value::str(std::env::var(&k).unwrap_or_default())
+        });
+    }
+
+    /// A two-string-arg → string builtin.
+    fn two_str(vm: &mut VM, argc: u8, f: impl Fn(&str, &str) -> String) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let p = args.get(1).map(go_str).unwrap_or_default();
+        Value::str(f(&s, &p))
+    }
+
+    /// A one-float-arg → float `math` builtin.
+    fn math1(vm: &mut VM, argc: u8, f: impl Fn(f64) -> f64) -> Value {
+        let args = pop_args(vm, argc);
+        Value::Float(f(args.first().map(|v| v.to_float()).unwrap_or(0.0)))
+    }
+
+    /// A two-float-arg → float `math` builtin.
+    fn math2(vm: &mut VM, argc: u8, f: impl Fn(f64, f64) -> f64) -> Value {
+        let args = pop_args(vm, argc);
+        let a = args.first().map(|v| v.to_float()).unwrap_or(0.0);
+        let b = args.get(1).map(|v| v.to_float()).unwrap_or(0.0);
+        Value::Float(f(a, b))
+    }
+
+    /// Sort a heap slice in place by `cmp`. Returns nil (sort.* are void).
+    fn sort_slice(
+        vm: &mut VM,
+        argc: u8,
+        cmp: impl Fn(&Value, &Value) -> std::cmp::Ordering,
+    ) -> Value {
+        let args = pop_args(vm, argc);
+        if let Some(Value::Obj(id)) = args.first() {
+            HEAP.with(|h| {
+                let mut h = h.borrow_mut();
+                if let Some(HostObj::Slice(a)) = h.get_mut(*id as usize) {
+                    a.sort_by(cmp);
+                }
+            });
+        }
+        Value::Undef
+    }
+
+    fn title_case(s: &str) -> String {
+        s.split(' ')
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().chain(c).collect::<String>(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn b_count(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let sub = args.get(1).map(go_str).unwrap_or_default();
+        Value::Int(if sub.is_empty() {
+            s.chars().count() as i64 + 1
+        } else {
+            s.matches(&sub).count() as i64
+        })
+    }
+
+    fn b_last_index(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let sub = args.get(1).map(go_str).unwrap_or_default();
+        Value::Int(s.rfind(&sub).map(|b| b as i64).unwrap_or(-1))
+    }
+
+    fn b_parse_int(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let base = args.get(1).map(|v| v.to_int()).unwrap_or(10).max(2) as u32;
+        Value::Int(i64::from_str_radix(s.trim(), base).unwrap_or(0))
+    }
+
+    fn b_format_int(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+        let base = args.get(1).map(|v| v.to_int()).unwrap_or(10);
+        Value::str(match base {
+            2 => format!("{n:b}"),
+            8 => format!("{n:o}"),
+            16 => format!("{n:x}"),
+            _ => n.to_string(),
+        })
     }
 
     /// A one-string-arg → string builtin.
