@@ -1,0 +1,55 @@
+[package]
+name = "go-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Go as a fusevm frontend: lexer (with automatic semicolon insertion), parser, and compiler to fusevm::Chunk, run on the shared three-tier Cranelift JIT — no goroutine runtime, no gc, no `go` toolchain"
+license = "MIT"
+documentation = "https://docs.rs/go-rs"
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
+repository = "https://github.com/MenkeTechnologies/go-rs"
+homepage = "https://menketechnologies.github.io/go-rs/"
+readme = "README.md"
+keywords = ["go", "golang", "compiler", "jit", "fusevm"]
+categories = ["command-line-utilities", "compilers"]
+publish = true
+# Dev-only artifacts kept out of the published crate. Consumers get src + the
+# `go` bin — not CI config, the integration-test corpus, or the .go examples.
+# None are referenced at compile time (no include_str! into them), so the
+# packaged crate still builds and its bin runs.
+exclude = [
+    "/.github/",
+    "/tests/",
+    "/examples/",
+    "/docs/",
+]
+
+# go-rs is a standalone crate, not a workspace member. An explicit empty
+# `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
+[workspace]
+
+[lib]
+name = "gors"
+path = "src/lib.rs"
+
+[[bin]]
+name = "go"
+path = "src/main.rs"
+
+[dependencies]
+# Go executes on fusevm. go-rs is a pure frontend: it lexes/parses Go and lowers
+# it to fusevm bytecode (src/compiler.rs). There is no local vm.rs/jit.rs and no
+# Go runtime — execution and codegen live in the shared engine behind zshrs,
+# strykelang, awkrs, vimlrs, elisprs, rubylang, javars, kotlinrs, and scalars.
+#
+# `jit-disk-cache` turns on fusevm's three-tier Cranelift JIT *and* its
+# persistent on-disk cache of compiled native code (keyed by chunk hash), so hot
+# Go loops trace-compile and warm runs skip recompilation. `aot` enables the
+# ahead-of-time object emitter used by later `go build` work. `ffi` enables the
+# inline-Rust bridge shared by the other frontends.
+fusevm = { version = "0.14.13", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"
