@@ -61,6 +61,9 @@ struct LambdaInfo {
     body: Vec<Stmt>,
     /// Free variables captured from the enclosing scope, in capture order.
     captures: Vec<String>,
+    /// Aligned with `captures`: whether each was captured by reference (a shared
+    /// heap cell) versus by value. Reads/writes of a cell capture go through it.
+    cell_captures: Vec<bool>,
 }
 
 /// A lexical scope inside a subroutine: local/parameter name → frame slot.
@@ -149,6 +152,13 @@ struct Compiler {
     /// Forward jumps (from `panic` sites and post-call unwind checks) to the
     /// current function's panic epilogue; patched when that epilogue is emitted.
     panic_jumps: Vec<usize>,
+    /// This function's params/locals that are captured by a nested closure and
+    /// so live in a shared heap cell (Go's capture-by-reference). Reads/writes go
+    /// through the cell; a captured cell handle is shared with the closure.
+    boxed: HashSet<String>,
+    /// While compiling a lambda: which of its captures are cells (captured by
+    /// reference). A cell capture is dereferenced on read and written through.
+    active_cell_captures: HashSet<String>,
 }
 
 /// Whether the program (a function body, recursing everywhere including nested
@@ -196,6 +206,387 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
         }
     }
     body.iter().any(st)
+}
+
+/// The set of a function's parameters/locals that are captured by some nested
+/// closure and must therefore be *boxed* (stored in a shared heap cell) so a
+/// closure's writes propagate — Go's capture-by-reference. Computed structurally
+/// before the body is compiled: the intersection of (names free in a nested
+/// function literal) and (this function's own params/locals).
+fn boxed_vars(params: &[Param], body: &[Stmt]) -> HashSet<String> {
+    let mut captured = HashSet::new();
+    for s in body {
+        collect_captured(s, &mut captured);
+    }
+    if captured.is_empty() {
+        return HashSet::new();
+    }
+    let mut locals: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    for s in body {
+        collect_locals(s, &mut locals);
+    }
+    // Loop variables are excluded: Go 1.22 gives them per-iteration value
+    // semantics, which capture-by-value already models correctly. Boxing them
+    // into one shared cell would regress to pre-1.22 (all closures see the last
+    // value).
+    let mut loop_vars = HashSet::new();
+    for s in body {
+        collect_loop_vars(s, &mut loop_vars);
+    }
+    captured
+        .intersection(&locals)
+        .filter(|n| !loop_vars.contains(*n))
+        .cloned()
+        .collect()
+}
+
+/// Names introduced as loop variables (a `for … := …` init or `for … range`),
+/// excluded from boxing (they keep Go 1.22 per-iteration value semantics).
+fn collect_loop_vars(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::For { init, body, .. } => {
+            if let Some(i) = init {
+                collect_locals(i, out);
+            }
+            body.iter().for_each(|s| collect_loop_vars(s, out));
+        }
+        Stmt::ForRange { key, val, body, .. } => {
+            out.extend(key.iter().cloned());
+            out.extend(val.iter().cloned());
+            body.iter().for_each(|s| collect_loop_vars(s, out));
+        }
+        Stmt::If { then, els, .. } => {
+            then.iter().for_each(|s| collect_loop_vars(s, out));
+            els.iter().for_each(|s| collect_loop_vars(s, out));
+        }
+        Stmt::Block(b) => b.iter().for_each(|s| collect_loop_vars(s, out)),
+        Stmt::Select { cases, default, .. } => {
+            for c in cases {
+                c.body.iter().for_each(|s| collect_loop_vars(s, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| collect_loop_vars(s, out));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Add to `out` the free names of every function literal reachable in `s` (a
+/// nested closure's free names bubble up through its enclosing literal).
+fn collect_captured(s: &Stmt, out: &mut HashSet<String>) {
+    fn ex(e: &Expr, out: &mut HashSet<String>) {
+        match e {
+            Expr::FuncLit { params, body, .. } => {
+                let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+                for s in body {
+                    free_stmt(s, &mut bound, out);
+                }
+            }
+            Expr::Unary { rhs, .. } => ex(rhs, out),
+            Expr::Binary { lhs, rhs, .. } => {
+                ex(lhs, out);
+                ex(rhs, out);
+            }
+            Expr::Call { func, args, .. } => {
+                ex(func, out);
+                args.iter().for_each(|a| ex(a, out));
+            }
+            Expr::Selector { recv, .. } => ex(recv, out),
+            Expr::Index { recv, index } => {
+                ex(recv, out);
+                ex(index, out);
+            }
+            Expr::SliceLit { elems, .. } => elems.iter().for_each(|e| ex(e, out)),
+            Expr::MapLit { pairs, .. } => pairs.iter().for_each(|(k, v)| {
+                ex(k, out);
+                ex(v, out);
+            }),
+            Expr::StructLit { fields, .. } => fields.iter().for_each(|(_, v)| ex(v, out)),
+            Expr::Make { len, elem_zero, .. } => {
+                if let Some(l) = len {
+                    ex(l, out);
+                }
+                ex(elem_zero, out);
+            }
+            Expr::MakeChan { cap: Some(c) } => ex(c, out),
+            Expr::MakeChan { cap: None } => {}
+            Expr::Recv { chan } => ex(chan, out),
+            _ => {}
+        }
+    }
+    walk_stmt_exprs(s, &mut |e| ex(e, out));
+}
+
+/// Add to `out` the names of variables declared at this function level (params
+/// handled by the caller); does not descend into nested function literals.
+fn collect_locals(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Var { name, .. } => {
+            out.insert(name.clone());
+        }
+        Stmt::Short { names, .. } => out.extend(names.iter().cloned()),
+        Stmt::ForRange { key, val, body, .. } => {
+            out.extend(key.iter().cloned());
+            out.extend(val.iter().cloned());
+            body.iter().for_each(|s| collect_locals(s, out));
+        }
+        Stmt::If {
+            init, then, els, ..
+        } => {
+            if let Some(i) = init {
+                collect_locals(i, out);
+            }
+            then.iter().for_each(|s| collect_locals(s, out));
+            els.iter().for_each(|s| collect_locals(s, out));
+        }
+        Stmt::For {
+            init, post, body, ..
+        } => {
+            if let Some(i) = init {
+                collect_locals(i, out);
+            }
+            if let Some(p) = post {
+                collect_locals(p, out);
+            }
+            body.iter().for_each(|s| collect_locals(s, out));
+        }
+        Stmt::Block(b) => b.iter().for_each(|s| collect_locals(s, out)),
+        Stmt::Select { cases, default, .. } => {
+            for c in cases {
+                if let SelectComm::Recv { bind: Some(b), .. } = &c.comm {
+                    out.insert(b.clone());
+                }
+                c.body.iter().for_each(|s| collect_locals(s, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| collect_locals(s, out));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Free-name walk of a statement: a referenced identifier not in `bound` is free
+/// (added to `out`). `bound` grows monotonically (matching [`Compiler::fv_stmt`]).
+fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
+    let fe = free_expr;
+    match s {
+        Stmt::Var { name, init, .. } => {
+            if let Some(e) = init {
+                fe(e, bound, out);
+            }
+            bound.insert(name.clone());
+        }
+        Stmt::Short { names, values, .. } => {
+            values.iter().for_each(|v| fe(v, bound, out));
+            bound.extend(names.iter().cloned());
+        }
+        Stmt::Assign { target, value, .. } => {
+            fe(target, bound, out);
+            fe(value, bound, out);
+        }
+        Stmt::IncDec { target, .. } => fe(target, bound, out),
+        Stmt::ExprStmt(e) => fe(e, bound, out),
+        Stmt::Return(vs, _) => vs.iter().for_each(|e| fe(e, bound, out)),
+        Stmt::If {
+            init,
+            cond,
+            then,
+            els,
+            ..
+        } => {
+            if let Some(i) = init {
+                free_stmt(i, bound, out);
+            }
+            fe(cond, bound, out);
+            then.iter().for_each(|s| free_stmt(s, bound, out));
+            els.iter().for_each(|s| free_stmt(s, bound, out));
+        }
+        Stmt::For {
+            init,
+            cond,
+            post,
+            body,
+            ..
+        } => {
+            if let Some(i) = init {
+                free_stmt(i, bound, out);
+            }
+            if let Some(c) = cond {
+                fe(c, bound, out);
+            }
+            if let Some(p) = post {
+                free_stmt(p, bound, out);
+            }
+            body.iter().for_each(|s| free_stmt(s, bound, out));
+        }
+        Stmt::ForRange {
+            key,
+            val,
+            iter,
+            body,
+            ..
+        } => {
+            fe(iter, bound, out);
+            bound.extend(key.iter().cloned());
+            bound.extend(val.iter().cloned());
+            body.iter().for_each(|s| free_stmt(s, bound, out));
+        }
+        Stmt::Go { call, .. } | Stmt::Defer { call, .. } => fe(call, bound, out),
+        Stmt::Send { chan, val, .. } => {
+            fe(chan, bound, out);
+            fe(val, bound, out);
+        }
+        Stmt::Select { cases, default, .. } => {
+            for c in cases {
+                match &c.comm {
+                    SelectComm::Recv { bind, chan } => {
+                        fe(chan, bound, out);
+                        if let Some(b) = bind {
+                            bound.insert(b.clone());
+                        }
+                    }
+                    SelectComm::Send { chan, val } => {
+                        fe(chan, bound, out);
+                        fe(val, bound, out);
+                    }
+                }
+                c.body.iter().for_each(|s| free_stmt(s, bound, out));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| free_stmt(s, bound, out));
+            }
+        }
+        Stmt::Block(b) => b.iter().for_each(|s| free_stmt(s, bound, out)),
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+/// Free-name walk of an expression (see [`free_stmt`]).
+fn free_expr(e: &Expr, bound: &HashSet<String>, out: &mut HashSet<String>) {
+    match e {
+        Expr::Ident(n) => {
+            if !bound.contains(n) {
+                out.insert(n.clone());
+            }
+        }
+        Expr::Unary { rhs, .. } => free_expr(rhs, bound, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            free_expr(lhs, bound, out);
+            free_expr(rhs, bound, out);
+        }
+        Expr::Call { func, args, .. } => {
+            free_expr(func, bound, out);
+            args.iter().for_each(|a| free_expr(a, bound, out));
+        }
+        Expr::Selector { recv, .. } => free_expr(recv, bound, out),
+        Expr::Index { recv, index } => {
+            free_expr(recv, bound, out);
+            free_expr(index, bound, out);
+        }
+        Expr::SliceLit { elems, .. } => elems.iter().for_each(|e| free_expr(e, bound, out)),
+        Expr::MapLit { pairs, .. } => pairs.iter().for_each(|(k, v)| {
+            free_expr(k, bound, out);
+            free_expr(v, bound, out);
+        }),
+        Expr::StructLit { fields, .. } => fields.iter().for_each(|(_, v)| free_expr(v, bound, out)),
+        Expr::Make { len, elem_zero, .. } => {
+            if let Some(l) = len {
+                free_expr(l, bound, out);
+            }
+            free_expr(elem_zero, bound, out);
+        }
+        Expr::MakeChan { cap: Some(c) } => free_expr(c, bound, out),
+        Expr::MakeChan { cap: None } => {}
+        Expr::Recv { chan } => free_expr(chan, bound, out),
+        // A nested function literal: its free names (minus its own params) are
+        // free in the enclosing one too.
+        Expr::FuncLit { params, body, .. } => {
+            let mut inner = bound.clone();
+            inner.extend(params.iter().map(|p| p.name.clone()));
+            for s in body {
+                free_stmt(s, &mut inner, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply `f` to every expression directly in a statement (not descending into
+/// nested statements' own expressions beyond the immediate ones); used to reach
+/// function literals for capture analysis.
+fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
+    match s {
+        Stmt::Var { init: Some(e), .. } => f(e),
+        Stmt::Var { init: None, .. } => {}
+        Stmt::Short { values, .. } => values.iter().for_each(&mut *f),
+        Stmt::Assign { target, value, .. } => {
+            f(target);
+            f(value);
+        }
+        Stmt::IncDec { target, .. } => f(target),
+        Stmt::ExprStmt(e) => f(e),
+        Stmt::Return(vs, _) => vs.iter().for_each(&mut *f),
+        Stmt::If {
+            init,
+            cond,
+            then,
+            els,
+            ..
+        } => {
+            if let Some(i) = init {
+                walk_stmt_exprs(i, f);
+            }
+            f(cond);
+            then.iter().for_each(|s| walk_stmt_exprs(s, f));
+            els.iter().for_each(|s| walk_stmt_exprs(s, f));
+        }
+        Stmt::For {
+            init,
+            cond,
+            post,
+            body,
+            ..
+        } => {
+            if let Some(i) = init {
+                walk_stmt_exprs(i, f);
+            }
+            if let Some(c) = cond {
+                f(c);
+            }
+            if let Some(p) = post {
+                walk_stmt_exprs(p, f);
+            }
+            body.iter().for_each(|s| walk_stmt_exprs(s, f));
+        }
+        Stmt::ForRange { iter, body, .. } => {
+            f(iter);
+            body.iter().for_each(|s| walk_stmt_exprs(s, f));
+        }
+        Stmt::Go { call, .. } | Stmt::Defer { call, .. } => f(call),
+        Stmt::Send { chan, val, .. } => {
+            f(chan);
+            f(val);
+        }
+        Stmt::Select { cases, default, .. } => {
+            for c in cases {
+                match &c.comm {
+                    SelectComm::Recv { chan, .. } => f(chan),
+                    SelectComm::Send { chan, val } => {
+                        f(chan);
+                        f(val);
+                    }
+                }
+                c.body.iter().for_each(|s| walk_stmt_exprs(s, f));
+            }
+            if let Some(d) = default {
+                d.iter().for_each(|s| walk_stmt_exprs(s, f));
+            }
+        }
+        Stmt::Block(b) => b.iter().for_each(|s| walk_stmt_exprs(s, f)),
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
 }
 
 /// Whether `body` contains a `defer` at this function level (not descending into
@@ -293,9 +684,13 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         uses_panic: body_uses_panic(&prog.main)
             || prog.funcs.iter().any(|f| body_uses_panic(&f.body)),
         panic_jumps: Vec::new(),
+        boxed: HashSet::new(),
+        active_cell_captures: HashSet::new(),
     };
 
     // ── main body (global scope) ──
+    // main's globals captured by a closure are boxed (shared cells) too.
+    c.boxed = boxed_vars(&[], &prog.main);
     c.fn_has_defer = body_has_defer(&prog.main);
     if c.fn_has_defer {
         c.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), 0);
@@ -371,11 +766,20 @@ impl Compiler {
         scope.next_slot = slot;
         self.scope = Some(scope);
 
+        // Params/locals captured by a nested closure are boxed (shared cells).
+        let mut all_params: Vec<Param> = Vec::new();
+        if let Some(r) = &f.receiver {
+            all_params.push(r.clone());
+        }
+        all_params.extend(f.params.iter().cloned());
+        self.boxed = boxed_vars(&all_params, &f.body);
+
         // Prologue: pop args into their slots. The last argument is on top of
         // the stack, so bind slots high-to-low (receiver deepest, at slot 0).
         for i in (0..slot).rev() {
             self.b.emit(Op::SetSlot(i), f.line);
         }
+        self.box_params(&all_params);
 
         self.fn_has_defer = body_has_defer(&f.body);
         self.panic_jumps.clear();
@@ -393,6 +797,7 @@ impl Compiler {
         self.emit_panic_epilogue(&f.results, f.line);
 
         self.fn_has_defer = false;
+        self.boxed = HashSet::new();
         self.scope = None;
         Ok(())
     }
@@ -405,8 +810,15 @@ impl Compiler {
         let id = self.lambdas.len() as i64;
         // Build the closure: push each captured value, then the target lambda's
         // subroutine name-index (so a dynamically-dispatched call can resolve it).
+        // A by-reference (boxed) capture forwards the shared cell handle (raw),
+        // so writes on either side propagate; a by-value capture forwards a copy.
+        let cell_captures: Vec<bool> = captures.iter().map(|c| self.is_boxed(c)).collect();
         for c in &captures {
-            self.emit_get(c, 0);
+            if self.is_boxed(c) {
+                self.emit_get_raw(c, 0);
+            } else {
+                self.emit_get(c, 0);
+            }
         }
         let nidx = self.b.add_name(&format!("$lambda_{id}"));
         self.b.emit(Op::LoadInt(nidx as i64), 0);
@@ -418,6 +830,7 @@ impl Compiler {
             params: params.to_vec(),
             body: body.to_vec(),
             captures,
+            cell_captures,
         });
         id
     }
@@ -605,6 +1018,7 @@ impl Compiler {
         let params = self.lambdas[id].params.clone();
         let body = self.lambdas[id].body.clone();
         let captures = self.lambdas[id].captures.clone();
+        let cell_captures = self.lambdas[id].cell_captures.clone();
 
         let entry = self.b.current_pos();
         let name_idx = self.b.add_name(&format!("$lambda_{id}"));
@@ -626,12 +1040,23 @@ impl Compiler {
             .enumerate()
             .map(|(i, n)| (n.clone(), i as u16))
             .collect();
+        // Captures that arrived as shared cells (captured by reference).
+        self.active_cell_captures = captures
+            .iter()
+            .zip(&cell_captures)
+            .filter(|(_, &cell)| cell)
+            .map(|(n, _)| n.clone())
+            .collect();
+        // This lambda's own params/locals captured by a further-nested closure.
+        let saved_boxed = std::mem::take(&mut self.boxed);
+        self.boxed = boxed_vars(&params, &body);
         self.scope = Some(scope);
 
         // Prologue: bind the closure + params (closure deepest, at slot 0).
         for i in (0..slot).rev() {
             self.b.emit(Op::SetSlot(i), 0);
         }
+        self.box_params(&params);
 
         self.fn_has_defer = body_has_defer(&body);
         let saved_panic_jumps = std::mem::take(&mut self.panic_jumps);
@@ -648,10 +1073,24 @@ impl Compiler {
         self.emit_panic_epilogue(&[], 0);
 
         self.panic_jumps = saved_panic_jumps;
+        self.boxed = saved_boxed;
         self.fn_has_defer = false;
         self.scope = None;
         self.active_captures.clear();
+        self.active_cell_captures.clear();
         Ok(())
+    }
+
+    /// After the prologue, wrap each boxed parameter's value in a fresh cell so a
+    /// nested closure that captures the parameter shares its storage.
+    fn box_params(&mut self, params: &[Param]) {
+        for p in params {
+            if self.boxed.contains(&p.name) {
+                self.emit_get_raw(&p.name, 0);
+                self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
+                self.emit_set_raw(&p.name, 0);
+            }
+        }
     }
 
     /// The free variables of a lambda: names read in `body` that are neither its
@@ -860,7 +1299,16 @@ impl Compiler {
 
     // ── variable access ────────────────────────────────────────────────────
 
-    fn emit_get(&mut self, name: &str, line: u32) {
+    /// Whether `name` is captured by reference in the current function — a boxed
+    /// local, or a cell capture inside a lambda (both live in a shared cell).
+    fn is_boxed(&self, name: &str) -> bool {
+        self.boxed.contains(name) || self.active_cell_captures.contains(name)
+    }
+
+    /// Push a variable's raw storage: the closure cell handle for a captured or
+    /// boxed variable, otherwise its plain value. Callers deref (`GCELL_GET`)
+    /// when they want the boxed value.
+    fn emit_get_raw(&mut self, name: &str, line: u32) {
         // Inside a lambda, a captured variable is read from the closure (slot 0).
         if let Some(&idx) = self.active_captures.get(name) {
             self.b.emit(Op::GetSlot(0), line);
@@ -880,7 +1328,8 @@ impl Compiler {
         }
     }
 
-    fn emit_set(&mut self, name: &str, line: u32) {
+    /// Store the top of stack into a variable's raw storage (slot/global).
+    fn emit_set_raw(&mut self, name: &str, line: u32) {
         match &mut self.scope {
             Some(scope) => {
                 let slot = scope.slot(name);
@@ -890,6 +1339,36 @@ impl Compiler {
                 let idx = self.b.add_name(name);
                 self.b.emit(Op::SetVar(idx), line);
             }
+        }
+    }
+
+    fn emit_get(&mut self, name: &str, line: u32) {
+        self.emit_get_raw(name, line);
+        if self.is_boxed(name) {
+            // The raw value is the cell handle; dereference to the boxed value.
+            self.b.emit(Op::CallBuiltin(host::GCELL_GET, 1), line);
+        }
+    }
+
+    fn emit_set(&mut self, name: &str, line: u32) {
+        if self.is_boxed(name) {
+            // Store into the shared cell: stack is `[value]`, push the cell handle
+            // above it, then `GCELL_SET` writes through (visible to every closure).
+            self.emit_get_raw(name, line);
+            self.b.emit(Op::CallBuiltin(host::GCELL_SET, 2), line);
+        } else {
+            self.emit_set_raw(name, line);
+        }
+    }
+
+    /// Declare a variable, binding the value on the stack. A boxed variable is
+    /// wrapped in a fresh cell so its closures share the storage.
+    fn emit_declare(&mut self, name: &str, line: u32) {
+        if self.boxed.contains(name) {
+            self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), line);
+            self.emit_set_raw(name, line);
+        } else {
+            self.emit_set(name, line);
         }
     }
 
@@ -930,7 +1409,7 @@ impl Compiler {
                 }
                 self.types.insert(name.clone(), nt);
                 self.decl_types.insert(name.clone(), decl_ty);
-                self.emit_set(name, *line);
+                self.emit_declare(name, *line);
             }
             Stmt::Short {
                 names,
@@ -954,7 +1433,7 @@ impl Compiler {
                         self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
                         self.types.insert(name.clone(), NumType::Unknown);
                         self.decl_types.insert(name.clone(), String::new());
-                        self.emit_set(name, *line);
+                        self.emit_declare(name, *line);
                     }
                 }
                 // `n, _ := strconv.Atoi(s)` — a single-value call (in go-rs) with
@@ -970,11 +1449,11 @@ impl Compiler {
                     self.emit_rhs(&names[0], e)?;
                     self.types.insert(names[0].clone(), nt);
                     self.decl_types.insert(names[0].clone(), dt);
-                    self.emit_set(&names[0], *line);
+                    self.emit_declare(&names[0], *line);
                     for name in &names[1..] {
                         self.b.emit(Op::LoadUndef, *line);
                         self.types.insert(name.clone(), NumType::Unknown);
-                        self.emit_set(name, *line);
+                        self.emit_declare(name, *line);
                     }
                 } else if names.len() != values.len() {
                     return Err(format!(
@@ -989,7 +1468,7 @@ impl Compiler {
                         self.emit_rhs(name, e)?;
                         self.types.insert(name.clone(), nt);
                         self.decl_types.insert(name.clone(), dt);
-                        self.emit_set(name, *line);
+                        self.emit_declare(name, *line);
                     }
                 }
             }
@@ -1898,7 +2377,11 @@ impl Compiler {
                 || self
                     .decl_types
                     .get(name)
-                    .is_some_and(|t| t.starts_with("func"));
+                    .is_some_and(|t| t.starts_with("func"))
+                // A declared variable (e.g. a global in `main` bound to a func
+                // value via `:=` or a multi-return destructure) that isn't a
+                // top-level function — dispatch its value dynamically.
+                || (self.types.contains_key(name) && !self.funcs.contains_key(name));
             if is_value_call {
                 let n = self.temp_counter;
                 self.temp_counter += 1;

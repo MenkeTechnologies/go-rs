@@ -122,7 +122,7 @@ A single-file `package main` that runs real Go programs:
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return |
 | Methods        | value/pointer receivers, `recv.m(args)` dispatch by receiver type |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type (a compiled type-switch over the concrete implementors) |
-| Closures       | function literals `func(…){…}` with capture-by-value; `f := func(){…}; f()`, IIFE, `go func(){…}()` |
+| Closures       | function literals `func(…){…}` with **capture-by-reference** (a closure mutating a captured variable propagates, and closures share captured state); `f := func(){…}; f()`, IIFE, `go func(){…}()`; Go 1.22 per-iteration loop-variable capture |
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
 | Functions      | multiple parameters, `(T, U)` multi-value results, `return a, b`, and `x, y := f()` destructuring |
 | Generics       | type parameters on funcs, types, and methods (`func F[T Number]`, `type Stack[T any]`, `Pair[K, V]{…}`), constraint interfaces (`~int \| ~float64`), inferred + explicit instantiation — **erased** onto the dynamic value model (no monomorphization) |
@@ -139,7 +139,11 @@ operations. **Generics are handled by erasure** — type-parameter and
 type-argument brackets are consumed and dropped, and the dynamically-typed value
 model runs one erased body for every instantiation (the zero value of a
 type-parameter-typed `var` is nil, treated as the additive identity so a generic
-accumulator matches Go for int/float/string). **`defer`/`panic`/`recover`** run
+accumulator matches Go for int/float/string). **Closures capture by reference**:
+a variable captured by a nested closure is boxed in a shared heap cell, so a
+closure's writes are seen by the enclosing scope and by sibling closures (loop
+variables keep Go 1.22 per-iteration value semantics and are not boxed).
+**`defer`/`panic`/`recover`** run
 on a host-side defer stack drained before every return: `defer` snapshots the
 call's arguments (and, for a method, its receiver by reference) and pushes a
 closure; a `panic` jumps to the function's defer drain and, if unrecovered,
@@ -206,8 +210,9 @@ documented rather than hidden):
   a `%f` can differ. go-rs matches Go's *variable/runtime* float semantics
   (`a := 1.950; a * b`) exactly — the fuzzer routes float operands through
   variables to test that.
-- **Closures capture by value, not by reference** — a closure that *mutates* a
-  captured variable does not propagate the change.
+- **Named return values** are not modeled as storage, so a deferred closure that
+  assigns to a named result (`func f() (err error) { defer func(){ err = … }() }`)
+  does not change what `f` returns (a plain `return v` and unnamed results work).
 
 ## License
 

@@ -942,3 +942,77 @@ func main() {
 ";
     assert_stdout(src, "5 ok\nrecovered: div by zero\n0 true\n");
 }
+
+#[test]
+fn closure_captures_variable_by_reference() {
+    // A closure mutating a captured variable propagates the change (Go captures
+    // the variable, not a copy): a counter closure, and two closures sharing one
+    // captured variable.
+    let src = "\
+package main
+import \"fmt\"
+func makeCounter() func() int {
+	count := 0
+	return func() int {
+		count++
+		return count
+	}
+}
+func main() {
+	c := makeCounter()
+	fmt.Println(c(), c(), c())
+	total := 0
+	add := func(n int) { total += n }
+	get := func() int { return total }
+	add(5)
+	add(10)
+	fmt.Println(get())
+}
+";
+    assert_stdout(src, "1 2 3\n15\n");
+}
+
+#[test]
+fn closure_mutation_observed_after_call() {
+    // Mutating an enclosing local through a closure is visible in the enclosing
+    // scope after the call returns.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	x := 1
+	bump := func() { x = x * 10 }
+	bump()
+	bump()
+	fmt.Println(x)
+}
+";
+    assert_stdout(src, "100\n");
+}
+
+#[test]
+fn loop_variable_capture_is_per_iteration() {
+    // Go 1.22: each iteration has its own loop variable, so a closure created in
+    // the loop captures that iteration's value (not the final one).
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	f0 := func() int { return -1 }
+	f1 := func() int { return -1 }
+	f2 := func() int { return -1 }
+	for i := 0; i < 3; i++ {
+		f := func() int { return i }
+		if i == 0 {
+			f0 = f
+		} else if i == 1 {
+			f1 = f
+		} else {
+			f2 = f
+		}
+	}
+	fmt.Println(f0(), f1(), f2())
+}
+";
+    assert_stdout(src, "0 1 2\n");
+}

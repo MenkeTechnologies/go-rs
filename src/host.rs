@@ -86,6 +86,12 @@ pub const GPANIC_ACTIVE: u16 = 887;
 pub const GRECOVER: u16 = 888;
 /// If a panic is still propagating at program end, print it and exit non-zero.
 pub const GPANIC_FINISH: u16 = 889;
+/// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
+pub const GCELL_NEW: u16 = 890;
+/// `[cell]` → read a boxed variable's current value.
+pub const GCELL_GET: u16 = 891;
+/// `[value, cell]` → store into a boxed variable (shared with its closures).
+pub const GCELL_SET: u16 = 892;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -126,7 +132,45 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GPANIC_ACTIVE, b_panic_active);
     vm.register_builtin(GRECOVER, b_recover);
     vm.register_builtin(GPANIC_FINISH, b_panic_finish);
+    vm.register_builtin(GCELL_NEW, b_cell_new);
+    vm.register_builtin(GCELL_GET, b_cell_get);
+    vm.register_builtin(GCELL_SET, b_cell_set);
     stdlib::install(vm);
+}
+
+/// `[value]` → a fresh heap cell boxing `value` (a by-reference-captured var).
+fn b_cell_new(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.into_iter().next().unwrap_or(Value::Undef);
+    Value::Obj(heap_alloc(HostObj::Cell(v)))
+}
+
+/// `[cell]` → the boxed value.
+fn b_cell_get(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    match args.first() {
+        Some(Value::Obj(id)) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Cell(v)) => v.clone(),
+            _ => Value::Undef,
+        }),
+        _ => Value::Undef,
+    }
+}
+
+/// `[value, cell]` → store `value` into the shared cell (writes reach closures).
+fn b_cell_set(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc);
+    // Stack order is [value, cell]; `cell` is the top (last) argument.
+    let cell = args.pop().unwrap_or(Value::Undef);
+    let value = args.pop().unwrap_or(Value::Undef);
+    if let Value::Obj(id) = cell {
+        HEAP.with(|h| {
+            if let Some(HostObj::Cell(slot)) = h.borrow_mut().get_mut(id as usize) {
+                *slot = value;
+            }
+        });
+    }
+    Value::Undef
 }
 
 /// `[value]` → begin a panic: store the value; unwinding is driven by the
@@ -345,6 +389,9 @@ pub(crate) enum HostObj {
     /// A closure: the name-index of its compiled `$lambda_N` subroutine (for
     /// dynamic dispatch when passed as a value) plus its captured values.
     Closure { name_idx: i64, captures: Vec<Value> },
+    /// A one-slot mutable box for a variable captured by reference: the enclosing
+    /// scope and every capturing closure share this handle, so writes propagate.
+    Cell(Value),
 }
 
 thread_local! {
@@ -829,6 +876,8 @@ fn obj_str(id: u32) -> String {
             }
             // Go prints a function value as a hex pointer; a fixed marker suffices.
             Some(HostObj::Closure { .. }) => "<func>".to_string(),
+            // A cell is an internal box; render its contents (a captured value).
+            Some(HostObj::Cell(v)) => go_str(v),
             None => "<nil>".to_string(),
         }
     })
