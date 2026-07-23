@@ -114,6 +114,8 @@ pub enum Tok {
     Shr,
     /// `&^` — bit clear (AND NOT).
     AndNot,
+    /// `...` — variadic parameter marker / argument spread.
+    Ellipsis,
     Eof,
 }
 
@@ -406,6 +408,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             "<<=" => (Tok::ShlAssign, 3),
             ">>=" => (Tok::ShrAssign, 3),
             "&^=" => (Tok::AndNotAssign, 3),
+            "..." => (Tok::Ellipsis, 3),
             _ => match two {
                 ":=" => (Tok::Define, 2),
                 "+=" => (Tok::PlusAssign, 2),

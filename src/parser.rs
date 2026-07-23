@@ -418,7 +418,7 @@ impl Parser {
             self.skip_type_brackets()?;
         }
         self.expect(&Tok::LParen)?;
-        let params = self.params()?;
+        let (params, variadic) = self.params()?;
         self.expect(&Tok::RParen)?;
         let (result_names, results): (Vec<String>, Vec<String>) =
             self.results()?.into_iter().unzip();
@@ -427,6 +427,7 @@ impl Parser {
             name,
             receiver,
             params,
+            variadic,
             results,
             result_names,
             body,
@@ -437,16 +438,22 @@ impl Parser {
     /// Parse a parameter list. Supports grouped parameters that share a type
     /// (`a, b int`): names without a trailing type inherit the next typed
     /// group's type, matching Go's rule.
-    fn params(&mut self) -> Result<Vec<Param>, String> {
+    fn params(&mut self) -> Result<(Vec<Param>, bool), String> {
         let mut params = Vec::new();
+        let mut variadic = false;
         if matches!(self.peek(), Tok::RParen) {
-            return Ok(params);
+            return Ok((params, variadic));
         }
         // Collect (name, optional-type) entries, then back-fill inherited types.
         let mut pending: Vec<(String, Option<String>)> = Vec::new();
         loop {
             let name = self.ident()?;
-            let ty = if self.type_starts() {
+            // `name ...T` — a variadic parameter; `ty` is the element type.
+            let ty = if matches!(self.peek(), Tok::Ellipsis) {
+                self.advance();
+                variadic = true;
+                Some(self.type_name()?)
+            } else if self.type_starts() {
                 Some(self.type_name()?)
             } else {
                 None
@@ -475,7 +482,7 @@ impl Parser {
                 ty: slot.unwrap_or_else(|| "any".to_string()),
             });
         }
-        Ok(params)
+        Ok((params, variadic))
     }
 
     /// Parse a function result signature: nothing, a single type, or a
@@ -489,7 +496,7 @@ impl Parser {
         if self.eat(&Tok::LParen) {
             if self.paren_list_is_named() {
                 // Named results share the grammar of a parameter list.
-                let params = self.params()?;
+                let (params, _) = self.params()?;
                 self.expect(&Tok::RParen)?;
                 return Ok(params.into_iter().map(|p| (p.name, p.ty)).collect());
             }
@@ -1350,8 +1357,14 @@ impl Parser {
                     let line = self.line();
                     self.advance();
                     let mut args = Vec::new();
+                    let mut spread = false;
                     while !matches!(self.peek(), Tok::RParen) {
                         args.push(self.expr()?);
+                        // `f(xs...)` — spread the last argument into a variadic call.
+                        if matches!(self.peek(), Tok::Ellipsis) {
+                            self.advance();
+                            spread = true;
+                        }
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -1360,6 +1373,7 @@ impl Parser {
                     e = Expr::Call {
                         func: Box::new(e),
                         args,
+                        spread,
                         line,
                     };
                 }
@@ -1402,7 +1416,8 @@ impl Parser {
             // A function literal (closure): `func(params) results { body }`.
             Tok::Func => {
                 self.expect(&Tok::LParen)?;
-                let params = self.params()?;
+                // Variadic closures are uncommon; the flag is dropped for FuncLit.
+                let (params, _) = self.params()?;
                 self.expect(&Tok::RParen)?;
                 // Closures keep only result types (named results on a func literal
                 // are uncommon; the name is dropped).
@@ -1550,9 +1565,15 @@ fn subst_iota(e: Expr, idx: i64) -> Expr {
             lhs: b(lhs),
             rhs: b(rhs),
         },
-        Expr::Call { func, args, line } => Expr::Call {
+        Expr::Call {
+            func,
+            args,
+            spread,
+            line,
+        } => Expr::Call {
             func: b(func),
             args: args.into_iter().map(|a| subst_iota(a, idx)).collect(),
+            spread,
             line,
         },
         Expr::Index { recv, index } => Expr::Index {

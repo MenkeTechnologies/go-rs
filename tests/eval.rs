@@ -1370,3 +1370,34 @@ func main() {
 ";
     assert_stdout(src, "1 2 4\n1024 1048576\n42\n");
 }
+
+#[test]
+fn variadic_functions_and_spread() {
+    let src = "\
+package main
+import \"fmt\"
+func sum(nums ...int) int {
+	total := 0
+	for _, n := range nums {
+		total += n
+	}
+	return total
+}
+func tag(prefix string, rest ...string) string {
+	out := prefix
+	for _, s := range rest {
+		out += \"-\" + s
+	}
+	return out
+}
+func main() {
+	fmt.Println(sum(1, 2, 3, 4, 5), sum(), sum(10))
+	xs := []int{6, 7, 8}
+	fmt.Println(sum(xs...))
+	fmt.Println(tag(\"a\"), tag(\"a\", \"b\", \"c\"))
+	parts := []string{\"x\", \"y\"}
+	fmt.Println(tag(\"p\", parts...))
+}
+";
+    assert_stdout(src, "15 0 10\n21\na a-b-c\np-x-y\n");
+}

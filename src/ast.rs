@@ -47,6 +47,9 @@ pub struct Func {
     /// The receiver for a method (`func (r T) m()`); `None` for a plain `func`.
     pub receiver: Option<Param>,
     pub params: Vec<Param>,
+    /// True if the last parameter is variadic (`args ...T`); inside the body it
+    /// binds a slice of the trailing arguments.
+    pub variadic: bool,
     /// Result types in declaration order.
     pub results: Vec<String>,
     /// Result names, aligned with `results` (`""` for an unnamed result). When
@@ -223,10 +226,12 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// A call `func(args)`.
+    /// A call `func(args)`. `spread` is true for `f(xs...)` — the last argument
+    /// is a slice expanded into the callee's variadic parameter.
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
+        spread: bool,
         line: u32,
     },
     /// A selector `recv.field` (e.g. `fmt.Println`, or a struct field read).

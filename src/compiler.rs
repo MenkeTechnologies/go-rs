@@ -53,6 +53,9 @@ struct FuncSig {
     result_ty: String,
     /// Number of declared result values (for multi-value-return destructuring).
     nresults: usize,
+    /// True if the last parameter is variadic (`args ...T`); the trailing call
+    /// arguments are packed into a slice.
+    variadic: bool,
 }
 
 /// A collected function literal, compiled to a `$lambda_N` subroutine.
@@ -779,6 +782,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                             .unwrap_or(NumType::Unknown),
                         result_ty: f.results.first().cloned().unwrap_or_default(),
                         nresults: f.results.len(),
+                        variadic: f.variadic,
                     },
                 );
             }
@@ -1184,6 +1188,7 @@ impl Compiler {
         let body = vec![Stmt::ExprStmt(Expr::Call {
             func: Box::new(new_func),
             args: new_args,
+            spread: false,
             line,
         })];
         self.emit_funclit(&[], &body);
@@ -2387,7 +2392,12 @@ impl Compiler {
                 }
                 self.binary(*op, lhs, rhs)?
             }
-            Expr::Call { func, args, line } => self.call(func, args, *line)?,
+            Expr::Call {
+                func,
+                args,
+                spread,
+                line,
+            } => self.call(func, args, *spread, *line)?,
             // A bare selector `x.f` is a package constant (`math.Pi`) or a
             // struct field read.
             Expr::Selector { recv, field } => {
@@ -2791,11 +2801,11 @@ impl Compiler {
         };
     }
 
-    fn call(&mut self, func: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
+    fn call(&mut self, func: &Expr, args: &[Expr], spread: bool, line: u32) -> Result<(), String> {
         // Multi-value spread: `f(g())` where `g` returns N>1 values passes them
         // as N arguments. Evaluate `g` into a tuple, extract each element into a
         // temporary, and recurse with those temporaries as the arguments.
-        if args.len() == 1 {
+        if args.len() == 1 && !spread {
             if let Some(n) = self.call_result_count(&args[0]) {
                 if n >= 2 {
                     let base = self.temp_counter;
@@ -2803,7 +2813,7 @@ impl Compiler {
                     let tup = format!("$sp{base}");
                     self.expr(&args[0])?;
                     self.emit_set(&tup, line);
-                    let mut spread = Vec::with_capacity(n);
+                    let mut expanded = Vec::with_capacity(n);
                     for i in 0..n {
                         self.emit_get(&tup, line);
                         self.b.emit(Op::LoadInt(i as i64), line);
@@ -2812,9 +2822,9 @@ impl Compiler {
                         self.types.insert(t.clone(), NumType::Unknown);
                         self.decl_types.insert(t.clone(), String::new());
                         self.emit_set(&t, line);
-                        spread.push(Expr::Ident(t));
+                        expanded.push(Expr::Ident(t));
                     }
-                    return self.call(func, &spread, line);
+                    return self.call(func, &expanded, false, line);
                 }
             }
         }
@@ -2967,10 +2977,42 @@ impl Compiler {
                 return Ok(());
             }
             if let Some(sig) = self.funcs.get(name) {
-                if sig.arity != args.len() {
+                let variadic = sig.variadic;
+                let arity = sig.arity;
+                if variadic {
+                    // Fixed params come first; the trailing arguments are packed
+                    // into the variadic slice parameter (or, for `f(xs...)`, the
+                    // already-a-slice argument is passed directly).
+                    let fixed = arity - 1;
+                    if args.len() < fixed {
+                        return Err(format!(
+                            "go-rs: `{name}` needs at least {fixed} argument(s), got {} (line {line})",
+                            args.len()
+                        ));
+                    }
+                    for a in &args[..fixed] {
+                        self.emit_value(a)?;
+                    }
+                    if spread {
+                        // `f(a, xs...)` — the last argument is the slice itself.
+                        self.emit_value(&args[fixed])?;
+                    } else {
+                        // Pack the remaining arguments into a fresh slice.
+                        let rest = &args[fixed..];
+                        for a in rest {
+                            self.emit_value(a)?;
+                        }
+                        self.b
+                            .emit(Op::CallBuiltin(host::GSLICE_LIT, rest.len() as u8), line);
+                    }
+                    let idx = self.b.add_name(name);
+                    self.b.emit(Op::Call(idx, arity as u8), line);
+                    self.emit_panic_check(line);
+                    return Ok(());
+                }
+                if arity != args.len() {
                     return Err(format!(
-                        "go-rs: `{name}` takes {} argument(s), got {} (line {line})",
-                        sig.arity,
+                        "go-rs: `{name}` takes {arity} argument(s), got {} (line {line})",
                         args.len()
                     ));
                 }
