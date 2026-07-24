@@ -2502,6 +2502,30 @@ impl Compiler {
             return Ok(());
         }
 
+        // `v, _ = strconv.Atoi(s)` — a single-value (builtin-backed) call with
+        // extra targets: assign the first, pad the rest with nil (the `(v, err)`
+        // idiom over a call go-rs models as single-valued).
+        if targets.len() > values.len()
+            && values.len() == 1
+            && matches!(&values[0], Expr::Call { .. })
+        {
+            let tmp = format!("$am{n}");
+            self.types.insert(tmp.clone(), self.infer(&values[0]));
+            self.decl_types
+                .insert(tmp.clone(), self.type_name(&values[0]));
+            self.emit_value(&values[0])?;
+            self.emit_set(&tmp, line);
+            self.assign(&targets[0], AssignOp::Set, &Expr::Ident(tmp), line)?;
+            let niltmp = format!("$amnil{n}");
+            self.b.emit(Op::LoadUndef, line);
+            self.types.insert(niltmp.clone(), NumType::Unknown);
+            self.emit_set(&niltmp, line);
+            for target in &targets[1..] {
+                self.assign(target, AssignOp::Set, &Expr::Ident(niltmp.clone()), line)?;
+            }
+            return Ok(());
+        }
+
         if targets.len() != values.len() {
             return Err(format!(
                 "go-rs: assignment mismatch: {} targets but {} values (line {line})",
