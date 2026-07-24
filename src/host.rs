@@ -1700,6 +1700,22 @@ pub mod stdlib {
     pub const HYPOT: u16 = 868;
     pub const MAX_F: u16 = 869;
     pub const MIN_F: u16 = 870;
+    // math.* trigonometry / exponential / logarithm (added wave).
+    pub const SIN: u16 = 907;
+    pub const COS: u16 = 908;
+    pub const TAN: u16 = 909;
+    pub const ASIN: u16 = 910;
+    pub const ACOS: u16 = 911;
+    pub const ATAN: u16 = 912;
+    pub const ATAN2: u16 = 913;
+    pub const SINH: u16 = 914;
+    pub const COSH: u16 = 915;
+    pub const TANH: u16 = 916;
+    pub const EXP: u16 = 917;
+    pub const LOG: u16 = 918;
+    pub const LOG2: u16 = 919;
+    pub const LOG10: u16 = 920;
+    pub const CBRT: u16 = 921;
     // sort.*
     pub const SORT_INTS: u16 = 875;
     pub const SORT_STRINGS: u16 = 876;
@@ -1747,6 +1763,21 @@ pub mod stdlib {
             ("math", "Hypot") => HYPOT,
             ("math", "Max") => MAX_F,
             ("math", "Min") => MIN_F,
+            ("math", "Sin") => SIN,
+            ("math", "Cos") => COS,
+            ("math", "Tan") => TAN,
+            ("math", "Asin") => ASIN,
+            ("math", "Acos") => ACOS,
+            ("math", "Atan") => ATAN,
+            ("math", "Atan2") => ATAN2,
+            ("math", "Sinh") => SINH,
+            ("math", "Cosh") => COSH,
+            ("math", "Tanh") => TANH,
+            ("math", "Exp") => EXP,
+            ("math", "Log") => LOG,
+            ("math", "Log2") => LOG2,
+            ("math", "Log10") => LOG10,
+            ("math", "Cbrt") => CBRT,
             ("sort", "Ints") => SORT_INTS,
             ("sort", "Strings") => SORT_STRINGS,
             ("sort", "Float64s") => SORT_FLOAT64S,
@@ -1831,6 +1862,21 @@ pub mod stdlib {
         vm.register_builtin(HYPOT, |vm, a| math2(vm, a, f64::hypot));
         vm.register_builtin(MAX_F, |vm, a| math2(vm, a, f64::max));
         vm.register_builtin(MIN_F, |vm, a| math2(vm, a, f64::min));
+        vm.register_builtin(SIN, |vm, a| math1(vm, a, f64::sin));
+        vm.register_builtin(COS, |vm, a| math1(vm, a, f64::cos));
+        vm.register_builtin(TAN, |vm, a| math1(vm, a, f64::tan));
+        vm.register_builtin(ASIN, |vm, a| math1(vm, a, f64::asin));
+        vm.register_builtin(ACOS, |vm, a| math1(vm, a, f64::acos));
+        vm.register_builtin(ATAN, |vm, a| math1(vm, a, f64::atan));
+        vm.register_builtin(ATAN2, |vm, a| math2(vm, a, f64::atan2));
+        vm.register_builtin(SINH, |vm, a| math1(vm, a, f64::sinh));
+        vm.register_builtin(COSH, |vm, a| math1(vm, a, f64::cosh));
+        vm.register_builtin(TANH, |vm, a| math1(vm, a, f64::tanh));
+        vm.register_builtin(EXP, |vm, a| math1(vm, a, f64::exp));
+        vm.register_builtin(LOG, |vm, a| math1(vm, a, f64::ln));
+        vm.register_builtin(LOG2, |vm, a| math1(vm, a, f64::log2));
+        vm.register_builtin(LOG10, |vm, a| math1(vm, a, f64::log10));
+        vm.register_builtin(CBRT, |vm, a| math1(vm, a, f64::cbrt));
         // sort.*
         vm.register_builtin(SORT_INTS, |vm, a| {
             sort_slice(vm, a, |x, y| x.to_int().cmp(&y.to_int()))
