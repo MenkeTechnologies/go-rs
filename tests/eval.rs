@@ -1886,3 +1886,27 @@ func main() {
 ";
     assert_stdout(src, "2 A b\nfalse\n1\n");
 }
+
+#[test]
+fn sort_slice_with_closure_comparator() {
+    // sort.Slice / sort.SliceStable sort in place via a closure comparator
+    // (lowered to a synthesized in-language insertion sort that calls `less`).
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"sort\"
+)
+func main() {
+	s := []int{5, 2, 8, 1, 9}
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	fmt.Println(s)
+	sort.Slice(s, func(i, j int) bool { return s[i] > s[j] })
+	fmt.Println(s)
+	w := []string{\"banana\", \"apple\", \"cherry\"}
+	sort.SliceStable(w, func(i, j int) bool { return w[i] < w[j] })
+	fmt.Println(w)
+}
+";
+    assert_stdout(src, "[1 2 5 8 9]\n[9 8 5 2 1]\n[apple banana cherry]\n");
+}

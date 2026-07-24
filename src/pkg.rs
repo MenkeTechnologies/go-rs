@@ -53,8 +53,30 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if uses_errorf(&main) {
         add_errorf_type(&mut main);
     }
+    add_sort_slice(&mut main);
     add_stringify(&mut main);
     Ok(main)
+}
+
+/// Synthesize `$sortSlice(s, less)` — the in-language target of `sort.Slice` /
+/// `sort.SliceStable`, whose comparator is a VM closure a host builtin can't
+/// call. An insertion sort keyed on `less(j, j-1)` (stable; the swap works on
+/// go-rs's reference-typed slice, mutating the caller's slice in place).
+fn add_sort_slice(prog: &mut Program) {
+    let src = "package p\n\
+        func h(s any, less func(int, int) bool) {\n\
+        \tfor i := 1; i < len(s); i++ {\n\
+        \t\tfor j := i; j > 0 && less(j, j-1); j-- {\n\
+        \t\t\ts[j], s[j-1] = s[j-1], s[j]\n\
+        \t\t}\n\
+        \t}\n\
+        }\n";
+    if let Ok(mut p) = crate::parse(src) {
+        if let Some(mut f) = p.funcs.pop() {
+            f.name = "$sortSlice".to_string();
+            prog.funcs.push(f);
+        }
+    }
 }
 
 /// Whether the program calls `fmt.Errorf` anywhere (drives synthesis of the

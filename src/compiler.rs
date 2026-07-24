@@ -3277,6 +3277,13 @@ impl Compiler {
                     return Ok(());
                 }
                 // Standard-library package calls.
+                // `sort.Slice(s, less)` / `sort.SliceStable(s, less)` — the
+                // comparator is a VM closure a host builtin can't call, so lower
+                // to the linker-synthesized `$sortSlice` (an in-language insertion
+                // sort that calls `less`).
+                if pkg == "sort" && (field == "Slice" || field == "SliceStable") {
+                    return self.call(&Expr::Ident("$sortSlice".to_string()), args, false, line);
+                }
                 if matches!(pkg.as_str(), "strings" | "strconv" | "math" | "sort" | "os") {
                     let id = host::stdlib::resolve(pkg, field).ok_or_else(|| {
                         format!("go-rs: unsupported call `{pkg}.{field}` (line {line})")
