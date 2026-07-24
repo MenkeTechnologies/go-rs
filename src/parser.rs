@@ -12,7 +12,7 @@
 
 use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The two kinds of `type` declaration the parser produces.
 enum TypeDecl {
@@ -38,6 +38,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         struct_names,
         generic_names,
         no_composite: false,
+        anon_structs: HashMap::new(),
     };
     p.program()
 }
@@ -55,6 +56,10 @@ struct Parser {
     /// composite literal is suppressed (Go's `exprLev` rule; use parens to force
     /// one). Reset to `false` inside parentheses and the composite's own braces.
     no_composite: bool,
+    /// Anonymous struct types encountered (`struct{…}` in a type or literal
+    /// position), keyed by a canonical name synthesized from their fields, so an
+    /// identical shape shares one type. Merged into the program's declared types.
+    anon_structs: HashMap<String, Vec<Param>>,
 }
 
 /// Collect names declared as `type Name struct` — including generic structs
@@ -263,6 +268,13 @@ impl Parser {
         globals.extend(main);
         let main = globals;
 
+        // Register anonymous struct types (`struct{…}` used as a type or literal)
+        // so the compiler can zero-fill and field-access them.
+        let mut types = types;
+        for (name, fields) in std::mem::take(&mut self.anon_structs) {
+            types.push(StructDecl { name, fields });
+        }
+
         Ok(Program {
             package,
             imports,
@@ -318,28 +330,51 @@ impl Parser {
             }
             _ => {
                 self.expect(&Tok::Struct)?;
-                self.expect(&Tok::LBrace)?;
-                self.skip_semis();
-                let mut fields = Vec::new();
-                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
-                    // One or more field names sharing a type: `x, y int`.
-                    let mut names = vec![self.ident()?];
-                    while self.eat(&Tok::Comma) {
-                        names.push(self.ident()?);
-                    }
-                    let ty = self.type_name()?;
-                    for n in names {
-                        fields.push(Param {
-                            name: n,
-                            ty: ty.clone(),
-                        });
-                    }
-                    self.skip_semis();
-                }
-                self.expect(&Tok::RBrace)?;
+                let fields = self.struct_field_list()?;
                 Ok(Some(TypeDecl::Struct(StructDecl { name, fields })))
             }
         }
+    }
+
+    /// Parse a `{ field-decls }` struct body into its fields. The `struct`
+    /// keyword is already consumed; the opening `{` is the current token.
+    fn struct_field_list(&mut self) -> Result<Vec<Param>, String> {
+        self.expect(&Tok::LBrace)?;
+        self.skip_semis();
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            // One or more field names sharing a type: `x, y int`.
+            let mut names = vec![self.ident()?];
+            while self.eat(&Tok::Comma) {
+                names.push(self.ident()?);
+            }
+            let ty = self.type_name()?;
+            for n in names {
+                fields.push(Param {
+                    name: n,
+                    ty: ty.clone(),
+                });
+            }
+            self.skip_semis();
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(fields)
+    }
+
+    /// Parse an anonymous `struct{ … }` type (the `struct` keyword is the current
+    /// token), register it under a canonical name synthesized from its fields,
+    /// and return that name. Identical shapes share one type.
+    fn anon_struct_type(&mut self) -> Result<String, String> {
+        self.expect(&Tok::Struct)?;
+        let fields = self.struct_field_list()?;
+        let inner = fields
+            .iter()
+            .map(|f| format!("{} {}", f.name, f.ty))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let name = format!("struct{{{inner}}}");
+        self.anon_structs.entry(name.clone()).or_insert(fields);
+        Ok(name)
     }
 
     /// Consume tokens through the closing `)` of an already-opened paren group.
@@ -615,6 +650,9 @@ impl Parser {
                 self.advance();
                 Ok(format!("chan {}", self.type_name()?))
             }
+            // `struct{ … }` — an anonymous struct type (a field type, a
+            // `map[K]struct{…}` value, a `chan struct{}` element, …).
+            Tok::Struct => self.anon_struct_type(),
             // `func(params) results` — a function type (for function-typed
             // parameters/fields). Consumed structurally; go-rs treats every
             // function value uniformly, so only the `func` tag is retained.
@@ -1619,6 +1657,11 @@ impl Parser {
             }
             return self.array_literal();
         }
+        // `struct{ … }{ … }` — an anonymous struct composite literal.
+        if matches!(self.peek(), Tok::Struct) {
+            let ty = self.anon_struct_type()?;
+            return self.struct_literal(ty);
+        }
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
             Tok::Float(f, dec) => Ok(Expr::Float(f, dec)),
@@ -1703,6 +1746,7 @@ impl Parser {
             // (`[]U`, `map[…]`) keep their own literal syntax.
             let elided_struct = matches!(self.peek(), Tok::LBrace)
                 && (self.struct_names.contains(&elem_ty)
+                    || elem_ty.starts_with("struct{")
                     || (elem_ty.contains('.')
                         && !elem_ty.starts_with("[]")
                         && !elem_ty.starts_with("map[")));

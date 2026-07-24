@@ -1833,3 +1833,33 @@ func main() {
 ";
     assert_stdout(src, "5 true\n");
 }
+
+#[test]
+fn anonymous_struct_types() {
+    // struct{…} as a map value (empty-struct set), as a slice element with elided
+    // literals and field access, and as an inline composite value.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	set := map[string]struct{}{}
+	set[\"a\"] = struct{}{}
+	_, ok := set[\"a\"]
+	_, no := set[\"z\"]
+	fmt.Println(len(set), ok, no)
+	tests := []struct {
+		name string
+		val  int
+	}{
+		{\"x\", 1},
+		{\"y\", 2},
+	}
+	for _, t := range tests {
+		fmt.Println(t.name, t.val)
+	}
+	p := struct{ a, b int }{10, 20}
+	fmt.Println(p.a + p.b)
+}
+";
+    assert_stdout(src, "1 true false\nx 1\ny 2\n30\n");
+}
