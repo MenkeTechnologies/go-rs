@@ -1797,3 +1797,39 @@ func main() {
 ";
     assert_stdout(src, "1 true\n0 true\n0 false\nhas b\n");
 }
+
+#[test]
+fn append_spread_expands_slice() {
+    // append(base, xs...) spreads every element of xs, incl. slice-expression
+    // arguments (element removal via append(s[:i], s[i+1:]...)).
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	a := []int{1, 2}
+	b := []int{3, 4, 5}
+	fmt.Println(append(a, b...))
+	s := []int{10, 20, 30, 40}
+	fmt.Println(append(s[:1], s[2:]...))
+}
+";
+    assert_stdout(src, "[1 2 3 4 5]\n[10 30 40]\n");
+}
+
+#[test]
+fn method_multi_value_return_destructures() {
+    // v, ok := recv.M() destructures a multi-value method return (not only a
+    // top-level func).
+    let src = "\
+package main
+import \"fmt\"
+type C struct{ n int }
+func (c *C) Two() (int, bool) { return c.n, c.n > 0 }
+func main() {
+	c := &C{5}
+	v, ok := c.Two()
+	fmt.Println(v, ok)
+}
+";
+    assert_stdout(src, "5 true\n");
+}

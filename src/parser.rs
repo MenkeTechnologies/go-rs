@@ -633,10 +633,19 @@ impl Parser {
                 Ok("func".to_string())
             }
             Tok::Ident(_) => {
-                let name = self.ident()?;
+                let mut name = self.ident()?;
+                // A qualified type from an imported package: `pkg.Type`. The
+                // linker rewrites the reference to the merged `pkg.Type` name.
+                if matches!(self.peek(), Tok::Dot) {
+                    self.advance();
+                    let field = self.ident()?;
+                    name = format!("{name}.{field}");
+                }
                 // Erase type arguments on a generic type reference: the base name
                 // of `Stack[int]` / `Pair[K, V]` is what go-rs types against.
-                if matches!(self.peek(), Tok::LBracket) && self.generic_names.contains(&name) {
+                if matches!(self.peek(), Tok::LBracket)
+                    && (self.generic_names.contains(&name) || name.contains('.'))
+                {
                     self.skip_type_brackets()?;
                 }
                 Ok(name)
@@ -1006,7 +1015,12 @@ impl Parser {
             val = names.get(1).cloned().flatten();
         }
         self.expect(&Tok::Range)?;
+        // The `{` after the range expression opens the body, so suppress bare
+        // composite literals while parsing the iterated expression.
+        let saved = self.no_composite;
+        self.no_composite = true;
         let iter = self.expr()?;
+        self.no_composite = saved;
         let body = self.block()?;
         Ok(Stmt::ForRange {
             key,
@@ -1467,18 +1481,25 @@ impl Parser {
                 // Restricted to a `pkg.Name` selector base so an index-then-call
                 // `fns[i](x)` (plain-ident base) is unaffected.
                 if matches!(&e, Expr::Selector { recv, .. } if matches!(recv.as_ref(), Expr::Ident(_)))
-                    && matches!(self.bracket_group_next(), Some(Tok::LParen | Tok::LBrace))
                 {
-                    self.skip_type_brackets()?;
-                    // `pkg.Type[T]{ … }` — a generic composite of an imported type.
-                    if matches!(self.peek(), Tok::LBrace) {
+                    let next = self.bracket_group_next();
+                    // `pkg.Func[T](…)` — a generic call. The `(` is never a loop
+                    // body, so this is unambiguous.
+                    if matches!(next, Some(Tok::LParen)) {
+                        self.skip_type_brackets()?;
+                        continue;
+                    }
+                    // `pkg.Type[T]{ … }` — a generic composite. Ambiguous with an
+                    // index in a control header (`range m[k] {`), so gated.
+                    if matches!(next, Some(Tok::LBrace)) && !self.no_composite {
+                        self.skip_type_brackets()?;
                         if let Expr::Selector { recv, field } = &e {
                             if let Expr::Ident(pkg) = recv.as_ref() {
                                 e = self.struct_literal(format!("{pkg}.{field}"))?;
                             }
                         }
+                        continue;
                     }
-                    continue;
                 }
             }
             match self.peek() {
@@ -1676,8 +1697,16 @@ impl Parser {
         let mut elems = Vec::new();
         while !matches!(self.peek(), Tok::RBrace) {
             // Elided element type: `[]T{ {…}, {…} }` — a bare `{…}` is a
-            // composite literal of the slice's element type.
-            if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&elem_ty) {
+            // composite literal of the slice's element type. This applies to a
+            // locally-known struct and to a qualified imported type (`pkg.T`,
+            // which the parser can't see is a struct); container element types
+            // (`[]U`, `map[…]`) keep their own literal syntax.
+            let elided_struct = matches!(self.peek(), Tok::LBrace)
+                && (self.struct_names.contains(&elem_ty)
+                    || (elem_ty.contains('.')
+                        && !elem_ty.starts_with("[]")
+                        && !elem_ty.starts_with("map[")));
+            if elided_struct {
                 elems.push(self.struct_literal(elem_ty.clone())?);
             } else {
                 elems.push(self.expr()?);

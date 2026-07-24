@@ -127,6 +127,9 @@ pub const GCOPY: u16 = 904;
 /// `[map, key]` → the comma-ok map lookup `v, ok := m[key]` as a 2-element slice
 /// `[value, present]`: the value (or zero) and whether the key was present.
 pub const GMAP_GET2: u16 = 905;
+/// `[base, xs]` → `append(base, xs...)`: a new slice of `base`'s elements
+/// followed by every element of the spread slice `xs`.
+pub const GAPPEND_SPREAD: u16 = 906;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -183,6 +186,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GRANGE_VAL, b_range_val);
     vm.register_builtin(GCOPY, b_copy);
     vm.register_builtin(GMAP_GET2, b_map_get2);
+    vm.register_builtin(GAPPEND_SPREAD, b_append_spread);
     stdlib::install(vm);
 }
 
@@ -904,6 +908,31 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             }
         }
     })
+}
+
+/// `append(base, xs...)` — a fresh slice of `base`'s elements then every element
+/// of each spread slice argument. Collecting into a new backing matches Go's
+/// observable result (a caller reassigns the return value).
+fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let mut out: Vec<Value> = Vec::new();
+    let mut extend_from = |v: &Value| {
+        if let Value::Obj(id) = v {
+            if let Some((_, _, len)) = slice_backing(*id) {
+                for i in 0..len {
+                    if let Some(e) = slice_get(*id, i) {
+                        out.push(e);
+                    }
+                }
+            }
+        }
+    };
+    // First argument is the base slice (nil → empty); the rest are spread slices
+    // (normally exactly one).
+    for a in &args {
+        extend_from(a);
+    }
+    Value::Obj(heap_alloc(HostObj::Slice(out)))
 }
 
 /// `[map, key]` → `[value, present]` for the comma-ok map lookup `v, ok := m[k]`.

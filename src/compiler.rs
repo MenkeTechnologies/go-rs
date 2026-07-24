@@ -131,6 +131,9 @@ struct Compiler {
     struct_fields: HashMap<String, Vec<(String, String)>>,
     /// Method arities keyed by `(receiver type, method name)`.
     methods: HashMap<(String, String), usize>,
+    /// Method result counts keyed by `(receiver type, method name)` — lets a
+    /// `v, ok := recv.M()` destructure a multi-value method return.
+    method_nresults: HashMap<(String, String), usize>,
     /// The stack of enclosing `for` loops (innermost last).
     loops: Vec<LoopScope>,
     /// `return`/jump-outs emitted inside `main`, patched to the end of `main`.
@@ -853,10 +856,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
 
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     let mut methods: HashMap<(String, String), usize> = HashMap::new();
+    let mut method_nresults: HashMap<(String, String), usize> = HashMap::new();
     for f in &prog.funcs {
         match &f.receiver {
             Some(r) => {
                 methods.insert((base_type(&r.ty), f.name.clone()), f.params.len());
+                method_nresults.insert((base_type(&r.ty), f.name.clone()), f.results.len());
             }
             None => {
                 funcs.insert(
@@ -893,6 +898,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         structs,
         struct_fields,
         methods,
+        method_nresults,
         loops: Vec::new(),
         main_exits: Vec::new(),
         temp_counter: 0,
@@ -3003,8 +3009,18 @@ impl Compiler {
     /// known top-level function (for multi-value-return destructuring).
     fn call_result_count(&self, e: &Expr) -> Option<usize> {
         if let Expr::Call { func, .. } = e {
-            if let Expr::Ident(name) = func.as_ref() {
-                return self.funcs.get(name).map(|s| s.nresults);
+            match func.as_ref() {
+                Expr::Ident(name) => return self.funcs.get(name).map(|s| s.nresults),
+                // A method call `recv.M()` — look up M's result count on the
+                // receiver's static type. (A package call like `strings.Split`
+                // has an untyped receiver, so this yields `None`.)
+                Expr::Selector { recv, field } => {
+                    let rt = self.type_name(recv);
+                    if !rt.is_empty() {
+                        return self.method_nresults.get(&(rt, field.clone())).copied();
+                    }
+                }
+                _ => {}
             }
         }
         None
@@ -3290,6 +3306,18 @@ impl Compiler {
                 // balanced (the op consumes the channel and pushes nothing, so
                 // synthesize an Undef result).
                 self.b.emit(Op::LoadUndef, line);
+                return Ok(());
+            }
+            // `append(base, xs...)` — spread every element of the slice `xs`
+            // into the result (not append the slice as a single element).
+            if name == "append" && spread {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.b.emit(
+                    Op::CallBuiltin(host::GAPPEND_SPREAD, args.len() as u8),
+                    line,
+                );
                 return Ok(());
             }
             // Builtins that take a variable arg count.
