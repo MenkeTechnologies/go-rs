@@ -37,6 +37,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         pos: 0,
         struct_names,
         generic_names,
+        no_composite: false,
     };
     p.program()
 }
@@ -49,6 +50,11 @@ struct Parser {
     /// Names declared generic (`func F[…]` / `type T[…]`) — enables telling an
     /// instantiation `F[int](…)` apart from an index expression `xs[i]`.
     generic_names: HashSet<String>,
+    /// True while parsing a control-clause header (`if`/`for`/`switch` init and
+    /// condition), where a `{` starts the body — so a bare `T{…}` / `pkg.T{…}`
+    /// composite literal is suppressed (Go's `exprLev` rule; use parens to force
+    /// one). Reset to `false` inside parentheses and the composite's own braces.
+    no_composite: bool,
 }
 
 /// Collect names declared as `type Name struct` — including generic structs
@@ -353,6 +359,28 @@ impl Parser {
     /// Consume a `[ … ]` bracket group (type parameters `[T any, U comparable]`
     /// or type arguments `[int, string]`) and discard it — generics are erased.
     /// The opening `[` must be the current token.
+    /// The token immediately after the `[ … ]` bracket group that starts at the
+    /// current position (which must be `[`), or `None` if unbalanced. Used to
+    /// tell a generic instantiation (`f[T](` / `T[U]{`) from an index (`xs[i]`).
+    fn bracket_group_next(&self) -> Option<&Tok> {
+        let mut i = self.pos;
+        let mut depth = 0;
+        loop {
+            match self.tokens.get(i).map(|t| &t.kind)? {
+                Tok::LBracket => depth += 1,
+                Tok::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.tokens.get(i + 1).map(|t| &t.kind);
+                    }
+                }
+                Tok::Eof => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
     fn skip_type_brackets(&mut self) -> Result<(), String> {
         self.expect(&Tok::LBracket)?;
         let mut depth = 1;
@@ -834,6 +862,10 @@ impl Parser {
     fn if_stmt(&mut self) -> Result<Stmt, String> {
         let line = self.line();
         self.expect(&Tok::If)?;
+        // A `{` in the header starts the body, so suppress bare composite
+        // literals while parsing the init/condition.
+        let saved = self.no_composite;
+        self.no_composite = true;
         // Optional init clause: `if x := f(); cond { … }`.
         let mut init = None;
         let first = self.simple_stmt()?;
@@ -843,6 +875,7 @@ impl Parser {
         } else {
             stmt_into_expr(first, line)?
         };
+        self.no_composite = saved;
         let then = self.block()?;
         let els = if self.eat(&Tok::Else) {
             if matches!(self.peek(), Tok::If) {
@@ -884,7 +917,10 @@ impl Parser {
             return self.for_range(line);
         }
 
-        // Otherwise a condition-only or three-clause header.
+        // Otherwise a condition-only or three-clause header. Suppress bare
+        // composite literals while parsing the header (a `{` starts the body).
+        let saved = self.no_composite;
+        self.no_composite = true;
         let first = if matches!(self.peek(), Tok::Semi) {
             None
         } else {
@@ -904,6 +940,7 @@ impl Parser {
             } else {
                 Some(Box::new(self.simple_stmt()?))
             };
+            self.no_composite = saved;
             let body = self.block()?;
             Ok(Stmt::For {
                 init: first.map(Box::new),
@@ -918,6 +955,7 @@ impl Parser {
                 Some(s) => Some(stmt_into_expr(s, line)?),
                 None => None,
             };
+            self.no_composite = saved;
             let body = self.block()?;
             Ok(Stmt::For {
                 init: None,
@@ -1028,7 +1066,10 @@ impl Parser {
         self.expect(&Tok::Switch)?;
 
         // Optional `init;` then the guard: a tag expression, or a type-switch
-        // guard `[v :=] x.(type)`.
+        // guard `[v :=] x.(type)`. A `{` in the header opens the case block, so
+        // suppress bare composite literals while parsing it.
+        let saved = self.no_composite;
+        self.no_composite = true;
         let mut init = None;
         let mut guard: Option<Stmt> = None;
         if !matches!(self.peek(), Tok::LBrace) {
@@ -1042,6 +1083,7 @@ impl Parser {
                 guard = Some(first);
             }
         }
+        self.no_composite = saved;
 
         // A type switch: the guard is `x.(type)` or `v := x.(type)`.
         if let Some((bind, expr)) = guard.as_ref().and_then(type_switch_guard) {
@@ -1418,6 +1460,26 @@ impl Parser {
                         continue;
                     }
                 }
+                // A package-qualified base with a bracket group immediately
+                // followed by `(` or `{` is a generic instantiation imported from
+                // another package — `pkg.Func[T](…)` / `pkg.Type[T]{…}` — which the
+                // local `generic_names` set can't know. Erase the type arguments.
+                // Restricted to a `pkg.Name` selector base so an index-then-call
+                // `fns[i](x)` (plain-ident base) is unaffected.
+                if matches!(&e, Expr::Selector { recv, .. } if matches!(recv.as_ref(), Expr::Ident(_)))
+                    && matches!(self.bracket_group_next(), Some(Tok::LParen | Tok::LBrace))
+                {
+                    self.skip_type_brackets()?;
+                    // `pkg.Type[T]{ … }` — a generic composite of an imported type.
+                    if matches!(self.peek(), Tok::LBrace) {
+                        if let Expr::Selector { recv, field } = &e {
+                            if let Expr::Ident(pkg) = recv.as_ref() {
+                                e = self.struct_literal(format!("{pkg}.{field}"))?;
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
             match self.peek() {
                 Tok::Dot => {
@@ -1436,10 +1498,23 @@ impl Parser {
                         };
                     } else {
                         let field = self.ident()?;
-                        e = Expr::Selector {
-                            recv: Box::new(e),
-                            field,
-                        };
+                        // `pkg.Type{ … }` — a composite literal of a type imported
+                        // from another package. Recognized when the receiver is a
+                        // bare package identifier and a `{` follows (outside a
+                        // control-clause header). The linker qualifies `pkg.Type`
+                        // to the merged struct name the compiler then resolves.
+                        if !self.no_composite
+                            && matches!(self.peek(), Tok::LBrace)
+                            && matches!(&e, Expr::Ident(_))
+                        {
+                            let Expr::Ident(pkg) = &e else { unreachable!() };
+                            e = self.struct_literal(format!("{pkg}.{field}"))?;
+                        } else {
+                            e = Expr::Selector {
+                                recv: Box::new(e),
+                                field,
+                            };
+                        }
                     }
                 }
                 Tok::LBracket => {
@@ -1480,6 +1555,9 @@ impl Parser {
                 Tok::LParen => {
                     let line = self.line();
                     self.advance();
+                    // Call-argument parentheses reset composite suppression.
+                    let saved = self.no_composite;
+                    self.no_composite = false;
                     let mut args = Vec::new();
                     let mut spread = false;
                     while !matches!(self.peek(), Tok::RParen) {
@@ -1494,6 +1572,7 @@ impl Parser {
                         }
                     }
                     self.expect(&Tok::RParen)?;
+                    self.no_composite = saved;
                     e = Expr::Call {
                         func: Box::new(e),
                         args,
@@ -1543,8 +1622,13 @@ impl Parser {
                 }
             }
             Tok::LParen => {
+                // Parentheses reset the composite-literal suppression: `if
+                // (Point{}).x > 0 { … }` is a valid composite inside a header.
+                let saved = self.no_composite;
+                self.no_composite = false;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;
+                self.no_composite = saved;
                 Ok(e)
             }
             // A function literal (closure): `func(params) results { body }`.
@@ -1716,6 +1800,10 @@ impl Parser {
     /// `T{ … }` — positional `T{a, b}` or keyed `T{x: a, y: b}`.
     fn struct_literal(&mut self, type_name: String) -> Result<Expr, String> {
         self.expect(&Tok::LBrace)?;
+        // Inside the composite's braces the `{`-ambiguity is over, so nested
+        // composites in field values are allowed again.
+        let saved = self.no_composite;
+        self.no_composite = false;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Tok::RBrace) {
             // Keyed element: `ident :` (but not `::`); otherwise positional.
@@ -1734,6 +1822,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace)?;
+        self.no_composite = saved;
         Ok(Expr::StructLit { type_name, fields })
     }
 

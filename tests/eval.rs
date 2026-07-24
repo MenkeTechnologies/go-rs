@@ -1751,3 +1751,26 @@ func main() {
 ";
     assert_stdout(src, "102\n112\n15\n102\n");
 }
+
+#[test]
+fn composite_literal_in_control_header_needs_parens() {
+    // A bare `T{…}` is suppressed in an if/for/switch header (a `{` there opens
+    // the body); parentheses re-enable it. Normal composite positions still work.
+    let src = "\
+package main
+import \"fmt\"
+type P struct{ x, y int }
+func main() {
+	p := P{x: 3, y: 4}
+	fmt.Println(p.x, p.y)
+	if (P{x: 5}).x > 0 {
+		fmt.Println(\"pos\")
+	}
+	for i := 0; i < (P{x: 2}).x; i++ {
+		fmt.Print(i, \" \")
+	}
+	fmt.Println()
+}
+";
+    assert_stdout(src, "3 4\npos\n0 1 \n");
+}
