@@ -270,7 +270,6 @@ impl Parser {
 
         // Register anonymous struct types (`struct{…}` used as a type or literal)
         // so the compiler can zero-fill and field-access them.
-        let mut types = types;
         for (name, fields) in std::mem::take(&mut self.anon_structs) {
             types.push(StructDecl { name, fields });
         }
