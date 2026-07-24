@@ -1723,3 +1723,31 @@ func main() {
 ";
     assert_stdout(src, "[7 8 9] 3\n5 hello\n");
 }
+
+#[test]
+fn package_globals_visible_in_functions() {
+    // Package-level consts/vars are readable and writable from any function, not
+    // just main. A local declaration shadows a global without clobbering it.
+    let src = "\
+package main
+import \"fmt\"
+var counter = 100
+const base = 10
+func inc()          { counter++ }
+func readGlobal() int { return counter + base }
+func shadow() int {
+	counter := 5
+	counter += base
+	return counter
+}
+func main() {
+	inc()
+	inc()
+	fmt.Println(counter)
+	fmt.Println(readGlobal())
+	fmt.Println(shadow())
+	fmt.Println(counter)
+}
+";
+    assert_stdout(src, "102\n112\n15\n102\n");
+}

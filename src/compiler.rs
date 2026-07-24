@@ -121,6 +121,10 @@ struct Compiler {
     decl_types: HashMap<String, String>,
     /// Every top-level (non-method) function, by name (for call resolution).
     funcs: HashMap<String, FuncSig>,
+    /// Package-level variable/constant names (declared at the top level of
+    /// `main`, which runs in the global scope). A function references these as
+    /// name-indexed globals (`GetVar`/`SetVar`), not local slots.
+    globals: HashSet<String>,
     /// Struct type names declared with `type T struct`.
     structs: HashSet<String>,
     /// Each struct type's fields, in declaration order: `(name, type)`.
@@ -802,6 +806,35 @@ pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
     compile_with(prog, true)
 }
 
+/// Collect the package-level variable/constant names — those declared at the
+/// top level of `main` (a `var`/`const`/`:=`, including grouped `const (…)` /
+/// `var (…)` blocks, which lower to a `Block` of `Var`s). These are stored as
+/// name-indexed globals, so functions reference them via `GetVar`/`SetVar`.
+fn collect_globals(stmts: &[Stmt]) -> HashSet<String> {
+    fn add(s: &Stmt, g: &mut HashSet<String>) {
+        match s {
+            Stmt::Var { name, .. } => {
+                g.insert(name.clone());
+            }
+            Stmt::Short { names, .. } => {
+                g.extend(names.iter().cloned());
+            }
+            // Grouped `const (…)` / `var (…)` blocks lower to a `Block` of `Var`s.
+            Stmt::Block(b) => {
+                for s in b {
+                    add(s, g);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut g = HashSet::new();
+    for s in stmts {
+        add(s, &mut g);
+    }
+    g
+}
+
 fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let structs: HashSet<String> = prog.types.iter().map(|t| t.name.clone()).collect();
     let struct_fields: HashMap<String, Vec<(String, String)>> = prog
@@ -845,12 +878,18 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
 
     let has_ffi = body_has_ffi(&prog.main) || prog.funcs.iter().any(|f| body_has_ffi(&f.body));
+    // Package-level names: variables/constants declared at the top level of
+    // `main` (which, after linking, holds every package's init-order globals
+    // ahead of `main`'s own body). Functions read these as globals.
+    let globals = collect_globals(&prog.main);
+
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         scope: None,
         types: HashMap::new(),
         decl_types: HashMap::new(),
         funcs,
+        globals,
         structs,
         struct_fields,
         methods,
@@ -1645,6 +1684,13 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(host::GCLOSURE_GET, 2), line);
             return;
         }
+        // Inside a function, a name that is not a local slot but is a package
+        // global is read as a name-indexed global (`GetVar`), not an empty slot.
+        if self.scope.is_some() && !self.scope_has(name) && self.globals.contains(name) {
+            let idx = self.b.add_name(name);
+            self.b.emit(Op::GetVar(idx), line);
+            return;
+        }
         match &mut self.scope {
             Some(scope) => {
                 let slot = scope.slot(name);
@@ -1657,8 +1703,21 @@ impl Compiler {
         }
     }
 
+    /// Whether `name` is already a slot in the current function's scope.
+    fn scope_has(&self, name: &str) -> bool {
+        self.scope.as_ref().is_some_and(|s| s.has(name))
+    }
+
     /// Store the top of stack into a variable's raw storage (slot/global).
     fn emit_set_raw(&mut self, name: &str, line: u32) {
+        // Assigning to a package global from inside a function writes the global
+        // (`SetVar`), not a fresh local slot. A shadowing local declaration
+        // pre-registers its slot in `emit_declare`, so `scope_has` is true there.
+        if self.scope.is_some() && !self.scope_has(name) && self.globals.contains(name) {
+            let idx = self.b.add_name(name);
+            self.b.emit(Op::SetVar(idx), line);
+            return;
+        }
         match &mut self.scope {
             Some(scope) => {
                 let slot = scope.slot(name);
@@ -1693,6 +1752,12 @@ impl Compiler {
     /// Declare a variable, binding the value on the stack. A boxed variable is
     /// wrapped in a fresh cell so its closures share the storage.
     fn emit_declare(&mut self, name: &str, line: u32) {
+        // Pre-register the local slot so a declaration that shadows a package
+        // global binds a fresh local (rather than writing the global): after
+        // this, `scope_has(name)` is true, so `emit_set_raw` uses the slot.
+        if let Some(scope) = self.scope.as_mut() {
+            scope.slot(name);
+        }
         if self.boxed.contains(name) {
             self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), line);
             self.emit_set_raw(name, line);
