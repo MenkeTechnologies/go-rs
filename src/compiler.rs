@@ -1846,6 +1846,32 @@ impl Compiler {
                         self.emit_declare(&names[0], *line);
                         return Ok(());
                     }
+                    // `v, ok := m[k]` — comma-ok map lookup: `GMAP_GET2` yields a
+                    // `[value, present]` pair, destructured into the two names.
+                    if let Expr::Index { recv, index } = &values[0] {
+                        let n = self.temp_counter;
+                        self.temp_counter += 1;
+                        let pair = format!("$mg{n}");
+                        self.expr(recv)?;
+                        self.expr(index)?;
+                        self.b.emit(Op::CallBuiltin(host::GMAP_GET2, 2), *line);
+                        self.types.insert(pair.clone(), NumType::Unknown);
+                        self.emit_set(&pair, *line);
+                        // v = pair[0]
+                        self.emit_get(&pair, *line);
+                        self.b.emit(Op::LoadInt(0), *line);
+                        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
+                        self.types.insert(names[0].clone(), NumType::Unknown);
+                        self.decl_types.insert(names[0].clone(), String::new());
+                        self.emit_declare(&names[0], *line);
+                        // ok = pair[1]
+                        self.emit_get(&pair, *line);
+                        self.b.emit(Op::LoadInt(1), *line);
+                        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
+                        self.types.insert(names[1].clone(), NumType::Bool);
+                        self.emit_declare(&names[1], *line);
+                        return Ok(());
+                    }
                 }
                 // `a, b := f()` where a user `func` returns exactly len(names)
                 // values: destructure the returned tuple (a slice heap value).

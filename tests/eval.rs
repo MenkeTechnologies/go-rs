@@ -1774,3 +1774,26 @@ func main() {
 ";
     assert_stdout(src, "3 4\npos\n0 1 \n");
 }
+
+#[test]
+fn map_comma_ok_lookup() {
+    // `v, ok := m[k]` reports whether the key was present, distinct from a zero
+    // value; also works in an if-init clause.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	m := map[string]int{\"a\": 1, \"b\": 0}
+	v, ok := m[\"a\"]
+	fmt.Println(v, ok)
+	z, ok2 := m[\"b\"]
+	fmt.Println(z, ok2)
+	miss, ok3 := m[\"x\"]
+	fmt.Println(miss, ok3)
+	if _, found := m[\"b\"]; found {
+		fmt.Println(\"has b\")
+	}
+}
+";
+    assert_stdout(src, "1 true\n0 true\n0 false\nhas b\n");
+}

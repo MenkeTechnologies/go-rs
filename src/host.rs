@@ -124,6 +124,9 @@ pub const GRANGE_VAL: u16 = 903;
 /// `src` (a slice, or a string for `copy([]byte, s)`) into `dst`, returning the
 /// count. Writes through `dst`'s backing so a sub-slice destination aliases.
 pub const GCOPY: u16 = 904;
+/// `[map, key]` → the comma-ok map lookup `v, ok := m[key]` as a 2-element slice
+/// `[value, present]`: the value (or zero) and whether the key was present.
+pub const GMAP_GET2: u16 = 905;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -179,6 +182,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GASSERT, b_assert);
     vm.register_builtin(GRANGE_VAL, b_range_val);
     vm.register_builtin(GCOPY, b_copy);
+    vm.register_builtin(GMAP_GET2, b_map_get2);
     stdlib::install(vm);
 }
 
@@ -900,6 +904,25 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             }
         }
     })
+}
+
+/// `[map, key]` → `[value, present]` for the comma-ok map lookup `v, ok := m[k]`.
+fn b_map_get2(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let recv = args.first().cloned().unwrap_or(Value::Undef);
+    let key = args.get(1).cloned().unwrap_or(Value::Undef);
+    let (val, present) = match recv {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Map(m)) => m
+                .iter()
+                .find(|(k, _)| key_eq(k, &key))
+                .map(|(_, v)| (v.clone(), true))
+                .unwrap_or((Value::Int(0), false)),
+            _ => (Value::Undef, false),
+        }),
+        _ => (Value::Undef, false),
+    };
+    Value::Obj(heap_alloc(HostObj::Slice(vec![val, Value::bool(present)])))
 }
 
 /// `x[i] = v` — slice element write (bounds-checked) or map insert. Returns `v`.
