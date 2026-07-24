@@ -3210,6 +3210,7 @@ impl Compiler {
                 "cap" => Some(host::GCAP),
                 "append" => Some(host::GAPPEND),
                 "delete" => Some(host::GDELETE),
+                "copy" => Some(host::GCOPY),
                 // Go 1.21 ordered builtins.
                 "min" => Some(host::GMIN),
                 "max" => Some(host::GMAX),
@@ -3407,7 +3408,7 @@ impl Compiler {
             },
             Expr::Call { func, args, .. } => match func.as_ref() {
                 Expr::Ident(name) => match name.as_str() {
-                    "len" | "cap" => NumType::Int,
+                    "len" | "cap" | "copy" => NumType::Int,
                     // A conversion `T(x)` is typed as T.
                     n if args.len() == 1 && is_conversion_type(n) => numtype_of_ty(n),
                     _ => self
@@ -3614,7 +3615,7 @@ fn is_conversion_type(name: &str) -> bool {
 fn is_builtin_call(name: &str) -> bool {
     matches!(
         name,
-        "len" | "cap" | "append" | "delete" | "make" | "min" | "max" | "println" | "print"
+        "len" | "cap" | "append" | "delete" | "copy" | "make" | "min" | "max" | "println" | "print"
     )
 }
 

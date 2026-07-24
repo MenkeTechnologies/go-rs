@@ -120,6 +120,10 @@ pub const GASSERT: u16 = 902;
 /// the rune (code point) starting at byte offset `key` (Go ranges strings by
 /// rune); a slice/map indexes normally.
 pub const GRANGE_VAL: u16 = 903;
+/// `[dst, src]` → `copy(dst, src)`: copy `min(len(dst), len(src))` elements from
+/// `src` (a slice, or a string for `copy([]byte, s)`) into `dst`, returning the
+/// count. Writes through `dst`'s backing so a sub-slice destination aliases.
+pub const GCOPY: u16 = 904;
 
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
@@ -174,6 +178,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GTYPETAG, b_typetag);
     vm.register_builtin(GASSERT, b_assert);
     vm.register_builtin(GRANGE_VAL, b_range_val);
+    vm.register_builtin(GCOPY, b_copy);
     stdlib::install(vm);
 }
 
@@ -749,6 +754,49 @@ fn slice_get(id: u32, i: usize) -> Option<Value> {
         Some(HostObj::Slice(a)) => a.get(offset + i).cloned(),
         _ => None,
     })
+}
+
+/// Write element `i` of a slice-or-view (bounds-checked), through its backing so
+/// a sub-slice write is visible to the parent. Returns whether it landed.
+fn slice_set(id: u32, i: usize, v: Value) -> bool {
+    let Some((backing, offset, len)) = slice_backing(id) else {
+        return false;
+    };
+    if i >= len {
+        return false;
+    }
+    HEAP.with(|h| {
+        if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+            if let Some(slot) = a.get_mut(offset + i) {
+                *slot = v;
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// `copy(dst, src)` — copy `min(len(dst), len(src))` elements into `dst`,
+/// returning the count. `src` may be a slice or a string (`copy([]byte, s)`).
+fn b_copy(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let Some(Value::Obj(dst)) = args.first().cloned() else {
+        return Value::Int(0);
+    };
+    let dst_len = slice_backing(dst).map(|(_, _, l)| l).unwrap_or(0);
+    let src_vals: Vec<Value> = match args.get(1) {
+        Some(Value::Obj(sid)) => {
+            let slen = slice_backing(*sid).map(|(_, _, l)| l).unwrap_or(0);
+            (0..slen).filter_map(|i| slice_get(*sid, i)).collect()
+        }
+        Some(Value::Str(s)) => s.bytes().map(|b| Value::Int(b as i64)).collect(),
+        _ => return Value::Int(0),
+    };
+    let n = dst_len.min(src_vals.len());
+    for (i, v) in src_vals.into_iter().take(n).enumerate() {
+        slice_set(dst, i, v);
+    }
+    Value::Int(n as i64)
 }
 
 /// Whether two values are equal as Go map keys (comparable kinds only).

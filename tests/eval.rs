@@ -1704,3 +1704,22 @@ func main() {
         "bad input: 42 (oops)\nbad input: 42 (oops)\ngot: code 7\n",
     );
 }
+
+#[test]
+fn copy_builtin() {
+    // copy(dst, src) copies min(len(dst), len(src)) elements and returns the
+    // count; src may be a slice or a string (copy([]byte, s)).
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	dst := make([]int, 3)
+	n := copy(dst, []int{7, 8, 9, 10})
+	fmt.Println(dst, n)
+	buf := make([]byte, 5)
+	m := copy(buf, \"hello world\")
+	fmt.Println(m, string(buf))
+}
+";
+    assert_stdout(src, "[7 8 9] 3\n5 hello\n");
+}
