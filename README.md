@@ -224,13 +224,24 @@ rational arithmetic and rounds to `f64` once, matching Go's arbitrary-precision
 constant semantics (a very long decimal or a non-terminating division whose exact
 terms leave the `f64`-exact range falls back to runtime `f64`).
 
-**Known gaps** (documented rather than hidden):
+**Bundled packages.** `go install-std` writes the vendored standard-library
+packages that run on go-rs into `~/.go-rs/src` (currently `errors`,
+`unicode/utf16`, `cmp`); imports resolve there first, then from the binary's
+vendored copies, then from `$GOROOT/src`. Any package placed under `~/.go-rs/src`
+(or `$GOPATH/src`) is importable — go-rs is an executor for real Go source, not a
+curated subset.
 
-- **Standard-library coverage is incremental.** Packages run from their real Go
-  source, but a package only works once go-rs supports every language feature it
-  (transitively) uses — packages needing `unsafe`, assembly, `cgo`, `reflect`, or
-  runtime internals don't load yet. `fmt`/`strings`/`strconv`/`math`/`sort`/`os`
-  are provided by the native runtime layer.
+**Blockers** (defects to close, not intentional scope — go-rs targets a Go
+superset):
+
+- **Dependencies on the compiler/runtime boundary.** A package that reaches
+  `unsafe`, `//go:linkname` to runtime symbols, `.s` assembly, `cgo`, or
+  `reflect` cannot yet run from source (e.g. `math/bits` links to
+  `runtime.overflowError`; `slices` uses `unsafe`). `fmt`/`strings`/`strconv`/
+  `math`/`sort`/`os` are provided by the native runtime layer instead.
+- **Generics are erased, so a type-parameter zero value is untyped** — `var zero
+  T; x != zero` (e.g. `cmp.Or`) compares against `nil` rather than the
+  instantiated type's zero. Needs monomorphization or a typed-zero sentinel.
 - **No fixed-width integer overflow wrapping** — all integers are 64-bit, so code
   relying on `uint8`/`uint16`/`uint32` wraparound (some hashes) diverges. A uint64
   constant prints as its signed `i64` (its bit pattern is correct for bitwise use).

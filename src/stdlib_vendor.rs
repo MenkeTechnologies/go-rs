@@ -11,6 +11,8 @@ pub fn source(path: &str) -> Option<String> {
     let text: &str = match path {
         // Vendored packages (verified to run on go-rs). Real stdlib source.
         "errors" => include_str!("../goroot/errors.go"),
+        "unicode/utf16" => include_str!("../goroot/utf16.go"),
+        "cmp" => include_str!("../goroot/cmp.go"),
         _ => return None,
     };
     Some(text.to_string())

@@ -685,7 +685,7 @@ pub fn gors_home() -> Option<std::path::PathBuf> {
 
 /// The vendored standard-library packages (import path → single-file source),
 /// written to `~/.go-rs/src/<path>/<name>.go` by `go install-std`.
-pub const VENDORED: &[&str] = &["errors"];
+pub const VENDORED: &[&str] = &["errors", "unicode/utf16", "cmp"];
 
 /// Install the vendored standard library into `~/.go-rs/src/`. Returns the
 /// number of packages written.
