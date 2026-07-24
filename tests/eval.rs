@@ -1683,3 +1683,24 @@ func main() {
 ";
     assert_stdout(src, "0 104\n1 233\n3 108\n4 108\n5 111\ncount 5\n");
 }
+
+#[test]
+fn fmt_errorf_builds_an_error_value() {
+    // fmt.Errorf formats a message into a real error value: it prints as the
+    // message, its Error() method returns the message, and it satisfies `error`.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	e := fmt.Errorf(\"bad input: %d (%s)\", 42, \"oops\")
+	fmt.Println(e)
+	fmt.Println(e.Error())
+	var err error = fmt.Errorf(\"code %d\", 7)
+	fmt.Printf(\"got: %v\\n\", err)
+}
+";
+    assert_stdout(
+        src,
+        "bad input: 42 (oops)\nbad input: 42 (oops)\ngot: code 7\n",
+    );
+}

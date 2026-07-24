@@ -3089,6 +3089,30 @@ impl Compiler {
             if let Expr::Ident(pkg) = recv.as_ref() {
                 // `fmt.*` print family.
                 if pkg == "fmt" {
+                    // `fmt.Errorf(f, args...)` builds a real error value:
+                    // `&$errorString{s: fmt.Sprintf(f, args...)}` (the error type
+                    // synthesized by the linker when Errorf is used). %w wrapping
+                    // is not modeled — the verb formats like %v.
+                    if field == "Errorf" {
+                        let msg = Expr::Call {
+                            func: Box::new(Expr::Selector {
+                                recv: Box::new(Expr::Ident("fmt".to_string())),
+                                field: "Sprintf".to_string(),
+                            }),
+                            args: args.to_vec(),
+                            spread: false,
+                            line,
+                        };
+                        let lit = Expr::StructLit {
+                            type_name: "$errorString".to_string(),
+                            fields: vec![(Some("s".to_string()), msg)],
+                        };
+                        let addr = Expr::Unary {
+                            op: UnOp::Addr,
+                            rhs: Box::new(lit),
+                        };
+                        return self.expr(&addr);
+                    }
                     let id = match field.as_str() {
                         "Println" => host::GPRINTLN,
                         "Print" => host::GPRINT,

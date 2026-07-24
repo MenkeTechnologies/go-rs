@@ -48,8 +48,148 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     }
     init_globals.extend(std::mem::take(&mut main.main));
     main.main = init_globals;
+    // `fmt.Errorf` builds a real error value — synthesize its type before
+    // `$stringify` so the helper picks up its `Error()` method.
+    if uses_errorf(&main) {
+        add_errorf_type(&mut main);
+    }
     add_stringify(&mut main);
     Ok(main)
+}
+
+/// Whether the program calls `fmt.Errorf` anywhere (drives synthesis of the
+/// error type it constructs).
+fn uses_errorf(prog: &Program) -> bool {
+    fn in_expr(e: &Expr) -> bool {
+        match e {
+            Expr::Call { func, args, .. } => {
+                let is_errorf = matches!(func.as_ref(),
+                    Expr::Selector { recv, field }
+                        if field == "Errorf"
+                            && matches!(recv.as_ref(), Expr::Ident(p) if p == "fmt"));
+                is_errorf || in_expr(func) || args.iter().any(in_expr)
+            }
+            Expr::Selector { recv, .. } => in_expr(recv),
+            Expr::Unary { rhs, .. } => in_expr(rhs),
+            Expr::Binary { lhs, rhs, .. } => in_expr(lhs) || in_expr(rhs),
+            Expr::Index { recv, index } => in_expr(recv) || in_expr(index),
+            Expr::Slice { recv, low, high } => {
+                in_expr(recv)
+                    || low.as_deref().is_some_and(in_expr)
+                    || high.as_deref().is_some_and(in_expr)
+            }
+            Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| in_expr(v)),
+            Expr::SliceLit { elems, .. } => elems.iter().any(in_expr),
+            Expr::MapLit { pairs, .. } => pairs.iter().any(|(k, v)| in_expr(k) || in_expr(v)),
+            Expr::FuncLit { body, .. } => body.iter().any(in_stmt),
+            _ => false,
+        }
+    }
+    fn in_stmt(s: &Stmt) -> bool {
+        match s {
+            Stmt::ExprStmt(e) => in_expr(e),
+            Stmt::Return(es, ..) => es.iter().any(in_expr),
+            Stmt::Var { init, .. } => init.as_ref().is_some_and(in_expr),
+            Stmt::Short { values, .. } => values.iter().any(in_expr),
+            Stmt::Assign { target, value, .. } => in_expr(target) || in_expr(value),
+            Stmt::AssignMulti {
+                targets, values, ..
+            } => targets.iter().chain(values).any(in_expr),
+            Stmt::IncDec { target, .. } => in_expr(target),
+            Stmt::If {
+                init,
+                cond,
+                then,
+                els,
+                ..
+            } => {
+                init.as_deref().is_some_and(in_stmt)
+                    || in_expr(cond)
+                    || then.iter().any(in_stmt)
+                    || els.iter().any(in_stmt)
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+                ..
+            } => {
+                init.as_deref().is_some_and(in_stmt)
+                    || cond.as_ref().is_some_and(in_expr)
+                    || post.as_deref().is_some_and(in_stmt)
+                    || body.iter().any(in_stmt)
+            }
+            Stmt::ForRange { iter, body, .. } => in_expr(iter) || body.iter().any(in_stmt),
+            Stmt::Block(b) => b.iter().any(in_stmt),
+            Stmt::Defer { call, .. } | Stmt::Go { call, .. } => in_expr(call),
+            Stmt::Send { chan, val, .. } => in_expr(chan) || in_expr(val),
+            Stmt::Switch {
+                init,
+                tag,
+                cases,
+                default,
+                ..
+            } => {
+                init.as_deref().is_some_and(in_stmt)
+                    || tag.as_ref().is_some_and(in_expr)
+                    || cases
+                        .iter()
+                        .any(|c| c.exprs.iter().any(in_expr) || c.body.iter().any(in_stmt))
+                    || default.as_ref().is_some_and(|d| d.iter().any(in_stmt))
+            }
+            Stmt::TypeSwitch {
+                init,
+                expr,
+                cases,
+                default,
+                ..
+            } => {
+                init.as_deref().is_some_and(in_stmt)
+                    || in_expr(expr)
+                    || cases.iter().any(|c| c.body.iter().any(in_stmt))
+                    || default.as_ref().is_some_and(|d| d.iter().any(in_stmt))
+            }
+            Stmt::Select { cases, default, .. } => {
+                cases.iter().any(|c| c.body.iter().any(in_stmt))
+                    || default.as_ref().is_some_and(|d| d.iter().any(in_stmt))
+            }
+            _ => false,
+        }
+    }
+    prog.main.iter().any(in_stmt) || prog.funcs.iter().any(|f| f.body.iter().any(in_stmt))
+}
+
+/// Synthesize the error type that `fmt.Errorf` constructs: a struct with a single
+/// message field and a value-returning `Error()` method. The compiler lowers
+/// `fmt.Errorf(f, args...)` to `&$errorString{s: fmt.Sprintf(f, args...)}`.
+fn add_errorf_type(prog: &mut Program) {
+    prog.types.push(StructDecl {
+        name: "$errorString".to_string(),
+        fields: vec![Param {
+            name: "s".to_string(),
+            ty: "string".to_string(),
+        }],
+    });
+    prog.funcs.push(Func {
+        name: "Error".to_string(),
+        receiver: Some(Param {
+            name: "e".to_string(),
+            ty: "*$errorString".to_string(),
+        }),
+        params: vec![],
+        variadic: false,
+        results: vec!["string".to_string()],
+        result_names: vec![String::new()],
+        body: vec![Stmt::Return(
+            vec![Expr::Selector {
+                recv: Box::new(Expr::Ident("e".to_string())),
+                field: "s".to_string(),
+            }],
+            0,
+        )],
+        line: 0,
+    });
 }
 
 /// Synthesize the `$stringify` helper — a type switch over every type with a
