@@ -768,6 +768,20 @@ fn is_buildable_go_file(p: &std::path::Path) -> bool {
             return false;
         }
     }
+    // Exclude generator/example files carrying an `ignore` build constraint
+    // (`//go:build ignore` or the legacy `// +build ignore`) — they are not part
+    // of the package build (e.g. math/bits/make_examples.go).
+    if let Ok(text) = std::fs::read_to_string(p) {
+        for line in text.lines().take(30) {
+            let l = line.trim();
+            if !l.is_empty() && !l.starts_with("//") && !l.starts_with("package ") {
+                break; // past the header; build constraints only appear above it
+            }
+            if (l.starts_with("//go:build") || l.starts_with("// +build")) && l.contains("ignore") {
+                return false;
+            }
+        }
+    }
     true
 }
 
