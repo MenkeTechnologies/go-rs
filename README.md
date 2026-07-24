@@ -203,7 +203,12 @@ cargo run --bin parity-fuzz -- --seed 1234 --once   # replay one divergence
 The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
 slices/maps, structs/methods, interfaces, closures, generics, goroutines/channels,
 and `select`. The fuzzer generates arithmetic / float / boolean / string / slice /
-map / control-flow / stdlib blocks and diffs both interpreters.
+map / control-flow / stdlib blocks plus rune arithmetic, fixed-size arrays
+(sequential + sparse), `[]byte`/`[]rune` conversions, string-range-by-rune,
+three-index slices, structs with value/pointer-receiver methods, `new(T)`,
+`fmt.Errorf`/`errors.New`, `defer`/`recover` on runtime panics, type switches,
+capturing closures, bitwise operators, and generic instantiation — and diffs both
+interpreters byte-for-byte (stdout + exit status).
 
 **Packages are run from source.** An `import` of a non-native package is resolved
 to its Go source, parsed, name-qualified (`errors.New` → the linked `errors.New`),

@@ -213,7 +213,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix.
 fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
-    match rng.below(11) {
+    match rng.below(25) {
         0 => format!(
             "\tfmt.Printf(\"%d %d\\n\", {}, {})\n",
             int_expr(rng, 3),
@@ -279,7 +279,7 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
         // arbitrary-precision constant rounding)
         9 => format!("\tfmt.Printf(\"%.8f\\n\", {})\n", const_float_expr(rng, 2)),
         // math stdlib (fixed precision so both format identically)
-        _ => {
+        10 => {
             uses.math = true;
             let (decl, vars) = float_vars(rng, n);
             let f = float_expr(rng, &vars, 1);
@@ -288,16 +288,137 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
                 "{decl}\tfmt.Printf(\"%.4f %.4f %.0f\\n\", math.Sqrt({f}), math.Abs(-({g})), math.Floor({f}))\n"
             )
         }
+        // rune literals as int32 code points: arithmetic, difference, and
+        // string(rune) conversion.
+        11 => {
+            let x = rng.int(0, 25);
+            format!("\tfmt.Println('A'+{x}, 'z'-'0', string(rune(97+{x})))\n")
+        }
+        // fixed-size array literal + range sum.
+        12 => {
+            let (a, b, c, d) = (
+                rng.int(-9, 30),
+                rng.int(-9, 30),
+                rng.int(-9, 30),
+                rng.int(-9, 30),
+            );
+            format!(
+                "\tarr{n} := [4]int{{{a}, {b}, {c}, {d}}}\n\tas{n} := 0\n\tfor _, v := range arr{n} {{\n\t\tas{n} += v\n\t}}\n\tfmt.Println(arr{n}, len(arr{n}), as{n})\n"
+            )
+        }
+        // sparse index-keyed array literal (zero-filled gaps).
+        13 => {
+            let (x, y, z) = (rng.int(1, 9), rng.int(1, 9), rng.int(1, 9));
+            format!(
+                "\tsp{n} := [5]int{{0: {x}, 2: {y}, 4: {z}}}\n\tfmt.Println(sp{n}, len(sp{n}))\n"
+            )
+        }
+        // []byte / []rune conversions and string() back.
+        14 => {
+            let w = rng.pick(WORDS);
+            format!(
+                "\tbb{n} := []byte(\"{w}\")\n\trr{n} := []rune(\"{w}\")\n\tfmt.Println(bb{n}, len(bb{n}), len(rr{n}), string(bb{n}), string(rr{n}))\n"
+            )
+        }
+        // range over a string yields runes: sum the code points.
+        15 => {
+            let w = rng.pick(WORDS);
+            format!(
+                "\tcp{n} := 0\n\tfor _, c := range \"{w}\" {{\n\t\tcp{n} += int(c)\n\t}}\n\tfmt.Println(cp{n})\n"
+            )
+        }
+        // three-index (full) slice expression.
+        16 => {
+            let (a, b, c, d, e, f) = (
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+            );
+            format!(
+                "\txs{n} := []int{{{a}, {b}, {c}, {d}, {e}, {f}}}\n\tp{n} := xs{n}[1:4:6]\n\tfmt.Println(p{n}, len(p{n}))\n"
+            )
+        }
+        // struct value + pointer-receiver method mutation.
+        17 => {
+            uses.structs = true;
+            let (x, y, k) = (rng.int(-9, 20), rng.int(-9, 20), rng.int(-3, 5));
+            format!(
+                "\tp{n} := pt{{{x}, {y}}}\n\tq{n} := p{n}\n\tq{n}.scale({k})\n\tfmt.Println(p{n}.sum(), q{n}.sum(), q{n}.x, q{n}.y)\n"
+            )
+        }
+        // new(T) — a zero-valued struct pointer.
+        18 => {
+            uses.structs = true;
+            let x = rng.int(-9, 20);
+            format!(
+                "\tr{n} := new(pt)\n\tr{n}.x = {x}\n\tfmt.Println(r{n}.x, r{n}.y, r{n}.sum())\n"
+            )
+        }
+        // fmt.Errorf builds an error value; errors.New too.
+        19 => {
+            uses.errors = true;
+            let x = rng.int(-9, 99);
+            let w = rng.pick(WORDS);
+            format!(
+                "\te{n} := fmt.Errorf(\"n=%d %s\", {x}, \"{w}\")\n\tfmt.Println(e{n}, e{n}.Error())\n\tfmt.Println(errors.New(\"{w}\"))\n"
+            )
+        }
+        // defer + recover on a runtime panic (integer divide-by-zero).
+        20 => {
+            let x = rng.int(1, 99);
+            format!(
+                "\tfunc() {{\n\t\tdefer func() {{\n\t\t\tif rec := recover(); rec != nil {{\n\t\t\t\tfmt.Println(\"recovered\")\n\t\t\t}}\n\t\t}}()\n\t\tz{n} := 0\n\t\tfmt.Println({x} / z{n})\n\t}}()\n"
+            )
+        }
+        // type switch over an `any` value.
+        21 => {
+            let (init, _tag) = match rng.below(3) {
+                0 => (rng.int(-9, 20).to_string(), "int"),
+                1 => (format!("\"{}\"", rng.pick(WORDS)), "string"),
+                _ => (rng.pick(&["true", "false"]).to_string(), "bool"),
+            };
+            format!(
+                "\tvar v{n} any = {init}\n\tswitch v{n}.(type) {{\n\tcase int:\n\t\tfmt.Println(\"int\")\n\tcase string:\n\t\tfmt.Println(\"string\")\n\tcase bool:\n\t\tfmt.Println(\"bool\")\n\t}}\n"
+            )
+        }
+        // closure capturing a mutable variable by reference.
+        22 => {
+            let times = rng.int(1, 5);
+            let mut calls = String::new();
+            for _ in 0..times {
+                calls.push_str(&format!("\tinc{n}()\n"));
+            }
+            format!("\tc{n} := 0\n\tinc{n} := func() {{ c{n}++ }}\n{calls}\tfmt.Println(c{n})\n")
+        }
+        // bitwise operators over non-negative ints (i64 == Go's 64-bit int here).
+        23 => {
+            let (x, y) = (rng.int(0, 255), rng.int(0, 255));
+            format!("\tfmt.Println({x}&{y}, {x}|{y}, {x}^{y}, {x}<<2, {x}>>1, {x}&^{y})\n")
+        }
+        // generic function instantiated at int and float64.
+        _ => {
+            uses.generic = true;
+            let (x, y) = (rng.int(-9, 30), rng.int(-9, 30));
+            let (a, b) = (rng.int(0, 12), rng.int(0, 12));
+            format!("\tfmt.Println(imax({x}, {y}), imax({a}.5, {b}.5))\n")
+        }
     }
 }
 
-/// Which optional stdlib packages a program's blocks reference (`fmt` is always
-/// imported), so the import list has no unused entries (Go rejects those).
+/// Which optional stdlib packages and top-level preamble declarations a program's
+/// blocks reference (`fmt` is always imported), so the import list has no unused
+/// entries (Go rejects those) and the preamble emits only what's used.
 #[derive(Default)]
 struct Uses {
     strings: bool,
     sort: bool,
     math: bool,
+    errors: bool,
+    structs: bool,
+    generic: bool,
 }
 
 /// Build a complete, deterministic-output Go program for `seed`.
@@ -310,6 +431,9 @@ fn program(seed: u64) -> String {
         body.push_str(&block(&mut rng, i, &mut uses));
     }
     let mut imports = vec!["\"fmt\""];
+    if uses.errors {
+        imports.push("\"errors\"");
+    }
     if uses.strings {
         imports.push("\"strings\"");
     }
@@ -324,23 +448,66 @@ fn program(seed: u64) -> String {
     } else {
         format!("import (\n\t{}\n)\n", imports.join("\n\t"))
     };
-    format!("package main\n\n{import_block}\nfunc main() {{\n{body}}}\n")
+    // Top-level preamble declarations referenced by some blocks — emitted only
+    // when used (Go allows unused top-level decls, but keeping programs minimal
+    // shrinks divergence repros).
+    let mut preamble = String::new();
+    if uses.structs {
+        preamble.push_str(
+            "type pt struct{ x, y int }\n\
+             func (p pt) sum() int { return p.x + p.y }\n\
+             func (p *pt) scale(k int) { p.x *= k; p.y *= k }\n\n",
+        );
+    }
+    if uses.generic {
+        preamble.push_str(
+            "func imax[T int | float64](a, b T) T {\n\
+             \tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n",
+        );
+    }
+    format!("package main\n\n{import_block}\n{preamble}func main() {{\n{body}}}\n")
 }
 
 // ── runner ───────────────────────────────────────────────────────────────
 
+/// Wall-clock budget for a single `go run` — either implementation exceeding it
+/// is treated as a `<timeout>` result (a caught divergence, so a hang in one
+/// case never stalls the whole run).
+const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn run(bin: &str, src_path: &str) -> (String, bool) {
-    match Command::new(bin)
+    let mut child = match Command::new(bin)
         .arg("run")
         .arg(src_path)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        Ok(o) => (
-            String::from_utf8_lossy(&o.stdout).into_owned(),
-            o.status.success(),
-        ),
-        Err(e) => (format!("<spawn error: {e}>"), false),
+        Ok(c) => c,
+        Err(e) => return (format!("<spawn error: {e}>"), false),
+    };
+    let deadline = std::time::Instant::now() + CASE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut so) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = so.read_to_string(&mut out);
+                }
+                return (out, status.success());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return ("<timeout>".to_string(), false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return (format!("<wait error: {e}>"), false),
+        }
     }
 }
 
@@ -358,6 +525,7 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(4);
     let mut once_seed: Option<u64> = None;
+    let mut start_seed = 0u64;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -372,6 +540,12 @@ fn main() {
             "--seed" => {
                 i += 1;
                 once_seed = args.get(i).and_then(|s| s.parse().ok());
+            }
+            // `--start N`: begin at seed N (disjoint batches cover distinct seeds
+            // across separate runs, each `count` cases wide).
+            "--start" => {
+                i += 1;
+                start_seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
             _ => {}
         }
@@ -393,7 +567,8 @@ fn main() {
         std::process::exit(if g == r && grc == rrc { 0 } else { 1 });
     }
 
-    let next = AtomicU64::new(0);
+    let next = AtomicU64::new(start_seed);
+    let end = start_seed + count;
     let pass = AtomicU64::new(0);
     let fail = AtomicU64::new(0);
     let divergences: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -403,7 +578,7 @@ fn main() {
         for _ in 0..jobs {
             scope.spawn(|| loop {
                 let seed = next.fetch_add(1, Ordering::Relaxed);
-                if seed >= count {
+                if seed >= end {
                     break;
                 }
                 let src = program(seed);
