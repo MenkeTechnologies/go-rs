@@ -812,8 +812,46 @@ fn key_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
+        // Struct (and array) keys compare by value, field-by-field — Go's rule
+        // for comparable struct/array keys — not by heap identity.
+        (Value::Obj(x), Value::Obj(y)) => {
+            if x == y {
+                return true;
+            }
+            HEAP.with(|h| {
+                let h = h.borrow();
+                match (h.get(*x as usize), h.get(*y as usize)) {
+                    (
+                        Some(HostObj::Struct {
+                            type_name: tx,
+                            fields: fx,
+                        }),
+                        Some(HostObj::Struct {
+                            type_name: ty,
+                            fields: fy,
+                        }),
+                    ) => {
+                        tx == ty
+                            && fx.len() == fy.len()
+                            && fx.iter().zip(fy).all(|((_, va), (_, vb))| key_eq(va, vb))
+                    }
+                    _ => false,
+                }
+            })
+        }
         _ => a.to_float() == b.to_float(),
     }
+}
+
+/// The index of `key` in the map at heap `id`, comparing by value. Keys are
+/// snapshotted first so a struct-key `key_eq` (which itself reads the heap) never
+/// re-enters an active borrow held by the caller.
+fn map_find_index(id: u32, key: &Value) -> Option<usize> {
+    let keys: Vec<Value> = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
+        _ => Vec::new(),
+    });
+    keys.iter().position(|k| key_eq(k, key))
 }
 
 /// `make([]T, n)` (2 args: kind-tag, n) or `make(map[K]V)` (1 arg: kind-tag).
@@ -892,22 +930,20 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             }
         };
     }
-    HEAP.with(|h| {
-        let h = h.borrow();
-        match h.get(id as usize) {
-            Some(HostObj::Map(m)) => m
-                .iter()
-                .find(|(k, _)| key_eq(k, &key))
-                .map(|(_, v)| v.clone())
-                // Go returns the value type's zero value for a missing key; 0
-                // covers the common numeric case (comma-ok form is a later wave).
-                .unwrap_or(Value::Int(0)),
-            _ => {
-                ffi_fault(vm, "go-rs: invalid index target".to_string());
-                Value::Undef
-            }
-        }
-    })
+    let is_map = HEAP.with(|h| matches!(h.borrow().get(id as usize), Some(HostObj::Map(_))));
+    if !is_map {
+        ffi_fault(vm, "go-rs: invalid index target".to_string());
+        return Value::Undef;
+    }
+    match map_find_index(id, &key) {
+        Some(i) => HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Map(m)) => m[i].1.clone(),
+            _ => Value::Undef,
+        }),
+        // Go returns the value type's zero value for a missing key; 0 covers the
+        // common numeric case (use comma-ok for the typed zero of other types).
+        None => Value::Int(0),
+    }
 }
 
 /// `append(base, xs...)` — a fresh slice of `base`'s elements then every element
@@ -941,14 +977,13 @@ fn b_map_get2(vm: &mut VM, argc: u8) -> Value {
     let recv = args.first().cloned().unwrap_or(Value::Undef);
     let key = args.get(1).cloned().unwrap_or(Value::Undef);
     let (val, present) = match recv {
-        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(id as usize) {
-            Some(HostObj::Map(m)) => m
-                .iter()
-                .find(|(k, _)| key_eq(k, &key))
-                .map(|(_, v)| (v.clone(), true))
-                .unwrap_or((Value::Int(0), false)),
-            _ => (Value::Undef, false),
-        }),
+        Value::Obj(id) => match map_find_index(id, &key) {
+            Some(i) => HEAP.with(|h| match h.borrow().get(id as usize) {
+                Some(HostObj::Map(m)) => (m[i].1.clone(), true),
+                _ => (Value::Undef, false),
+            }),
+            None => (Value::Int(0), false),
+        },
         _ => (Value::Undef, false),
     };
     Value::Obj(heap_alloc(HostObj::Slice(vec![val, Value::bool(present)])))
@@ -987,14 +1022,16 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
             }
         };
     }
+    // Find an existing key (by value) without holding the borrow across key_eq,
+    // then insert/overwrite under a fresh mutable borrow.
+    let existing = map_find_index(id, &key);
     let err = HEAP.with(|h| {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
             Some(HostObj::Map(m)) => {
-                if let Some(slot) = m.iter_mut().find(|(k, _)| key_eq(k, &key)) {
-                    slot.1 = val.clone();
-                } else {
-                    m.push((key.clone(), val.clone()));
+                match existing {
+                    Some(i) => m[i].1 = val.clone(),
+                    None => m.push((key.clone(), val.clone())),
                 }
                 None
             }
@@ -1132,12 +1169,15 @@ fn b_delete(vm: &mut VM, argc: u8) -> Value {
     let recv = args.first().cloned().unwrap_or(Value::Undef);
     let key = args.get(1).cloned().unwrap_or(Value::Undef);
     if let Value::Obj(id) = recv {
-        HEAP.with(|h| {
-            let mut h = h.borrow_mut();
-            if let Some(HostObj::Map(m)) = h.get_mut(id as usize) {
-                m.retain(|(k, _)| !key_eq(k, &key));
-            }
-        });
+        // Locate the key (by value) before taking the mutable borrow, so a
+        // struct-key `key_eq` doesn't re-enter the heap.
+        if let Some(i) = map_find_index(id, &key) {
+            HEAP.with(|h| {
+                if let Some(HostObj::Map(m)) = h.borrow_mut().get_mut(id as usize) {
+                    m.remove(i);
+                }
+            });
+        }
     }
     Value::Undef
 }

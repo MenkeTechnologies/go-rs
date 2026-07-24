@@ -1863,3 +1863,26 @@ func main() {
 ";
     assert_stdout(src, "1 true false\nx 1\ny 2\n30\n");
 }
+
+#[test]
+fn struct_values_as_map_keys() {
+    // A struct key compares by value (field-by-field), not heap identity: insert,
+    // overwrite, lookup, comma-ok miss, and delete all key on the struct's fields.
+    let src = "\
+package main
+import \"fmt\"
+type P struct{ x, y int }
+func main() {
+	m := map[P]string{}
+	m[P{1, 2}] = \"a\"
+	m[P{3, 4}] = \"b\"
+	m[P{1, 2}] = \"A\"
+	fmt.Println(len(m), m[P{1, 2}], m[P{3, 4}])
+	_, ok := m[P{9, 9}]
+	fmt.Println(ok)
+	delete(m, P{3, 4})
+	fmt.Println(len(m))
+}
+";
+    assert_stdout(src, "2 A b\nfalse\n1\n");
+}
