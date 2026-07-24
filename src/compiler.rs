@@ -2567,7 +2567,7 @@ impl Compiler {
                     self.expr(value)?;
                     let l = self.types.get(name).copied().unwrap_or(NumType::Unknown);
                     let r = self.infer(value);
-                    self.emit_arith(assign_binop(op), l, r, line);
+                    self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
                 }
                 self.emit_set(name, line);
             }
@@ -2580,7 +2580,13 @@ impl Compiler {
                     self.b.emit(Op::Dup2, line);
                     self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
                     self.expr(value)?;
-                    self.emit_arith(assign_binop(op), NumType::Unknown, self.infer(value), line);
+                    self.emit_arith(
+                        assign_binop(op),
+                        NumType::Unknown,
+                        self.infer(value),
+                        is_nonzero_const(value),
+                        line,
+                    );
                 }
                 self.b.emit(Op::CallBuiltin(host::GINDEX_SET, 3), line);
                 self.b.emit(Op::Pop, line);
@@ -2596,7 +2602,13 @@ impl Compiler {
                     self.b.emit(Op::Dup2, line);
                     self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), line);
                     self.expr(value)?;
-                    self.emit_arith(assign_binop(op), NumType::Unknown, self.infer(value), line);
+                    self.emit_arith(
+                        assign_binop(op),
+                        NumType::Unknown,
+                        self.infer(value),
+                        is_nonzero_const(value),
+                        line,
+                    );
                 }
                 self.b.emit(Op::CallBuiltin(host::GFIELD_SET, 3), line);
                 self.b.emit(Op::Pop, line);
@@ -3124,13 +3136,15 @@ impl Compiler {
         let r = self.infer(rhs);
         self.expr(lhs)?;
         self.expr(rhs)?;
-        self.emit_arith(op, l, r, 0);
+        self.emit_arith(op, l, r, is_nonzero_const(rhs), 0);
         Ok(())
     }
 
     /// Emit an arithmetic op for two already-pushed operands, appending
     /// `TruncInt` for integer division (Go truncates `int / int` toward zero).
-    fn emit_arith(&mut self, op: BinOp, l: NumType, r: NumType, line: u32) {
+    /// `safe_div` is true when the divisor is a provably-nonzero constant, so
+    /// integer `/`/`%` can use the native ops the JIT/AOT keep in registers.
+    fn emit_arith(&mut self, op: BinOp, l: NumType, r: NumType, safe_div: bool, line: u32) {
         match op {
             BinOp::Add => {
                 self.b.emit(Op::Add, line);
@@ -3141,18 +3155,33 @@ impl Compiler {
             BinOp::Mul => {
                 self.b.emit(Op::Mul, line);
             }
-            // `%` is integer-only in Go; route through the builtin so a zero
-            // divisor panics (`runtime error: integer divide by zero`).
+            // `%` is integer-only in Go. With a provably-nonzero constant divisor
+            // (`i % 7`), emit the native `Op::Mod` — an integer op the JIT and AOT
+            // lower to a register `srem`, keeping a hot loop entirely in registers
+            // (~2 orders of magnitude faster). Otherwise route through GIMOD so a
+            // zero divisor raises a panic (recoverable under `recover`, else it
+            // aborts like Go).
             BinOp::Mod => {
-                self.b.emit(Op::CallBuiltin(host::GIMOD, 2), line);
-                self.emit_panic_check(line);
+                if safe_div {
+                    self.b.emit(Op::Mod, line);
+                } else {
+                    self.b.emit(Op::CallBuiltin(host::GIMOD, 2), line);
+                    self.emit_panic_check(line);
+                }
             }
             BinOp::Div => {
                 if l == NumType::Int && r == NumType::Int {
-                    // Integer division panics on a zero divisor (and truncates
-                    // toward zero, which GIDIV does).
-                    self.b.emit(Op::CallBuiltin(host::GIDIV, 2), line);
-                    self.emit_panic_check(line);
+                    if safe_div {
+                        // Native float divide + truncate toward zero — both scalar
+                        // ops the JIT/AOT keep in registers (divisor is nonzero).
+                        self.b.emit(Op::Div, line);
+                        self.b.emit(Op::TruncInt, line);
+                    } else {
+                        // Truncating integer division that panics on a zero
+                        // divisor (recoverable / aborting to match Go).
+                        self.b.emit(Op::CallBuiltin(host::GIDIV, 2), line);
+                        self.emit_panic_check(line);
+                    }
                 } else {
                     // Float division: `x / 0.0` yields ±Inf like Go, no panic.
                     self.b.emit(Op::Div, line);
@@ -3767,6 +3796,13 @@ fn is_builtin_call(name: &str) -> bool {
         name,
         "len" | "cap" | "append" | "delete" | "copy" | "make" | "min" | "max" | "println" | "print"
     )
+}
+
+/// Whether `e` is a provably-nonzero constant — so an integer `/`/`%` by it can
+/// never divide by zero and may use the native (register-lowered) op instead of
+/// the panic-checking builtin.
+fn is_nonzero_const(e: &Expr) -> bool {
+    matches!(e, Expr::Int(n) if *n != 0)
 }
 
 fn assign_binop(op: AssignOp) -> BinOp {
