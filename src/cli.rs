@@ -31,6 +31,9 @@ pub enum Command {
     DumpTokens,
     DumpAst,
     Disasm,
+    /// `go --tiers file.go` — run it, then report which fusevm tiers took its
+    /// chunk.
+    Tiers,
 }
 
 /// Parsed command line.
@@ -108,6 +111,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--dump-tokens" => cli.cmd = Command::DumpTokens,
             "--dump-ast" => cli.cmd = Command::DumpAst,
             "--disasm" => cli.cmd = Command::Disasm,
+            "--tiers" => cli.cmd = Command::Tiers,
             "--lsp" => cli.cmd = Command::Lsp,
             "--dap" => cli.cmd = Command::Dap,
             "-h" | "--help" => {
@@ -159,6 +163,7 @@ introspection / editor:
   --dump-tokens <file>     print the lexer token stream
   --dump-ast    <file>     print the parsed AST
   --disasm      <file>     print the lowered fusevm bytecode
+  --tiers       <file>     run it, then report which fusevm tiers took it
   --lsp                    Language Server Protocol over stdio
   --dap                    Debug Adapter Protocol over stdio
 ";

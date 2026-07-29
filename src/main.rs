@@ -60,7 +60,8 @@ fn main() -> ExitCode {
         | Command::Vet
         | Command::DumpTokens
         | Command::DumpAst
-        | Command::Disasm => run_file_cmd(&cli),
+        | Command::Disasm
+        | Command::Tiers => run_file_cmd(&cli),
     }
 }
 
@@ -78,6 +79,13 @@ fn run_file_cmd(cli: &gors::cli::Cli) -> ExitCode {
         Command::DumpTokens => finish(dump_tokens(&src)),
         Command::DumpAst => finish(dump_ast(&src)),
         Command::Disasm => finish(gors::disassemble(&src)),
+        Command::Tiers => match gors::tiers::report(&src) {
+            Ok(r) => {
+                println!("{r}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Command::Vet => match gors::vet(&src) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e),

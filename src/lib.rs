@@ -21,6 +21,7 @@ pub mod parser;
 pub mod pkg;
 pub mod rust_ffi;
 pub mod stdlib_vendor;
+pub mod tiers;
 
 pub use banner::version_banner;
 use fusevm::{Op, Scheduler, VMResult, Value, VM};

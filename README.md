@@ -61,6 +61,7 @@ go help [command]     # usage (optionally for one command)
 go --dump-tokens f.go # lexer token stream (with inserted semicolons)
 go --dump-ast f.go    # parsed AST
 go --disasm f.go      # lowered fusevm bytecode
+go --tiers f.go       # run it, then report which fusevm tiers took it
 go --lsp / --dap      # Language Server / Debug Adapter Protocol over stdio
 ```
 
@@ -174,7 +175,7 @@ other `fusevm` frontends:
 - **HTML docs** — [`docs/`](docs) (index, engineering report, and a `reference.html`
   generated from the LSP corpus by the `gen-docs` binary).
 - **Inline Rust FFI** — `rust {}` blocks via the shared `fusevm` FFI runtime.
-- **Introspection** — `--dump-tokens` / `--dump-ast` / `--disasm`.
+- **Introspection** — `--dump-tokens` / `--dump-ast` / `--disasm` / `--tiers`.
 
 ## Build & test
 
