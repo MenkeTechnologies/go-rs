@@ -4,7 +4,7 @@
 //! go-rs is an executor swap — the standard library is real Go code, so an
 //! imported package is *run from its source*, not reimplemented. Each package's
 //! top-level names are qualified with the import path (`errors.New`,
-//! `errors.errorString`) so many packages coexist in one [`ast::Program`] that
+//! `errors.errorString`) so many packages coexist in one [`crate::ast::Program`] that
 //! the existing single-program [`crate::compiler`] then lowers unchanged.
 //!
 //! A small set of packages ([`NATIVE`]) stay as host builtins: the irreducible
