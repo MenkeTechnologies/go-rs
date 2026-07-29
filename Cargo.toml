@@ -17,12 +17,22 @@ publish = true
 # `go` bin — not CI config, the integration-test corpus, or the .go examples.
 # None are referenced at compile time (no include_str! into them), so the
 # packaged crate still builds and its bin runs.
+# `goroot/` is NOT excluded — its `.go` files are embedded at compile time via
+# include_str! in src/stdlib_vendor.rs.
 exclude = [
     "/.github/",
     "/tests/",
     "/examples/",
     "/docs/",
+    "/bench/",
+    "/benches/",
+    "/parity/",
     "/parity-scripts/",
+    "/scripts/",
+    "/vendor/",
+    "/tools/",
+    "/fuzz/",
+    "/BUGS.md",
 ]
 
 # go-rs is a standalone crate, not a workspace member. An explicit empty
