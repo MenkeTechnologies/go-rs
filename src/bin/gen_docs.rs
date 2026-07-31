@@ -1,24 +1,26 @@
-//! Offline generator for `docs/reference.html` — the keyword / type / IO
-//! reference page, rendered with the same cyberpunk HUD chrome as
-//! `docs/index.html`. Run before publishing GitHub Pages:
+//! Offline generator for `docs/reference.html` — the full language reference,
+//! rendered with the same cyberpunk HUD chrome as `docs/index.html`. Run before
+//! publishing GitHub Pages:
 //!
 //! ```sh
 //! cargo run --bin gen-docs
 //! ```
 //!
-//! Source of truth: the LSP corpus in `gors::lsp` (`corpus()`), the exact
-//! `(name, chapter, doc, example)` table the editor completion/hover path
-//! renders from. The static page and the language server therefore never drift
-//! — a name is documented here only if the runtime actually recognizes it in
-//! `lexer.rs` (keywords), the compiler's type table (declaration-position
-//! types), or `host.rs` (the `fmt` print builtins).
+//! Source of truth: the reference corpus in `gors::lsp` (`corpus()`), the exact
+//! `Entry` table the editor completion/hover path and `go doc` render from. The
+//! static page and the language server therefore never drift — a name is
+//! documented here only if the runtime actually recognizes it in `lexer.rs`
+//! (keywords), the compiler's type and builtin tables, `host.rs` (the print,
+//! composite and stdlib builtins), or the Go source `pkg.rs` links from
+//! `goroot/`.
 
+use gors::lsp::Entry;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 fn main() {
     let corpus = gors::lsp::corpus();
-    let chapters: BTreeSet<&str> = corpus.iter().map(|(_, c, _, _)| *c).collect();
+    let chapters: BTreeSet<&str> = corpus.iter().map(|entry| entry.chapter).collect();
 
     let page = format!(
         "{head}{body}{foot}",
@@ -41,19 +43,15 @@ fn main() {
     );
 }
 
-/// A reference-corpus entry: (name, chapter, doc, example).
-type CEntry<'a> = (&'a str, &'a str, &'a str, &'a str);
-
 /// Render one `<section>` per chapter (first-seen order), each holding one
-/// `<article class="doc-entry">` per name: heading, one-line description, and a
-/// runnable usage example.
-fn build_body(corpus: &[CEntry]) -> String {
-    let mut chapters: Vec<(&str, Vec<&CEntry>)> = Vec::new();
+/// `<article class="doc-entry">` per name: an anchored heading, the declaration
+/// form in a fenced code block, the description, and a runnable example.
+fn build_body(corpus: &[Entry]) -> String {
+    let mut chapters: Vec<(&str, Vec<&Entry>)> = Vec::new();
     for entry in corpus {
-        let chapter = entry.1;
-        match chapters.iter_mut().find(|(c, _)| *c == chapter) {
+        match chapters.iter_mut().find(|(c, _)| *c == entry.chapter) {
             Some((_, entries)) => entries.push(entry),
-            None => chapters.push((chapter, vec![entry])),
+            None => chapters.push((entry.chapter, vec![entry])),
         }
     }
 
@@ -66,19 +64,21 @@ fn build_body(corpus: &[CEntry]) -> String {
             slug = slugify(chapter),
             title = html_escape(chapter),
         );
-        for (idx, (name, _chapter, doc, example)) in entries.iter().enumerate() {
+        for (idx, entry) in entries.iter().enumerate() {
             let anchor = format!("doc-{}-{}", slugify(chapter), idx + 1);
             let _ = write!(
                 out,
                 "        <article class=\"doc-entry\" id=\"{anchor}\">\n\
                  \x20         <h3><a class=\"doc-anchor\" href=\"#{anchor}\">#</a> <code>{name}</code></h3>\n\
+                 \x20         <pre><code class=\"lang-go\">{signature}</code></pre>\n\
                  \x20         <p>{doc}</p>\n\
                  \x20         <pre><code class=\"lang-go\">{example}</code></pre>\n\
                  \x20       </article>\n",
                 anchor = anchor,
-                name = html_escape(name),
-                doc = html_escape(doc),
-                example = html_escape(example),
+                name = html_escape(entry.name),
+                signature = html_escape(entry.signature),
+                doc = html_escape(entry.doc),
+                example = html_escape(entry.example),
             );
         }
         out.push_str("      </section>\n");
@@ -114,7 +114,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="go-rs — Language reference. Keywords, declaration types, and console IO recognized by the current go-rs build. MIT licensed.">
+  <meta name="description" content="go-rs — Language reference. Every keyword, type, conversion, builtin, standard-library function, operator, statement and expression form the current go-rs build implements, plus its documented divergences from gc-compiled Go. MIT licensed.">
   <title>go-rs &mdash; Language Reference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -169,7 +169,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Every reserved keyword, declaration-position type name, and console-IO surface the current go-rs build recognizes, grouped by keyword then type then IO. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; types mirror the compiler's numeric-type table; the <code>fmt</code> methods mirror the print builtins in <code>host.rs</code>.</p>
+      <p class="tutorial-subtitle">Every keyword, predeclared identifier, type, conversion, builtin function, standard-library entry, operator, statement form and expression form the current go-rs build implements — each with its declaration form, what the implementation actually does, and a runnable example. The last chapter documents where behaviour diverges from gc-compiled Go. This page is generated from the reference corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it never drifts from what the runtime, <code>go doc</code> and the language server know: keywords mirror <code>lexer.rs</code>; types, conversions and builtins mirror the compiler's tables; the package chapters mirror the native dispatch tables in <code>host.rs</code> and the Go source linked from <code>goroot/</code>.</p>
 "#;
 
 const FOOT: &str = r#"
