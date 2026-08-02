@@ -42,7 +42,8 @@ pub struct Cli {
     pub cmd: Command,
     /// The `.go` file, if any.
     pub file: Option<String>,
-    /// Program arguments after the file (become `os.Args`).
+    /// Program arguments after the file. Accepted and collected; `os.Args` is
+    /// not exposed to the program yet, so nothing reads this today.
     pub argv: Vec<String>,
     /// `-o <path>` output for `go build`.
     pub out: Option<String>,

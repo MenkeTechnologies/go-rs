@@ -56,6 +56,7 @@ go build -o bin f.go  # AOT-compile to a standalone native executable (no go too
 go vet file.go        # parse + compile-check; report errors, do not run
 go env                # print the Go environment (GOOS/GOARCH/GOVERSION/…)
 go doc [name]         # reference docs for a keyword/type/builtin (or the index)
+go install-std        # install the vendored standard library into ~/.go-rs
 go version            # print the version banner
 go help [command]     # usage (optionally for one command)
 go --dump-tokens f.go # lexer token stream (with inserted semicolons)
@@ -136,13 +137,13 @@ Real Go, executed on fusevm:
 | defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
 | panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; **runtime faults** (integer divide-by-zero, index-out-of-range, nil dereference) are recoverable too — `recover()` returns the `runtime error: …` value; an unrecovered panic prints `panic: <value>` and exits non-zero (matching Go, minus the goroutine trace) |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported |
-| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %d %s %f %t %q %%`, and `Errorf` — builds a real `error` value, `%w` formats like `%v`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Cbrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min, trig Sin/Cos/Tan/Asin/Acos/Atan/Atan2/Sinh/Cosh/Tanh, Exp/Log/Log2/Log10 + Pi/E); `sort` (Ints/Strings/Float64s); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`new`/`close`/`min`/`max`/`println`/`print` |
+| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %d %s %f %t %q %x %X %o %b %c %%` with width / `.precision` / `-` / `+` / `0` flags, and `Errorf` — builds a real `error` value, `%w` formats like `%v`); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/Replace/ReplaceAll/Title/EqualFold); `strconv` (Itoa/Atoi/ParseInt/ParseFloat/FormatInt/Quote); `math` (Abs/Sqrt/Cbrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min, trig Sin/Cos/Tan/Asin/Acos/Atan/Atan2/Sinh/Cosh/Tanh, Exp/Log/Log2/Log10 + consts Pi/E/Sqrt2/MaxInt/MinInt/MaxInt64/MinInt64); `sort` (Ints/Strings/Float64s + Slice/SliceStable, which take a closure comparator and lower to an in-language stable insertion sort); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`new`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
-Goroutines, channels, and `select` run on a **cooperative scheduler added to the
-shared `fusevm` VM** (`fusevm::sched`, v0.14.14–0.14.15): each goroutine is its
-own VM sharing the program and the single-threaded heap, yielding at channel
-operations. **Generics are handled by erasure** — type-parameter and
+Goroutines, channels, and `select` run on a **cooperative scheduler in the
+shared `fusevm` VM** (`fusevm::sched`, from the pinned `fusevm` 0.15.0): each
+goroutine is its own VM sharing the program and the single-threaded heap,
+yielding at channel operations. **Generics are handled by erasure** — type-parameter and
 type-argument brackets are consumed and dropped, and the dynamically-typed value
 model runs one erased body for every instantiation (the zero value of a
 type-parameter-typed `var` is nil, treated as the additive identity so a generic
@@ -156,12 +157,10 @@ call's arguments (and, for a method, its receiver by reference) and pushes a
 closure; a `panic` jumps to the function's defer drain and, if unrecovered,
 propagates up the call chain (a compile-time check after each call, active only
 in programs that panic). Documented simplifications: a map read of a missing key
-returns the numeric zero (`0`) rather than the comma-ok form; method receivers
-use reference semantics (a value receiver is not copied); `go` targets a
-top-level function call (no closure goroutines yet); a deferred closure that
-mutates a **named** return value does not propagate that change (pending
-capture-by-reference), and an unrecovered panic prints its message but not Go's
-goroutine stack trace.
+yields the **numeric** zero whatever the value type — the comma-ok form reports
+`ok` correctly, but `m["missing"]` on a `map[string]string` is `0`, not `""`;
+method receivers use reference semantics (a value receiver is not copied); and
+an unrecovered panic prints its message but not Go's goroutine stack trace.
 
 ## Toolchain
 
@@ -213,10 +212,10 @@ interpreters byte-for-byte (stdout + exit status).
 
 **Packages are run from source.** An `import` of a non-native package is resolved
 to its Go source, parsed, name-qualified (`errors.New` → the linked `errors.New`),
-and compiled into the same unit as `main` (see [`src/pkg.rs`]) — the standard
+and compiled into the same unit as `main` (see [`src/pkg.rs`](src/pkg.rs)) — the standard
 library is *executed*, not reimplemented. A small native layer stays as host
 builtins for the irreducible runtime/I-O boundary (`fmt` writes stdout, `os`
-touches the OS). The vendored stdlib ([`goroot/`]) grows as go-rs gains the
+touches the OS). The vendored stdlib ([`goroot/`](goroot)) grows as go-rs gains the
 language features each package needs; a not-yet-supported import is a clear error.
 
 Constant float expressions are **folded exactly** — go-rs evaluates a

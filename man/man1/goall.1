@@ -10,7 +10,8 @@ is a pure Go frontend for the
 bytecode VM. The pipeline is
 .IR "lexer \(-> parser \(-> compiler \(-> fusevm::Chunk" ,
 after which fusevm runs the chunk on its three\-tier Cranelift JIT. No component
-interprets Go directly; there is no goroutine runtime and no garbage collector.
+interprets Go directly; there is no Go runtime and no garbage collector \(em
+goroutines ride fusevm's own cooperative scheduler.
 .SH ARCHITECTURE
 .TP
 .B lexer.rs
@@ -33,24 +34,60 @@ The
 .B fmt
 print family and builtin
 .BR println / print ,
-plus the inline\-Rust FFI compile/call builtins.
-.SH LANGUAGE SURFACE (SLICE 1)
-Single\-file
-.BR "package main" ;
-top\-level
+the heap backing slices/arrays/maps/structs, the
+.BR strings / strconv / math / sort / os
+builtins, plus the inline\-Rust FFI compile/call builtins.
+.TP
+.B pkg.rs
+Resolves a non\-native
+.B import
+to real Go source, name\-qualifies it, and links it into the same compilation
+unit (with
+.B stdlib_vendor.rs
+supplying the packages vendored into the binary).
+.TP
+.B aot_native.rs
+Drives
+.BR "go build" :
+fusevm's ahead\-of\-time object emitter, linked against the go\-rs runtime
+.RB ( libgors.a )
+into a standalone native executable.
+.TP
+.BR lsp.rs " / " dap.rs
+The
+.BR \-\-lsp " / " \-\-dap
+servers, and the documentation corpus behind
+.B go doc
+and
+.BR docs/reference.html .
+.SH LANGUAGE SURFACE
+A
+.B package main
+entry file plus imported packages linked from source; top\-level
 .B func
-with parameters, results, and recursion;
-.BR ":=" " / " var ;
-assignment and compound assignment;
-.BR if / else ;
-three\-clause / condition / infinite
-.BR for ;
+and methods with parameters, results, and recursion;
+.BR ":=" " / " var ,
+assignment (parallel and multi\-value) and compound assignment;
+.BR if / else ,
+.BR switch ,
+type switch, the three\-clause / condition / infinite / range
+.BR for ,
+and
 .BR break / continue / return ;
-arithmetic, comparisons, and short\-circuit
+arithmetic, the full bitwise set, comparisons, and short\-circuit
 .BR "&&" " / " "||" ;
-.BR fmt.Println / Print / Printf .
-Structs, methods, interfaces, slices, maps, channels, and goroutines are future
-waves.
+.BR struct s
+with methods and pointers, interfaces with dynamic dispatch, slices, fixed\-size
+arrays, maps, channels with
+.BR select ,
+closures capturing by reference,
+.BR defer / panic / recover ,
+and erased generics;
+.BR fmt / strings / strconv / math / sort / os
+as native builtins. Open gaps: fixed\-width integer wrapping (all integers are
+64\-bit), monomorphized generics, and source packages that reach
+.BR unsafe / cgo / reflect
+or assembly.
 .SH TOOLCHAIN
 Standalone
 .B go
@@ -64,8 +101,10 @@ an HTML docs/report site with a generated
 .BR reference.html ;
 inline
 .B rust {}
-FFI; and
-.BR \-\-dump\-tokens " / " \-\-dump\-ast " / " \-\-disasm
+FFI;
+.B go doc
+offline reference lookup; and
+.BR \-\-dump\-tokens " / " \-\-dump\-ast " / " \-\-disasm " / " \-\-tiers
 introspection.
 .SH SEE ALSO
 .BR go (1)

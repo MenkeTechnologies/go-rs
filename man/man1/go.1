@@ -20,8 +20,12 @@ behind
 .BR stryke ,
 .BR awkrs ,
 vimlrs, elisprs, rubylang, javars, kotlinrs, and scalars. There is no bespoke VM
-and no Go runtime; execution and codegen live in fusevm, with no goroutine
-scheduler and no garbage collector.
+and no Go runtime; execution and codegen live in fusevm, with no garbage
+collector. Goroutines, channels, and
+.B select
+run on fusevm's own cooperative scheduler
+.RB ( fusevm::sched ),
+not a Go runtime.
 .PP
 A program is a
 .B package main
@@ -39,15 +43,23 @@ and lowers every other top\-level
 .B func
 to a fusevm subroutine (recursion supported). Statements cover
 .BR ":=" " / " var
-declarations, assignment and compound assignment, post\-increment/decrement,
+declarations, assignment (including parallel assignment and multi\-value
+destructuring) and compound assignment, post\-increment/decrement,
 .BR if / else ,
-the three\-clause / condition / infinite
+the three\-clause / condition / infinite / range
 .BR for ,
-and
-.BR break / continue / return .
+.B switch
+and type switch, and
+.BR break / continue / return / defer / go .
+The type surface adds
+.BR struct s
+with methods and pointers, interfaces with dynamic dispatch, slices, fixed\-size
+arrays, maps, channels, closures that capture by reference, and erased generics.
 Printing is
 .BR fmt.Println / Print / Printf
-plus the builtins
+(plus
+.BR Sprintf / Sprint / Sprintln / Errorf )
+and the builtins
 .BR println / print .
 Static
 .BR int / float

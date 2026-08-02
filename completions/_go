@@ -8,6 +8,7 @@ _go() {
     '--dump-tokens[print the lexer token stream and exit]' \
     '--dump-ast[print the parsed AST and exit]' \
     '--disasm[print the lowered fusevm bytecode and exit]' \
+    '--tiers[run the program, then report which fusevm tiers took it]' \
     '--lsp[speak the Language Server Protocol over stdio]' \
     '--dap[speak the Debug Adapter Protocol over stdio]' \
     '1: :(run build vet env doc install-std version help)' \
