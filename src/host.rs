@@ -640,6 +640,11 @@ fn b_range_keys(vm: &mut VM, argc: u8) -> Value {
                 })
             }
         }
+        // Go 1.22's range-over-int: `for i := range n` yields 0 … n-1. A
+        // non-positive `n` yields nothing, which is why this is a range and not
+        // an error. Without this arm an integer produced *no* keys, so the loop
+        // silently ran zero times.
+        Some(Value::Int(n)) => (0..*n).map(Value::Int).collect(),
         _ => Vec::new(),
     };
     Value::Obj(heap_alloc(HostObj::Slice(keys)))
@@ -660,6 +665,10 @@ fn b_range_val(vm: &mut VM, argc: u8) -> Value {
                 None => Value::Int(0),
             }
         }
+        // Range-over-int has only one loop variable — the integer itself — so
+        // the "value" is the key. Go rejects a second variable there, which the
+        // parser reports rather than inventing one.
+        Value::Int(_) => key,
         _ => {
             // Slice/map: index normally.
             vm.push(iter);
@@ -1209,17 +1218,70 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
-            Some(HostObj::Struct { fields, .. }) => fields
-                .iter()
-                .find(|(f, _)| *f == name)
-                .map(|(_, v)| v.clone())
-                .unwrap_or(Value::Undef),
+            Some(HostObj::Struct { fields, .. }) => {
+                if let Some((_, v)) = fields.iter().find(|(f, _)| *f == name) {
+                    return v.clone();
+                }
+                // Not a direct field — try an embedded one (Go field promotion).
+                match embedded_field_owner(&h, id, &name) {
+                    Some(owner) => match h.get(owner as usize) {
+                        Some(HostObj::Struct { fields, .. }) => fields
+                            .iter()
+                            .find(|(f, _)| *f == name)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Undef),
+                        _ => Value::Undef,
+                    },
+                    None => Value::Undef,
+                }
+            }
             _ => {
                 ffi_fault(vm, format!("go-rs: no field `{name}`"));
                 Value::Undef
             }
         }
     })
+}
+
+/// Find the struct that declares `name` through `root`'s embedded fields, and
+/// return its heap id. An embedded field is one whose field name equals the
+/// type name of the struct it holds — exactly how the parser records
+/// `struct { Base }`. The search is breadth-first so the shallowest depth wins,
+/// matching Go's promotion rule.
+fn embedded_field_owner(heap: &[HostObj], root: u32, name: &str) -> Option<u32> {
+    let mut frontier = vec![root];
+    // Embedding is acyclic in Go (a struct cannot embed itself by value), so
+    // the walk terminates on the type graph's depth.
+    for _ in 0..16 {
+        let mut next = Vec::new();
+        for id in frontier {
+            let Some(HostObj::Struct { fields, .. }) = heap.get(id as usize) else {
+                continue;
+            };
+            for (fname, fval) in fields {
+                let Value::Obj(inner) = fval else { continue };
+                let Some(HostObj::Struct {
+                    type_name,
+                    fields: inner_fields,
+                }) = heap.get(*inner as usize)
+                else {
+                    continue;
+                };
+                if fname != type_name {
+                    continue; // a named field, not an embedded one
+                }
+                if inner_fields.iter().any(|(f, _)| f == name) {
+                    return Some(*inner);
+                }
+                next.push(*inner);
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
 }
 
 /// `s.field = v` write on a struct. Returns `v`.
@@ -1237,7 +1299,15 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
     };
     let ok = HEAP.with(|h| {
         let mut h = h.borrow_mut();
-        match h.get_mut(id as usize) {
+        // A write to a promoted field lands on the embedded struct that owns
+        // it, not as a new field on the outer one.
+        let target = match h.get(id as usize) {
+            Some(HostObj::Struct { fields, .. }) if !fields.iter().any(|(f, _)| *f == name) => {
+                embedded_field_owner(&h, id, &name).unwrap_or(id)
+            }
+            _ => id,
+        };
+        match h.get_mut(target as usize) {
             Some(HostObj::Struct { fields, .. }) => {
                 if let Some(slot) = fields.iter_mut().find(|(f, _)| *f == name) {
                     slot.1 = val.clone();

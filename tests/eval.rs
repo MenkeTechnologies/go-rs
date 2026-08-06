@@ -26,6 +26,26 @@ fn run(src: &str) -> (String, bool) {
     )
 }
 
+/// As [`run`], but returns stderr as well — for programs expected to be
+/// rejected, where the diagnostic is the thing under test.
+fn run_capturing_stderr(src: &str) -> (String, bool) {
+    let mut f = tempfile::Builder::new()
+        .suffix(".go")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(src.as_bytes()).expect("write source");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_go"))
+        .arg("run")
+        .arg(f.path())
+        .output()
+        .expect("spawn go binary");
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout),
+        out.status.success(),
+    )
+}
+
 /// Assert a program runs successfully and prints exactly `expected` on stdout.
 fn assert_stdout(src: &str, expected: &str) {
     let (stdout, ok) = run(src);
@@ -1909,4 +1929,182 @@ func main() {
 }
 ";
     assert_stdout(src, "[1 2 5 8 9]\n[9 8 5 2 1]\n[apple banana cherry]\n");
+}
+
+#[test]
+fn labeled_break_and_continue() {
+    // A label names an enclosing `for` or `switch`; `continue L` restarts that
+    // loop from a nested one, `break L` leaves it — including from inside a
+    // `switch`, which an unlabeled `break` would only leave the switch of.
+    // Verified against go 1.26.5.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+outer:
+	for i := 0; i < 4; i++ {
+		for j := 0; j < 4; j++ {
+			if j == 2 {
+				continue outer
+			}
+			if i == 3 {
+				break outer
+			}
+			fmt.Println(i, j)
+		}
+	}
+loop:
+	for i := range 5 {
+		switch i {
+		case 2:
+			continue loop
+		case 4:
+			break loop
+		}
+		fmt.Println(\"i =\", i)
+	}
+	n := 0
+sw:
+	switch n {
+	case 0:
+		for k := 0; k < 3; k++ {
+			if k == 1 {
+				break sw
+			}
+			fmt.Println(\"k\", k)
+		}
+		fmt.Println(\"unreachable\")
+	}
+	fmt.Println(\"done\")
+}
+";
+    assert_stdout(
+        src,
+        "0 0\n0 1\n1 0\n1 1\n2 0\n2 1\ni = 0\ni = 1\ni = 3\nk 0\ndone\n",
+    );
+}
+
+#[test]
+fn label_on_a_non_loop_is_rejected() {
+    // A label can only introduce a `for` or a `switch`, so labeling anything
+    // else is a compile error rather than a label that binds to nothing.
+    let src = "\
+package main
+func main() {
+lbl:
+	x := 1
+	_ = x
+}
+";
+    let (out, ok) = run_capturing_stderr(src);
+    assert!(!ok, "program unexpectedly succeeded: {out:?}");
+    assert!(out.contains("label `lbl`"), "unexpected error: {out}");
+}
+
+#[test]
+fn elided_composite_literal_element_types() {
+    // Inside a composite literal the element type may be elided, for container
+    // element types (`[][]int{{1, 2}}`) as well as struct ones. Verified
+    // against go 1.26.5.
+    let src = "\
+package main
+import \"fmt\"
+type Point struct{ X, Y int }
+func main() {
+	fmt.Println([][]int{{1, 2}, {3, 4, 5}, {}})
+	fmt.Println([]Point{{1, 2}, {X: 3}, {}})
+	fmt.Println(map[string][]int{\"a\": {1, 2}}[\"a\"])
+	fmt.Println(map[string]map[string]int{\"x\": {\"i\": 1}}[\"x\"][\"i\"])
+	fmt.Println(map[string]Point{\"o\": {1, 2}}[\"o\"].Y)
+	fmt.Println([2][2]int{{1, 2}, {3, 4}})
+	fmt.Println([][][]int{{{1}, {2, 3}}, {{4}}})
+	fmt.Println([4][]int{2: {7, 8}})
+	fmt.Println(map[Point]string{{1, 2}: \"a\"}[Point{1, 2}])
+}
+";
+    assert_stdout(
+        src,
+        "[[1 2] [3 4 5] []]\n[{1 2} {3 0} {0 0}]\n[1 2]\n1\n2\n[[1 2] [3 4]]\n\
+         [[[1] [2 3]] [[4]]]\n[[] [] [7 8] []]\na\n",
+    );
+}
+
+#[test]
+fn embedded_struct_promotes_fields_and_methods() {
+    // An embedded field's fields and methods are promoted onto the outer
+    // struct, through more than one level; a method the outer type declares
+    // itself shadows the promoted one, and a promoted field assignment writes
+    // through to the embedded value. Verified against go 1.26.5.
+    let src = "\
+package main
+import \"fmt\"
+type Base struct {
+	N    int
+	Name string
+}
+func (b Base) Describe() string { return fmt.Sprintf(\"Base(%d,%s)\", b.N, b.Name) }
+func (b Base) Double() int      { return b.N * 2 }
+type Middle struct {
+	Base
+	Tag string
+}
+func (m Middle) Describe() string { return \"Middle:\" + m.Tag }
+type Derived struct {
+	Middle
+	Extra int
+}
+type Describer interface{ Describe() string }
+func main() {
+	d := Derived{Middle: Middle{Base: Base{N: 3, Name: \"x\"}, Tag: \"t\"}, Extra: 9}
+	fmt.Println(d.N, d.Name, d.Tag, d.Extra)
+	fmt.Println(d.Describe(), d.Double(), d.Base.Describe(), d.Middle.Base.N)
+	d.N = 42
+	fmt.Println(d.N, d.Base.N, d.Double())
+	var i Describer = d
+	fmt.Println(i.Describe())
+	i = d.Base
+	fmt.Println(i.Describe())
+	fmt.Println(d)
+}
+";
+    assert_stdout(
+        src,
+        "3 x t 9\nMiddle:t 6 Base(3,x) 3\n42 42 84\nMiddle:t\nBase(42,x)\n{{{42 x} t} 9}\n",
+    );
+}
+
+#[test]
+fn embedded_pointer_and_shadowed_field_name() {
+    // An embedded `*T` promotes through the pointer (so a pointer-receiver
+    // method mutates the shared value), and a struct may hold both an embedded
+    // `Base` and a named field of the same type without them colliding.
+    // Verified against go 1.26.5.
+    let src = "\
+package main
+import \"fmt\"
+type Animal struct{ Legs int }
+func (a *Animal) AddLeg()      { a.Legs++ }
+func (a Animal) Walk() string  { return fmt.Sprintf(\"walking on %d\", a.Legs) }
+type Dog struct {
+	*Animal
+	Name string
+}
+type Base struct{ ID int }
+func (b *Base) Bump() { b.ID += 10 }
+type Pair struct {
+	Base
+	B Base
+}
+func main() {
+	d := Dog{Animal: &Animal{Legs: 4}, Name: \"rex\"}
+	fmt.Println(d.Legs, d.Name, d.Walk())
+	d.AddLeg()
+	fmt.Println(d.Legs, d.Animal.Legs)
+	p := Pair{Base{5}, Base{6}}
+	fmt.Println(p.ID, p.B.ID, p)
+	p.Bump()
+	fmt.Println(p.ID, p.B.ID)
+}
+";
+    assert_stdout(src, "4 rex walking on 4\n5 5\n5 6 {{5} {6}}\n15 6\n");
 }

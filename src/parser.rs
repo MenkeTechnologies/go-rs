@@ -153,6 +153,14 @@ impl Parser {
         &self.tokens[self.pos].kind
     }
 
+    /// The token `n` positions ahead (`0` is the current one).
+    fn peek_at(&self, n: usize) -> &Tok {
+        self.tokens
+            .get(self.pos + n)
+            .map(|t| &t.kind)
+            .unwrap_or(&Tok::Eof)
+    }
+
     fn peek2(&self) -> &Tok {
         self.tokens
             .get(self.pos + 1)
@@ -162,6 +170,32 @@ impl Parser {
 
     fn line(&self) -> u32 {
         self.tokens[self.pos].line
+    }
+
+    /// The label of a `break label` / `continue label`, when one follows on the
+    /// same line. Go's semicolon insertion ends the statement at the newline, so
+    /// an identifier on the *next* line is a new statement and not a label.
+    fn opt_label(&mut self) -> Option<String> {
+        let Tok::Ident(name) = self.peek().clone() else {
+            return None;
+        };
+        if self.tokens[self.pos].line != self.tokens[self.pos.saturating_sub(1)].line {
+            return None;
+        }
+        self.advance();
+        Some(name)
+    }
+
+    /// Whether the cursor sits on `label:` introducing a labeled statement — an
+    /// identifier followed by a colon. Distinguished from `x := …` by the colon
+    /// standing alone, and from a `case`/`default` label by those being their own
+    /// tokens.
+    fn at_label(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(_))
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(Tok::Colon)
+            )
     }
 
     fn advance(&mut self) -> Tok {
@@ -342,6 +376,15 @@ impl Parser {
         self.skip_semis();
         let mut fields = Vec::new();
         while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            // An embedded field is a bare type with no name: `struct { Base }`.
+            // Its field name is the type's own name (the last component of a
+            // qualified one), which is what promotion later reads through.
+            if let Some(ty) = self.embedded_field()? {
+                let name = ty.rsplit('.').next().unwrap_or(&ty).to_string();
+                fields.push(Param { name, ty });
+                self.skip_semis();
+                continue;
+            }
             // One or more field names sharing a type: `x, y int`.
             let mut names = vec![self.ident()?];
             while self.eat(&Tok::Comma) {
@@ -358,6 +401,40 @@ impl Parser {
         }
         self.expect(&Tok::RBrace)?;
         Ok(fields)
+    }
+
+    /// An embedded field at the current position — `Base`, `pkg.Base`, or
+    /// `*Base` with no field name — consumed and returned as its type text.
+    /// Returns `None` (consuming nothing) if this is an ordinary named field.
+    fn embedded_field(&mut self) -> Result<Option<String>, String> {
+        // `*T` can only be an embedded pointer here; a named field would have
+        // its name first.
+        let star = matches!(self.peek(), Tok::Star);
+        let base = if star { 1 } else { 0 };
+        let Tok::Ident(_) = self.peek_at(base) else {
+            return Ok(None);
+        };
+        // A qualified type takes two more tokens (`.` `Ident`); the field ends
+        // where the type ends, so what follows must close the declaration.
+        let qualified = matches!(self.peek_at(base + 1), Tok::Dot);
+        let after = if qualified { base + 3 } else { base + 1 };
+        if !matches!(self.peek_at(after), Tok::Semi | Tok::RBrace | Tok::Str(_)) {
+            return Ok(None);
+        }
+        if star {
+            self.advance();
+        }
+        let mut ty = self.ident()?;
+        if qualified {
+            self.expect(&Tok::Dot)?;
+            ty.push('.');
+            ty.push_str(&self.ident()?);
+        }
+        // A field tag (`json:"…"`) is accepted and ignored.
+        if matches!(self.peek(), Tok::Str(_)) {
+            self.advance();
+        }
+        Ok(Some(ty))
     }
 
     /// Parse an anonymous `struct{ … }` type (the `struct` keyword is the current
@@ -709,6 +786,25 @@ impl Parser {
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {
+        // `label:` before a loop or `switch` — the target a labeled
+        // `break`/`continue` names. The label rides on the statement it
+        // introduces rather than becoming a statement of its own, because that
+        // is the only thing it can attach to.
+        if self.at_label() {
+            let Tok::Ident(label) = self.advance() else {
+                unreachable!("at_label checked the token")
+            };
+            self.advance(); // `:`
+            self.skip_semis();
+            let mut inner = self.stmt()?;
+            if !set_stmt_label(&mut inner, &label) {
+                return Err(format!(
+                    "go-rs: label `{label}` must introduce a `for` or `switch` (line {})",
+                    self.line()
+                ));
+            }
+            return Ok(inner);
+        }
         match self.peek() {
             Tok::Var => self.var_stmt(),
             Tok::Const => self.const_stmt(),
@@ -727,12 +823,12 @@ impl Parser {
             Tok::Break => {
                 let line = self.line();
                 self.advance();
-                Ok(Stmt::Break(line))
+                Ok(Stmt::Break(line, self.opt_label()))
             }
             Tok::Continue => {
                 let line = self.line();
                 self.advance();
-                Ok(Stmt::Continue(line))
+                Ok(Stmt::Continue(line, self.opt_label()))
             }
             Tok::Fallthrough => {
                 let line = self.line();
@@ -949,6 +1045,7 @@ impl Parser {
         if matches!(self.peek(), Tok::LBrace) {
             let body = self.block()?;
             return Ok(Stmt::For {
+                label: None,
                 init: None,
                 cond: None,
                 post: None,
@@ -989,6 +1086,7 @@ impl Parser {
             self.no_composite = saved;
             let body = self.block()?;
             Ok(Stmt::For {
+                label: None,
                 init: first.map(Box::new),
                 cond,
                 post,
@@ -1004,6 +1102,7 @@ impl Parser {
             self.no_composite = saved;
             let body = self.block()?;
             Ok(Stmt::For {
+                label: None,
                 init: None,
                 cond,
                 post: None,
@@ -1060,6 +1159,7 @@ impl Parser {
         self.no_composite = saved;
         let body = self.block()?;
         Ok(Stmt::ForRange {
+            label: None,
             key,
             val,
             define,
@@ -1173,6 +1273,7 @@ impl Parser {
         }
         self.expect(&Tok::RBrace)?;
         Ok(Stmt::Switch {
+            label: None,
             init,
             tag,
             cases,
@@ -1735,30 +1836,9 @@ impl Parser {
                 line,
             });
         }
-        self.expect(&Tok::LBrace)?;
-        let mut elems = Vec::new();
-        while !matches!(self.peek(), Tok::RBrace) {
-            // Elided element type: `[]T{ {…}, {…} }` — a bare `{…}` is a
-            // composite literal of the slice's element type. This applies to a
-            // locally-known struct and to a qualified imported type (`pkg.T`,
-            // which the parser can't see is a struct); container element types
-            // (`[]U`, `map[…]`) keep their own literal syntax.
-            let elided_struct = matches!(self.peek(), Tok::LBrace)
-                && (self.struct_names.contains(&elem_ty)
-                    || elem_ty.starts_with("struct{")
-                    || (elem_ty.contains('.')
-                        && !elem_ty.starts_with("[]")
-                        && !elem_ty.starts_with("map[")));
-            if elided_struct {
-                elems.push(self.struct_literal(elem_ty.clone())?);
-            } else {
-                elems.push(self.expr()?);
-            }
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
-        self.expect(&Tok::RBrace)?;
+        // Each element may elide the type: `[]T{ {…}, {…} }` means
+        // `[]T{ T{…}, T{…} }`, for a struct `T` and for a container `T` alike.
+        let elems = self.brace_list(|p| p.elem_or_expr(&elem_ty))?;
         Ok(Expr::SliceLit { elem_ty, elems })
     }
 
@@ -1784,12 +1864,10 @@ impl Parser {
         let mut placed: Vec<(usize, Expr)> = Vec::new();
         let mut next_idx = 0usize;
         while !matches!(self.peek(), Tok::RBrace) {
-            // A bare `{ … }` is an elided composite of a struct element type
-            // (sequential, no index key).
-            let is_bare_struct =
-                matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&elem_ty);
-            if is_bare_struct {
-                let v = self.struct_literal(elem_ty.clone())?;
+            // A bare `{ … }` is an elided composite of the element type, and
+            // cannot be an index key, so it is always sequential.
+            if matches!(self.peek(), Tok::LBrace) {
+                let v = self.elided_literal(&elem_ty)?;
                 placed.push((next_idx, v));
                 next_idx += 1;
             } else {
@@ -1802,13 +1880,7 @@ impl Parser {
                             self.line()
                         )
                     })? as usize;
-                    let v = if matches!(self.peek(), Tok::LBrace)
-                        && self.struct_names.contains(&elem_ty)
-                    {
-                        self.struct_literal(elem_ty.clone())?
-                    } else {
-                        self.expr()?
-                    };
+                    let v = self.elem_or_expr(&elem_ty)?;
                     placed.push((idx, v));
                     next_idx = idx + 1;
                 } else {
@@ -1826,7 +1898,20 @@ impl Parser {
         // Zero value for any gap: an empty struct literal for a struct element
         // type (the compiler zero-fills), else the scalar zero.
         let zero = |ety: &str| -> Expr {
-            if self.struct_names.contains(ety) {
+            if let Some(inner) = ety.strip_prefix("[]") {
+                // A gap in an array of slices is a nil slice, which prints and
+                // measures as empty — not the scalar zero.
+                Expr::SliceLit {
+                    elem_ty: inner.to_string(),
+                    elems: Vec::new(),
+                }
+            } else if let Some((key_ty, val_ty)) = split_map_type(ety) {
+                Expr::MapLit {
+                    key_ty,
+                    val_ty,
+                    pairs: Vec::new(),
+                }
+            } else if self.struct_names.contains(ety) {
                 Expr::StructLit {
                     type_name: ety.to_string(),
                     fields: Vec::new(),
@@ -1853,9 +1938,9 @@ impl Parser {
         self.expect(&Tok::LBrace)?;
         let mut pairs = Vec::new();
         while !matches!(self.peek(), Tok::RBrace) {
-            let k = self.expr()?;
+            let k = self.elem_or_expr(&key_ty)?;
             self.expect(&Tok::Colon)?;
-            let v = self.expr()?;
+            let v = self.elem_or_expr(&val_ty)?;
             pairs.push((k, v));
             if !self.eat(&Tok::Comma) {
                 break;
@@ -1867,6 +1952,72 @@ impl Parser {
             val_ty,
             pairs,
         })
+    }
+
+    /// One element of a composite literal whose element type is `ty`. A bare
+    /// `{ … }` here is Go's elided element type — `[][]int{{1, 2}}` means
+    /// `[][]int{[]int{1, 2}}` — so it is parsed as a literal of `ty` rather than
+    /// as an expression. Anything else is an ordinary expression.
+    fn elem_or_expr(&mut self, ty: &str) -> Result<Expr, String> {
+        if !matches!(self.peek(), Tok::LBrace) {
+            return self.expr();
+        }
+        self.elided_literal(ty)
+    }
+
+    /// A `{ … }` standing in for a literal of the known element type `ty`.
+    /// Reconstructs which literal form `ty` calls for, since the type text was
+    /// written once on the outer literal and elided on every element.
+    fn elided_literal(&mut self, ty: &str) -> Result<Expr, String> {
+        if let Some(inner) = ty.strip_prefix("[]") {
+            let elems = self.brace_list(|p| p.elem_or_expr(inner))?;
+            return Ok(Expr::SliceLit {
+                elem_ty: inner.to_string(),
+                elems,
+            });
+        }
+        if let Some((key_ty, val_ty)) = split_map_type(ty) {
+            self.expect(&Tok::LBrace)?;
+            let mut pairs = Vec::new();
+            while !matches!(self.peek(), Tok::RBrace) {
+                let k = self.elem_or_expr(&key_ty)?;
+                self.expect(&Tok::Colon)?;
+                let v = self.elem_or_expr(&val_ty)?;
+                pairs.push((k, v));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RBrace)?;
+            return Ok(Expr::MapLit {
+                key_ty,
+                val_ty,
+                pairs,
+            });
+        }
+        // Anything else names a struct — a declared one, an inline `struct{…}`,
+        // or a qualified `pkg.T` the parser can't see the definition of.
+        self.struct_literal(ty.to_string())
+    }
+
+    /// `{ a, b, … }` — a comma-separated brace list, each element parsed by `f`.
+    fn brace_list<T>(
+        &mut self,
+        mut f: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
+        self.expect(&Tok::LBrace)?;
+        let saved = self.no_composite;
+        self.no_composite = false;
+        let mut out = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace) {
+            out.push(f(self)?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.no_composite = saved;
+        self.expect(&Tok::RBrace)?;
+        Ok(out)
     }
 
     /// `T{ … }` — positional `T{a, b}` or keyed `T{x: a, y: b}`.
@@ -2088,4 +2239,25 @@ fn stmt_into_expr(s: Stmt, line: u32) -> Result<Expr, String> {
             "go-rs: expected a boolean expression on line {line}"
         )),
     }
+}
+
+/// Split `map[K]V` into `(K, V)`, matching brackets so a map-keyed-by-map or a
+/// slice value (`map[string][]int`) splits at the right `]`. Returns `None` for
+/// any type that isn't a map.
+fn split_map_type(ty: &str) -> Option<(String, String)> {
+    let rest = ty.strip_prefix("map[")?;
+    let mut depth = 1usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((rest[..i].to_string(), rest[i + 1..].to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

@@ -105,6 +105,10 @@ impl Scope {
 /// non-switch (loop), so a `continue` inside a switch reaches the enclosing loop.
 #[derive(Default)]
 struct LoopScope {
+    /// The `label:` written immediately before this loop, if any. A labeled
+    /// `break`/`continue` names it to leave or step an *outer* loop rather than
+    /// the innermost one.
+    label: Option<String>,
     breaks: Vec<usize>,
     continues: Vec<usize>,
     is_switch: bool,
@@ -266,7 +270,7 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
                     || cases.iter().any(|c| body_uses_panic(&c.body))
                     || default.as_deref().is_some_and(body_uses_panic)
             }
-            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => false,
+            Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => false,
         }
     }
     body.iter().any(st)
@@ -597,7 +601,7 @@ fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
             }
         }
         Stmt::Block(b) => b.iter().for_each(|s| free_stmt(s, bound, out)),
-        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
+        Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => {}
     }
 }
 
@@ -769,7 +773,7 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
             }
         }
         Stmt::Block(b) => b.iter().for_each(|s| walk_stmt_exprs(s, f)),
-        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
+        Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => {}
     }
 }
 
@@ -838,7 +842,144 @@ fn collect_globals(stmts: &[Stmt]) -> HashSet<String> {
     g
 }
 
+/// Synthesize the forwarding methods Go's field/method promotion implies: for
+/// every struct that embeds another, each method of the embedded type that the
+/// outer type does not declare itself becomes a real method on the outer type
+/// whose body forwards to the embedded value. Making them real methods (rather
+/// than a lookup rule) means static dispatch, dynamic dispatch, and interface
+/// satisfaction all see the promoted method with no further special-casing.
+fn promoted_methods(prog: &Program) -> Vec<Func> {
+    let field_types: HashMap<&str, Vec<&Param>> = prog
+        .types
+        .iter()
+        .map(|t| (t.name.as_str(), t.fields.iter().collect()))
+        .collect();
+    // A field is embedded when its name is its type's own name.
+    let embedded = |ty: &str| -> Vec<String> {
+        field_types
+            .get(ty)
+            .map(|fs| {
+                fs.iter()
+                    .filter(|p| p.name == base_type(&p.ty).rsplit('.').next().unwrap_or_default())
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let declared: HashSet<(&str, &str)> = prog
+        .funcs
+        .iter()
+        .filter_map(|f| {
+            f.receiver
+                .as_ref()
+                .map(|r| (base_type(&r.ty), f.name.as_str()))
+        })
+        .map(|(t, m)| {
+            (
+                field_types.keys().find(|k| **k == t).copied().unwrap_or(""),
+                m,
+            )
+        })
+        .filter(|(t, _)| !t.is_empty())
+        .collect();
+
+    let mut out: Vec<Func> = Vec::new();
+    // Each round promotes one level of embedding, so a method reaches an outer
+    // type through a chain of embedded fields as well as a single one.
+    for _ in 0..8 {
+        let mut round: Vec<Func> = Vec::new();
+        // Everything visible on a type so far: its own methods plus the
+        // forwarders already synthesized for it.
+        let have = |ty: &str, m: &str, out: &[Func]| -> bool {
+            declared.contains(&(ty, m))
+                || out.iter().any(|f| {
+                    f.name == m && f.receiver.as_ref().is_some_and(|r| base_type(&r.ty) == ty)
+                })
+        };
+        for t in prog.types.iter() {
+            for inner in embedded(&t.name) {
+                let sources: Vec<&Func> = prog
+                    .funcs
+                    .iter()
+                    .filter(|f| {
+                        f.receiver
+                            .as_ref()
+                            .is_some_and(|r| base_type(&r.ty) == inner)
+                    })
+                    .chain(out.iter().filter(|f| {
+                        f.receiver
+                            .as_ref()
+                            .is_some_and(|r| base_type(&r.ty) == inner)
+                    }))
+                    .collect();
+                for src in sources {
+                    if have(&t.name, &src.name, &out) || have(&t.name, &src.name, &round) {
+                        continue; // the outer type overrides it
+                    }
+                    round.push(forwarder(&t.name, &inner, src));
+                }
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        out.extend(round);
+    }
+    out
+}
+
+/// `func (r Outer) m(args…) … { [return] r.Inner.m(args…) }` — the body of one
+/// promoted method.
+fn forwarder(outer: &str, inner: &str, src: &Func) -> Func {
+    let recv = "$r".to_string();
+    let args: Vec<Expr> = src
+        .params
+        .iter()
+        .map(|p| Expr::Ident(p.name.clone()))
+        .collect();
+    let call = Expr::Call {
+        func: Box::new(Expr::Selector {
+            recv: Box::new(Expr::Selector {
+                recv: Box::new(Expr::Ident(recv.clone())),
+                field: inner.to_string(),
+            }),
+            field: src.name.clone(),
+        }),
+        args,
+        spread: src.variadic,
+        line: src.line,
+    };
+    let body = if src.results.is_empty() {
+        vec![Stmt::ExprStmt(call)]
+    } else {
+        vec![Stmt::Return(vec![call], src.line)]
+    };
+    Func {
+        name: src.name.clone(),
+        receiver: Some(Param {
+            name: recv,
+            ty: outer.to_string(),
+        }),
+        params: src.params.clone(),
+        variadic: src.variadic,
+        results: src.results.clone(),
+        result_names: vec![String::new(); src.results.len()],
+        body,
+        line: src.line,
+    }
+}
+
 fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
+    // Promotion is a source-level rewrite: the forwarders join the program's
+    // own functions before anything else looks at the method set.
+    let promoted = promoted_methods(prog);
+    let prog = &if promoted.is_empty() {
+        prog.clone()
+    } else {
+        let mut p = prog.clone();
+        p.funcs.extend(promoted);
+        p
+    };
     let structs: HashSet<String> = prog.types.iter().map(|t| t.name.clone()).collect();
     let struct_fields: HashMap<String, Vec<(String, String)>> = prog
         .types
@@ -1592,7 +1733,7 @@ impl Compiler {
                     self.fv_stmt(s, bound, caps);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => {}
+            Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => {}
         }
     }
 
@@ -2034,15 +2175,17 @@ impl Compiler {
                 cond,
                 post,
                 body,
+                label,
                 ..
-            } => self.compile_for(init, cond, post, body)?,
+            } => self.compile_for(init, cond, post, body, label)?,
             Stmt::ForRange {
                 key,
                 val,
                 iter,
                 body,
+                label,
                 ..
-            } => self.compile_for_range(key, val, iter, body)?,
+            } => self.compile_for_range(key, val, iter, body, label)?,
             Stmt::Go { call, line } => {
                 let Expr::Call { func, args, .. } = call else {
                     return Err(format!(
@@ -2104,7 +2247,8 @@ impl Compiler {
                 cases,
                 default,
                 line,
-            } => self.compile_switch(init, tag, cases, default, *line)?,
+                label,
+            } => self.compile_switch(init, tag, cases, default, *line, label)?,
             Stmt::TypeSwitch {
                 init,
                 bind,
@@ -2113,25 +2257,49 @@ impl Compiler {
                 default,
                 line,
             } => self.compile_type_switch(init, bind, expr, cases, default, *line)?,
-            Stmt::Break(line) => {
+            Stmt::Break(line, label) => {
                 let j = self.b.emit(Op::Jump(0), *line);
-                self.loops
-                    .last_mut()
-                    .ok_or_else(|| format!("go-rs: `break` outside a loop (line {line})"))?
-                    .breaks
-                    .push(j);
+                // A labeled `break` leaves the loop or `switch` carrying that
+                // label, however many scopes out it is; an unlabeled one leaves
+                // the innermost.
+                let scope = match label {
+                    Some(l) => self
+                        .loops
+                        .iter_mut()
+                        .rev()
+                        .find(|s| s.label.as_deref() == Some(l.as_str()))
+                        .ok_or_else(|| {
+                            format!("go-rs: no enclosing label `{l}` for `break` (line {line})")
+                        })?,
+                    None => self
+                        .loops
+                        .last_mut()
+                        .ok_or_else(|| format!("go-rs: `break` outside a loop (line {line})"))?,
+                };
+                scope.breaks.push(j);
             }
-            Stmt::Continue(line) => {
+            Stmt::Continue(line, label) => {
                 let j = self.b.emit(Op::Jump(0), *line);
-                // `continue` targets the innermost enclosing loop, skipping any
-                // switch scopes in between.
-                self.loops
-                    .iter_mut()
-                    .rev()
-                    .find(|s| !s.is_switch)
-                    .ok_or_else(|| format!("go-rs: `continue` outside a loop (line {line})"))?
-                    .continues
-                    .push(j);
+                // `continue` targets a *loop*, so a `switch` scope is skipped
+                // whether or not it carries the named label — Go only allows the
+                // label of an enclosing loop here.
+                let scope = match label {
+                    Some(l) => self
+                        .loops
+                        .iter_mut()
+                        .rev()
+                        .find(|s| !s.is_switch && s.label.as_deref() == Some(l.as_str()))
+                        .ok_or_else(|| {
+                            format!("go-rs: no enclosing loop labeled `{l}` for `continue` (line {line})")
+                        })?,
+                    None => self
+                        .loops
+                        .iter_mut()
+                        .rev()
+                        .find(|s| !s.is_switch)
+                        .ok_or_else(|| format!("go-rs: `continue` outside a loop (line {line})"))?,
+                };
+                scope.continues.push(j);
             }
             Stmt::Block(stmts) => {
                 for s in stmts {
@@ -2148,11 +2316,15 @@ impl Compiler {
         cond: &Option<Expr>,
         post: &Option<Box<Stmt>>,
         body: &[Stmt],
+        label: &Option<String>,
     ) -> Result<(), String> {
         if let Some(init) = init {
             self.stmt(init)?;
         }
-        self.loops.push(LoopScope::default());
+        self.loops.push(LoopScope {
+            label: label.clone(),
+            ..Default::default()
+        });
         let top = self.b.current_pos();
         // A condition, if present, exits the loop when false (patched to `end`
         // alongside every `break`).
@@ -2196,6 +2368,7 @@ impl Compiler {
         cases: &[SwitchCase],
         default: &Option<Vec<Stmt>>,
         line: u32,
+        label: &Option<String>,
     ) -> Result<(), String> {
         if let Some(init) = init {
             self.stmt(init)?;
@@ -2221,6 +2394,7 @@ impl Compiler {
         // A switch is breakable (but transparent to `continue`).
         self.loops.push(LoopScope {
             is_switch: true,
+            label: label.clone(),
             ..Default::default()
         });
 
@@ -2632,6 +2806,7 @@ impl Compiler {
         val: &Option<String>,
         iter: &Expr,
         body: &[Stmt],
+        label: &Option<String>,
     ) -> Result<(), String> {
         let n = self.temp_counter;
         self.temp_counter += 1;
@@ -2648,7 +2823,10 @@ impl Compiler {
         self.b.emit(Op::LoadInt(0), 0);
         self.emit_set(&i, 0);
 
-        self.loops.push(LoopScope::default());
+        self.loops.push(LoopScope {
+            label: label.clone(),
+            ..Default::default()
+        });
         let top = self.b.current_pos();
         // if $i >= len($keys) break
         self.emit_get(&i, 0);
@@ -3869,8 +4047,8 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::Switch { line, .. }
         | Stmt::TypeSwitch { line, .. }
         | Stmt::Fallthrough(line)
-        | Stmt::Break(line)
-        | Stmt::Continue(line) => *line,
+        | Stmt::Break(line, _)
+        | Stmt::Continue(line, _) => *line,
         Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
     }
 }
@@ -3912,7 +4090,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                 || cases.iter().any(|c| body_has_ffi(&c.body))
                 || default.as_ref().is_some_and(|d| body_has_ffi(d))
         }
-        Stmt::IncDec { .. } | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Fallthrough(_) => false,
+        Stmt::IncDec { .. } | Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => false,
     })
 }
 

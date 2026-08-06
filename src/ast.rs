@@ -116,6 +116,8 @@ pub enum Stmt {
     /// `for [init;] [cond;] [post] { body }` — covers the infinite, condition-
     /// only, and three-clause forms.
     For {
+        /// The `label:` written before this loop, if any. See [`Stmt::Break`].
+        label: Option<String>,
         init: Option<Box<Stmt>>,
         cond: Option<Expr>,
         post: Option<Box<Stmt>>,
@@ -126,6 +128,8 @@ pub enum Stmt {
     /// `define` is true for `:=`, false for `=`; `key`/`val` are `None` for the
     /// blank identifier `_` or an omitted value.
     ForRange {
+        /// The `label:` written before this loop, if any.
+        label: Option<String>,
         key: Option<String>,
         val: Option<String>,
         define: bool,
@@ -150,6 +154,9 @@ pub enum Stmt {
     /// case expression is a boolean condition (expression switch). Cases run the
     /// first match then break (no implicit fallthrough).
     Switch {
+        /// The `label:` written before this switch, if any — a labeled `break`
+        /// may leave a `switch`, though a labeled `continue` may not.
+        label: Option<String>,
         init: Option<Box<Stmt>>,
         tag: Option<Expr>,
         cases: Vec<SwitchCase>,
@@ -169,9 +176,13 @@ pub enum Stmt {
     /// `fallthrough` — transfer to the next `switch` case's body.
     Fallthrough(u32),
     /// `break`.
-    Break(u32),
+    /// `break` / `break label` — the label names an enclosing labeled loop or
+    /// `switch`, which is the one this leaves.
+    Break(u32, Option<String>),
     /// `continue`.
-    Continue(u32),
+    /// `continue` / `continue label` — the label names the enclosing labeled
+    /// loop whose next iteration to step to.
+    Continue(u32, Option<String>),
     /// A `{ ... }` block.
     Block(Vec<Stmt>),
 }
@@ -353,4 +364,18 @@ pub enum BinOp {
     Shl,
     Shr,
     AndNot,
+}
+
+/// Attach a `label:` to the statement it introduces. Only a `for` or a `switch`
+/// can carry one, because those are the only things a labeled `break` or
+/// `continue` can name; anything else is a compile error rather than a label
+/// that silently binds to nothing.
+pub fn set_stmt_label(s: &mut Stmt, name: &str) -> bool {
+    match s {
+        Stmt::For { label, .. } | Stmt::ForRange { label, .. } | Stmt::Switch { label, .. } => {
+            *label = Some(name.to_string());
+            true
+        }
+        _ => false,
+    }
 }
