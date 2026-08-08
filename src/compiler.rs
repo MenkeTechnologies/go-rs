@@ -1945,6 +1945,13 @@ impl Compiler {
                 // pointer `var p *T` is nil, not a zero struct.
                 let is_pointer = ty.as_ref().is_some_and(|t| t.starts_with('*'));
                 match init {
+                    // `var x float64 = 3` stores a float, not the raw integer
+                    // constant — Go converts on assignment to a declared type.
+                    Some(e) if nt == NumType::Float && self.infer(e) == NumType::Int => {
+                        let t = ty.clone().unwrap_or_default();
+                        self.closure_vars.remove(name);
+                        self.emit_typed(e, &t)?;
+                    }
                     Some(e) => self.emit_rhs(name, e)?,
                     None if !is_pointer && self.structs.contains(&decl_ty) => {
                         self.struct_lit(&decl_ty, &[])?
@@ -2919,6 +2926,12 @@ impl Compiler {
                 // pointer sees the same struct the original variable holds.
                 if matches!(op, UnOp::Addr | UnOp::Deref) {
                     self.expr(rhs)?;
+                } else if matches!(op, UnOp::Neg) && matches!(**rhs, Expr::Float(f, _) if f == 0.0)
+                {
+                    // Go's untyped constants have no signed zero, so the constant
+                    // `-0.0` is exactly `0` and prints as `0`, not `-0`. Negating
+                    // at run time would produce IEEE −0.0.
+                    self.b.emit(Op::LoadFloat(0.0), 0);
                 } else {
                     self.expr(rhs)?;
                     self.b.emit(
@@ -2997,17 +3010,21 @@ impl Compiler {
                 }
                 self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 3), 0);
             }
-            Expr::SliceLit { elems, .. } => {
+            Expr::SliceLit { elem_ty, elems } => {
                 for e in elems {
-                    self.expr(e)?;
+                    self.emit_typed(e, elem_ty)?;
                 }
                 self.b
                     .emit(Op::CallBuiltin(host::GSLICE_LIT, elems.len() as u8), 0);
             }
-            Expr::MapLit { pairs, .. } => {
+            Expr::MapLit {
+                key_ty,
+                val_ty,
+                pairs,
+            } => {
                 for (k, v) in pairs {
-                    self.expr(k)?;
-                    self.expr(v)?;
+                    self.emit_typed(k, key_ty)?;
+                    self.emit_typed(v, val_ty)?;
                 }
                 self.b
                     .emit(Op::CallBuiltin(host::GMAP_LIT, (pairs.len() * 2) as u8), 0);
@@ -3016,6 +3033,7 @@ impl Compiler {
             Expr::Make {
                 is_map,
                 len,
+                cap,
                 elem_zero,
             } => {
                 if *is_map {
@@ -3032,7 +3050,14 @@ impl Compiler {
                         }
                     }
                     self.expr(elem_zero)?;
-                    self.b.emit(Op::CallBuiltin(host::GMAKE, 3), 0);
+                    // `cap` defaults to `len`; `-1` tells the host "omitted".
+                    match cap {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            self.b.emit(Op::LoadInt(-1), 0);
+                        }
+                    }
+                    self.b.emit(Op::CallBuiltin(host::GMAKE, 4), 0);
                 }
             }
             Expr::MakeChan { cap } => {
@@ -3084,7 +3109,7 @@ impl Compiler {
                 given.get(i).map(|(_, v)| v)
             };
             match value {
-                Some(e) => self.expr(e)?,
+                Some(e) => self.emit_typed(e, fty)?,
                 None => self.emit_default(numtype_of_ty(fty), 0),
             }
         }
@@ -3114,6 +3139,32 @@ impl Compiler {
                 self.emit_value(e)?;
             }
         }
+        Ok(())
+    }
+
+    /// Emit `e` converted to the declared type `ty`, when that conversion is one
+    /// Go's assignability rules perform implicitly.
+    ///
+    /// The case that matters is an untyped integer constant landing in a float
+    /// slot: `[]float64{1, 2}`, `map[string]float64{"k": 3}`, `S{F: 3}`,
+    /// `var x float64 = 3`. Go converts each to a `float64`, so the value is a
+    /// float for every later operation. go-rs used to store the raw integer,
+    /// which made `xs[0] / 2` take the integer-division path and made
+    /// `[]float64{1e6}` print as `1000000` instead of `1e+06`.
+    fn emit_typed(&mut self, e: &Expr, ty: &str) -> Result<(), String> {
+        if numtype_of_ty(ty) != NumType::Float || self.infer(e) != NumType::Int {
+            return self.emit_value(e);
+        }
+        // A literal converts at compile time; anything else goes through the
+        // runtime conversion builtin `float64(x)` uses.
+        if let Expr::Int(n) = e {
+            self.b.emit(Op::LoadFloat(*n as f64), 0);
+            return Ok(());
+        }
+        self.emit_value(e)?;
+        let c = self.b.add_constant(Value::str("float64"));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(host::GCONV, 2), 0);
         Ok(())
     }
 
@@ -3360,9 +3411,26 @@ impl Compiler {
                         self.b.emit(Op::CallBuiltin(host::GIDIV, 2), line);
                         self.emit_panic_check(line);
                     }
-                } else {
+                } else if l == NumType::Float || r == NumType::Float {
                     // Float division: `x / 0.0` yields ±Inf like Go, no panic.
-                    self.b.emit(Op::Div, line);
+                    // fusevm's `Op::Div` returns `Undef` for a zero divisor, so
+                    // only a provably-nonzero constant divisor can use it (and
+                    // keep the JIT/AOT register lowering); everything else goes
+                    // through the IEEE builtin.
+                    if safe_div {
+                        self.b.emit(Op::Div, line);
+                    } else {
+                        self.b.emit(Op::CallBuiltin(host::GFDIV, 2), line);
+                    }
+                } else {
+                    // At least one operand's numeric category is unknown at
+                    // compile time (indexing a slice/map, a method result, an
+                    // `interface{}` value). Go picks integer vs float division
+                    // from the static types; go-rs defers the same choice to the
+                    // runtime representations rather than assuming float, which
+                    // made `xs[0] / 2` yield `3.5` instead of `3`.
+                    self.b.emit(Op::CallBuiltin(host::GDYNDIV, 2), line);
+                    self.emit_panic_check(line);
                 }
             }
             // Bitwise operators (integer-only in Go).

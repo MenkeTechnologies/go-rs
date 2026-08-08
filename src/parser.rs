@@ -685,6 +685,8 @@ impl Parser {
                 | Some(Tok::Star)
                 | Some(Tok::Chan)
                 | Some(Tok::Func)
+                | Some(Tok::Struct)
+                | Some(Tok::Interface)
         )
     }
 
@@ -729,6 +731,27 @@ impl Parser {
             // `struct{ … }` — an anonymous struct type (a field type, a
             // `map[K]struct{…}` value, a `chan struct{}` element, …).
             Tok::Struct => self.anon_struct_type(),
+            // An inline interface type — `interface{}` (the empty interface, so
+            // `var x interface{}` / `[]interface{}` / an `interface{}`
+            // parameter) or a method set. go-rs types every interface value
+            // dynamically, so the body is consumed and the type erases to the
+            // one opaque `interface{}` name.
+            Tok::Interface => {
+                self.advance();
+                self.expect(&Tok::LBrace)?;
+                let mut depth = 1;
+                while depth > 0 {
+                    match self.advance() {
+                        Tok::LBrace => depth += 1,
+                        Tok::RBrace => depth -= 1,
+                        Tok::Eof => {
+                            return Err("go-rs: unterminated `{` in interface type".to_string())
+                        }
+                        _ => {}
+                    }
+                }
+                Ok("interface{}".to_string())
+            }
             // `func(params) results` — a function type (for function-typed
             // parameters/fields). Consumed structurally; go-rs treats every
             // function value uniformly, so only the `func` tag is retained.
@@ -914,6 +937,7 @@ impl Parser {
             Some(Expr::Make {
                 is_map: false,
                 len: Some(Box::new(Expr::Int(len as i64))),
+                cap: None,
                 elem_zero: Box::new(zero),
             })
         } else {
@@ -2070,8 +2094,8 @@ impl Parser {
         })
     }
 
-    /// `make([]T, len)` (slice) or `make(map[K]V)` (map). The first argument is a
-    /// type; a slice may carry a length (and an ignored capacity).
+    /// `make([]T, len[, cap])` (slice) or `make(map[K]V)` (map). The first
+    /// argument is a type; a slice may carry a length and a capacity.
     fn make_expr(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::LParen)?;
         let ty = self.type_name()?;
@@ -2087,11 +2111,11 @@ impl Parser {
         }
         let is_map = ty.starts_with("map[");
         let mut len = None;
+        let mut cap = None;
         if self.eat(&Tok::Comma) {
             len = Some(Box::new(self.expr()?));
-            // An optional capacity argument is accepted and ignored.
             if self.eat(&Tok::Comma) {
-                let _ = self.expr()?;
+                cap = Some(Box::new(self.expr()?));
             }
         }
         self.expect(&Tok::RParen)?;
@@ -2099,6 +2123,7 @@ impl Parser {
         Ok(Expr::Make {
             is_map,
             len,
+            cap,
             elem_zero: Box::new(zero_expr(elem_ty)),
         })
     }

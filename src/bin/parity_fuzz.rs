@@ -12,10 +12,13 @@
 //!
 //! Determinism invariant: the generator only emits constructs whose output is
 //! deterministic and identical across a correct implementation — no goroutine
-//! scheduling order, floats printed with an explicit `%.4f` (never `%v`
-//! shortest-repr), integer `/` and `%` with a guaranteed-nonzero divisor, and
+//! scheduling order, integer `/` and `%` with a guaranteed-nonzero divisor, and
 //! maps printed via `fmt` (which sorts keys on both sides). Pure random bytes
 //! would only produce mutual syntax errors that agree and teach nothing.
+//!
+//! Floats are emitted both with an explicit `%.4f` and — since the shortest-`g`
+//! thresholds are implemented — with `%v`/`%g`/`%e`, which is where exponent
+//! notation (`1e+06`) appears.
 //!
 //! Build: cargo build --bin parity-fuzz
 //! Run:   ./target/debug/parity-fuzz --count 20000 --jobs 12
@@ -213,7 +216,23 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix.
 fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
-    match rng.below(25) {
+    match rng.below(27) {
+        // Shortest-representation float output (`%v`, `Println`, `%g`). This is
+        // the form that switches to `1e+06`-style exponent notation, so it
+        // exercises strconv's 'g' thresholds rather than a fixed `%.4f`.
+        25 => {
+            let (decl, vars) = float_vars(rng, n);
+            let f = float_expr(rng, &vars, 2);
+            format!("{decl}\tfmt.Println({f})\n\tfmt.Printf(\"%v|%g|%e\\n\", {f}, {f}, {f})\n")
+        }
+        // Integer division and modulo through a slice element, whose numeric
+        // type go-rs only learns at run time.
+        26 => {
+            let (a, b, c) = (rng.int(-40, 90), rng.int(1, 12), rng.int(-9, 9));
+            format!(
+                "\tq{n} := []int{{{a}, {c}}}\n\td{n} := []int{{{b}, {b}}}\n\tfmt.Println(q{n}[0]/d{n}[0], q{n}[0]%d{n}[0], q{n}[1]/d{n}[1], q{n}[1]%d{n}[1])\n"
+            )
+        }
         0 => format!(
             "\tfmt.Printf(\"%d %d\\n\", {}, {})\n",
             int_expr(rng, 3),

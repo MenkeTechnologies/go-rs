@@ -303,6 +303,10 @@ pub enum Expr {
     Make {
         is_map: bool,
         len: Option<Box<Expr>>,
+        /// `make([]T, len, cap)`'s third argument. The slice's backing array is
+        /// `cap` long, so `cap(s)` reports it and appends up to it write in
+        /// place instead of reallocating.
+        cap: Option<Box<Expr>>,
         elem_zero: Box<Expr>,
     },
     /// `make(chan T, cap)` — a channel with buffer capacity `cap` (0 if omitted).

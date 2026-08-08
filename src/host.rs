@@ -131,6 +131,30 @@ pub const GMAP_GET2: u16 = 905;
 /// followed by every element of the spread slice `xs`.
 pub const GAPPEND_SPREAD: u16 = 906;
 
+/// `[a, b]` → `a / b` chosen at run time from the operand representations.
+///
+/// Go's `/` is integer division when both operands are integers and float
+/// division otherwise, and the choice is made statically by the type checker.
+/// go-rs's compiler infers a numeric category for most expressions, but some
+/// forms (indexing a slice/map, a method result, an `interface{}` value) come
+/// back [`NumType::Unknown`]; emitting the float `Op::Div` for those made
+/// `xs[0] / 2` yield `3.5` where Go yields `3`. This builtin resolves the same
+/// rule against the actual values, so an untyped-at-compile-time integer pair
+/// still truncates toward zero (and panics on a zero divisor) like Go.
+///
+/// Numbered above the `stdlib`/`math` block (which runs to 921) — 907 collides
+/// with `math.Sin`.
+pub const GDYNDIV: u16 = 950;
+
+/// `[a, b]` → IEEE float `a / b`: `±Inf` for a nonzero numerator over zero and
+/// `NaN` for `0.0 / 0.0`, as Go's float division does.
+///
+/// fusevm's native `Op::Div` yields `Undef` for a zero divisor (it has no
+/// float-specific division), so `1.0 / z` printed `<nil>`. The compiler still
+/// emits `Op::Div` — which the JIT and AOT keep in registers — whenever the
+/// divisor is a provably-nonzero constant, and falls back here otherwise.
+pub const GFDIV: u16 = 951;
+
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
 pub fn install(vm: &mut VM) {
@@ -187,6 +211,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GCOPY, b_copy);
     vm.register_builtin(GMAP_GET2, b_map_get2);
     vm.register_builtin(GAPPEND_SPREAD, b_append_spread);
+    vm.register_builtin(GDYNDIV, b_dyndiv);
+    vm.register_builtin(GFDIV, b_fdiv);
     stdlib::install(vm);
 }
 
@@ -338,6 +364,33 @@ fn b_idiv(vm: &mut VM, argc: u8) -> Value {
     Value::Int(a.wrapping_div(b))
 }
 
+/// `[a, b]` → `a / b`, picking Go's integer or float division from the operand
+/// representations. Both integers ⇒ truncating integer division (panicking on a
+/// zero divisor); anything else ⇒ float division, where `x / 0.0` is ±Inf.
+fn b_dyndiv(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().cloned().unwrap_or(Value::Undef);
+    let b = args.get(1).cloned().unwrap_or(Value::Undef);
+    match (&a, &b) {
+        (Value::Int(x), Value::Int(y)) => {
+            if *y == 0 {
+                runtime_panic(vm, "integer divide by zero");
+                return Value::Int(0);
+            }
+            Value::Int(x.wrapping_div(*y))
+        }
+        _ => Value::Float(a.to_float() / b.to_float()),
+    }
+}
+
+/// `[a, b]` → IEEE float `a / b` (`±Inf` / `NaN` on a zero divisor).
+fn b_fdiv(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().map(Value::to_float).unwrap_or(0.0);
+    let b = args.get(1).map(Value::to_float).unwrap_or(0.0);
+    Value::Float(a / b)
+}
+
 /// `[a, b]` → `a % b` (integer), panicking on divide-by-zero like Go.
 fn b_imod(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
@@ -366,9 +419,16 @@ fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
             let Some((backing, base, len)) = slice_backing(id) else {
                 return Value::Undef;
             };
+            // Go bounds a re-slice by capacity, not length: `s[:cap(s)]` is
+            // legal and exposes the backing array's spare room, so an element an
+            // append wrote past `len` is reachable through `s[0:len+1]`.
+            let cap = HEAP.with(|h| match h.borrow().get(backing as usize) {
+                Some(HostObj::Slice(a)) => a.len().saturating_sub(base),
+                _ => len,
+            }) as i64;
             let len = len as i64;
-            let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, len) as usize;
-            let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, len) as usize;
+            let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, cap) as usize;
+            let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, cap) as usize;
             let hi = hi.max(lo);
             Value::Obj(heap_alloc(HostObj::SliceView {
                 backing,
@@ -874,11 +934,29 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
         _ => {
             let n = args.get(1).map(|v| v.to_int()).unwrap_or(0);
             let zero = args.get(2).cloned().unwrap_or(Value::Int(0));
+            // `-1` is the compiler's marker for an omitted capacity.
+            let c = args.get(3).map(|v| v.to_int()).unwrap_or(-1);
             if n < 0 {
                 ffi_fault(vm, format!("go-rs: makeslice: len out of range ({n})"));
                 return Value::Undef;
             }
-            Value::Obj(heap_alloc(HostObj::Slice(vec![zero; n as usize])))
+            if c >= 0 && c < n {
+                ffi_fault(vm, format!("go-rs: makeslice: cap out of range ({c})"));
+                return Value::Undef;
+            }
+            let (len, cap) = (n as usize, if c < 0 { n as usize } else { c as usize });
+            if cap == len {
+                return Value::Obj(heap_alloc(HostObj::Slice(vec![zero; len])));
+            }
+            // A `cap > len` slice is a view over a longer backing array — the
+            // same shape Go's slice header has, so `cap` reports the spare room
+            // and an append that fits writes into it instead of reallocating.
+            let backing = heap_alloc(HostObj::Slice(vec![zero; cap]));
+            Value::Obj(heap_alloc(HostObj::SliceView {
+                backing,
+                offset: 0,
+                len,
+            }))
         }
     }
 }
@@ -1100,7 +1178,65 @@ fn b_cap(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
-/// `append(s, elems...)` — extend slice `s` in place and return its handle.
+/// Go's `runtime.nextslicecap`: the capacity a slice grows to when an append
+/// pushes its length to `new_len` past a capacity of `old_cap`.
+///
+/// Port of `runtime/slice.go`:
+///
+/// ```text
+/// newcap := oldCap
+/// doublecap := newcap + newcap
+/// if newLen > doublecap { return newLen }
+/// const threshold = 256
+/// if oldCap < threshold { return doublecap }
+/// for { newcap += (newcap + 3*threshold) >> 2; if newcap >= newLen { break } }
+/// return newcap
+/// ```
+///
+/// Go then rounds the byte size up to a malloc size class, which go-rs does not
+/// model (it has no sized allocator), so `cap` can read low for an append that
+/// grows by more than double into a non-size-class length.
+fn next_slice_cap(new_len: usize, old_cap: usize) -> usize {
+    let doublecap = old_cap.saturating_mul(2);
+    if new_len > doublecap {
+        return new_len;
+    }
+    const THRESHOLD: usize = 256;
+    if old_cap < THRESHOLD {
+        return doublecap;
+    }
+    let mut newcap = old_cap;
+    loop {
+        newcap += (newcap + 3 * THRESHOLD) >> 2;
+        if newcap >= new_len {
+            return newcap;
+        }
+    }
+}
+
+/// Grow `elems` into a fresh backing array sized by [`next_slice_cap`] and
+/// return a view of the live prefix — the reallocating half of Go's
+/// `growslice`. The spare room is zero-filled with the slice's own element
+/// shape so later appends have somewhere to land.
+fn grow_slice(elems: Vec<Value>, old_cap: usize) -> Value {
+    let new_len = elems.len();
+    let cap = next_slice_cap(new_len, old_cap);
+    // Go zeroes the tail of the new array; go-rs has no element type here, so
+    // the filler is the untyped zero. It is never readable through the returned
+    // slice (indices past `len` are out of bounds) — only a later append or a
+    // re-slice within `cap` can reach it, and both overwrite it first.
+    let mut backing = elems;
+    backing.resize(cap, Value::Int(0));
+    let id = heap_alloc(HostObj::Slice(backing));
+    Value::Obj(heap_alloc(HostObj::SliceView {
+        backing: id,
+        offset: 0,
+        len: new_len,
+    }))
+}
+
+/// `append(s, elems...)` — return a slice with `elems` appended, growing the
+/// backing array per Go's `growslice` when the capacity is exhausted.
 /// A nil slice (non-handle) is treated as empty, so `append(nil, x)` allocates.
 fn b_append(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_args(vm, argc);
@@ -1147,20 +1283,23 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                     _ => Vec::new(),
                 });
                 out.extend(args);
-                return Value::Obj(heap_alloc(HostObj::Slice(out)));
+                return grow_slice(out, cap);
             }
-            let ok = HEAP.with(|h| {
-                let mut h = h.borrow_mut();
-                if let Some(HostObj::Slice(a)) = h.get_mut(id as usize) {
-                    a.extend(args.iter().cloned());
-                    true
-                } else {
-                    false
-                }
+            // A plain slice is its own backing with `cap == len`, so every append
+            // reallocates — as it does in Go, which is why `b := append(a, x)`
+            // does not alias `a`. The new backing carries Go's growth headroom,
+            // so the following appends land in place and `cap` doubles the way
+            // Go's does.
+            let existing = HEAP.with(|h| match h.borrow().get(id as usize) {
+                Some(HostObj::Slice(a)) => Some(a.clone()),
+                _ => None,
             });
-            if ok {
-                Value::Obj(id)
-            } else {
+            if let Some(mut out) = existing {
+                let old_cap = out.len();
+                out.extend(args);
+                return grow_slice(out, old_cap);
+            }
+            {
                 ffi_fault(
                     vm,
                     "go-rs: first argument to append must be a slice".to_string(),
@@ -1474,75 +1613,388 @@ fn pop_args(vm: &mut VM, argc: u8) -> Vec<Value> {
 /// maps, structs) are looked up on the heap and formatted with Go's bracket /
 /// `map[…]` / `{…}` conventions.
 pub fn go_str(v: &Value) -> String {
+    go_str_mode(v, FmtMode::V)
+}
+
+/// Which of `fmt`'s three struct-rendering verbs is being applied. They differ
+/// only in how composites and strings are printed, so one walker serves all
+/// three.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FmtMode {
+    /// `%v` — `{1 a}`, bare strings.
+    V,
+    /// `%+v` — `{X:1 Y:a}`, field names added, strings still bare.
+    PlusV,
+    /// `%#v` — `main.P{X:1, Y:"a"}`, Go-syntax with types and quoted strings.
+    SharpV,
+}
+
+pub(crate) fn go_str_mode(v: &Value, mode: FmtMode) -> String {
     match v {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Int(n) => n.to_string(),
         Value::Float(f) => format_float(*f),
-        Value::Str(s) => s.as_str().to_string(),
+        Value::Str(s) => {
+            if mode == FmtMode::SharpV {
+                go_quote(s.as_str())
+            } else {
+                s.as_str().to_string()
+            }
+        }
+        // A nil operand renders as `<nil>` under all three verbs.
         Value::Undef => "<nil>".to_string(),
-        Value::Obj(id) => obj_str(*id),
+        Value::Obj(id) => obj_str_mode(*id, mode),
         other => other.as_str_cow().into_owned(),
+    }
+}
+
+/// `%q` on a string: Go's `strconv.Quote` — double quotes, backslash escapes for
+/// the C escapes and `\`/`"`, and `\xNN`/`\uNNNN` for other non-printables.
+pub(crate) fn go_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\u{b}' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `%q` on an integer: Go quotes it as a rune literal (`'A'`, `'\n'`, `'世'`).
+pub(crate) fn go_quote_rune(n: i64) -> String {
+    let Some(c) = u32::try_from(n).ok().and_then(char::from_u32) else {
+        // Go renders an out-of-range code point as the replacement character.
+        return "'\u{fffd}'".to_string();
+    };
+    let inner = go_quote(&c.to_string());
+    // Reuse the string escaper, then swap the delimiters and fix `'`/`"`.
+    let body = &inner[1..inner.len() - 1];
+    let body = body.replace("\\\"", "\"").replace('\'', "\\'");
+    format!("'{body}'")
+}
+
+/// `%T`: the value's Go type name. go-rs carries no static element type for a
+/// slice or map, so those are described from the values actually present and an
+/// empty one falls back to `interface {}`.
+pub(crate) fn go_type_name(v: &Value) -> String {
+    match v {
+        Value::Bool(_) => "bool".to_string(),
+        Value::Int(_) => "int".to_string(),
+        Value::Float(_) => "float64".to_string(),
+        Value::Str(_) => "string".to_string(),
+        Value::Undef => "<nil>".to_string(),
+        Value::Obj(id) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Slice(a)) => {
+                    format!("[]{}", elem_type_name(a.first()))
+                }
+                Some(HostObj::SliceView {
+                    backing, offset, ..
+                }) => {
+                    let e = match h.get(*backing as usize) {
+                        Some(HostObj::Slice(a)) => a.get(*offset).cloned(),
+                        _ => None,
+                    };
+                    format!("[]{}", elem_type_name(e.as_ref()))
+                }
+                Some(HostObj::Map(m)) => format!(
+                    "map[{}]{}",
+                    elem_type_name(m.first().map(|(k, _)| k)),
+                    elem_type_name(m.first().map(|(_, v)| v))
+                ),
+                // A user-declared struct is qualified by its package, and go-rs
+                // only ever compiles `package main`.
+                Some(HostObj::Struct { type_name, .. }) => format!("main.{type_name}"),
+                Some(HostObj::Closure { .. }) => "func()".to_string(),
+                Some(HostObj::Cell(v)) => go_type_name(v),
+                None => "<nil>".to_string(),
+            }
+        }),
+        _ => "interface {}".to_string(),
+    }
+}
+
+fn elem_type_name(v: Option<&Value>) -> String {
+    match v {
+        Some(v) => go_type_name(v),
+        None => "interface {}".to_string(),
+    }
+}
+
+/// The elements of a slice value (materialising a sub-slice view), or `None`
+/// when the value is not a slice. Lets a verb distribute over a slice the way
+/// `fmt` does for `%d`/`%x`.
+pub(crate) fn slice_elems(v: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(*id as usize) {
+            Some(HostObj::Slice(a)) => Some(a.clone()),
+            Some(HostObj::SliceView {
+                backing,
+                offset,
+                len,
+            }) => match h.get(*backing as usize) {
+                Some(HostObj::Slice(a)) => Some(a[*offset..*offset + *len].to_vec()),
+                _ => Some(Vec::new()),
+            },
+            _ => None,
+        }
+    })
+}
+
+/// A value's bytes for the text-oriented verbs (`%s`, `%q`): a string's UTF-8,
+/// or a slice whose elements are all byte-valued integers — go-rs has no static
+/// element type, so a `[]byte` is recognised by its contents. A slice holding
+/// anything outside `0..=255` is not text and yields `None`.
+pub(crate) fn bytes_of(v: &Value) -> Option<Vec<u8>> {
+    match v {
+        Value::Str(s) => Some(s.as_str().as_bytes().to_vec()),
+        _ => {
+            let es = slice_elems(v)?;
+            es.iter()
+                .map(|e| match e {
+                    Value::Int(n) if (0..=255).contains(n) => Some(*n as u8),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 }
 
 /// Format a heap object the way Go's `%v` does: `[e0 e1 …]` for a slice,
 /// `map[k0:v0 …]` (keys sorted, as Go's fmt does) for a map, `{f0 f1 …}` for a
 /// struct.
-fn obj_str(id: u32) -> String {
+fn obj_str_mode(id: u32, mode: FmtMode) -> String {
+    // `%#v` uses Go source syntax: a typed composite literal, `, `-separated,
+    // with every element itself in Go syntax. `%v`/`%+v` use the space-separated
+    // display forms, differing only in whether struct fields are named.
+    let sharp = mode == FmtMode::SharpV;
+    let sep = if sharp { ", " } else { " " };
+    let elems = |vs: &[Value]| -> String {
+        vs.iter()
+            .map(|v| go_str_mode(v, mode))
+            .collect::<Vec<_>>()
+            .join(sep)
+    };
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
             Some(HostObj::Slice(a)) => {
-                let parts: Vec<String> = a.iter().map(go_str).collect();
-                format!("[{}]", parts.join(" "))
+                if sharp {
+                    format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
+                } else {
+                    format!("[{}]", elems(a))
+                }
             }
             Some(HostObj::SliceView {
                 backing,
                 offset,
                 len,
             }) => {
-                let parts: Vec<String> = match h.get(*backing as usize) {
-                    Some(HostObj::Slice(a)) => {
-                        a[*offset..*offset + *len].iter().map(go_str).collect()
-                    }
+                let view: Vec<Value> = match h.get(*backing as usize) {
+                    Some(HostObj::Slice(a)) => a[*offset..*offset + *len].to_vec(),
                     _ => Vec::new(),
                 };
-                format!("[{}]", parts.join(" "))
+                if sharp {
+                    format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(&view))
+                } else {
+                    format!("[{}]", elems(&view))
+                }
             }
             Some(HostObj::Map(m)) => {
-                let mut parts: Vec<String> = m
+                // `fmt` sorts map keys so map output is deterministic. Sorting
+                // the rendered `k:v` strings is only right when the keys order
+                // the same as their text, so sort on the key values themselves.
+                let mut pairs: Vec<(String, String)> = m
                     .iter()
-                    .map(|(k, v)| format!("{}:{}", go_str(k), go_str(v)))
+                    .map(|(k, v)| (go_str_mode(k, mode), go_str_mode(v, mode)))
                     .collect();
-                parts.sort();
-                format!("map[{}]", parts.join(" "))
+                pairs.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
+                let body = pairs
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join(sep);
+                if sharp {
+                    format!("{}{{{}}}", go_type_name(&Value::Obj(id)), body)
+                } else {
+                    format!("map[{body}]")
+                }
             }
-            Some(HostObj::Struct { fields, .. }) => {
-                let parts: Vec<String> = fields.iter().map(|(_, v)| go_str(v)).collect();
-                format!("{{{}}}", parts.join(" "))
-            }
+            Some(HostObj::Struct { type_name, fields }) => match mode {
+                FmtMode::V => {
+                    let parts: Vec<String> =
+                        fields.iter().map(|(_, v)| go_str_mode(v, mode)).collect();
+                    format!("{{{}}}", parts.join(" "))
+                }
+                FmtMode::PlusV => {
+                    let parts: Vec<String> = fields
+                        .iter()
+                        .map(|(n, v)| format!("{n}:{}", go_str_mode(v, mode)))
+                        .collect();
+                    format!("{{{}}}", parts.join(" "))
+                }
+                FmtMode::SharpV => {
+                    let parts: Vec<String> = fields
+                        .iter()
+                        .map(|(n, v)| format!("{n}:{}", go_str_mode(v, mode)))
+                        .collect();
+                    format!("main.{type_name}{{{}}}", parts.join(", "))
+                }
+            },
             // Go prints a function value as a hex pointer; a fixed marker suffices.
             Some(HostObj::Closure { .. }) => "<func>".to_string(),
             // A cell is an internal box; render its contents (a captured value).
-            Some(HostObj::Cell(v)) => go_str(v),
+            Some(HostObj::Cell(v)) => go_str_mode(v, mode),
             None => "<nil>".to_string(),
         }
     })
 }
 
+/// Order two rendered map keys the way `fmt` orders the underlying values:
+/// numerically when both parse as numbers, lexicographically otherwise. Plain
+/// string sorting would put `10` before `9`.
+fn map_key_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
 /// Go prints floats via `strconv.FormatFloat(f, 'g', -1, 64)`: shortest exact
 /// decimal, whole values without a fractional part (`3`, not `3.0`), and
 /// `+Inf`/`-Inf`/`NaN` for the non-finite cases.
-fn format_float(f: f64) -> String {
+pub(crate) fn format_float(f: f64) -> String {
     if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f < 0.0 { "-Inf" } else { "+Inf" }.to_string()
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Inf" } else { "+Inf" }.to_string();
+    }
+    // Go's `ftoa` shortest-`g` path picks the `%e` form when the decimal
+    // exponent is `< -4` or `>= 6`, and the `%f` form otherwise (strconv/ftoa.go
+    // sets `eprec = 6` for the shortest case). So `999999` prints as `999999`
+    // but `1000000` prints as `1e+06`, and `0.0001` stays decimal while
+    // `0.00001` becomes `1e-05`.
+    let (mant, exp) = shortest_sci(f);
+    if !(-4..6).contains(&exp) {
+        format_e(&mant, exp, 'e')
     } else {
-        // Rust's `{}` for f64 already yields the shortest round-tripping decimal
-        // and omits a trailing `.0`, matching Go's `%v` for the common range.
+        // Inside the plain-decimal window Rust's `{}` is the same shortest
+        // round-tripping decimal Go computes, and never switches to exponent
+        // notation itself.
         format!("{f}")
     }
+}
+
+/// Split a finite `f64` into its shortest round-tripping decimal mantissa
+/// (`"-1.2345"`, sign included) and decimal exponent, via Rust's `{:e}` — which
+/// already emits the shortest such representation.
+fn shortest_sci(f: f64) -> (String, i32) {
+    let s = format!("{f:e}");
+    match s.split_once('e') {
+        Some((m, e)) => (m.to_string(), e.parse().unwrap_or(0)),
+        None => (s, 0),
+    }
+}
+
+/// Assemble Go's `%e` rendering from a mantissa and exponent: the exponent
+/// always carries a sign and at least two digits (`1e+06`, `1.5e-07`,
+/// `1e+100`).
+fn format_e(mant: &str, exp: i32, e: char) -> String {
+    let sign = if exp < 0 { '-' } else { '+' };
+    let mag = exp.unsigned_abs();
+    if mag < 10 {
+        format!("{mant}{e}{sign}0{mag}")
+    } else {
+        format!("{mant}{e}{sign}{mag}")
+    }
+}
+
+/// Go's `%e`/`%E` verb: `prec` digits after the mantissa's decimal point
+/// (default 6), or the shortest round-tripping mantissa when `prec` is `None`
+/// and the caller asked for `%v`-style shortest output.
+fn format_float_e(f: f64, prec: Option<usize>, upper: bool) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Inf" } else { "+Inf" }.to_string();
+    }
+    let e = if upper { 'E' } else { 'e' };
+    match prec {
+        None => {
+            let (mant, exp) = shortest_sci(f);
+            format_e(&mant, exp, e)
+        }
+        Some(p) => {
+            // Rust's `{:.*e}` rounds the mantissa to `p` fractional digits with
+            // the same semantics, so only the exponent spelling differs.
+            let s = format!("{:.*e}", p, f);
+            match s.split_once('e') {
+                Some((m, ex)) => format_e(m, ex.parse().unwrap_or(0), e),
+                None => s,
+            }
+        }
+    }
+}
+
+/// Go's `%g`/`%G` verb. With no explicit precision this is the same shortest
+/// representation `%v` uses; with a precision it means "`prec` significant
+/// digits", and the `%e`-vs-`%f` choice compares the decimal exponent against
+/// that precision instead of the shortest-case 6.
+fn format_float_g(f: f64, prec: Option<usize>, upper: bool) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Inf" } else { "+Inf" }.to_string();
+    }
+    let Some(p) = prec else {
+        let s = format_float(f);
+        return if upper { s.replace('e', "E") } else { s };
+    };
+    // Go treats `%.0g` as `%.1g` (at least one significant digit).
+    let p = p.max(1);
+    // Round to `p` significant digits first, then decide the form from the
+    // rounded exponent — rounding can carry into a new decade (9.99 → 1e+01).
+    let (mant, exp) = match format!("{:.*e}", p - 1, f).split_once('e') {
+        Some((m, e)) => (m.to_string(), e.parse::<i32>().unwrap_or(0)),
+        None => (format!("{f}"), 0),
+    };
+    let e = if upper { 'E' } else { 'e' };
+    if exp < -4 || exp >= p as i32 {
+        // `%g` strips a trailing zero run from the mantissa that `%e` keeps.
+        format_e(trim_zeros(&mant), exp, e)
+    } else {
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        trim_zeros(&format!("{:.*}", decimals, f)).to_string()
+    }
+}
+
+/// Drop a trailing fractional zero run (and a bare trailing `.`) from a decimal
+/// string, the way Go's `%g` does. Leaves integral strings untouched.
+fn trim_zeros(s: &str) -> &str {
+    if !s.contains('.') {
+        return s;
+    }
+    s.trim_end_matches('0').trim_end_matches('.')
 }
 
 fn b_println(vm: &mut VM, argc: u8) -> Value {
@@ -1615,13 +2067,14 @@ fn sprintf(args: &[Value]) -> String {
             break;
         }
         // flags
-        let (mut left, mut zero, mut plus) = (false, false, false);
+        let (mut left, mut zero, mut plus, mut sharp) = (false, false, false, false);
         while i < chars.len() {
             match chars[i] {
                 '-' => left = true,
                 '0' => zero = true,
                 '+' => plus = true,
-                ' ' | '#' => {}
+                '#' => sharp = true,
+                ' ' => {}
                 _ => break,
             }
             i += 1;
@@ -1658,35 +2111,167 @@ fn sprintf(args: &[Value]) -> String {
                 continue;
             }
             't' => rest.next().map(go_str).unwrap_or_default(),
-            'q' => format!("\"{}\"", rest.next().map(go_str).unwrap_or_default()),
+            // `%q` quotes a string with `strconv.Quote` and an integer as a rune
+            // literal; a composite quotes each element.
+            'q' => match rest.next() {
+                Some(Value::Int(n)) => go_quote_rune(*n),
+                Some(Value::Str(s)) => go_quote(s.as_str()),
+                Some(v) => match bytes_of(v) {
+                    Some(b) => go_quote(&String::from_utf8_lossy(&b)),
+                    None => go_quote(&go_str(v)),
+                },
+                None => "\"\"".to_string(),
+            },
+            // `%T` is the operand's type, not its value.
+            'T' => rest.next().map(go_type_name).unwrap_or_default(),
             'f' | 'F' => {
                 let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
-                let s = format!("{:.*}", prec.unwrap_or(6), v);
-                if plus && v >= 0.0 {
+                let s = if v.is_nan() {
+                    "NaN".to_string()
+                } else if v.is_infinite() {
+                    if v < 0.0 { "-Inf" } else { "+Inf" }.to_string()
+                } else {
+                    format!("{:.*}", prec.unwrap_or(6), v)
+                };
+                if plus && !s.starts_with('-') {
+                    format!("+{s}")
+                } else {
+                    s
+                }
+            }
+            'e' | 'E' => {
+                let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
+                let s = format_float_e(v, Some(prec.unwrap_or(6)), verb == 'E');
+                if plus && !s.starts_with('-') {
+                    format!("+{s}")
+                } else {
+                    s
+                }
+            }
+            'g' | 'G' => {
+                let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
+                let s = format_float_g(v, prec, verb == 'G');
+                if plus && !s.starts_with('-') {
                     format!("+{s}")
                 } else {
                     s
                 }
             }
             'd' => {
-                let n = rest.next().map(|v| v.to_int()).unwrap_or(0);
-                if plus && n >= 0 {
-                    format!("+{n}")
-                } else {
-                    n.to_string()
+                // `%d` on a slice distributes over the elements: `[1 2 3]`.
+                match rest.next() {
+                    Some(v) => match slice_elems(v) {
+                        Some(es) => format!(
+                            "[{}]",
+                            es.iter()
+                                .map(|e| e.to_int().to_string())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ),
+                        None => {
+                            let n = v.to_int();
+                            if plus && n >= 0 {
+                                format!("+{n}")
+                            } else {
+                                n.to_string()
+                            }
+                        }
+                    },
+                    None => "0".to_string(),
                 }
             }
-            'x' => format!("{:x}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
-            'X' => format!("{:X}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
+            // `%x`/`%X` hex-encode a string or byte slice bytewise; on a number
+            // they are base-16 digits.
+            'x' | 'X' => {
+                let upper = verb == 'X';
+                let hex = |n: i64| {
+                    if upper {
+                        format!("{n:X}")
+                    } else {
+                        format!("{n:x}")
+                    }
+                };
+                let body = match rest.next() {
+                    // A string hex-encodes its bytes, two digits each and no
+                    // separator.
+                    Some(Value::Str(s)) => s
+                        .as_str()
+                        .bytes()
+                        .map(|b| {
+                            if upper {
+                                format!("{b:02X}")
+                            } else {
+                                format!("{b:02x}")
+                            }
+                        })
+                        .collect::<String>(),
+                    // A slice distributes the verb over its elements. (Go
+                    // hex-encodes a `[]byte` as one run of digits instead, but
+                    // go-rs carries no static element type to tell `[]byte` from
+                    // `[]int`, and the per-element form is the one that is right
+                    // for `[]int`.)
+                    Some(v) if slice_elems(v).is_some() => {
+                        let es = slice_elems(v).unwrap_or_default();
+                        format!(
+                            "[{}]",
+                            es.iter()
+                                .map(|e| hex(e.to_int()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    }
+                    Some(v) => hex(v.to_int()),
+                    None => "0".to_string(),
+                };
+                if sharp {
+                    format!("{}{body}", if upper { "0X" } else { "0x" })
+                } else {
+                    body
+                }
+            }
             'o' => format!("{:o}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
             'b' => format!("{:b}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
             'c' => char::from_u32(rest.next().map(|v| v.to_int()).unwrap_or(0) as u32)
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
-            // %v, %s and anything else: Go's `%v` rendering, with precision
-            // truncating a string.
+            // `%U` is Go's Unicode format: `U+4E16`, at least four hex digits.
+            'U' => {
+                let n = rest.next().map(|v| v.to_int()).unwrap_or(0);
+                format!("U+{:04X}", n.max(0))
+            }
+            // `%s` on a byte slice is its bytes as text, not the `%v` list form.
+            's' => match rest.next() {
+                Some(v) => {
+                    let mut s = match v {
+                        Value::Str(s) => s.as_str().to_string(),
+                        v => match bytes_of(v) {
+                            Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                            None => go_str(v),
+                        },
+                    };
+                    if let Some(p) = prec {
+                        if s.chars().count() > p {
+                            s = s.chars().take(p).collect();
+                        }
+                    }
+                    s
+                }
+                None => String::new(),
+            },
+            // %v and anything else: Go's `%v` rendering (with `+`/`#` selecting
+            // the `%+v`/`%#v` struct forms), precision truncating a string.
             _ => {
-                let mut s = rest.next().map(go_str).unwrap_or_default();
+                let mode = if sharp {
+                    FmtMode::SharpV
+                } else if plus {
+                    FmtMode::PlusV
+                } else {
+                    FmtMode::V
+                };
+                let mut s = rest
+                    .next()
+                    .map(|v| go_str_mode(v, mode))
+                    .unwrap_or_default();
                 if let Some(p) = prec {
                     if s.chars().count() > p {
                         s = s.chars().take(p).collect();
@@ -2181,6 +2766,14 @@ pub mod stdlib {
 /// or comparison op is non-numeric (a string). Implements Go's `+` string
 /// concatenation and string ordering; every other arithmetic op on a string is
 /// a type error, reported rather than coerced (Go rejects `"a" - 1`).
+/// Both operands as `i64`, or `None` if either is not an integer.
+fn int_pair(a: &Value, b: &Value) -> Option<(i64, i64)> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Some((*x, *y)),
+        _ => None,
+    }
+}
+
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     match op {
         // The zero value of an erased generic type parameter (`var total T`) is
@@ -2189,6 +2782,20 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         // concrete type is passed: nil+int→int, nil+float→float, nil+str→str.
         NumOp::Add if matches!(a, Value::Undef) => Ok(b.clone()),
         NumOp::Add if matches!(b, Value::Undef) => Ok(a.clone()),
+        // fusevm also routes here when a native integer op overflows. Go's
+        // integers are fixed-width and wrap on overflow (two's complement), so
+        // two integer operands wrap instead of reaching the string branches
+        // below — which used to turn `int64max + 1` into the *concatenation*
+        // "92233720368547758071" rather than -9223372036854775808.
+        NumOp::Add | NumOp::Sub | NumOp::Mul if int_pair(a, b).is_some() => {
+            let (x, y) = int_pair(a, b).unwrap_or((0, 0));
+            Ok(Value::Int(match op {
+                NumOp::Add => x.wrapping_add(y),
+                NumOp::Sub => x.wrapping_sub(y),
+                _ => x.wrapping_mul(y),
+            }))
+        }
+        NumOp::Neg if matches!(a, Value::Int(_)) => Ok(Value::Int(a.to_int().wrapping_neg())),
         NumOp::Add => Ok(Value::str(format!("{}{}", go_str(a), go_str(b)))),
         NumOp::Eq => Ok(Value::bool(go_str(a) == go_str(b))),
         NumOp::Ne => Ok(Value::bool(go_str(a) != go_str(b))),
