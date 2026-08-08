@@ -18,6 +18,19 @@ use std::collections::{HashMap, HashSet};
 /// left as package selectors for the compiler, never loaded from source.
 pub const NATIVE: &[&str] = &["fmt", "strings", "strconv", "math", "sort", "os"];
 
+/// Names a vendored package references but does not declare: host intrinsics the
+/// compiler lowers directly (`errors.asTag` needs the runtime type tag a type
+/// switch dispatches on, which no Go source can name). Listed here so they are
+/// qualified like the package's own names — a user program's `runtimeTypeTag`
+/// then cannot capture the reference.
+const INTRINSICS: &[(&str, &str)] = &[("errors", "runtimeTypeTag")];
+
+/// Whether a type name is the parser's canonical name for an anonymous interface
+/// (`interface{Unwrap}`), which names a method set rather than a package's type.
+fn is_anon_iface(name: &str) -> bool {
+    name.starts_with("interface{")
+}
+
 /// The default local name of an import path — its last segment
 /// (`unicode/utf8` → `utf8`).
 fn import_alias(path: &str) -> &str {
@@ -79,26 +92,40 @@ fn add_sort_slice(prog: &mut Program) {
     }
 }
 
-/// Whether the program calls `fmt.Errorf` anywhere (drives synthesis of the
-/// error type it constructs).
+/// Whether the program calls anything that yields a host-built error value —
+/// `fmt.Errorf`, or a `strconv` conversion whose second result is one — which
+/// drives synthesis of the error types those values use.
 fn uses_errorf(prog: &Program) -> bool {
+    /// `pkg.Func` calls that build an error value.
+    const ERROR_MAKERS: &[(&str, &str)] = &[
+        ("fmt", "Errorf"),
+        ("strconv", "Atoi"),
+        ("strconv", "ParseInt"),
+        ("strconv", "ParseFloat"),
+    ];
     fn in_expr(e: &Expr) -> bool {
         match e {
             Expr::Call { func, args, .. } => {
                 let is_errorf = matches!(func.as_ref(),
                     Expr::Selector { recv, field }
-                        if field == "Errorf"
-                            && matches!(recv.as_ref(), Expr::Ident(p) if p == "fmt"));
+                        if matches!(recv.as_ref(), Expr::Ident(p)
+                            if ERROR_MAKERS.contains(&(p.as_str(), field.as_str()))));
                 is_errorf || in_expr(func) || args.iter().any(in_expr)
             }
             Expr::Selector { recv, .. } => in_expr(recv),
             Expr::Unary { rhs, .. } => in_expr(rhs),
             Expr::Binary { lhs, rhs, .. } => in_expr(lhs) || in_expr(rhs),
             Expr::Index { recv, index } => in_expr(recv) || in_expr(index),
-            Expr::Slice { recv, low, high } => {
+            Expr::Slice {
+                recv,
+                low,
+                high,
+                max,
+            } => {
                 in_expr(recv)
                     || low.as_deref().is_some_and(in_expr)
                     || high.as_deref().is_some_and(in_expr)
+                    || max.as_deref().is_some_and(in_expr)
             }
             Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| in_expr(v)),
             Expr::SliceLit { elems, .. } => elems.iter().any(in_expr),
@@ -182,36 +209,60 @@ fn uses_errorf(prog: &Program) -> bool {
     prog.main.iter().any(in_stmt) || prog.funcs.iter().any(|f| f.body.iter().any(in_stmt))
 }
 
-/// Synthesize the error type that `fmt.Errorf` constructs: a struct with a single
-/// message field and a value-returning `Error()` method. The compiler lowers
-/// `fmt.Errorf(f, args...)` to `&$errorString{s: fmt.Sprintf(f, args...)}`.
+/// Synthesize the three error types `fmt.Errorf` constructs, mirroring Go's
+/// `fmt/errors.go`: a plain message error when the format wraps nothing, a
+/// `wrapError` (`Unwrap() error`) for one `%w`, and a `wrapErrors`
+/// (`Unwrap() []error`) for several. Each has a message field `s` returned by
+/// `Error()`; the compiler picks the type at the `fmt.Errorf` call site from the
+/// `%w` verbs in the format.
 fn add_errorf_type(prog: &mut Program) {
-    prog.types.push(StructDecl {
-        name: "$errorString".to_string(),
-        fields: vec![Param {
-            name: "s".to_string(),
-            ty: "string".to_string(),
-        }],
-    });
-    prog.funcs.push(Func {
-        name: "Error".to_string(),
-        receiver: Some(Param {
-            name: "e".to_string(),
-            ty: "*$errorString".to_string(),
-        }),
-        params: vec![],
-        variadic: false,
-        results: vec!["string".to_string()],
-        result_names: vec![String::new()],
-        body: vec![Stmt::Return(
-            vec![Expr::Selector {
-                recv: Box::new(Expr::Ident("e".to_string())),
-                field: "s".to_string(),
-            }],
-            0,
-        )],
-        line: 0,
-    });
+    /// `func (e *T) name() ret { return e.field }`
+    fn getter(ty: &str, name: &str, field: &str, ret: &str) -> Func {
+        Func {
+            name: name.to_string(),
+            receiver: Some(Param {
+                name: "e".to_string(),
+                ty: format!("*{ty}"),
+            }),
+            params: vec![],
+            variadic: false,
+            results: vec![ret.to_string()],
+            result_names: vec![String::new()],
+            body: vec![Stmt::Return(
+                vec![Expr::Selector {
+                    recv: Box::new(Expr::Ident("e".to_string())),
+                    field: field.to_string(),
+                }],
+                0,
+            )],
+            line: 0,
+        }
+    }
+    let msg = Param {
+        name: "s".to_string(),
+        ty: "string".to_string(),
+    };
+    for (ty, extra, unwrap_ret) in [
+        ("$errorString", None, None),
+        ("$wrapError", Some(("err", "error")), Some("error")),
+        ("$wrapErrors", Some(("errs", "[]error")), Some("[]error")),
+    ] {
+        let mut fields = vec![msg.clone()];
+        if let Some((name, fty)) = extra {
+            fields.push(Param {
+                name: name.to_string(),
+                ty: fty.to_string(),
+            });
+        }
+        prog.types.push(StructDecl {
+            name: ty.to_string(),
+            fields,
+        });
+        prog.funcs.push(getter(ty, "Error", "s", "string"));
+        if let (Some((field, _)), Some(ret)) = (extra, unwrap_ret) {
+            prog.funcs.push(getter(ty, "Unwrap", field, ret));
+        }
+    }
 }
 
 /// Synthesize the `$stringify` helper — a type switch over every type with a
@@ -321,11 +372,21 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
             own.insert(t.name.clone());
         }
         for i in &prog.interfaces {
-            own.insert(i.name.clone());
+            // An anonymous interface (`interface{ Unwrap() error }`) is named by
+            // its method set, not by the package — every package that writes the
+            // same one means the same type, so it is never qualified.
+            if !is_anon_iface(&i.name) {
+                own.insert(i.name.clone());
+            }
         }
         for s in &prog.main {
             if let Stmt::Var { name, .. } = s {
                 own.insert(name.clone());
+            }
+        }
+        for (pkg, name) in INTRINSICS {
+            if *pkg == path {
+                own.insert((*name).to_string());
             }
         }
     }
@@ -354,7 +415,7 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         }
     }
     for i in &mut prog.interfaces {
-        if rename {
+        if rename && !is_anon_iface(&i.name) {
             i.name = q.qual(&i.name);
         }
     }
@@ -612,14 +673,14 @@ impl Qualifier {
                 self.expr(index, bound);
             }
             Expr::Slice {
-                recv, low, high, ..
+                recv,
+                low,
+                high,
+                max,
             } => {
                 self.expr(recv, bound);
-                if let Some(l) = low {
-                    self.expr(l, bound);
-                }
-                if let Some(h) = high {
-                    self.expr(h, bound);
+                for e in [low, high, max].into_iter().flatten() {
+                    self.expr(e, bound);
                 }
             }
             Expr::TypeAssert { expr, ty } => {
@@ -707,7 +768,7 @@ pub fn gors_home() -> Option<std::path::PathBuf> {
 
 /// The vendored standard-library packages (import path → single-file source),
 /// written to `~/.go-rs/src/<path>/<name>.go` by `go install-std`.
-pub const VENDORED: &[&str] = &["errors", "unicode/utf16", "cmp"];
+pub const VENDORED: &[&str] = &["errors", "sync", "unicode/utf16", "cmp"];
 
 /// Install the vendored standard library into `~/.go-rs/src/`. Returns the
 /// number of packages written.

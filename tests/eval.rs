@@ -351,6 +351,11 @@ func main() {
 
 #[test]
 fn strconv_stdlib() {
+    // `strconv.Atoi` returns Go's `(int, error)` pair, so the value is bound by
+    // destructuring. (This test previously asserted `strconv.Atoi("100")+1` —
+    // a single-value use of a two-value call, which the real `go` toolchain
+    // rejects with "multiple-value strconv.Atoi(...) in single-value context".
+    // go-rs now rejects it too; see `multi_value_call_in_single_value_context`.)
     let src = "\
 package main
 import (
@@ -358,10 +363,51 @@ import (
 	\"strconv\"
 )
 func main() {
-	fmt.Println(strconv.Itoa(42), strconv.Atoi(\"100\")+1)
+	n, err := strconv.Atoi(\"100\")
+	fmt.Println(strconv.Itoa(42), n+1, err)
+	_, err = strconv.Atoi(\"xx\")
+	fmt.Println(err)
+	f, ferr := strconv.ParseFloat(\"2.5\", 64)
+	fmt.Println(f, ferr)
+	h, herr := strconv.ParseInt(\"ff\", 16, 64)
+	fmt.Println(h, herr)
 }
 ";
-    assert_stdout(src, "42 101\n");
+    assert_stdout(
+        src,
+        "42 101 <nil>\nstrconv.Atoi: parsing \"xx\": invalid syntax\n2.5 <nil>\n255 <nil>\n",
+    );
+}
+
+#[test]
+fn multi_value_call_in_single_value_context() {
+    // Go rejects using a two-value call where one value is expected; go-rs's
+    // tuple is an ordinary slice value, so without the check the operand would
+    // silently be that slice.
+    let (_stdout, ok) = run("\
+package main
+import (
+	\"fmt\"
+	\"strconv\"
+)
+func main() {
+	fmt.Println(strconv.Atoi(\"100\") + 1)
+}
+");
+    assert!(
+        !ok,
+        "a two-value call in single-value context must not compile"
+    );
+
+    let (_stdout, ok) = run("\
+package main
+func two() (int, int) { return 1, 2 }
+func main() {
+	n := two()
+	_ = n
+}
+");
+    assert!(!ok, "binding a two-value call to one name must not compile");
 }
 
 #[test]
@@ -1669,18 +1715,22 @@ func main() {
 
 #[test]
 fn three_index_slice_expression() {
-    // A full slice expression s[low:high:max] — the capacity bound is accepted
-    // (and ignored, since go-rs sub-slices copy).
+    // A full slice expression s[low:high:max] caps the result at `max - low`, so
+    // an append that would pass it reallocates instead of writing into backing
+    // the sub-slice no longer owns.
     let src = "\
 package main
 import \"fmt\"
 func main() {
 	s := []int{1, 2, 3, 4, 5}
-	fmt.Println(s[1:3:4], len(s[1:3:4]))
-	fmt.Println(s[:2:5])
+	fmt.Println(s[1:3:4], len(s[1:3:4]), cap(s[1:3:4]))
+	fmt.Println(s[:2:5], cap(s[:2:5]), cap(s[:2]))
+	t := s[0:2:2]
+	t = append(t, 99)
+	fmt.Println(t, s)
 }
 ";
-    assert_stdout(src, "[2 3] 2\n[1 2]\n");
+    assert_stdout(src, "[2 3] 2 3\n[1 2] 5 5\n[1 2 99] [1 2 3 4 5]\n");
 }
 
 #[test]
@@ -2107,4 +2157,149 @@ func main() {
 }
 ";
     assert_stdout(src, "4 rex walking on 4\n5 5\n5 6 {{5} {6}}\n15 6\n");
+}
+
+#[test]
+fn errors_is_as_unwrap_and_wrap_verb() {
+    // %w records the cause, so Is walks the chain; a plain %v does not. Two
+    // errors with the same text are distinct values, which is what makes
+    // sentinel matching mean anything.
+    let src = "\
+package main
+import (
+	\"errors\"
+	\"fmt\"
+)
+var ErrGone = errors.New(\"gone\")
+type codeErr struct{ code int }
+func (e *codeErr) Error() string { return \"code\" }
+func main() {
+	wrapped := fmt.Errorf(\"step: %w\", ErrGone)
+	plain := fmt.Errorf(\"step: %v\", ErrGone)
+	fmt.Println(wrapped, errors.Is(wrapped, ErrGone), errors.Is(plain, ErrGone))
+	fmt.Println(errors.Unwrap(wrapped) == ErrGone, errors.Unwrap(ErrGone))
+	fmt.Println(errors.New(\"gone\") == errors.New(\"gone\"))
+	deep := fmt.Errorf(\"outer: %w\", wrapped)
+	fmt.Println(errors.Is(deep, ErrGone))
+	ce := &codeErr{7}
+	var got *codeErr
+	fmt.Println(errors.As(fmt.Errorf(\"ctx: %w\", ce), &got), got.code)
+	var miss *codeErr
+	fmt.Println(errors.As(ErrGone, &miss), miss == nil)
+	joined := errors.Join(ErrGone, ce)
+	fmt.Println(errors.Is(joined, ErrGone), errors.Is(joined, ce))
+}
+";
+    assert_stdout(
+        src,
+        "step: gone true false\ntrue <nil>\nfalse\ntrue\ntrue 7\nfalse true\ntrue true\n",
+    );
+}
+
+#[test]
+fn anonymous_interface_assertion_tests_the_method_set() {
+    // `err.(interface{ Unwrap() error })` must match only types that really
+    // have that method — and must tell `Unwrap() error` from `Unwrap() []error`,
+    // which is the distinction errors.Is depends on.
+    let src = "\
+package main
+import \"fmt\"
+type leaf struct{}
+func (leaf) Error() string { return \"leaf\" }
+type one struct{}
+func (one) Error() string { return \"one\" }
+func (one) Unwrap() error { return leaf{} }
+type many struct{}
+func (many) Error() string   { return \"many\" }
+func (many) Unwrap() []error { return []error{leaf{}} }
+func kind(err error) string {
+	switch x := err.(type) {
+	case interface{ Unwrap() error }:
+		return \"single:\" + x.Unwrap().Error()
+	case interface{ Unwrap() []error }:
+		return fmt.Sprint(\"multi:\", len(x.Unwrap()))
+	default:
+		return \"none\"
+	}
+}
+func main() {
+	fmt.Println(kind(one{}), kind(many{}), kind(leaf{}))
+	var e error = leaf{}
+	_, ok := e.(interface{ Unwrap() error })
+	fmt.Println(ok)
+}
+";
+    assert_stdout(src, "single:leaf multi:1 none\nfalse\n");
+}
+
+#[test]
+fn fixed_width_integers_wrap_at_their_declared_width() {
+    // Every sized type wraps at its own width, through ++, compound assignment,
+    // binary operators and a function result; 64-bit types keep 64-bit wrapping.
+    let src = "\
+package main
+import \"fmt\"
+func fnv32(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+func main() {
+	var i8 int8 = 127
+	i8++
+	var u8 uint8 = 0
+	u8--
+	var i32 int32 = 2147483647
+	i32++
+	fmt.Println(i8, u8, i32)
+	var n int = 127
+	n++
+	fmt.Println(n)
+	var a int8 = 100
+	fmt.Println(a+a, ^uint8(0))
+	xs := []uint8{250}
+	xs[0] += 10
+	fmt.Println(xs[0])
+	fmt.Println(fnv32(\"hello\"))
+}
+";
+    assert_stdout(src, "-128 255 -2147483648\n128\n-56 255\n4\n1335831723\n");
+}
+
+#[test]
+fn sync_waitgroup_mutex_and_once() {
+    // The vendored `sync` over fusevm's cooperative scheduler: Wait parks until
+    // every Done lands, a Mutex guards a shared counter, and Once runs once.
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"sync\"
+)
+func main() {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	total := 0
+	for i := 1; i <= 10; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			mu.Lock()
+			total += n
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	var once sync.Once
+	runs := 0
+	for i := 0; i < 3; i++ {
+		once.Do(func() { runs++ })
+	}
+	fmt.Println(total, runs, mu.TryLock())
+}
+";
+    assert_stdout(src, "55 1 true\n");
 }

@@ -7,29 +7,13 @@ prints, and what it would take to close.
 Found by the differential harnesses:
 
 - `bash parity-scripts/run.sh` — byte-diffs every `parity-scripts/**/*.go`
-  against `go run`. Currently 28/28.
+  against `go run`, and prints the rate. It is a green gate: every file matches.
 - `cargo build --bin parity-fuzz && ./target/debug/parity-fuzz --count 20000`
   — generated deterministic-output programs, byte-diffed the same way.
 
 A gap listed here is deliberately **not** represented by a corpus file, because
 the corpus is a green byte-parity gate. Close the gap and add the corpus file in
 the same change.
-
-## Fixed-width integer arithmetic does not wrap to its declared width
-
-```go
-var i8 int8 = 127
-i8++            // go: -128     go-rs: 128
-var u8 uint8 = 0
-u8--            // go: 255      go-rs: -1
-```
-
-Conversions already truncate correctly (`int8(300)` → 44, `int32(5e9)` →
-705032704), and `int`/`int64` arithmetic wraps at 64 bits. Only the narrower
-declared widths are unmodelled: every integer is a 64-bit `Value::Int`, and
-nothing records that a variable is 8/16/32-bit or unsigned. Closing it needs a
-width tag on the value (or a typed-slot model in the compiler) so `++`, `+` and
-the shift operators can mask to the declared width.
 
 ## `float32` prints with `float64` precision
 
@@ -40,9 +24,14 @@ fmt.Println(f)  // go: 0.33333334     go-rs: 0.3333333333333333
 
 The conversion itself is right — `float32(x)` does round to `f32` — but `fmt`
 formats every float with the shortest representation that round-trips as an
-`f64`. Go picks the shortest that round-trips at the value's own width. Needs
-the same width tag as the integer case; `format_float` then selects the 32-bit
-shortest digits.
+`f64`. Go picks the shortest that round-trips at the value's own width.
+
+Unlike the integer case — now closed by `emit_narrow` in `src/compiler.rs` —
+this one cannot be fixed by emitting ops around
+the arithmetic: the width is not needed at the *operation*, it is needed at the
+*print*, which happens in a host builtin that only ever sees a `Value::Float`.
+Closing it needs the value itself to carry its width — a `Value` variant or a
+compile-time-known formatting hint threaded into `fmt` — not a lowering trick.
 
 ## A nil slice or nil map prints as `<nil>`
 
@@ -55,21 +44,50 @@ fmt.Println(m["x"]) // go: 0            go-rs: go-rs: invalid index of nil
 
 `len`, `cap` and `append` on a nil slice are already correct. The zero value is
 `Value::Undef`, which carries no element type, so the printer cannot tell a nil
-slice from a nil map from a nil interface. A distinguished heap object per kind
-would print correctly, but `s == nil` compiles to fusevm's generic equality
-against `Undef` — making it true for that object needs an equality hook go-rs
-does not currently install.
+slice from a nil map from a nil interface.
+
+**Tractability of the equality hook (assessed).** The blocker recorded here
+previously was that a distinguished nil object would print right but `s == nil`
+would then be false, and that go-rs installs no equality hook to fix it. That is
+no longer true: `numeric_hook` in `src/host.rs` already receives `NumOp::Eq` /
+`NumOp::Ne` for every comparison whose operands are not both numeric, and the
+pointer-identity rule added for `errors.Is` (`ptr_eq`) is exactly such a hook.
+A `HostObj::NilSlice` / `HostObj::NilMap` comparing equal to `Value::Undef` is
+the same three lines. So the hook is **not** the obstacle.
+
+What remains is plumbing, and it is the larger half:
+
+- `emit_default` (`src/compiler.rs`) is handed a `NumType`, which has collapsed
+  `[]int`, `map[K]V` and `any` into one `Unknown`. It needs the written type to
+  choose which distinguished nil to emit, so its callers must pass it.
+- Every builtin that consumes a slice or map (`GLEN`, `GCAP`, `GAPPEND`,
+  `GINDEX_GET`, `GRANGE_KEYS`, `GCOPY`, `GMAP_GET2`, `GDELETE`) has to treat the
+  new objects as empty, and `GINDEX_SET` on a nil map has to panic with Go's
+  "assignment to entry in nil map" rather than go-rs's current fault text.
+
+Both are mechanical; neither is a substrate gap. This is a plumbing task, not a
+blocked one.
 
 ## A pointer to a struct prints without `&`
 
 ```go
 p := point{1, "a"}
-fmt.Println(&p)  // go: &{1 a}     go-rs: {1 a}
+fmt.Println(&p)             // go: &{1 a}          go-rs: {1 a}
+fmt.Println(outer{p: &p})   // go: {0xc000010030}  go-rs: {{1 a}}
 ```
 
-go-rs models `&x` as the same heap handle as `x` (structs are already
-reference-shaped on the host heap), so nothing distinguishes the pointer from
-the value at print time. Needs a pointer wrapper object.
+A *heap-allocated* pointer is now distinguishable at run time — `&T{…}` and
+`new(T)` mark their handle `by_ref` (`HostObj::Struct`, `src/host.rs`), which is
+what makes `==` compare them by identity. Two things still block the printing
+half:
+
+- `&x` on an existing variable is a no-op on the shared handle, so it cannot be
+  marked without also marking `x`, which would wrongly make `x == y` compare by
+  identity for the plain struct value. It needs a real pointer wrapper object
+  (with the deref plumbing that implies), not a flag.
+- A pointer *nested* inside a printed value is a hex address in Go, which is
+  nondeterministic and not reproducible at all; the depth-0 `&{…}` form is the
+  only part worth matching.
 
 ## `append` capacity misses Go's malloc size-class rounding
 
@@ -88,57 +106,86 @@ so it cannot compute the byte size. Sniffing it from the element values would
 give the wrong answer for `[]byte` (1 byte) and for struct elements, so it is
 left unrounded rather than confidently wrong.
 
-## The three-index slice `a[lo:hi:max]` ignores `max`
+## `for v := range ch` yields nothing
 
 ```go
-base := make([]int, 5, 5)
-fmt.Println(cap(base[1:2:3]))  // go: 2     go-rs: 4
+ch := make(chan int, 3)
+ch <- 1; ch <- 2; ch <- 3
+close(ch)
+for v := range ch { fmt.Println(v) }   // go: 1 2 3     go-rs: (no iterations)
 ```
 
-`max` is parsed and discarded. A `HostObj::SliceView`'s capacity is derived as
-`backing.len() - offset`, so there is nowhere to record a capacity smaller than
-the backing allows. Needs a `cap` field on `SliceView`.
+Ranging a channel silently produces no values (the channel is a `Value::Int`
+handle, so the range lowers onto Go 1.22's range-over-int and iterates the
+handle's *id*). Every other channel operation — send, receive, `close`,
+`select`, buffered and unbuffered — is correct; receive in a counted loop
+meanwhile.
 
-## `errors.Is` / `errors.As` / `errors.Unwrap` and `%w` are missing
+Closing it needs fusevm, not go-rs: `Scheduler::recv` returns the frontend's
+`recv_zero` for a drained closed channel and reports no "closed" flag, so a
+receive cannot tell a closed channel from one that delivered a real zero. A
+`v, ok := <-ch` result (or a `chan_closed(ch)` query paired with a length query)
+would make the loop expressible; setting `recv_zero` to a sentinel instead would
+regress plain `<-ch` on a closed `chan int`, which correctly yields `0` today.
+
+## A `strconv` error is not a `*strconv.NumError`
 
 ```go
-e2 := fmt.Errorf("wrap: %w", e)
-errors.Is(e2, e)   // go-rs: undefined: errors.Is
+_, err := strconv.Atoi("xx")
+fmt.Println(err)                            // matches Go exactly
+errors.Is(err, strconv.ErrSyntax)           // go: true    go-rs: undefined
+var ne *strconv.NumError; errors.As(err, &ne)  // go: true  go-rs: undefined
 ```
 
-`errors.New`, the `error` interface, `Error()` dispatch and `fmt.Errorf` with
-`%v` all work. The vendored `goroot/errors.go` stops at `New`. Porting the rest
-faithfully needs two things go-rs does not have: `%w` recording a wrapped error
-rather than formatting it, and assertions against anonymous interface types
-(`err.(interface{ Unwrap() error })`), which is how the real `Is`/`As` walk the
-chain. `As` additionally needs `reflectlite`.
+The error *text* is Go's, and the value is a real error (non-nil, printable,
+compares by identity). What is missing is its type: Go returns a
+`*strconv.NumError` wrapping `strconv.ErrSyntax` / `strconv.ErrRange`, whereas
+go-rs returns the same `&$errorString{s: …}` that `fmt.Errorf` builds. Closing
+it needs `strconv` vendored as Go source (it is a native host package today,
+because it reaches the float-formatting runtime), or a host-side `NumError`
+struct plus the two sentinel errors exported as package constants.
 
-## `strconv` conversions always report a nil error
+## `var a, b int = 1, 2` does not parse
 
 ```go
-n, err := strconv.Atoi("xx")
-// go:    0 strconv.Atoi: parsing "xx": invalid syntax
-// go-rs: 0 <nil>
+var wide, wider int = 300, 5000000000
+// go-rs: unexpected token `Comma` in expression
 ```
 
-`Atoi`, `ParseInt` and `ParseFloat` return a bare value, and the compiler pads
-the extra assignment names with nil. The tuple-destructuring path used by
-`GMAP_GET2` would carry a real `(value, error)` pair, but go-rs also accepts
-`strconv.Atoi(s)` in single-value expression position (`tests/eval.rs:361`
-asserts `strconv.Atoi("100")+1`), which real Go rejects. Changing the return
-shape has to update that test in the same change.
+A `var` declaration binds one name. The multi-name forms — with or without an
+initializer list — are unsupported; `a, b := 1, 2` and separate `var`
+statements both work. `Stmt::Var` holds a single `name`, so closing it means
+either widening that node or desugaring one declaration into several.
 
-## `sync` is not vendored
+## A failed anonymous-interface assertion names its method set, not its signature
 
 ```go
-var wg sync.WaitGroup   // go-rs: expected identifier, found `Star` on line 123
+var err error = errors.New("x")
+_ = err.(interface{ Unwrap() error })
+// go:    panic: interface conversion: *errors.errorString is not
+//        interface { Unwrap() error }: missing method Unwrap
+// go-rs: panic: interface conversion: main.$errorString is not
+//        interface{Unwrap/0:error}: missing method Unwrap
 ```
 
-`sync` is not in `goroot/`, so `pkg` falls back to the local toolchain's
-`$GOROOT/src/sync`, whose real source uses constructs go-rs cannot parse. The
-goroutine and channel primitives themselves work; only the `sync` types are
-unreachable. Needs either a go-rs-compatible vendored `sync` or host builtins
-for `WaitGroup`/`Mutex`.
+Whether the assertion succeeds is right — that is method-set containment on
+signatures, and it is what `errors.Is`/`As` rely on. Only the panic *text*
+differs, because the parser canonicalizes an inline interface to
+[`method_sig`]-encoded names (`src/ast.rs`) rather than keeping the written
+source, which it cannot recover: tokens carry a line but no byte offset.
+
+## A conversion to an interface type is rejected
+
+```go
+_ = error(myErr{})   // go-rs: undefined: error
+_ = any(3)
+```
+
+`T(x)` is accepted for the builtin scalar types and `[]byte`/`[]rune`; naming an
+interface type in call position is read as a call to an undefined function.
+Assigning through a declared variable (`var e error = myErr{}`) is the working
+spelling. Closing it means treating a known interface name in call position as
+the identity conversion it is.
 
 ## Unsupported stdlib calls
 

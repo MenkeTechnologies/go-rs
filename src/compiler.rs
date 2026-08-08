@@ -33,6 +33,22 @@ enum NumType {
     Unknown,
 }
 
+/// The bit width and signedness of a Go integer type narrower than 64 bits —
+/// the ones whose arithmetic wraps somewhere other than where `Value::Int`
+/// (an `i64`) already wraps. `int` / `int64` / `uint64` / `uintptr` are 64-bit,
+/// so 64-bit two's-complement wrapping is already Go's answer for them.
+fn int_width(ty: &str) -> Option<(u32, bool)> {
+    Some(match ty {
+        "int8" => (8, true),
+        "int16" => (16, true),
+        "int32" | "rune" => (32, true),
+        "uint8" | "byte" => (8, false),
+        "uint16" => (16, false),
+        "uint32" => (32, false),
+        _ => return None,
+    })
+}
+
 /// Map a Go type name to its numeric category.
 fn numtype_of_ty(ty: &str) -> NumType {
     match ty {
@@ -138,6 +154,13 @@ struct Compiler {
     /// Method result counts keyed by `(receiver type, method name)` — lets a
     /// `v, ok := recv.M()` destructure a multi-value method return.
     method_nresults: HashMap<(String, String), usize>,
+    /// Each interface type's method set, keyed by its name — both declared
+    /// (`type Stringer interface{…}`) and anonymous (`interface{ Unwrap() error }`,
+    /// registered by the parser under a canonical name). Only method-bearing
+    /// interfaces are here; the empty interface matches everything and needs no
+    /// test. A type assertion or type-switch case naming one of these lowers to a
+    /// method-set check instead of a type-tag comparison.
+    iface_methods: HashMap<String, Vec<String>>,
     /// The stack of enclosing `for` loops (innermost last).
     loops: Vec<LoopScope>,
     /// `return`/jump-outs emitted inside `main`, patched to the end of `main`.
@@ -1023,6 +1046,60 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         }
     }
 
+    // Each concrete type's method set, and each method-bearing interface's — the
+    // two halves of Go's interface satisfaction rule, resolved at run time
+    // against the table the prologue registers.
+    let mut type_methods: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for f in &prog.funcs {
+        if let Some(r) = &f.receiver {
+            type_methods
+                .entry(base_type(&r.ty))
+                .or_default()
+                .push(method_sig(&f.name, f.params.len(), &f.results));
+        }
+    }
+    // Go promotes an embedded type's methods into the embedding struct's method
+    // set, so a struct satisfies an interface its embedded field implements.
+    for _ in 0..prog.types.len() {
+        let mut grew = false;
+        for t in &prog.types {
+            // An embedded field is the one whose name is its own type.
+            let promoted: Vec<String> = t
+                .fields
+                .iter()
+                .filter(|f| f.name == base_type(&f.ty).rsplit('.').next().unwrap_or_default())
+                .filter_map(|f| type_methods.get(&base_type(&f.ty)).cloned())
+                .flatten()
+                .collect();
+            let own = type_methods.entry(t.name.clone()).or_default();
+            for m in promoted {
+                if !own.contains(&m) {
+                    own.push(m);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for ms in type_methods.values_mut() {
+        ms.sort();
+        ms.dedup();
+    }
+    let iface_methods: HashMap<String, Vec<String>> = prog
+        .interfaces
+        .iter()
+        .filter(|i| !i.methods.is_empty())
+        .map(|i| {
+            let mut ms = i.methods.clone();
+            ms.sort();
+            ms.dedup();
+            (i.name.clone(), ms)
+        })
+        .collect();
+
     let has_ffi = body_has_ffi(&prog.main) || prog.funcs.iter().any(|f| body_has_ffi(&f.body));
     // Package-level names: variables/constants declared at the top level of
     // `main` (which, after linking, holds every package's init-order globals
@@ -1040,6 +1117,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         struct_fields,
         methods,
         method_nresults,
+        iface_methods,
         loops: Vec::new(),
         main_exits: Vec::new(),
         temp_counter: 0,
@@ -1063,6 +1141,18 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     if c.uses_panic {
         c.b.emit(Op::CallBuiltin(host::GSET_PANIC_MODE, 0), 0);
         c.b.emit(Op::Pop, 0);
+    }
+    // Publish every concrete type's method set when the program tests a value
+    // against a method-bearing interface; a program that never does pays nothing.
+    if !c.iface_methods.is_empty() {
+        for (ty, ms) in &type_methods {
+            let t = c.b.add_constant(Value::str(ty.clone()));
+            c.b.emit(Op::LoadConst(t), 0);
+            let m = c.b.add_constant(Value::str(ms.join(",")));
+            c.b.emit(Op::LoadConst(m), 0);
+            c.b.emit(Op::CallBuiltin(host::GREG_METHODS, 2), 0);
+            c.b.emit(Op::Pop, 0);
+        }
     }
     // main's globals captured by a closure are boxed (shared cells) too.
     c.boxed = boxed_vars(&[], &prog.main);
@@ -1761,12 +1851,14 @@ impl Compiler {
                 self.fv_expr(recv, bound, caps);
                 self.fv_expr(index, bound, caps);
             }
-            Expr::Slice { recv, low, high } => {
+            Expr::Slice {
+                recv,
+                low,
+                high,
+                max,
+            } => {
                 self.fv_expr(recv, bound, caps);
-                if let Some(e) = low {
-                    self.fv_expr(e, bound, caps);
-                }
-                if let Some(e) = high {
+                for e in [low, high, max].into_iter().flatten() {
                     self.fv_expr(e, bound, caps);
                 }
             }
@@ -1974,15 +2066,19 @@ impl Compiler {
                         let n = self.temp_counter;
                         self.temp_counter += 1;
                         let tmp = format!("$ta{n}");
+                        let tag = format!("$tatag{n}");
                         self.expr(expr)?;
                         self.types.insert(tmp.clone(), NumType::Unknown);
                         self.emit_set(&tmp, *line);
-                        // ok = typetag(tmp) == tag
                         self.emit_get(&tmp, *line);
                         self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), *line);
-                        let c = self.b.add_constant(Value::str(type_to_tag(ty)));
-                        self.b.emit(Op::LoadConst(c), *line);
-                        self.b.emit(Op::StrEq, *line);
+                        self.types.insert(tag.clone(), NumType::Str);
+                        self.emit_set(&tag, *line);
+                        // ok = whether tmp's dynamic type is T (the empty
+                        // interface, which every value satisfies, is always true).
+                        if !self.emit_type_test(&tmp, &tag, ty, *line) {
+                            self.b.emit(Op::LoadTrue, *line);
+                        }
                         self.types.insert(names[1].clone(), NumType::Bool);
                         self.emit_declare(&names[1], *line);
                         // v = ok ? tmp : zero(T)  (Go zeroes v on a failed assert).
@@ -2074,6 +2170,9 @@ impl Compiler {
                     ));
                 } else {
                     for (name, e) in names.iter().zip(values) {
+                        // `n := strconv.Atoi(s)` — Go rejects binding a two-value
+                        // call to one name.
+                        self.check_single_value(e, *line)?;
                         let nt = self.infer(e);
                         let dt = self.type_name(e);
                         self.emit_rhs(name, e)?;
@@ -2520,16 +2619,11 @@ impl Compiler {
             let mut match_jumps = Vec::new();
             let mut skip_jumps = Vec::new();
             for (k, ty) in case.types.iter().enumerate() {
-                let ctag = type_to_tag(ty);
-                if ctag.is_empty() {
-                    // An interface type (`any`) matches unconditionally.
+                if !self.emit_type_test(&val, &tag, ty, line) {
+                    // The empty interface (`any`) matches unconditionally.
                     match_jumps.push(self.b.emit(Op::Jump(0), line));
                     break;
                 }
-                self.emit_get(&tag, line);
-                let c = self.b.add_constant(Value::str(ctag));
-                self.b.emit(Op::LoadConst(c), line);
-                self.b.emit(Op::StrEq, line);
                 if k + 1 < case.types.len() {
                     match_jumps.push(self.b.emit(Op::JumpIfTrue(0), line));
                 } else {
@@ -2575,6 +2669,41 @@ impl Compiler {
             self.b.patch_jump(j, end);
         }
         Ok(())
+    }
+
+    /// The method set of `ty` when it names a method-bearing interface — the
+    /// types an assertion against it must accept.
+    fn iface_of(&self, ty: &str) -> Option<&Vec<String>> {
+        self.iface_methods.get(&base_type(ty))
+    }
+
+    /// Emit a test of whether the value in `val_tmp` (whose runtime type tag is
+    /// in `tag_tmp`) has type `ty`, leaving a bool on the stack. Returns `false`
+    /// — emitting nothing — when `ty` is the empty interface, which every value
+    /// satisfies.
+    ///
+    /// An interface with a method set is satisfied by any type implementing every
+    /// method, so it tests the method set rather than the type tag; that is what
+    /// `errors.Is`/`errors.As` use (`err.(interface{ Unwrap() error })`) to walk
+    /// a wrap chain without naming any concrete error type.
+    fn emit_type_test(&mut self, val_tmp: &str, tag_tmp: &str, ty: &str, line: u32) -> bool {
+        if let Some(ms) = self.iface_of(ty) {
+            let want = ms.join(",");
+            self.emit_get(val_tmp, line);
+            let c = self.b.add_constant(Value::str(want));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::CallBuiltin(host::GIFACE_OK, 2), line);
+            return true;
+        }
+        let tag = type_to_tag(ty);
+        if tag.is_empty() {
+            return false;
+        }
+        self.emit_get(tag_tmp, line);
+        let c = self.b.add_constant(Value::str(tag));
+        self.b.emit(Op::LoadConst(c), line);
+        self.b.emit(Op::StrEq, line);
+        true
     }
 
     /// Emit an equality compare between a tag temp and a case expression, picking
@@ -2749,6 +2878,10 @@ impl Compiler {
                     let l = self.types.get(name).copied().unwrap_or(NumType::Unknown);
                     let r = self.infer(value);
                     self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
+                    // `u8++` / `i8 += n` wrap at the variable's declared width.
+                    if let Some(ty) = self.decl_types.get(name).cloned() {
+                        self.emit_narrow(&ty, line);
+                    }
                 }
                 self.emit_set(name, line);
             }
@@ -2768,6 +2901,10 @@ impl Compiler {
                         is_nonzero_const(value),
                         line,
                     );
+                    // `xs[i] += n` wraps at the element type's width.
+                    if let Some(ty) = self.sized_int_ty(target) {
+                        self.emit_narrow(&ty, line);
+                    }
                 }
                 self.b.emit(Op::CallBuiltin(host::GINDEX_SET, 3), line);
                 self.b.emit(Op::Pop, line);
@@ -2790,6 +2927,10 @@ impl Compiler {
                         is_nonzero_const(value),
                         line,
                     );
+                    // `s.f += n` wraps at the field's declared width.
+                    if let Some(ty) = self.sized_int_ty(target) {
+                        self.emit_narrow(&ty, line);
+                    }
                 }
                 self.b.emit(Op::CallBuiltin(host::GFIELD_SET, 3), line);
                 self.b.emit(Op::Pop, line);
@@ -2926,6 +3067,14 @@ impl Compiler {
                 // pointer sees the same struct the original variable holds.
                 if matches!(op, UnOp::Addr | UnOp::Deref) {
                     self.expr(rhs)?;
+                    // `&T{…}` (and `new(T)`, which parses to it) allocates: the
+                    // result is a pointer, which Go compares by address, not by
+                    // field. Mark the fresh handle so `==` knows. Taking the
+                    // address of an existing variable shares its handle, which
+                    // must keep comparing as the value it already is.
+                    if matches!(op, UnOp::Addr) && matches!(**rhs, Expr::StructLit { .. }) {
+                        self.b.emit(Op::CallBuiltin(host::GPTR_MARK, 1), 0);
+                    }
                 } else if matches!(op, UnOp::Neg) && matches!(**rhs, Expr::Float(f, _) if f == 0.0)
                 {
                     // Go's untyped constants have no signed zero, so the constant
@@ -2943,6 +3092,11 @@ impl Compiler {
                         },
                         0,
                     );
+                    // `^uint8(0)` is 255, not -1: a sized operand wraps the
+                    // result at its own width.
+                    if let Some(ty) = self.sized_int_ty(e) {
+                        self.emit_narrow(&ty, 0);
+                    }
                 }
             }
             Expr::Binary { op, lhs, rhs } => {
@@ -2966,9 +3120,23 @@ impl Compiler {
             // mismatch. (The comma-ok form is handled in the `Short` statement.)
             Expr::TypeAssert { expr, ty } => {
                 self.expr(expr)?;
-                let c = self.b.add_constant(Value::str(type_to_tag(ty)));
-                self.b.emit(Op::LoadConst(c), 0);
-                self.b.emit(Op::CallBuiltin(host::GASSERT, 2), 0);
+                // An interface with a method set is satisfied by method set, not
+                // by type identity, so it asserts through its own builtin (whose
+                // panic names the missing method, as Go's does).
+                match self.iface_of(ty) {
+                    Some(ms) => {
+                        let want = self.b.add_constant(Value::str(ms.join(",")));
+                        self.b.emit(Op::LoadConst(want), 0);
+                        let disp = self.b.add_constant(Value::str(base_type(ty)));
+                        self.b.emit(Op::LoadConst(disp), 0);
+                        self.b.emit(Op::CallBuiltin(host::GASSERT_IFACE, 3), 0);
+                    }
+                    None => {
+                        let c = self.b.add_constant(Value::str(type_to_tag(ty)));
+                        self.b.emit(Op::LoadConst(c), 0);
+                        self.b.emit(Op::CallBuiltin(host::GASSERT, 2), 0);
+                    }
+                }
                 self.emit_panic_check(0);
             }
             // A bare selector `x.f` is a package constant (`math.Pi`) or a
@@ -2993,22 +3161,24 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
                 self.emit_panic_check(0); // index out of range is recoverable
             }
-            Expr::Slice { recv, low, high } => {
-                // `recv[low:high]`: push recv, low (or -1), high (or -1).
+            Expr::Slice {
+                recv,
+                low,
+                high,
+                max,
+            } => {
+                // `recv[low:high:max]`: push recv, low, high, max — each omitted
+                // bound as `-1` (0 / len / cap respectively).
                 self.expr(recv)?;
-                match low {
-                    Some(e) => self.expr(e)?,
-                    None => {
-                        self.b.emit(Op::LoadInt(-1), 0);
+                for bound in [low, high, max] {
+                    match bound {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            self.b.emit(Op::LoadInt(-1), 0);
+                        }
                     }
                 }
-                match high {
-                    Some(e) => self.expr(e)?,
-                    None => {
-                        self.b.emit(Op::LoadInt(-1), 0);
-                    }
-                }
-                self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 3), 0);
+                self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 4), 0);
             }
             Expr::SliceLit { elem_ty, elems } => {
                 for e in elems {
@@ -3035,6 +3205,7 @@ impl Compiler {
                 len,
                 cap,
                 elem_zero,
+                ..
             } => {
                 if *is_map {
                     let c = self.b.add_constant(Value::str("map"));
@@ -3110,6 +3281,10 @@ impl Compiler {
             };
             match value {
                 Some(e) => self.emit_typed(e, fty)?,
+                // A struct-typed field's zero value is a zero struct, not nil —
+                // `var c counter` gives `c.mu` a usable `sync.Mutex`. A pointer
+                // field (`*T`) is nil, so only the bare type recurses.
+                None if self.structs.contains(fty) => self.struct_lit(fty, &[])?,
                 None => self.emit_default(numtype_of_ty(fty), 0),
             }
         }
@@ -3226,7 +3401,17 @@ impl Compiler {
             .map(|((t, _), _)| t.clone())
             .collect();
         candidates.sort();
-        if candidates.is_empty() {
+        // A call on an interface-typed receiver is legal as long as the interface
+        // declares the method — whether any concrete type in the program
+        // implements it is irrelevant, because the assertion that produced the
+        // receiver can then never succeed. (`errors.Is` calls `x.Is(target)` on
+        // an `interface{ Is(error) bool }` binding; most programs define no such
+        // method, and Go still compiles the call.) Anything else is a real
+        // unknown-method error.
+        let declared_by_iface = self
+            .iface_of(&ty)
+            .is_some_and(|ms| ms.iter().any(|m| m.starts_with(&format!("{method}/"))));
+        if candidates.is_empty() && !declared_by_iface {
             return Err(format!(
                 "go-rs: no method `{method}` with {} argument(s) (line {line})",
                 args.len()
@@ -3276,10 +3461,16 @@ impl Compiler {
         if let Expr::Call { func, .. } = e {
             match func.as_ref() {
                 Expr::Ident(name) => return self.funcs.get(name).map(|s| s.nresults),
-                // A method call `recv.M()` — look up M's result count on the
-                // receiver's static type. (A package call like `strings.Split`
-                // has an untyped receiver, so this yields `None`.)
                 Expr::Selector { recv, field } => {
+                    // A native package function that returns `(value, error)`.
+                    if let Expr::Ident(pkg) = recv.as_ref() {
+                        if host::stdlib::returns_error(pkg, field) {
+                            return Some(2);
+                        }
+                    }
+                    // A method call `recv.M()` — look up M's result count on the
+                    // receiver's static type. (A package call like `strings.Split`
+                    // has an untyped receiver, so this yields `None`.)
                     let rt = self.type_name(recv);
                     if !rt.is_empty() {
                         return self.method_nresults.get(&(rt, field.clone())).copied();
@@ -3289,6 +3480,36 @@ impl Compiler {
             }
         }
         None
+    }
+
+    /// Reject a multiple-value call used where one value is expected — Go's
+    /// "multiple-value f() in single-value context". go-rs's tuple is a slice
+    /// heap value, so without this the operand would silently be that slice.
+    fn check_single_value(&self, e: &Expr, line: u32) -> Result<(), String> {
+        if self.call_result_count(e).is_some_and(|n| n >= 2) {
+            let name = match e {
+                Expr::Call { func, .. } => match func.as_ref() {
+                    Expr::Ident(n) => n.clone(),
+                    Expr::Selector { recv, field } => match recv.as_ref() {
+                        Expr::Ident(p) => format!("{p}.{field}"),
+                        _ => field.clone(),
+                    },
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            // Expression lowering carries no line of its own; only report one
+            // when the caller had it.
+            let at = if line == 0 {
+                String::new()
+            } else {
+                format!(" (line {line})")
+            };
+            return Err(format!(
+                "go-rs: multiple-value {name}() in single-value context{at}"
+            ));
+        }
+        Ok(())
     }
 
     /// The static Go type name of an expression, or `""` when unknown. Drives
@@ -3322,8 +3543,99 @@ impl Compiler {
                     .unwrap_or_default(),
                 _ => String::new(),
             },
+            // A slice literal names its own type, so a variable bound to one
+            // records `[]T` and an element's declared type is recoverable.
+            Expr::SliceLit { elem_ty, .. } => format!("[]{elem_ty}"),
+            Expr::Make {
+                is_map, elem_ty, ..
+            } if !is_map => format!("[]{elem_ty}"),
             _ => String::new(),
         }
+    }
+
+    /// Emit one operand of a comparison. `*p` loads the pointed-to struct as a
+    /// *value*, so `*a == *b` compares fields even when `a` and `b` are distinct
+    /// pointers; go-rs's deref is a no-op on the shared handle, so the load is
+    /// made explicit here (the copy is discarded right after the compare).
+    fn emit_compare_operand(&mut self, e: &Expr) -> Result<(), String> {
+        self.check_single_value(e, 0)?;
+        self.expr(e)?;
+        if matches!(
+            e,
+            Expr::Unary {
+                op: UnOp::Deref,
+                ..
+            }
+        ) {
+            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+        }
+        Ok(())
+    }
+
+    /// Lower `errors.As(err, &target)`: walk `err`'s tree for an error whose
+    /// dynamic type is `target`'s, assign it to `target` on a hit, and leave the
+    /// hit/miss bool on the stack (the call sits in expression position).
+    ///
+    /// Go reads the target's type off the `*T` pointer with reflectlite and
+    /// stores through it; go-rs takes the type from the target's declaration and
+    /// assigns the variable directly, which needs no reflection and no pointer
+    /// write-back. A target whose type go-rs cannot name is rejected rather than
+    /// silently never matching.
+    fn errors_as(&mut self, args: &[Expr], line: u32) -> Result<(), String> {
+        let [err, target] = args else {
+            return Err(format!(
+                "go-rs: errors.As takes 2 arguments, got {} (line {line})",
+                args.len()
+            ));
+        };
+        let Expr::Unary {
+            op: UnOp::Addr,
+            rhs: target,
+        } = target
+        else {
+            return Err(format!(
+                "go-rs: errors.As: second argument must be `&target` (line {line})"
+            ));
+        };
+        let ty = self.type_name(target);
+        if ty.is_empty() {
+            return Err(format!(
+                "go-rs: errors.As: cannot determine the target's type (line {line})"
+            ));
+        }
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let tup = format!("$as{n}");
+        let ok = format!("$asok{n}");
+        self.call(
+            &Expr::Ident("errors.asTag".to_string()),
+            &[err.clone(), Expr::Str(type_to_tag(&ty))],
+            false,
+            line,
+        )?;
+        self.types.insert(tup.clone(), NumType::Unknown);
+        self.emit_set(&tup, line);
+        // ok = tuple[1]
+        self.emit_get(&tup, line);
+        self.b.emit(Op::LoadInt(1), line);
+        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+        self.types.insert(ok.clone(), NumType::Bool);
+        self.emit_set(&ok, line);
+        // Go leaves the target untouched on a miss.
+        self.emit_get(&ok, line);
+        let skip = self.b.emit(Op::JumpIfFalse(0), line);
+        let hit = format!("$ashit{n}");
+        self.emit_get(&tup, line);
+        self.b.emit(Op::LoadInt(0), line);
+        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+        self.types.insert(hit.clone(), NumType::Unknown);
+        self.decl_types.insert(hit.clone(), ty);
+        self.emit_set(&hit, line);
+        self.assign(target, AssignOp::Set, &Expr::Ident(hit), line)?;
+        let end = self.b.current_pos();
+        self.b.patch_jump(skip, end);
+        self.emit_get(&ok, line);
+        Ok(())
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
@@ -3353,20 +3665,114 @@ impl Compiler {
         // Comparisons pick string vs numeric ops from the operand types.
         if let Some(strcmp) = str_compare_op(op) {
             let is_str = self.infer(lhs) == NumType::Str || self.infer(rhs) == NumType::Str;
-            self.expr(lhs)?;
-            self.expr(rhs)?;
+            self.emit_compare_operand(lhs)?;
+            self.emit_compare_operand(rhs)?;
             self.b
                 .emit(if is_str { strcmp } else { num_compare_op(op) }, 0);
             return Ok(());
         }
 
         // Arithmetic.
+        self.check_single_value(lhs, 0)?;
+        self.check_single_value(rhs, 0)?;
         let l = self.infer(lhs);
         let r = self.infer(rhs);
         self.expr(lhs)?;
         self.expr(rhs)?;
         self.emit_arith(op, l, r, is_nonzero_const(rhs), 0);
+        // Go's arithmetic is fixed-width: a sized operand makes the result wrap
+        // at its own width, not at 64 bits.
+        if let Some(ty) = self.sized_int_ty(&Expr::Binary {
+            op,
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
+        }) {
+            self.emit_narrow(&ty, 0);
+        }
         Ok(())
+    }
+
+    /// Wrap the integer on the stack to `ty`'s declared width — Go's fixed-width
+    /// arithmetic, where `int8(127) + 1` is `-128` rather than `128`.
+    ///
+    /// Signed: shift left to put the type's sign bit in bit 63, then shift
+    /// arithmetically back, which discards the high bits and sign-extends.
+    /// Unsigned: mask the high bits off. Both are ordinary ops the interpreter,
+    /// the tracing JIT and the AOT backend all lower natively, and both are
+    /// emitted per site, so widths mix freely inside one chunk. Emits nothing for
+    /// a 64-bit type, whose wrapping `Value::Int` already is.
+    fn emit_narrow(&mut self, ty: &str, line: u32) {
+        let Some((bits, signed)) = int_width(ty) else {
+            return;
+        };
+        if signed {
+            let shift = 64 - bits as i64;
+            self.b.emit(Op::LoadInt(shift), line);
+            self.b.emit(Op::Shl, line);
+            self.b.emit(Op::LoadInt(shift), line);
+            self.b.emit(Op::Shr, line);
+        } else {
+            self.b.emit(Op::LoadInt((1i64 << bits) - 1), line);
+            self.b.emit(Op::BitAnd, line);
+        }
+    }
+
+    /// The narrower-than-64-bit integer type an arithmetic expression produces,
+    /// if any. Go's untyped constants take the type of the other operand, so one
+    /// sized operand anywhere fixes the whole expression's width; a shift takes
+    /// its type from the left operand alone (the count has its own).
+    fn sized_int_ty(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident(n) => self
+                .decl_types
+                .get(n)
+                .filter(|t| int_width(t).is_some())
+                .cloned(),
+            Expr::Unary {
+                op: UnOp::Neg | UnOp::BitNot,
+                rhs,
+            } => self.sized_int_ty(rhs),
+            Expr::Binary {
+                op: BinOp::Shl | BinOp::Shr,
+                lhs,
+                ..
+            } => self.sized_int_ty(lhs),
+            Expr::Binary { op, lhs, rhs } if str_compare_op(*op).is_none() => {
+                self.sized_int_ty(lhs).or_else(|| self.sized_int_ty(rhs))
+            }
+            Expr::Call { func, .. } => match func.as_ref() {
+                // A conversion `int8(x)` names its own type.
+                Expr::Ident(n) if int_width(n).is_some() => Some(n.clone()),
+                Expr::Ident(n) => self
+                    .funcs
+                    .get(n)
+                    .map(|s| base_type(&s.result_ty))
+                    .filter(|t| int_width(t).is_some()),
+                _ => None,
+            },
+            Expr::Selector { .. } | Expr::TypeAssert { .. } => {
+                let t = self.type_name(e);
+                (int_width(&t).is_some()).then_some(t)
+            }
+            // A slice element takes its width from the slice's element type.
+            Expr::Index { recv, .. } => self.elem_ty_of(recv).filter(|t| int_width(t).is_some()),
+            _ => None,
+        }
+    }
+
+    /// The written element type of a slice-valued expression, when go-rs recorded
+    /// one — how `xs[i] += n` learns the width to wrap at.
+    fn elem_ty_of(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident(n) => self
+                .decl_types
+                .get(n)
+                .and_then(|t| t.strip_prefix("[]"))
+                .map(str::to_string),
+            Expr::SliceLit { elem_ty, .. } => Some(elem_ty.clone()),
+            Expr::Make { elem_ty, .. } => Some(elem_ty.clone()),
+            _ => None,
+        }
     }
 
     /// Emit an arithmetic op for two already-pushed operands, appending
@@ -3495,10 +3901,13 @@ impl Compiler {
             if let Expr::Ident(pkg) = recv.as_ref() {
                 // `fmt.*` print family.
                 if pkg == "fmt" {
-                    // `fmt.Errorf(f, args...)` builds a real error value:
-                    // `&$errorString{s: fmt.Sprintf(f, args...)}` (the error type
-                    // synthesized by the linker when Errorf is used). %w wrapping
-                    // is not modeled — the verb formats like %v.
+                    // `fmt.Errorf(f, args...)` builds a real error value whose
+                    // message is `fmt.Sprintf(f, args...)`. Which value depends on
+                    // how many operands the format binds to `%w`, exactly as Go's
+                    // `fmt.Errorf` does: none gives a plain `errors.New`-shaped
+                    // error, one a `*wrapError` (`Unwrap() error`), more a
+                    // `*wrapErrors` (`Unwrap() []error`). The linker synthesizes
+                    // all three types when Errorf is used.
                     if field == "Errorf" {
                         let msg = Expr::Call {
                             func: Box::new(Expr::Selector {
@@ -3509,13 +3918,43 @@ impl Compiler {
                             spread: false,
                             line,
                         };
-                        let lit = Expr::StructLit {
-                            type_name: "$errorString".to_string(),
-                            fields: vec![(Some("s".to_string()), msg)],
+                        let wrapped: Vec<Expr> = match args.first() {
+                            Some(Expr::Str(f)) => wrap_operands(f)
+                                .into_iter()
+                                .filter_map(|i| args.get(i + 1).cloned())
+                                .collect(),
+                            // A non-literal format cannot be scanned for `%w`, so
+                            // the result wraps nothing (Go would decide at run
+                            // time).
+                            _ => Vec::new(),
+                        };
+                        let mut fields = vec![(Some("s".to_string()), msg)];
+                        let type_name = match wrapped.len() {
+                            0 => "$errorString",
+                            1 => {
+                                fields.push((
+                                    Some("err".to_string()),
+                                    wrapped.into_iter().next().expect("one wrapped error"),
+                                ));
+                                "$wrapError"
+                            }
+                            _ => {
+                                fields.push((
+                                    Some("errs".to_string()),
+                                    Expr::SliceLit {
+                                        elem_ty: "error".to_string(),
+                                        elems: wrapped,
+                                    },
+                                ));
+                                "$wrapErrors"
+                            }
                         };
                         let addr = Expr::Unary {
                             op: UnOp::Addr,
-                            rhs: Box::new(lit),
+                            rhs: Box::new(Expr::StructLit {
+                                type_name: type_name.to_string(),
+                                fields,
+                            }),
                         };
                         return self.expr(&addr);
                     }
@@ -3624,6 +4063,21 @@ impl Compiler {
                     Op::CallBuiltin(host::GAPPEND_SPREAD, args.len() as u8),
                     line,
                 );
+                return Ok(());
+            }
+            // `errors.As(err, &target)` — Go recovers the target's type from the
+            // pointer at run time with reflectlite. go-rs already knows it
+            // statically, so the call lowers to the vendored package's `asTag`
+            // walk keyed on that type's runtime tag, and assigns the target only
+            // when the walk finds a match (as Go's `As` does).
+            if name == "errors.As" {
+                return self.errors_as(args, line);
+            }
+            // The vendored `errors` package's one host intrinsic: the runtime type
+            // tag a type switch dispatches on, which `asTag` compares against.
+            if name == "errors.runtimeTypeTag" && args.len() == 1 {
+                self.expr(&args[0])?;
+                self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), line);
                 return Ok(());
             }
             // Builtins that take a variable arg count.
@@ -3988,6 +4442,54 @@ fn rational_to_f64(num: i128, den: i128) -> Option<f64> {
 /// pkg.Fn(...)` needn't snapshot the callee).
 fn is_package(name: &str) -> bool {
     matches!(name, "fmt" | "strings" | "strconv" | "math" | "sort" | "os")
+}
+
+/// The operand indices (0-based among `fmt.Errorf`'s arguments after the format)
+/// that a literal `format` binds to a `%w` verb — what Go's `fmt.Errorf` records
+/// as the errors it wraps.
+///
+/// Walks the same shape `fmt` does: `%`, flags, width, `.` precision, verb. `%%`
+/// consumes no operand; a `*` width or precision consumes one of its own.
+fn wrap_operands(format: &str) -> Vec<usize> {
+    let chars: Vec<char> = format.chars().collect();
+    let mut out = Vec::new();
+    let mut arg = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < chars.len() && matches!(chars[i], '-' | '+' | '#' | ' ' | '0') {
+            i += 1;
+        }
+        for _ in 0..2 {
+            if i < chars.len() && chars[i] == '*' {
+                arg += 1;
+                i += 1;
+            } else {
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            // Only a `.` introduces the second (precision) round.
+            if !(i < chars.len() && chars[i] == '.') {
+                break;
+            }
+            i += 1;
+        }
+        let Some(&verb) = chars.get(i) else { break };
+        i += 1;
+        if verb == '%' {
+            continue;
+        }
+        if verb == 'w' {
+            out.push(arg);
+        }
+        arg += 1;
+    }
+    out
 }
 
 /// Normalize a written type to the runtime tag [`host::GTYPETAG`] produces:

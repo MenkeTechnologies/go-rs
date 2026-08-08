@@ -37,7 +37,21 @@ pub struct StructDecl {
 #[derive(Debug, Clone)]
 pub struct InterfaceDecl {
     pub name: String,
+    /// The method set, each entry encoded by [`method_sig`].
     pub methods: Vec<String>,
+}
+
+/// The canonical encoding of one method in a method set: `name/arity:results`
+/// (`Unwrap/0:error`, `Unwrap/0:[]error`, `Is/1:bool`).
+///
+/// Interface satisfaction compares method *signatures*, not just names — the
+/// `errors` package turns on telling `Unwrap() error` from `Unwrap() []error`
+/// apart. Parameter *types* are not part of the encoding, only how many there
+/// are: go-rs cannot tell a named parameter from an unnamed one in an interface
+/// method without a full type parse, and two same-named methods that differ only
+/// in parameter types do not arise in practice.
+pub fn method_sig(name: &str, arity: usize, results: &[String]) -> String {
+    format!("{name}/{arity}:{}", results.join(","))
 }
 
 /// A top-level function or method declaration.
@@ -276,11 +290,13 @@ pub enum Expr {
         index: Box<Expr>,
     },
     /// A slice expression `recv[low:high]` (either bound optional: `s[lo:]`,
-    /// `s[:hi]`, `s[:]`).
+    /// `s[:hi]`, `s[:]`), or the three-index full slice `recv[low:high:max]`
+    /// whose `max` caps the result's capacity at `max - low`.
     Slice {
         recv: Box<Expr>,
         low: Option<Box<Expr>>,
         high: Option<Box<Expr>>,
+        max: Option<Box<Expr>>,
     },
     /// A slice composite literal `[]T{elems}`.
     SliceLit {
@@ -299,9 +315,11 @@ pub enum Expr {
         fields: Vec<(Option<String>, Expr)>,
     },
     /// `make([]T, len)` (a slice) or `make(map[K]V)` (a map). `elem_zero` is the
-    /// slice element's zero value.
+    /// slice element's zero value, `elem_ty` the element type as written (which
+    /// fixes the width of arithmetic on an element).
     Make {
         is_map: bool,
+        elem_ty: String,
         len: Option<Box<Expr>>,
         /// `make([]T, len, cap)`'s third argument. The slice's backing array is
         /// `cap` long, so `cap(s)` reports it and appends up to it write in

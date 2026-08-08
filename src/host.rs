@@ -146,6 +146,22 @@ pub const GAPPEND_SPREAD: u16 = 906;
 /// with `math.Sin`.
 pub const GDYNDIV: u16 = 950;
 
+/// `[value]` → the same handle, marked as a Go pointer (`&T{…}` / `new(T)`) so
+/// `==` compares it by address rather than field by field.
+pub const GPTR_MARK: u16 = 955;
+/// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
+/// per method-bearing type in the program prologue, and only when the program
+/// tests a value against an interface's method set.
+pub const GREG_METHODS: u16 = 952;
+/// `[value, "m1,m2,…"]` → `Bool`: whether the value's dynamic type implements
+/// every named method — Go's interface satisfaction, which is what a type
+/// assertion or type-switch case against an interface type tests.
+pub const GIFACE_OK: u16 = 953;
+/// `[value, "m1,m2,…", "<interface display>"]` → the value when its dynamic type
+/// implements the method set, else a recoverable `interface conversion` panic
+/// naming the first missing method (Go's message).
+pub const GASSERT_IFACE: u16 = 954;
+
 /// `[a, b]` → IEEE float `a / b`: `±Inf` for a nonzero numerator over zero and
 /// `NaN` for `0.0 / 0.0`, as Go's float division does.
 ///
@@ -213,7 +229,77 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GAPPEND_SPREAD, b_append_spread);
     vm.register_builtin(GDYNDIV, b_dyndiv);
     vm.register_builtin(GFDIV, b_fdiv);
+    vm.register_builtin(GPTR_MARK, b_ptr_mark);
+    vm.register_builtin(GREG_METHODS, b_reg_methods);
+    vm.register_builtin(GIFACE_OK, b_iface_ok);
+    vm.register_builtin(GASSERT_IFACE, b_assert_iface);
     stdlib::install(vm);
+}
+
+thread_local! {
+    /// Every concrete type's method set, keyed by the tag [`type_tag_of`]
+    /// produces. Populated by [`GREG_METHODS`] in the program prologue; the
+    /// interface tests read it to decide satisfaction.
+    static METHOD_SETS: RefCell<std::collections::HashMap<String, Vec<String>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// `[typeName, "m1,m2,…"]` — record a concrete type's method set.
+fn b_reg_methods(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let ty = args.first().map(go_str).unwrap_or_default();
+    let methods: Vec<String> = args
+        .get(1)
+        .map(go_str)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .collect();
+    METHOD_SETS.with(|m| m.borrow_mut().insert(ty, methods));
+    Value::Undef
+}
+
+/// The first method of `want` that `v`'s dynamic type does not have, or `None`
+/// when it implements them all. A nil value has no methods, so it satisfies only
+/// the empty interface — as in Go, where a nil interface fails every assertion.
+fn missing_method(v: &Value, want: &str) -> Option<String> {
+    let tag = type_tag_of(v);
+    METHOD_SETS.with(|m| {
+        let m = m.borrow();
+        let have = m.get(&tag);
+        want.split(',')
+            .filter(|w| !w.is_empty())
+            .find(|w| !have.is_some_and(|h| h.iter().any(|x| x == w)))
+            .map(str::to_string)
+    })
+}
+
+/// `[value, "m1,m2,…"]` → whether the value's dynamic type implements them all.
+fn b_iface_ok(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let want = args.get(1).map(go_str).unwrap_or_default();
+    Value::bool(missing_method(&v, &want).is_none())
+}
+
+/// `[value, "m1,m2,…", display]` → the value, or an `interface conversion` panic.
+fn b_assert_iface(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let want = args.get(1).map(go_str).unwrap_or_default();
+    let display = args.get(2).map(go_str).unwrap_or_default();
+    match missing_method(&v, &want) {
+        None => v,
+        Some(m) => {
+            let got = go_type_name(&v);
+            runtime_panic(
+                vm,
+                format!("interface conversion: {got} is not {display}: missing method {m}"),
+            );
+            Value::Undef
+        }
+    }
 }
 
 /// `[value, "tag"]` → a single-result type assertion. Returns the value when its
@@ -403,14 +489,15 @@ fn b_imod(vm: &mut VM, argc: u8) -> Value {
     Value::Int(a.wrapping_rem(b))
 }
 
-/// `s[low:high]` on a slice or string: stack `[recv, low, high]`. Returns a new
-/// slice (a copy — go-rs sub-slices don't share the parent's backing array) or a
-/// substring. `low`/`high` of `-1` mean "omitted" (0 / len).
+/// `s[low:high:max]` on a slice, or `s[low:high]` on a slice or string: stack
+/// `[recv, low, high, max]`. Returns a view sharing the parent's backing array
+/// (or a substring). A bound of `-1` means "omitted": `0` / `len` / `cap`.
 fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let recv = args.first().cloned().unwrap_or(Value::Undef);
     let lo_raw = args.get(1).map(Value::to_int).unwrap_or(-1);
     let hi_raw = args.get(2).map(Value::to_int).unwrap_or(-1);
+    let max_raw = args.get(3).map(Value::to_int).unwrap_or(-1);
     match recv {
         // A sub-slice shares the parent's backing array (so element writes are
         // visible both ways), matching Go — collapse a view-of-a-view to the
@@ -422,18 +509,20 @@ fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
             // Go bounds a re-slice by capacity, not length: `s[:cap(s)]` is
             // legal and exposes the backing array's spare room, so an element an
             // append wrote past `len` is reachable through `s[0:len+1]`.
-            let cap = HEAP.with(|h| match h.borrow().get(backing as usize) {
-                Some(HostObj::Slice(a)) => a.len().saturating_sub(base),
-                _ => len,
-            }) as i64;
+            let cap = slice_cap(id).unwrap_or(len) as i64;
             let len = len as i64;
             let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, cap) as usize;
             let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, cap) as usize;
             let hi = hi.max(lo);
+            // The three-index form `s[lo:hi:max]` gives the result capacity
+            // `max - lo`; omitted, it keeps the rest of the parent's capacity.
+            let mx = if max_raw < 0 { cap } else { max_raw }.clamp(0, cap) as usize;
+            let mx = mx.max(hi);
             Value::Obj(heap_alloc(HostObj::SliceView {
                 backing,
                 offset: base + lo,
                 len: hi - lo,
+                cap: mx - lo,
             }))
         }
         Value::Str(s) => {
@@ -751,18 +840,31 @@ pub(crate) enum HostObj {
     Slice(Vec<Value>),
     /// A sub-slice view `s[lo:hi]` sharing another slice's backing array at an
     /// offset, so element writes are visible through the parent (and vice versa).
-    /// `backing` indexes a [`HostObj::Slice`]; `cap` is `backing.len() - offset`.
+    /// `backing` indexes a [`HostObj::Slice`]. `cap` is the view's own capacity:
+    /// normally `backing.len() - offset`, but the three-index form `s[lo:hi:max]`
+    /// records the smaller `max - lo` so an append past it reallocates instead of
+    /// writing into backing the view no longer owns.
     SliceView {
         backing: u32,
         offset: usize,
         len: usize,
+        cap: usize,
     },
     /// A map, insertion-ordered for stable iteration; keys compared by value.
     Map(Vec<(Value, Value)>),
     /// A struct: its type name and ordered `(field, value)` pairs.
+    ///
+    /// `by_ref` marks a handle produced by `&T{…}` / `new(T)` — a Go *pointer*
+    /// rather than a struct value. go-rs models both as the same heap handle, but
+    /// `==` does not treat them alike: Go compares struct values field by field
+    /// and pointers by address. A `by_ref` handle therefore compares by identity,
+    /// which is what makes two `errors.New("x")` values distinct (and so what
+    /// `errors.Is` walks a wrap chain looking for). A [`GSTRUCT_COPY`] of one
+    /// clears the flag: the copy is a value, not the pointer.
     Struct {
         type_name: String,
         fields: Vec<(String, Value)>,
+        by_ref: bool,
     },
     /// A closure: the name-index of its compiled `$lambda_N` subroutine (for
     /// dynamic dispatch when passed as a value) plus its captured values.
@@ -791,6 +893,7 @@ thread_local! {
 /// Clear the object heap, defer stack, and panic state. Called at each run start.
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
+    METHOD_SETS.with(|m| m.borrow_mut().clear());
     DEFERS.with(|d| d.borrow_mut().clear());
     PANIC.with(|p| *p.borrow_mut() = None);
     PANIC_MODE.with(|m| *m.borrow_mut() = false);
@@ -816,7 +919,18 @@ fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
             backing,
             offset,
             len,
+            ..
         }) => Some((*backing, *offset, *len)),
+        _ => None,
+    })
+}
+
+/// A slice handle's capacity — `len` for a slice that owns its backing, the
+/// recorded `cap` for a view. `None` if `id` is not a slice.
+fn slice_cap(id: u32) -> Option<usize> {
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Slice(a)) => Some(a.len()),
+        Some(HostObj::SliceView { cap, .. }) => Some(*cap),
         _ => None,
     })
 }
@@ -894,10 +1008,12 @@ fn key_eq(a: &Value, b: &Value) -> bool {
                         Some(HostObj::Struct {
                             type_name: tx,
                             fields: fx,
+                            ..
                         }),
                         Some(HostObj::Struct {
                             type_name: ty,
                             fields: fy,
+                            ..
                         }),
                     ) => {
                         tx == ty
@@ -956,6 +1072,7 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
                 backing,
                 offset: 0,
                 len,
+                cap,
             }))
         }
     }
@@ -1158,22 +1275,14 @@ fn b_len(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
-/// `cap(x)` — a slice's capacity: `backing.len() - offset` (a sub-slice can grow
-/// into the remaining backing without reallocating, like Go).
+/// `cap(x)` — a slice's capacity: normally the room left in its backing array
+/// (a sub-slice can grow into it without reallocating, like Go), or the smaller
+/// bound a three-index slice `s[lo:hi:max]` recorded.
 fn b_cap(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     match args.first() {
         Some(Value::Str(s)) => Value::Int(s.len() as i64),
-        Some(Value::Obj(id)) => {
-            if let Some((backing, offset, _)) = slice_backing(*id) {
-                let cap = HEAP.with(|h| match h.borrow().get(backing as usize) {
-                    Some(HostObj::Slice(a)) => a.len().saturating_sub(offset),
-                    _ => 0,
-                });
-                return Value::Int(cap as i64);
-            }
-            Value::Int(0)
-        }
+        Some(Value::Obj(id)) => Value::Int(slice_cap(*id).unwrap_or(0) as i64),
         _ => Value::Int(0),
     }
 }
@@ -1232,6 +1341,7 @@ fn grow_slice(elems: Vec<Value>, old_cap: usize) -> Value {
         backing: id,
         offset: 0,
         len: new_len,
+        cap,
     }))
 }
 
@@ -1256,14 +1366,13 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                     None => return Value::Obj(heap_alloc(HostObj::Slice(args))),
                 };
                 let new_len = len + args.len();
-                // Go semantics: if the shared backing has spare capacity after the
-                // view, the new elements are written *in place* (clobbering the
-                // parent's data there); only a full backing forces a reallocation
-                // into a fresh, independent slice.
-                let cap = HEAP.with(|h| match h.borrow().get(backing as usize) {
-                    Some(HostObj::Slice(a)) => a.len().saturating_sub(offset),
-                    _ => 0,
-                });
+                // Go semantics: if the view has spare capacity, the new elements
+                // are written *in place* (clobbering the parent's data there);
+                // exhausting the capacity forces a reallocation into a fresh,
+                // independent slice. A three-index view's capacity stops short of
+                // the backing's end, which is exactly what makes `s[a:b:b]`
+                // guarantee the next append cannot clobber the parent.
+                let cap = slice_cap(id).unwrap_or(0);
                 if new_len <= cap {
                     HEAP.with(|h| {
                         if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
@@ -1276,6 +1385,7 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                         backing,
                         offset,
                         len: new_len,
+                        cap,
                     }));
                 }
                 let mut out = HEAP.with(|h| match h.borrow().get(backing as usize) {
@@ -1339,7 +1449,65 @@ fn b_struct_new(vm: &mut VM, argc: u8) -> Value {
     while let (Some(name), Some(val)) = (it.next(), it.next()) {
         fields.push((go_str(&name), val));
     }
-    Value::Obj(heap_alloc(HostObj::Struct { type_name, fields }))
+    Value::Obj(heap_alloc(HostObj::Struct {
+        type_name,
+        fields,
+        by_ref: false,
+    }))
+}
+
+/// The error value a host builtin returns for a failed conversion: the same
+/// `&$errorString{s: …}` shape `fmt.Errorf` builds, so `fmt` renders it through
+/// the synthesized `Error()` method and `err != nil` and `err == err` behave like
+/// any other Go error. (Go returns a `*strconv.NumError` here, whose `Error()`
+/// produces exactly this text; its `Func`/`Num`/`Err` fields are not modelled,
+/// so `errors.Is(err, strconv.ErrSyntax)` does not work — see BUGS.md.)
+pub(crate) fn make_error(msg: String) -> Value {
+    Value::Obj(heap_alloc(HostObj::Struct {
+        type_name: "$errorString".to_string(),
+        fields: vec![("s".to_string(), Value::str(msg))],
+        by_ref: true,
+    }))
+}
+
+/// `[value]` → the same handle, marked as a pointer. Emitted for `&T{…}` and
+/// `new(T)`, whose results Go compares by address rather than field by field.
+fn b_ptr_mark(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            if let Some(HostObj::Struct { by_ref, .. }) = h.borrow_mut().get_mut(id as usize) {
+                *by_ref = true;
+            }
+        });
+    }
+    v
+}
+
+/// Whether `v` is a handle Go would compare by address (a `&T{…}` pointer).
+fn is_ptr(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(HostObj::Struct { by_ref: true, .. })
+        )
+    })
+}
+
+/// Go's `==` on two values go-rs holds as heap handles. A pointer compares by
+/// address — here, by handle — so two separately allocated errors with the same
+/// message are distinct; anything else falls back to the caller's structural
+/// comparison. `None` when neither side is a pointer.
+pub(crate) fn ptr_eq(a: &Value, b: &Value) -> Option<bool> {
+    if !is_ptr(a) && !is_ptr(b) {
+        return None;
+    }
+    Some(match (a, b) {
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        _ => false,
+    })
 }
 
 /// `s.field` read on a struct.
@@ -1402,6 +1570,7 @@ fn embedded_field_owner(heap: &[HostObj], root: u32, name: &str) -> Option<u32> 
                 let Some(HostObj::Struct {
                     type_name,
                     fields: inner_fields,
+                    ..
                 }) = heap.get(*inner as usize)
                 else {
                     continue;
@@ -1476,9 +1645,14 @@ fn b_struct_copy(vm: &mut VM, argc: u8) -> Value {
             let cloned = HEAP.with(|h| {
                 let h = h.borrow();
                 match h.get(id as usize) {
-                    Some(HostObj::Struct { type_name, fields }) => Some(HostObj::Struct {
+                    // The copy is a struct *value*, never the pointer it was taken
+                    // from, so it compares field-wise again.
+                    Some(HostObj::Struct {
+                        type_name, fields, ..
+                    }) => Some(HostObj::Struct {
                         type_name: type_name.clone(),
                         fields: fields.clone(),
+                        by_ref: false,
                     }),
                     _ => None,
                 }
@@ -1749,6 +1923,7 @@ pub(crate) fn slice_elems(v: &Value) -> Option<Vec<Value>> {
                 backing,
                 offset,
                 len,
+                ..
             }) => match h.get(*backing as usize) {
                 Some(HostObj::Slice(a)) => Some(a[*offset..*offset + *len].to_vec()),
                 _ => Some(Vec::new()),
@@ -1806,6 +1981,7 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                 backing,
                 offset,
                 len,
+                ..
             }) => {
                 let view: Vec<Value> = match h.get(*backing as usize) {
                     Some(HostObj::Slice(a)) => a[*offset..*offset + *len].to_vec(),
@@ -1837,7 +2013,9 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     format!("map[{body}]")
                 }
             }
-            Some(HostObj::Struct { type_name, fields }) => match mode {
+            Some(HostObj::Struct {
+                type_name, fields, ..
+            }) => match mode {
                 FmtMode::V => {
                     let parts: Vec<String> =
                         fields.iter().map(|(_, v)| go_str_mode(v, mode)).collect();
@@ -2441,6 +2619,16 @@ pub mod stdlib {
         })
     }
 
+    /// Whether `pkg.func` returns Go's `(value, error)` pair rather than a bare
+    /// value — so the compiler destructures it and rejects its use where one
+    /// value is expected.
+    pub fn returns_error(pkg: &str, func: &str) -> bool {
+        matches!(
+            (pkg, func),
+            ("strconv", "Atoi") | ("strconv", "ParseInt") | ("strconv", "ParseFloat")
+        )
+    }
+
     /// Resolve a package constant `pkg.NAME` (e.g. `math.Pi`) to its value, or
     /// `None` if unknown. Used by the compiler for bare selector values.
     pub fn resolve_const(pkg: &str, name: &str) -> Option<Value> {
@@ -2492,19 +2680,11 @@ pub mod stdlib {
         vm.register_builtin(LAST_INDEX, b_last_index);
         // extra strconv.*
         vm.register_builtin(PARSE_INT, b_parse_int);
-        vm.register_builtin(PARSE_FLOAT, |vm, a| {
-            let args = pop_args(vm, a);
-            Value::Float(
-                args.first()
-                    .map(go_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .parse()
-                    .unwrap_or(0.0),
-            )
-        });
+        vm.register_builtin(PARSE_FLOAT, b_parse_float);
         vm.register_builtin(FORMAT_INT, b_format_int);
-        vm.register_builtin(QUOTE, |vm, a| s1(vm, a, |s| format!("\"{s}\"")));
+        // `strconv.Quote` is the same double-quoted Go literal `%q` produces —
+        // escapes and all, which wrapping the raw string in quotes was not.
+        vm.register_builtin(QUOTE, |vm, a| s1(vm, a, super::go_quote));
         // math.*
         vm.register_builtin(ABS, |vm, a| math1(vm, a, f64::abs));
         vm.register_builtin(SQRT, |vm, a| math1(vm, a, f64::sqrt));
@@ -2628,11 +2808,29 @@ pub mod stdlib {
         Value::Int(s.rfind(&sub).map(|b| b as i64).unwrap_or(-1))
     }
 
+    /// `strconv.ParseInt(s, base, bitSize) (int64, error)`.
     fn b_parse_int(vm: &mut VM, argc: u8) -> Value {
         let args = pop_args(vm, argc);
         let s = args.first().map(go_str).unwrap_or_default();
         let base = args.get(1).map(|v| v.to_int()).unwrap_or(10).max(2) as u32;
-        Value::Int(i64::from_str_radix(s.trim(), base).unwrap_or(0))
+        parse_signed(&s, base, "ParseInt")
+    }
+
+    /// `strconv.ParseFloat(s, bitSize) (float64, error)`. An overflowing literal
+    /// yields ±Inf *and* a range error, as Go's does; a written `Inf` does not.
+    fn b_parse_float(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        match s.parse::<f64>() {
+            Ok(f)
+                if f.is_infinite()
+                    && !s.trim_start_matches(['+', '-']).eq_ignore_ascii_case("inf") =>
+            {
+                parsed(Value::Float(f), Some(num_error("ParseFloat", &s, RANGE)))
+            }
+            Ok(f) => parsed(Value::Float(f), None),
+            Err(_) => parsed(Value::Float(0.0), Some(num_error("ParseFloat", &s, SYNTAX))),
+        }
     }
 
     fn b_format_int(vm: &mut VM, argc: u8) -> Value {
@@ -2734,6 +2932,7 @@ pub mod stdlib {
                         backing,
                         offset,
                         len,
+                        ..
                     }) => match h.get(*backing as usize) {
                         Some(HostObj::Slice(a)) => &a[*offset..*offset + *len],
                         _ => &[],
@@ -2753,12 +2952,47 @@ pub mod stdlib {
         Value::str(args.first().map(|v| v.to_int()).unwrap_or(0).to_string())
     }
 
-    /// `strconv.Atoi(s)` — parse a decimal string; go-rs returns 0 on failure
-    /// (the paired error is a later wave).
+    /// A `(value, error)` result as the 2-element tuple the compiler
+    /// destructures, with `err` nil on success.
+    fn parsed(value: Value, err: Option<String>) -> Value {
+        let e = match err {
+            Some(msg) => super::make_error(msg),
+            None => Value::Undef,
+        };
+        Value::Obj(heap_alloc(HostObj::Slice(vec![value, e])))
+    }
+
+    /// Go's `strconv` error text: `strconv.<Func>: parsing <quoted>: <reason>`
+    /// (the `Error()` of the `*strconv.NumError` Go returns).
+    fn num_error(func: &str, num: &str, reason: &str) -> String {
+        format!("strconv.{func}: parsing {}: {reason}", super::go_quote(num))
+    }
+
+    const SYNTAX: &str = "invalid syntax";
+    const RANGE: &str = "value out of range";
+
+    /// Parse a signed integer in `base` the way `strconv` does: no surrounding
+    /// whitespace is allowed, and an out-of-range value saturates *and* reports a
+    /// range error (Go returns the clamped value alongside it).
+    fn parse_signed(s: &str, base: u32, func: &str) -> Value {
+        match i64::from_str_radix(s, base) {
+            Ok(n) => parsed(Value::Int(n), None),
+            Err(e) => {
+                let (v, reason) = match e.kind() {
+                    std::num::IntErrorKind::PosOverflow => (i64::MAX, RANGE),
+                    std::num::IntErrorKind::NegOverflow => (i64::MIN, RANGE),
+                    _ => (0, SYNTAX),
+                };
+                parsed(Value::Int(v), Some(num_error(func, s, reason)))
+            }
+        }
+    }
+
+    /// `strconv.Atoi(s) (int, error)` — a base-10 signed integer.
     fn b_atoi(vm: &mut VM, argc: u8) -> Value {
         let args = pop_args(vm, argc);
         let s = args.first().map(go_str).unwrap_or_default();
-        Value::Int(s.trim().parse::<i64>().unwrap_or(0))
+        parse_signed(&s, 10, "Atoi")
     }
 }
 
@@ -2797,6 +3031,11 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         }
         NumOp::Neg if matches!(a, Value::Int(_)) => Ok(Value::Int(a.to_int().wrapping_neg())),
         NumOp::Add => Ok(Value::str(format!("{}{}", go_str(a), go_str(b)))),
+        // A pointer compares by address, a struct value field by field.
+        NumOp::Eq | NumOp::Ne if ptr_eq(a, b).is_some() => {
+            let same = ptr_eq(a, b).unwrap_or(false);
+            Ok(Value::bool(if op == NumOp::Eq { same } else { !same }))
+        }
         NumOp::Eq => Ok(Value::bool(go_str(a) == go_str(b))),
         NumOp::Ne => Ok(Value::bool(go_str(a) != go_str(b))),
         NumOp::Lt => Ok(Value::bool(go_str(a) < go_str(b))),

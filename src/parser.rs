@@ -39,6 +39,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         generic_names,
         no_composite: false,
         anon_structs: HashMap::new(),
+        anon_interfaces: HashMap::new(),
     };
     p.program()
 }
@@ -60,6 +61,24 @@ struct Parser {
     /// position), keyed by a canonical name synthesized from their fields, so an
     /// identical shape shares one type. Merged into the program's declared types.
     anon_structs: HashMap<String, Vec<Param>>,
+    /// Anonymous interface types with a method set (`interface{ Unwrap() error }`
+    /// in a type-assertion or type-switch position), keyed by the canonical name
+    /// [`iface_name`] builds, so an identical method set shares one type. Merged
+    /// into the program's interface declarations.
+    anon_interfaces: HashMap<String, Vec<String>>,
+}
+
+/// The canonical name of an interface type with method set `methods`:
+/// `interface{Is;Unwrap}`, methods sorted so the written order does not matter
+/// (Go's interface identity ignores it too). An empty method set is the opaque
+/// `interface{}` every interface value already erases to.
+fn iface_name(methods: &mut Vec<String>) -> String {
+    if methods.is_empty() {
+        return "interface{}".to_string();
+    }
+    methods.sort();
+    methods.dedup();
+    format!("interface{{{}}}", methods.join(";"))
 }
 
 /// Collect names declared as `type Name struct` — including generic structs
@@ -307,6 +326,12 @@ impl Parser {
         for (name, fields) in std::mem::take(&mut self.anon_structs) {
             types.push(StructDecl { name, fields });
         }
+        // Register anonymous interface types (`interface{ Unwrap() error }` in a
+        // type-assertion or type-switch position) so the compiler can test a
+        // value's method set against them.
+        for (name, methods) in std::mem::take(&mut self.anon_interfaces) {
+            interfaces.push(InterfaceDecl { name, methods });
+        }
 
         Ok(Program {
             package,
@@ -338,27 +363,7 @@ impl Parser {
         match self.peek() {
             Tok::Interface => {
                 self.advance();
-                self.expect(&Tok::LBrace)?;
-                self.skip_semis();
-                let mut methods = Vec::new();
-                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
-                    // An element is either a method (`name(params) results`) or a
-                    // generic type-constraint term (`~int | ~float64`, an embedded
-                    // constraint name). A method is exactly `Ident (`; anything
-                    // else is a constraint term, which go-rs erases.
-                    if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::LParen) {
-                        methods.push(self.ident()?);
-                        self.expect(&Tok::LParen)?;
-                        self.skip_balanced_parens()?;
-                    }
-                    // Skip to the end of the element (method results, or the whole
-                    // constraint term including `~`, `|`, and bracketed types).
-                    while !matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::Eof) {
-                        self.advance();
-                    }
-                    self.skip_semis();
-                }
-                self.expect(&Tok::RBrace)?;
+                let methods = self.interface_body()?;
                 Ok(Some(TypeDecl::Interface(InterfaceDecl { name, methods })))
             }
             _ => {
@@ -367,6 +372,86 @@ impl Parser {
                 Ok(Some(TypeDecl::Struct(StructDecl { name, fields })))
             }
         }
+    }
+
+    /// Parse an interface body `{ … }` into its method set, each entry encoded by
+    /// [`method_sig`]. The `interface` keyword is already consumed; the opening
+    /// `{` is the current token.
+    ///
+    /// An element is either a method (`name(params) results`) or a generic
+    /// type-constraint term (`~int | ~float64`, an embedded constraint name). A
+    /// method is exactly `Ident (`; anything else is a constraint term, which
+    /// go-rs erases — constraints contribute no methods.
+    fn interface_body(&mut self) -> Result<Vec<String>, String> {
+        self.expect(&Tok::LBrace)?;
+        self.skip_semis();
+        let mut methods = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::LParen) {
+                let name = self.ident()?;
+                self.expect(&Tok::LParen)?;
+                let arity = self.skip_param_list()?;
+                let results = self.result_types()?;
+                methods.push(method_sig(&name, arity, &results));
+            }
+            // Skip to the end of the element (a constraint term including `~`,
+            // `|`, and bracketed types — a method's results are already parsed).
+            while !matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::Eof) {
+                self.advance();
+            }
+            self.skip_semis();
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(methods)
+    }
+
+    /// Consume an already-opened interface-method parameter list and return how
+    /// many parameters it declares — the top-level comma count plus one, which is
+    /// right whether the parameters are named (`a, b error`) or bare types
+    /// (`error, error`). Their types are not recorded (see [`method_sig`]).
+    fn skip_param_list(&mut self) -> Result<usize, String> {
+        let mut depth = 1;
+        let mut commas = 0;
+        let mut empty = true;
+        loop {
+            match self.advance() {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Comma if depth == 1 => {
+                    commas += 1;
+                    empty = false;
+                }
+                Tok::Eof => return Err("go-rs: unterminated `(` in interface method".to_string()),
+                _ => empty = false,
+            }
+        }
+        Ok(if empty { 0 } else { commas + 1 })
+    }
+
+    /// Parse an interface method's result list: nothing, one type, or a
+    /// parenthesized `(T, U)` list.
+    fn result_types(&mut self) -> Result<Vec<String>, String> {
+        if self.eat(&Tok::LParen) {
+            let mut out = Vec::new();
+            while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
+                out.push(self.type_name()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen)?;
+            return Ok(out);
+        }
+        if matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::Eof) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.type_name()?])
     }
 
     /// Parse a `{ field-decls }` struct body into its fields. The `struct`
@@ -538,10 +623,28 @@ impl Parser {
     fn func_decl(&mut self) -> Result<Func, String> {
         let line = self.line();
         self.expect(&Tok::Func)?;
-        // Optional method receiver: `func (r T) name(...)`.
+        // Optional method receiver: `func (r T) name(...)`, or the unnamed form
+        // `func (T) name(...)` / `func (*T) name(...)` a method that ignores its
+        // receiver may write. An unnamed receiver gets a placeholder name the
+        // body cannot refer to.
         let receiver = if matches!(self.peek(), Tok::LParen) {
             self.advance();
-            let rname = self.ident()?;
+            // The receiver is unnamed when the type is all that stands before
+            // the `)`: `*T`, `T`, or `pkg.T`.
+            let unnamed = match self.peek() {
+                Tok::Star => true,
+                Tok::Ident(_) => match self.peek2() {
+                    Tok::RParen => true,
+                    Tok::Dot => matches!(self.peek_at(3), Tok::RParen),
+                    _ => false,
+                },
+                _ => false,
+            };
+            let rname = if unnamed {
+                "$recv".to_string()
+            } else {
+                self.ident()?
+            };
             let rty = self.type_name()?;
             self.expect(&Tok::RParen)?;
             Some(Param {
@@ -733,24 +836,19 @@ impl Parser {
             Tok::Struct => self.anon_struct_type(),
             // An inline interface type — `interface{}` (the empty interface, so
             // `var x interface{}` / `[]interface{}` / an `interface{}`
-            // parameter) or a method set. go-rs types every interface value
-            // dynamically, so the body is consumed and the type erases to the
-            // one opaque `interface{}` name.
+            // parameter), or a method set (`interface{ Unwrap() error }`, how
+            // `errors.Is`/`As` walk a wrap chain). An empty method set erases to
+            // the one opaque `interface{}` name every interface value carries; a
+            // non-empty one is registered under its canonical name so a type
+            // assertion against it can test the value's method set.
             Tok::Interface => {
                 self.advance();
-                self.expect(&Tok::LBrace)?;
-                let mut depth = 1;
-                while depth > 0 {
-                    match self.advance() {
-                        Tok::LBrace => depth += 1,
-                        Tok::RBrace => depth -= 1,
-                        Tok::Eof => {
-                            return Err("go-rs: unterminated `{` in interface type".to_string())
-                        }
-                        _ => {}
-                    }
+                let mut methods = self.interface_body()?;
+                let name = iface_name(&mut methods);
+                if !methods.is_empty() {
+                    self.anon_interfaces.entry(name.clone()).or_insert(methods);
                 }
-                Ok("interface{}".to_string())
+                Ok(name)
             }
             // `func(params) results` — a function type (for function-typed
             // parameters/fields). Consumed structurally; go-rs treats every
@@ -928,7 +1026,7 @@ impl Parser {
             let elem = t.strip_prefix("[]").unwrap_or(t).to_string();
             let zero = if self.struct_names.contains(&elem) {
                 Expr::StructLit {
-                    type_name: elem,
+                    type_name: elem.clone(),
                     fields: Vec::new(),
                 }
             } else {
@@ -936,6 +1034,7 @@ impl Parser {
             };
             Some(Expr::Make {
                 is_map: false,
+                elem_ty: elem,
                 len: Some(Box::new(Expr::Int(len as i64))),
                 cap: None,
                 elem_zero: Box::new(zero),
@@ -1715,17 +1814,19 @@ impl Parser {
                         } else {
                             Some(self.expr()?)
                         };
-                        // A three-index (full) slice `s[low:high:max]` — the
-                        // capacity bound is parsed and ignored (go-rs sub-slices
-                        // copy, so capacity has no effect).
-                        if self.eat(&Tok::Colon) {
-                            let _ = self.expr()?;
-                        }
+                        // A three-index (full) slice `s[low:high:max]` — `max`
+                        // caps the result's capacity at `max - low`.
+                        let max = if self.eat(&Tok::Colon) {
+                            Some(self.expr()?)
+                        } else {
+                            None
+                        };
                         self.expect(&Tok::RBracket)?;
                         e = Expr::Slice {
                             recv: Box::new(e),
                             low: low.map(Box::new),
                             high: high.map(Box::new),
+                            max: max.map(Box::new),
                         };
                     } else {
                         self.expect(&Tok::RBracket)?;
@@ -2124,6 +2225,7 @@ impl Parser {
             is_map,
             len,
             cap,
+            elem_ty: elem_ty.to_string(),
             elem_zero: Box::new(zero_expr(elem_ty)),
         })
     }
