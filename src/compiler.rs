@@ -204,6 +204,9 @@ struct Compiler {
     struct_fields: HashMap<String, Vec<(String, String)>>,
     /// Method arities keyed by `(receiver type, method name)`.
     methods: HashMap<(String, String), usize>,
+    /// `(type, method)` for every method declared with a value receiver — the
+    /// receiver is copied at the call, so the method's writes stay local.
+    value_recv_methods: HashSet<(String, String)>,
     /// Method result counts keyed by `(receiver type, method name)` — lets a
     /// `v, ok := recv.M()` destructure a multi-value method return.
     method_nresults: HashMap<(String, String), usize>,
@@ -1043,11 +1046,20 @@ fn forwarder(outer: &str, inner: &str, src: &Func) -> Func {
     } else {
         vec![Stmt::Return(vec![call], src.line)]
     };
+    // The forwarder inherits the promoted method's receiver kind. Go promotes a
+    // pointer-receiver method into the outer type's *pointer* method set, so
+    // `d.Bump()` on an addressable `d` mutates the embedded field; giving the
+    // forwarder a value receiver would copy `d` and drop the write.
+    let by_pointer = src.receiver.as_ref().is_some_and(|r| r.ty.starts_with('*'));
     Func {
         name: src.name.clone(),
         receiver: Some(Param {
             name: recv,
-            ty: outer.to_string(),
+            ty: if by_pointer {
+                format!("*{outer}")
+            } else {
+                outer.to_string()
+            },
         }),
         params: src.params.clone(),
         variadic: src.variadic,
@@ -1087,11 +1099,18 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     let mut methods: HashMap<(String, String), usize> = HashMap::new();
     let mut method_nresults: HashMap<(String, String), usize> = HashMap::new();
+    // Methods declared with a *value* receiver (`func (t T)`, not `func (t *T)`).
+    // Go binds such a receiver to a copy, so the method cannot mutate the caller's
+    // struct; a pointer receiver binds the struct itself and is meant to.
+    let mut value_recv_methods: HashSet<(String, String)> = HashSet::new();
     for f in &prog.funcs {
         match &f.receiver {
             Some(r) => {
                 methods.insert((base_type(&r.ty), f.name.clone()), f.params.len());
                 method_nresults.insert((base_type(&r.ty), f.name.clone()), f.results.len());
+                if !r.ty.starts_with('*') {
+                    value_recv_methods.insert((base_type(&r.ty), f.name.clone()));
+                }
             }
             None => {
                 funcs.insert(
@@ -1178,6 +1197,26 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // ahead of `main`'s own body). Functions read these as globals.
     let globals = collect_globals(&prog.main);
 
+    // Tell the runtime which fields a struct value-copy must recurse into: those
+    // declared as a struct type by value. A `*T` field keeps its raw `*` here, so
+    // it is not in the plan and stays aliased — Go copies a pointer, not what it
+    // points at.
+    host::set_struct_plan(
+        struct_fields
+            .iter()
+            .map(|(name, fields)| {
+                (
+                    name.clone(),
+                    fields
+                        .iter()
+                        .filter(|(_, ty)| structs.contains(ty.as_str()))
+                        .map(|(f, _)| f.clone())
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         scope: None,
@@ -1188,6 +1227,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         structs,
         struct_fields,
         methods,
+        value_recv_methods,
         method_nresults,
         iface_methods,
         iface_names,
@@ -2489,7 +2529,9 @@ impl Compiler {
             Stmt::Defer { call, line } => self.compile_defer(call, *line)?,
             Stmt::Send { chan, val, line } => {
                 self.expr(chan)?;
-                self.expr(val)?;
+                // A send transfers a *copy* of a struct value: the sender may go
+                // on mutating its own variable without the receiver seeing it.
+                self.emit_value(val)?;
                 self.b.emit(Op::ChanSend, *line);
             }
             Stmt::Select {
@@ -3102,7 +3144,9 @@ impl Compiler {
                 self.expr(recv)?;
                 self.expr(index)?;
                 if op == AssignOp::Set {
-                    self.expr(value)?;
+                    // `m[k] = v` / `xs[i] = v` stores a *copy* of a struct value,
+                    // so a later write to `v` is not visible through the container.
+                    self.emit_value(value)?;
                 } else {
                     self.b.emit(Op::Dup2, line);
                     self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
@@ -3233,8 +3277,22 @@ impl Compiler {
             self.emit_get(&i, 0);
             self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
             self.b.emit(Op::CallBuiltin(host::GRANGE_VAL, 2), 0);
+            // The range variable is a *copy* of the element, so `for _, v := range
+            // xs { v.N = 1 }` leaves `xs` untouched — the single most damaging
+            // place aliasing showed up, because Go programs rely on it to mean
+            // "read-only walk".
+            let elem = self.elem_type_of(&self.type_name(iter));
+            if self.structs.contains(&elem) {
+                self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+            }
             self.emit_set(v, 0);
             self.types.insert(v.clone(), NumType::Unknown);
+            // Only when the element type is actually known: recording an empty
+            // one would clobber whatever an outer declaration of this name left
+            // behind, which is what `emit_narrow` and the width tags read.
+            if !elem.is_empty() {
+                self.decl_types.insert(v.clone(), elem);
+            }
         }
 
         for s in body {
@@ -3718,11 +3776,24 @@ impl Compiler {
         Ok(())
     }
 
+    /// Copy the receiver already on the stack when `ty.method` was declared with
+    /// a value receiver. Go binds `func (t T) m()` to a copy — `a.m()` cannot
+    /// change `a` — while `func (t *T) m()` binds the struct itself, which is the
+    /// shared handle go-rs already has.
+    fn emit_recv_copy(&mut self, ty: &str, method: &str) {
+        if self
+            .value_recv_methods
+            .contains(&(ty.to_string(), method.to_string()))
+        {
+            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+        }
+    }
+
     /// Lower a method call `recv.method(args)`. The receiver's static type names
     /// the method set; the receiver is passed as the first (deepest) argument.
-    /// Receivers use reference semantics (the receiver struct is not copied), so
-    /// a method mutating a field is observed by the caller — matching Go's
-    /// pointer-receiver idiom.
+    /// A *pointer*-receiver method gets the caller's own struct handle, so a
+    /// field it writes is observed by the caller; a value-receiver one gets a
+    /// copy ([`Self::emit_recv_copy`]) and cannot write through.
     fn method_call(
         &mut self,
         recv: &Expr,
@@ -3742,6 +3813,7 @@ impl Compiler {
                 ));
             }
             self.expr(recv)?;
+            self.emit_recv_copy(&ty, method);
             for a in args {
                 self.emit_value(a)?;
             }
@@ -3797,6 +3869,10 @@ impl Compiler {
             self.b.emit(Op::StrEq, line);
             let jf = self.b.emit(Op::JumpIfFalse(0), line);
             self.emit_get(&recv_tmp, line);
+            // The dispatch arm knows the concrete type, so the value-vs-pointer
+            // receiver question is answerable here even though the static type
+            // was not.
+            self.emit_recv_copy(t, method);
             for a in args {
                 self.emit_value(a)?;
             }
@@ -3920,8 +3996,36 @@ impl Compiler {
             Expr::MakeChan { elem_ty, .. } => format!("chan {elem_ty}"),
             // `<-ch` has the channel's element type.
             Expr::Recv { chan } => self.chan_elem_ty(chan),
+            // `s[i]` / `m[k]` has the container's element type. Naming it is what
+            // makes an indexed read of a struct element copy (Go value
+            // semantics): `e := xs[0]; e.N = 1` must not write through to `xs[0]`.
+            Expr::Index { recv, .. } => self.elem_type_of(&self.type_name(recv)),
             _ => String::new(),
         }
+    }
+
+    /// The element type of a written container type: `[]T` and `map[K]V` name
+    /// `T` and `V`. Anything else has no element type.
+    fn elem_type_of(&self, container: &str) -> String {
+        if let Some(elem) = container.strip_prefix("[]") {
+            return base_type(elem);
+        }
+        let Some(rest) = container.strip_prefix("map[") else {
+            return String::new();
+        };
+        // The key can carry brackets of its own (`map[[2]int]V`) and so can the
+        // value (`map[string][]T`), so the key ends at the `]` that closes the
+        // one `map[` opened — found by depth, not by first or last `]`.
+        let mut depth = 0usize;
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' if depth == 0 => return base_type(&rest[i + 1..]),
+                ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        String::new()
     }
 
     /// Emit one operand of a comparison. `*p` loads the pointed-to struct as a
@@ -4694,11 +4798,26 @@ impl Compiler {
             // `append(base, xs...)` — spread every element of the slice `xs`
             // into the result (not append the slice as a single element).
             if name == "append" && spread {
+                // Whether the elements being spread are struct *values*, which
+                // `append` copies. Read from the static element type here because
+                // the runtime cannot tell a `[]T` element from a `[]*T` one.
+                let elem = args
+                    .last()
+                    .map(|a| self.elem_type_of(&self.type_name(a)))
+                    .unwrap_or_default();
+                self.b.emit(
+                    if self.structs.contains(&elem) {
+                        Op::LoadTrue
+                    } else {
+                        Op::LoadFalse
+                    },
+                    line,
+                );
                 for a in args {
                     self.expr(a)?;
                 }
                 self.b.emit(
-                    Op::CallBuiltin(host::GAPPEND_SPREAD, args.len() as u8),
+                    Op::CallBuiltin(host::GAPPEND_SPREAD, args.len() as u8 + 1),
                     line,
                 );
                 return Ok(());
@@ -4734,8 +4853,17 @@ impl Compiler {
                 _ => None,
             };
             if let Some(id) = simple_builtin {
-                for a in args {
-                    self.expr(a)?;
+                for (i, a) in args.iter().enumerate() {
+                    // `append(s, v)` stores a *copy* of a struct element — the
+                    // appended variable stays independent of the slice. The base
+                    // slice (argument 0) is a reference and passes through; every
+                    // other builtin here takes no struct by value, so the copy is
+                    // asked for only where Go performs one.
+                    if id == host::GAPPEND && i > 0 {
+                        self.emit_value(a)?;
+                    } else {
+                        self.expr(a)?;
+                    }
                 }
                 self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
                 return Ok(());

@@ -8,6 +8,7 @@
 
 use fusevm::{NumOp, Value, VM};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// `fmt.Println` — space-separated operands, trailing newline, to stdout.
 pub const GPRINTLN: u16 = 800;
@@ -1381,6 +1382,27 @@ thread_local! {
     /// The per-run drained-closed-channel sentinel handle, allocated on first
     /// use and dropped by [`heap_reset`] along with the heap slot it names.
     static CHAN_CLOSED: RefCell<Option<Value>> = const { RefCell::new(None) };
+
+    /// Struct type name → the names of its fields that hold a struct **value**
+    /// (a field declared `T` where `T` is a struct type, not `*T`). Written once
+    /// per compile by [`set_struct_plan`], read by [`b_struct_copy`] so a copy
+    /// recurses exactly as far as Go's value semantics reach and no further: a
+    /// `*T` field is a pointer and must stay aliased, and slices/maps/channels
+    /// are reference types whose handle the copy shares.
+    ///
+    /// Keyed by field *name* rather than position: a keyed composite literal
+    /// (`T{B: 1, A: 2}`) may build the field vector in written order, so a
+    /// positional plan would recurse into the wrong field.
+    static STRUCT_PLAN: RefCell<HashMap<String, Vec<String>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record which struct fields a value-copy must recurse into. Called by the
+/// compiler, which is the only place the declared field types are known — the
+/// runtime sees a `Value::Obj` handle with no type information beyond the
+/// struct's own name.
+pub fn set_struct_plan(plan: HashMap<String, Vec<String>>) {
+    STRUCT_PLAN.with(|p| *p.borrow_mut() = plan);
 }
 
 /// Clear the object heap, defer stack, and panic state. Called at each run start.
@@ -1568,13 +1590,19 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
                 return Value::Undef;
             }
             let (len, cap) = (n as usize, if c < 0 { n as usize } else { c as usize });
+            // Each element gets its *own* zero value. Cloning one `Value` would
+            // share a struct zero's handle across every slot, so a write to
+            // `s[0].f` would appear in every element. `struct_copy` is the
+            // identity on a scalar zero, so the scalar case is unchanged.
+            let fill =
+                |k: usize| -> Vec<Value> { (0..k).map(|_| struct_copy(zero.clone())).collect() };
             if cap == len {
-                return Value::Obj(heap_alloc(HostObj::Slice(vec![zero; len])));
+                return Value::Obj(heap_alloc(HostObj::Slice(fill(len))));
             }
             // A `cap > len` slice is a view over a longer backing array — the
             // same shape Go's slice header has, so `cap` reports the spare room
             // and an append that fits writes into it instead of reallocating.
-            let backing = heap_alloc(HostObj::Slice(vec![zero; cap]));
+            let backing = heap_alloc(HostObj::Slice(fill(cap)));
             Value::Obj(heap_alloc(HostObj::SliceView {
                 backing,
                 offset: 0,
@@ -1673,21 +1701,28 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
 /// observable result (a caller reassigns the return value).
 fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
+    // Argument 0 is the compiler's answer to "is the element type a struct
+    // value?", from the static type of the spread operand. Deciding it here
+    // instead — by looking at what the elements happen to be — would copy a
+    // `[]*T`'s pointers, which Go shares.
+    let copy_elems = matches!(args.first(), Some(Value::Bool(true)));
     let mut out: Vec<Value> = Vec::new();
     let mut extend_from = |v: &Value| {
         if let Value::Obj(id) = v {
             if let Some((_, _, len)) = slice_backing(*id) {
                 for i in 0..len {
                     if let Some(e) = slice_get(*id, i) {
-                        out.push(e);
+                        // `append(dst, src...)` copies each element of `src`, so a
+                        // struct element in the result is independent of `src`'s.
+                        out.push(if copy_elems { struct_copy(e) } else { e });
                     }
                 }
             }
         }
     };
-    // First argument is the base slice (nil → empty); the rest are spread slices
-    // (normally exactly one).
-    for a in &args {
+    // Then the base slice (nil → empty), then the spread slices (normally
+    // exactly one).
+    for a in args.iter().skip(1) {
         extend_from(a);
     }
     Value::Obj(heap_alloc(HostObj::Slice(out)))
@@ -2162,35 +2197,51 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
-/// Deep-copy a struct value (Go value semantics). Non-struct values pass
-/// through unchanged (slices/maps are reference types and must NOT be copied).
+/// Copy a struct value (Go value semantics). Non-struct values pass through
+/// unchanged (slices/maps are reference types and must NOT be copied).
 fn b_struct_copy(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let v = args.first().cloned().unwrap_or(Value::Undef);
-    match v {
-        Value::Obj(id) => {
-            let cloned = HEAP.with(|h| {
-                let h = h.borrow();
-                match h.get(id as usize) {
-                    // The copy is a struct *value*, never the pointer it was taken
-                    // from, so it compares field-wise again.
-                    Some(HostObj::Struct {
-                        type_name, fields, ..
-                    }) => Some(HostObj::Struct {
-                        type_name: type_name.clone(),
-                        fields: fields.clone(),
-                        by_ref: false,
-                    }),
-                    _ => None,
-                }
-            });
-            match cloned {
-                Some(obj) => Value::Obj(heap_alloc(obj)),
-                None => v, // slice/map/other: reference type, share the handle
-            }
+    struct_copy(args.first().cloned().unwrap_or(Value::Undef))
+}
+
+/// One struct value copy, recursing into the fields [`STRUCT_PLAN`] records as
+/// struct-valued.
+///
+/// Go copies a struct *transitively*: assigning `outer{inner{1}, 2}` copies the
+/// embedded `inner` too, so a write through the copy is invisible to the
+/// original at every depth. Cloning only the field vector would share the
+/// nested struct's handle and let a write through the copy reach the original
+/// (`y := x; y.I.N = 8` used to change `x.I.N`).
+///
+/// The recursion is bounded without a visited set: Go rejects a struct type
+/// that contains itself by value ("invalid recursive type"), so the plan graph
+/// over value fields is a DAG. A pointer field breaks the cycle and is shared,
+/// which is what makes a self-referential `*T` node type copy correctly.
+fn struct_copy(v: Value) -> Value {
+    let Value::Obj(id) = v else { return v };
+    let parts = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Struct {
+            type_name, fields, ..
+        }) => Some((type_name.clone(), fields.clone())),
+        // slice/map/other: a reference type, share the handle.
+        _ => None,
+    });
+    let Some((type_name, mut fields)) = parts else {
+        return v;
+    };
+    let nested = STRUCT_PLAN.with(|p| p.borrow().get(&type_name).cloned().unwrap_or_default());
+    for (name, fv) in fields.iter_mut() {
+        if nested.iter().any(|n| n == name) {
+            *fv = struct_copy(fv.clone());
         }
-        other => other,
     }
+    // The copy is a struct *value*, never the pointer it was taken from, so it
+    // compares field-wise again.
+    Value::Obj(heap_alloc(HostObj::Struct {
+        type_name,
+        fields,
+        by_ref: false,
+    }))
 }
 
 /// Install the builtins plus the debug line-marker used by `go --dap`. The

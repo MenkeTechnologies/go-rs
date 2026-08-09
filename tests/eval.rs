@@ -2606,3 +2606,64 @@ func main() {
          9223372036854775808 4611686018427387904 true\n144\ndeferred -56\n",
     );
 }
+
+/// Go copies a struct value transitively, but only through the fields that are
+/// themselves struct *values*: a `*T`, slice or map field is a reference and the
+/// copy shares it. Getting one half right and the other wrong is silent data
+/// corruption in either direction, so both are pinned in one program — and each
+/// container slot must get its own zero, or a write to one appears in all.
+#[test]
+fn struct_copy_is_transitive_but_stops_at_reference_fields() {
+    let src = "package main
+
+import \"fmt\"
+
+type leaf struct{ N int }
+
+type mid struct {
+	L leaf
+	N int
+}
+
+type rich struct {
+	M mid
+	P *leaf
+	S []int
+	H map[string]int
+}
+
+func (r rich) byValue()    { r.M.L.N = 90 }
+func (r *rich) byPointer() { r.M.L.N = 70 }
+
+func main() {
+	base := rich{mid{leaf{1}, 2}, &leaf{3}, []int{4}, map[string]int{\"k\": 5}}
+	cp := base
+	cp.M.L.N = 10
+	cp.P.N = 30
+	cp.S[0] = 40
+	cp.H[\"k\"] = 50
+	fmt.Println(base.M.L.N, cp.M.L.N, base.P.N, base.S[0], base.H[\"k\"])
+
+	base.byValue()
+	fmt.Println(base.M.L.N)
+	base.byPointer()
+	fmt.Println(base.M.L.N)
+
+	xs := []mid{base.M}
+	out := xs[0]
+	out.L.N = 11
+	for _, v := range xs {
+		v.L.N = 12
+	}
+	fmt.Println(xs[0].L.N, out.L.N)
+
+	made := make([]mid, 3)
+	made[0].L.N = 21
+	fmt.Println(made)
+}
+";
+    assert_stdout(
+        src,
+        "1 10 30 40 50\n1\n70\n70 11\n[{{21} 0} {{0} 0} {{0} 0}]\n",
+    );
+}

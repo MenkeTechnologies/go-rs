@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 32;
+const SHAPES: u64 = 33;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -542,6 +542,43 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                 "\tp{n} := pt{{{x}, {y}}}\n\tq{n} := p{n}\n\tq{n}.scale({k})\n\tfmt.Println(p{n}.sum(), q{n}.sum(), q{n}.x, q{n}.y)\n"
             )
         }
+        // ── struct value semantics ────────────────────────────────────────
+        // Go copies a struct at every assignment, argument bind, return,
+        // container store, container read, range binding, channel send and
+        // value-receiver call — and does it *transitively*, so a nested struct
+        // field is copied too. A frontend that models a struct as a shared
+        // handle passes the flat case (`pt` in shape 17) while every nested one
+        // writes through to the original, which is silent data corruption
+        // rather than a visibly wrong answer. Every value here is printed after
+        // a deliberate write through the copy, so any missed copy shows up.
+        32 => {
+            uses.nested = true;
+            let (a, b, d) = (rng.int(-9, 20), rng.int(-9, 20), rng.int(1, 7));
+            let (w, x, y) = (rng.int(-5, 9), rng.int(-5, 9), rng.int(-5, 9));
+            format!(
+                "\tn{n} := node{{leaf{{{a}}}, {b}}}\n\
+                 \tc{n} := n{n}\n\tc{n}.k = {w}\n\tc{n}.l.n = {x}\n\
+                 \tfmt.Println(\"asg\", n{n}.k, n{n}.l.n, c{n}.k, c{n}.l.n)\n\
+                 \tfmt.Println(\"vrecv\", n{n}.valSum(), n{n}.k, n{n}.l.n)\n\
+                 \tn{n}.ptrBump({d})\n\tfmt.Println(\"precv\", n{n}.k, n{n}.l.n)\n\
+                 \tf{n} := func(v node) node {{ v.k = {y}; v.l.n = {y}; return v }}\n\
+                 \tg{n} := f{n}(n{n})\n\tfmt.Println(\"call\", n{n}.k, n{n}.l.n, g{n}.k, g{n}.l.n)\n\
+                 \txs{n} := []node{{n{n}, c{n}}}\n\txs{n} = append(xs{n}, g{n})\n\
+                 \te{n} := xs{n}[0]\n\te{n}.l.n = {w}\n\
+                 \tfmt.Println(\"idx\", xs{n}[0].l.n, e{n}.l.n)\n\
+                 \tfor _, v{n} := range xs{n} {{\n\t\tv{n}.k = {x}\n\t\tv{n}.l.n = {x}\n\t}}\n\
+                 \tfmt.Println(\"rng\", xs{n}[0].k, xs{n}[1].l.n, xs{n}[2].k)\n\
+                 \tys{n} := append([]node{{}}, xs{n}...)\n\tys{n}[0].l.n = {y}\n\
+                 \tfmt.Println(\"spread\", xs{n}[0].l.n, ys{n}[0].l.n)\n\
+                 \tm{n} := map[string]node{{\"a\": n{n}}}\n\tm{n}[\"b\"] = c{n}\n\
+                 \th{n} := m{n}[\"b\"]\n\th{n}.l.n = {a}\n\
+                 \tfmt.Println(\"map\", m{n}[\"b\"].l.n, h{n}.l.n)\n\
+                 \tk{n} := make(chan node, 1)\n\tk{n} <- n{n}\n\tr{n} := <-k{n}\n\tr{n}.l.n = {b}\n\
+                 \tfmt.Println(\"chan\", n{n}.l.n, r{n}.l.n)\n\
+                 \tfmt.Println(\"eq\", n{n} == c{n}, c{n} == c{n}, node{{leaf{{{a}}}, {b}}} == node{{leaf{{{a}}}, {b}}})\n\
+                 \tfmt.Println(\"val\", n{n}, c{n}, g{n}, xs{n}, m{n}[\"a\"])\n"
+            )
+        }
         // new(T) — a zero-valued struct pointer.
         18 => {
             uses.structs = true;
@@ -611,6 +648,8 @@ struct Uses {
     math: bool,
     errors: bool,
     structs: bool,
+    /// The nested-struct type the value-semantics shape copies through.
+    nested: bool,
     generic: bool,
     /// The defer/panic/recover shape's top-level helpers.
     deferred: bool,
@@ -652,6 +691,18 @@ fn program(seed: u64, only: Option<u64>) -> String {
             "type pt struct{ x, y int }\n\
              func (p pt) sum() int { return p.x + p.y }\n\
              func (p *pt) scale(k int) { p.x *= k; p.y *= k }\n\n",
+        );
+    }
+    if uses.nested {
+        // `valSum` writes to its value receiver before reading it: Go binds that
+        // receiver to a copy, so the answer is the same every call and the
+        // caller's struct is untouched. `ptrBump` is the pointer-receiver half,
+        // which must write through.
+        preamble.push_str(
+            "type leaf struct{ n int }\n\
+             type node struct {\n\tl leaf\n\tk int\n}\n\n\
+             func (v node) valSum() int { v.k = 99; v.l.n = 98; return v.k + v.l.n }\n\
+             func (v *node) ptrBump(d int) { v.k += d; v.l.n += d }\n\n",
         );
     }
     if uses.generic {

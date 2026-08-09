@@ -2330,7 +2330,17 @@ impl Parser {
             } else {
                 elem_ty.to_string()
             },
-            elem_zero: Box::new(zero_expr(elem_ty)),
+            // A struct element's zero is a zero-valued struct, not `0` — without
+            // it `make([]T, n)` fills with integers and the first `s[i].f = v`
+            // panics on a nil dereference. Same rule as `bare_array_init`.
+            elem_zero: Box::new(if self.struct_names.contains(elem_ty) {
+                Expr::StructLit {
+                    type_name: elem_ty.to_string(),
+                    fields: Vec::new(),
+                }
+            } else {
+                zero_expr(elem_ty)
+            }),
         })
     }
 }

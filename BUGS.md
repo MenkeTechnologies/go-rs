@@ -36,6 +36,46 @@ other channel operation is correct. Closing this needs a fusevm release
 carrying a channel-length op; vendoring or path-overriding fusevm to add one is
 not an option — the published pin is the contract.
 
+## Arrays are modeled as slices, so they are reference values
+
+```go
+a := [3]int{1, 2, 3}
+b := a
+b[0] = 9
+fmt.Println(a, b, a == b)   // go: [1 2 3] [9 2 3] false   go-rs: [9 2 3] [9 2 3] true
+```
+
+`[N]T` is erased to `[]T` at parse time (`var_decl_type` / `array_literal` in
+`src/parser.rs`), so an array is the same heap handle a slice is. Go's arrays
+are **values**, and every place that implies is wrong here — each of these was
+measured against `go1.26.5`:
+
+| construct | go | go-rs |
+|---|---|---|
+| `b := a; b[0] = 9` | `a` unchanged | `a` changed |
+| `f(a)` mutating its parameter | `a` unchanged | `a` changed |
+| `return g` then writing the result | `g` unchanged | `g` changed |
+| `var s [2]int = g; s[1] = 8` | `g` unchanged | `g` changed |
+| an array-typed struct field, copied with the struct | independent | shared |
+| `a == b` | element-wise | handle identity |
+| `for i, v := range a` with `a` written mid-loop | iterates a copy | reads the live array |
+| `m[[2]int{1,2}]` | hit | miss |
+
+The mutation rows are silent: the program keeps running with corrupted data.
+
+Closing it means carrying the length in the static type — `[N]T` rather than
+`[]T` — through `type_name`, `struct_fields` and the composite-literal path, so
+the copy sites that already exist for structs (see below) can fire for arrays
+too. The runtime side is nearly free: a copy is the same recursive walk
+`struct_copy` already does, and the heap object is already the right shape. It
+is the type-erasure in the parser that has to be undone first.
+
+Struct value semantics, by contrast, *are* implemented at every copy site —
+assignment, argument bind, return, container store, container read, `range`
+binding, channel send, `append`, value-receiver call — and recurse through
+nested struct fields while leaving pointer, slice and map fields shared. The
+gate for that is `parity-scripts/struct_value_semantics.go`.
+
 ## `map` operations are O(n) each, so building one is O(n²)
 
 ```go
@@ -143,8 +183,10 @@ source, which it cannot recover: tokens carry a line but no byte offset.
 
 ## Unsupported stdlib calls
 
-`fmt.Fprintln` / `fmt.Fprintf` (writer-directed output) and
-`strconv.FormatFloat` are rejected at compile time.
+`fmt.Fprintln` / `fmt.Fprintf` / `fmt.Fprint` (writer-directed output),
+`strconv.FormatFloat`, and `strings.Builder`'s methods (`WriteString`, `String`)
+are rejected at compile time. Each is a build failure rather than a wrong
+answer, so a program using one does not run at all.
 
 ## Constant-overflow is not diagnosed
 

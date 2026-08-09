@@ -126,7 +126,7 @@ Real Go, executed on fusevm:
 | Slices         | `[]T{…}`, `make([]T, n)` / `make([]T, n, cap)` (spare capacity is real backing-array room), `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` / three-index `s[lo:hi:max]` (the capacity bound is applied: the result's `cap` is `max - lo`, so a later `append` reallocates instead of clobbering the parent; two-index also on strings) that **share the backing array** (writes alias the parent; a re-slice is bounded by `cap`, not `len`; `append` writes in place when the backing has room, else reallocates by Go's `runtime.nextslicecap` growth so `cap` doubles the way Go's does), `len` / `cap` / `append`, `for i, v := range s`, `for i := range n` over an int (Go 1.22); a nested element type may be elided inside a literal (`[][]int{{1, 2}}`, `[]T{{…}}`); ranging a **string** yields runes (byte offset + code point, once per rune) |
 | Arrays         | fixed-size `[N]T` / `[...]T` (modeled as slices): sequential `[3]int{…}`, sparse index-keyed `[N]T{3: v}` with zero-fill, struct elements with elided `{…}`, and bare `var buf [N]scalar` zero-filled to N |
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m`; element types may be elided inside a literal (`map[string][]int{"a": {1, 2}}`). The zero value is a **typed nil** — it prints `map[]`, reads as empty, is `== nil`, and panics `assignment to entry in nil map` on a write, exactly as Go's does (a nil slice is the same: `[]`, `len` 0, appendable) |
-| Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return, **embedded fields** (`struct { Base }`, including `*Base`) whose fields and methods are **promoted** onto the outer type through any depth of embedding — an outer declaration shadows a promoted one, and a promoted method satisfies an interface |
+| Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** — transitive through nested struct fields — on assign, argument bind, return, container store and read, `range` binding, `append`, channel send and value-receiver calls, while pointer/slice/map fields stay shared; **embedded fields** (`struct { Base }`, including `*Base`) whose fields and methods are **promoted** onto the outer type through any depth of embedding — an outer declaration shadows a promoted one, and a promoted method satisfies an interface |
 | Methods        | value/pointer receivers (named or unnamed — `func (T) m()`), `recv.m(args)` dispatch by receiver type |
 | Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref, `new(T)` (a pointer to a zero value of `T`); a pointer shares the pointed-to struct, and `==` on an allocated pointer compares **identity** (two `errors.New("x")` are distinct) while struct values still compare field by field |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type; `any`/`interface{}` values, type assertions `x.(T)` (+ comma-ok `v, ok := x.(T)`), and type switches `switch v := x.(type) { case T: … }`. An interface **with a method set** — named or anonymous (`err.(interface{ Unwrap() error })`) — is matched by *method-set containment* on signatures, so `Unwrap() error` and `Unwrap() []error` are told apart, and embedded methods count |
@@ -226,12 +226,16 @@ slice element, and generic instantiation. Five further shapes cover unsigned
 vs logical `>>`, shifts at or past the width, conversion truncation), labelled
 and unlabelled `break`/`continue` nested two deep plus `switch` fallthrough,
 `defer`/`panic`/`recover` frame rules, and channels (`range`, comma-ok receive,
-`select` with `default`). The fixed-width shape runs its arithmetic both
-directly and inside a capturing closure, which are separate code paths. It
-diffs both interpreters byte-for-byte (stdout + exit status).
+`select` with `default`). A further shape covers **struct value semantics**
+through a nested struct: copy on assignment, argument bind, return, slice and
+map store, indexed read, `range` binding, `append` (including a spread),
+channel send, value- vs pointer-receiver calls, and field-wise `==`. The
+fixed-width shape runs its arithmetic both directly and inside a capturing
+closure, which are separate code paths. It diffs both interpreters
+byte-for-byte (stdout + exit status).
 
 `--only N` pins every generated block to statement shape `N`, so one shape's
-divergence rate is measurable instead of diluted across the other 31, and
+divergence rate is measurable instead of diluted across the other 32, and
 `--ours PATH` runs a go-rs binary built from another commit — together they are
 how a newly added shape is shown to actually exercise what it claims to.
 
@@ -300,10 +304,10 @@ superset):
   decimal for a statically-`float32` operand (including `[]float32`,
   `map[K]float32` and the operand struct's own fields), but the width is read
   from the static type at the `fmt` call site, so it does not survive erasure.
-- **Struct value semantics have a replication boundary** — a bare `var a [N]Struct`
-  (no literal) and circular self-referential structures share one element handle
-  rather than N distinct zero values; array/slice literals with explicit struct
-  elements copy correctly.
+- **Fixed-size arrays are reference values.** `[N]T` is erased to `[]T` at parse
+  time, so `b := a` on an array aliases instead of copying and `==` compares
+  handles instead of elements. Struct values are unaffected — those are copied
+  at every site Go copies them (see [`BUGS.md`](BUGS.md)).
 
 ## License
 
