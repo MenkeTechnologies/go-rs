@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 33;
+const SHAPES: u64 = 34;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -579,6 +579,58 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                  \tfmt.Println(\"val\", n{n}, c{n}, g{n}, xs{n}, m{n}[\"a\"])\n"
             )
         }
+        // ── fixed-size array value semantics ──────────────────────────────
+        // A Go array is a *value*, like a struct and unlike a slice: it is
+        // copied at assignment, argument bind, return, container read and
+        // store, channel send, `append`, and `range` — and elementwise, so an
+        // array of arrays or of structs separates at every depth while an array
+        // of slices keeps sharing. Shapes 12 and 13 already built arrays, but
+        // only ever read them back, so a frontend that modeled one as a slice
+        // handle scored clean on both. Every value here is printed after a
+        // deliberate write through what Go says is an independent copy.
+        33 => {
+            uses.structs = true;
+            uses.arrays = true;
+            let (a, b, c) = (rng.int(-9, 20), rng.int(-9, 20), rng.int(-9, 20));
+            let (d, w, x, y) = (
+                rng.int(1, 7),
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+                rng.int(-5, 9),
+            );
+            format!(
+                "\ta{n} := [3]int{{{a}, {b}, {c}}}\n\tb{n} := a{n}\n\tb{n}[0] = {w}\n\
+                 \tfmt.Println(\"asg\", a{n}, b{n})\n\
+                 \tc{n} := bumpArr(a{n}, {d})\n\tfmt.Println(\"call\", a{n}, c{n})\n\
+                 \tnz{n} := [2][2]int{{{{{a}, {b}}}, {{{c}, {w}}}}}\n\tmz{n} := nz{n}\n\tmz{n}[0][0] = {x}\n\
+                 \tfmt.Println(\"nest\", nz{n}, mz{n})\n\
+                 \tg{n} := grid{{a: [2]int{{{a}, {b}}}, q: [2]pt{{{{{c}, {w}}}, {{{x}, {y}}}}}}}\n\
+                 \th{n} := g{n}\n\th{n}.a[1] = {x}\n\th{n}.q[0].x = {y}\n\
+                 \tfmt.Println(\"field\", g{n}.a, h{n}.a, g{n}.q, h{n}.q)\n\
+                 \txs{n} := [][2]int{{{{{a}, {b}}}, {{{c}, {w}}}}}\n\
+                 \te{n} := xs{n}[0]\n\te{n}[0] = {x}\n\tfmt.Println(\"idx\", xs{n}[0], e{n})\n\
+                 \ts{n} := [2]int{{{x}, {y}}}\n\txs{n}[1] = s{n}\n\ts{n}[0] = {d}\n\
+                 \tfmt.Println(\"store\", xs{n}[1], s{n})\n\
+                 \tys{n} := append(xs{n}, s{n})\n\ts{n}[1] = {d}\n\
+                 \tzs{n} := append([][2]int{{}}, xs{n}...)\n\tzs{n}[0][0] = {w}\n\
+                 \tfmt.Println(\"append\", ys{n}[2], xs{n}[0], zs{n}[0])\n\
+                 \tm{n} := map[string][2]int{{\"a\": s{n}}}\n\tv{n} := m{n}[\"a\"]\n\tv{n}[0] = {y}\n\
+                 \tfmt.Println(\"map\", m{n}[\"a\"], v{n})\n\
+                 \tkm{n} := map[[2]int]int{{{{{a}, {b}}}: {x}}}\n\
+                 \tfmt.Println(\"key\", km{n}[[2]int{{{a}, {b}}}], len(km{n}))\n\
+                 \tk{n} := make(chan [3]int, 1)\n\tk{n} <- a{n}\n\trv{n} := <-k{n}\n\trv{n}[1] = {y}\n\
+                 \tfmt.Println(\"chan\", a{n}, rv{n})\n\
+                 \trs{n} := 0\n\tfor i{n}, ev{n} := range a{n} {{\n\t\tif i{n} == 0 {{\n\t\t\ta{n}[1] = {d}\n\t\t}}\n\t\trs{n} += ev{n}\n\t}}\n\
+                 \tfmt.Println(\"rng\", rs{n}, a{n})\n\
+                 \tfor _, ev{n} := range xs{n} {{\n\t\tev{n}[0] = {w}\n\t}}\n\
+                 \tfmt.Println(\"rngelem\", xs{n})\n\
+                 \tsh{n} := [2][]int{{{{{a}}}, {{{b}}}}}\n\tsk{n} := sh{n}\n\tsk{n}[0][0] = {x}\n\tsk{n}[1] = []int{{{y}}}\n\
+                 \tfmt.Println(\"share\", sh{n}, sk{n})\n\
+                 \tvar zv{n} [2][2]int\n\tvar zg{n} grid\n\
+                 \tfmt.Println(\"zero\", zv{n}, zg{n})\n\
+                 \tfmt.Println(\"eq\", [2]int{{{a}, {b}}} == [2]int{{{a}, {b}}}, a{n} == b{n}, nz{n} == mz{n})\n"
+            )
+        }
         // new(T) — a zero-valued struct pointer.
         18 => {
             uses.structs = true;
@@ -650,6 +702,9 @@ struct Uses {
     structs: bool,
     /// The nested-struct type the value-semantics shape copies through.
     nested: bool,
+    /// The array-valued struct and the array-taking helper the array
+    /// value-semantics shape copies through.
+    arrays: bool,
     generic: bool,
     /// The defer/panic/recover shape's top-level helpers.
     deferred: bool,
@@ -703,6 +758,16 @@ fn program(seed: u64, only: Option<u64>) -> String {
              type node struct {\n\tl leaf\n\tk int\n}\n\n\
              func (v node) valSum() int { v.k = 99; v.l.n = 98; return v.k + v.l.n }\n\
              func (v *node) ptrBump(d int) { v.k += d; v.l.n += d }\n\n",
+        );
+    }
+    if uses.arrays {
+        // `bumpArr` writes to its array parameter before returning it: Go binds
+        // that parameter to a copy, so the caller's array is untouched and the
+        // returned one carries the write. `grid` holds arrays by value, so
+        // copying a `grid` must copy them — including the `[2]pt`'s structs.
+        preamble.push_str(
+            "type grid struct {\n\ta [2]int\n\tq [2]pt\n}\n\n\
+             func bumpArr(a [3]int, d int) [3]int { a[0] += d; return a }\n\n",
         );
     }
     if uses.generic {

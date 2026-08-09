@@ -229,13 +229,17 @@ and unlabelled `break`/`continue` nested two deep plus `switch` fallthrough,
 `select` with `default`). A further shape covers **struct value semantics**
 through a nested struct: copy on assignment, argument bind, return, slice and
 map store, indexed read, `range` binding, `append` (including a spread),
-channel send, value- vs pointer-receiver calls, and field-wise `==`. The
+channel send, value- vs pointer-receiver calls, and field-wise `==`. A last one
+covers **array value semantics** over the same sites, plus the depths a struct
+does not reach: nested `[N][M]T`, an array of structs, an array-typed struct
+field, `range` over an array written mid-loop, an array map key, and the
+reference half (an array of slices keeps sharing its slices). The
 fixed-width shape runs its arithmetic both directly and inside a capturing
 closure, which are separate code paths. It diffs both interpreters
 byte-for-byte (stdout + exit status).
 
 `--only N` pins every generated block to statement shape `N`, so one shape's
-divergence rate is measurable instead of diluted across the other 32, and
+divergence rate is measurable instead of diluted across the other 33, and
 `--ours PATH` runs a go-rs binary built from another commit — together they are
 how a newly added shape is shown to actually exercise what it claims to.
 
