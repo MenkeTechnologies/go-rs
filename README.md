@@ -320,8 +320,11 @@ superset):
 - **`%T` erases a defined type over a non-struct base**, so `type Weekday int`
   prints as `int` — the parser discards the base type, and nothing at run time
   records the name. A defined *struct* type is named correctly.
-- **`%q` does not distribute over a slice**, so `[]string{"a","b"}` prints
-  `"[a b]"` where Go prints `["a" "b"]` (see [`BUGS.md`](BUGS.md)).
+- **An unassigned code point prints literally where Go escapes it**, so `%q` of
+  `0x378` is the raw rune rather than its `͸` escape. `unicode.IsPrint`'s
+  other three non-printable classes (the controls, the separators and the
+  private-use areas) are decided exactly; `Cn` needs the Unicode general-category
+  tables (see [`BUGS.md`](BUGS.md)).
 - **A call passes at most 255 arguments.** fusevm carries a call's argument
   count in a `u8`, and unlike a composite literal a call site has nothing to
   build up in chunks, so `fmt.Println` with 256 arguments is a compile error.

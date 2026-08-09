@@ -137,6 +137,20 @@ pub const GLIT_EXTEND: u16 = 966;
 /// copy of one of those, and [`GARRAY_COPY`] carries the tag across, so the tag
 /// survives assignment, a parameter bind, a return and an `any` box alike.
 pub const GARRAY_TAG: u16 = 967;
+/// `[value, type]` → the value with every slice inside it stamped with its
+/// *written* element type, for a `fmt` argument position only.
+///
+/// `fmt` reads `[]byte` as text under `%s`, `%q` and `%x` but distributes those
+/// verbs over the elements of any other slice — `%q` of a `[]byte("ab")` is
+/// `"ab"` and of a `[]int{97, 98}` is `['a' 'b']`. Nothing in the values tells
+/// the two apart: both are integer elements. So the written type rides in from
+/// the compiler, which walks it alongside the value and tags each slice node
+/// (including the ones nested in an array, a slice or a map value). Like the
+/// [`GF32_BOX`] / [`GU64_BOX`] width tags, the tagged value is a rebuilt copy
+/// used for display only, so the program's own slice is untouched — and an
+/// operand whose static type the compiler does not know is left untagged, where
+/// the byte-slice guess from the element values stands in.
+pub const GELEM_TAG: u16 = 968;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -306,6 +320,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
     vm.register_builtin(GARRAY_TAG, b_array_tag);
+    vm.register_builtin(GELEM_TAG, b_elem_tag);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
     vm.register_builtin(GMIN, b_min);
@@ -1064,9 +1079,18 @@ pub(crate) enum HostObj {
     /// `[3]int` from a 3-element `[]int`. The tag is set where an array is born
     /// (a composite literal, a zero value) and carried by [`array_copy`], so it
     /// survives into an `any` where a `fmt`-position box could not.
+    ///
+    /// `elem_ty` is the written element type (`byte`, `int`, `string`, …) and is
+    /// set only by [`b_elem_tag`], on the display copy of a `fmt` argument. It
+    /// exists because `fmt` reads a `[]byte` as text under `%s`/`%q`/`%x` and
+    /// distributes those verbs over the elements of every other slice, and the
+    /// elements alone cannot tell a `[]byte` from a `[]int`. `None` means the
+    /// compiler had no static type for the operand, and the formatter falls back
+    /// to guessing from the element values.
     Slice {
         elems: Vec<Value>,
         arr_ty: Option<String>,
+        elem_ty: Option<String>,
     },
     /// A sub-slice view `s[lo:hi]` sharing another slice's backing array at an
     /// offset, so element writes are visible through the parent (and vice versa).
@@ -1139,6 +1163,7 @@ impl HostObj {
         HostObj::Slice {
             elems,
             arr_ty: None,
+            elem_ty: None,
         }
     }
 }
@@ -1289,7 +1314,11 @@ fn box_for_fmt(v: &Value, spec: &str, tag: BoxTag) -> Value {
             }),
             _ => None,
         };
-        return Value::Obj(heap_alloc(HostObj::Slice { elems, arr_ty }));
+        return Value::Obj(heap_alloc(HostObj::Slice {
+            elems,
+            arr_ty,
+            elem_ty: None,
+        }));
     }
     if let Some(pairs) = map_pairs(v) {
         let boxed = pairs
@@ -2426,7 +2455,11 @@ fn array_copy(v: Value, elem_ty: &str) -> Value {
         Some(HostObj::Slice { arr_ty, .. }) => arr_ty.clone(),
         _ => None,
     });
-    Value::Obj(heap_alloc(HostObj::Slice { elems, arr_ty }))
+    Value::Obj(heap_alloc(HostObj::Slice {
+        elems,
+        arr_ty,
+        elem_ty: None,
+    }))
 }
 
 /// One struct value copy, recursing into the fields [`STRUCT_PLAN`] records as
@@ -2646,14 +2679,46 @@ pub(crate) fn go_quote(s: &str) -> String {
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
             '\u{b}' => out.push_str("\\v"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
+            c if !go_is_print(c) => out.push_str(&escape_rune(c as u32)),
             c => out.push(c),
         }
     }
     out.push('"');
     out
+}
+
+/// How `strconv.Quote` writes a rune it will not print literally: `\xNN` for a
+/// C0 control or `DEL`, `\uNNNN` inside the basic plane and `\UNNNNNNNN` above
+/// it. The named escapes (`\n`, `\t`, …) are matched before this is reached.
+fn escape_rune(c: u32) -> String {
+    match c {
+        0..=0x1f | 0x7f => format!("\\x{c:02x}"),
+        0..=0xffff => format!("\\u{c:04x}"),
+        _ => format!("\\U{c:08x}"),
+    }
+}
+
+/// Whether Go's `strconv` writes a rune literally inside a quoted string —
+/// `unicode.IsPrint`, which is every letter, mark, number, punctuation and
+/// symbol plus the ASCII space.
+///
+/// The three non-printable classes tested here are exact: `Cc` (the C0 and C1
+/// controls) is [`char::is_control`], every separator but the ASCII space is
+/// [`char::is_whitespace`], and the private-use areas are three fixed ranges.
+/// The fourth, `Cn` (code points Unicode has not assigned), needs the category
+/// tables Rust's standard library does not expose, so an unassigned rune still
+/// prints literally where Go escapes it — see BUGS.md.
+fn go_is_print(c: char) -> bool {
+    if c.is_control() {
+        return false;
+    }
+    if c == ' ' {
+        return true;
+    }
+    if c.is_whitespace() {
+        return false;
+    }
+    !matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
 }
 
 /// `%q` on an integer: Go quotes it as a rune literal (`'A'`, `'\n'`, `'世'`).
@@ -2686,12 +2751,17 @@ pub(crate) fn go_type_name(v: &Value) -> String {
         Value::Obj(id) => HEAP.with(|h| {
             let h = h.borrow();
             match h.get(*id as usize) {
+                // A `fmt`-tagged slice names its written element type, which is
+                // the only way `[]uint8` and `[]int32` are distinguishable from
+                // `[]int` — their elements are all plain integers.
                 Some(HostObj::Slice {
                     elems: a,
                     arr_ty: None,
-                }) => {
-                    format!("[]{}", elem_type_name(a.first()))
-                }
+                    elem_ty,
+                }) => match elem_ty {
+                    Some(t) => format!("[]{}", go_type_spelling(t)),
+                    None => format!("[]{}", elem_type_name(a.first())),
+                },
                 Some(HostObj::Slice {
                     arr_ty: Some(ty), ..
                 }) => ty.clone(),
@@ -2716,7 +2786,7 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 Some(HostObj::Cell(v)) => go_type_name(v),
                 // A typed nil records the type it was written as, so unlike a
                 // populated slice or map it needs no guess from its contents.
-                Some(HostObj::Nil { ty, .. }) => ty.clone(),
+                Some(HostObj::Nil { ty, .. }) => go_type_spelling(ty),
                 Some(HostObj::F32(_)) => "float32".to_string(),
                 Some(HostObj::U64 { ty, .. }) => ty.clone(),
                 // Every receive site maps the sentinel away, so it is only
@@ -2734,6 +2804,167 @@ fn elem_type_name(v: Option<&Value>) -> String {
         Some(v) => go_type_name(v),
         None => "interface {}".to_string(),
     }
+}
+
+/// How `%T` spells a written type.
+///
+/// `byte` and `rune` are Go aliases and `%T` prints the type they name, so a
+/// `[]byte` is `[]uint8` and a `[]rune` is `[]int32`. Any identifier that is not
+/// predeclared names a type declared in the program, which `%T` qualifies by its
+/// package — always `main` here. Both are applied per identifier, so
+/// `map[string]pt` renames only the element.
+pub(crate) fn go_type_spelling(ty: &str) -> String {
+    let mut out = String::with_capacity(ty.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        match word.as_str() {
+            "" => {}
+            "byte" => out.push_str("uint8"),
+            "rune" => out.push_str("int32"),
+            w if is_predeclared_type(w) => out.push_str(w),
+            w => {
+                out.push_str("main.");
+                out.push_str(w);
+            }
+        }
+        word.clear();
+    };
+    for c in ty.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// Whether `w` is one of Go's predeclared type names (plus the keywords that
+/// open a type literal), which `%T` prints unqualified. Everything else is
+/// declared in the program and carries its package.
+fn is_predeclared_type(w: &str) -> bool {
+    matches!(
+        w,
+        "bool"
+            | "string"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "any"
+            | "interface"
+            | "struct"
+            | "map"
+            | "chan"
+            | "func"
+    ) || w.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The element type of a written container type — `[]T` and `[N]T` name `T`,
+/// `map[K]V` names `V` — or `None` when the type is not a container. The key of
+/// a `map[K]V` can itself carry brackets (`map[[2]int]V`), so the key ends at
+/// the `]` closing the one `map[` opened, found by depth.
+fn elem_ty_spelling(ty: &str) -> Option<String> {
+    if let Some(rest) = ty.strip_prefix("[]") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = ty.strip_prefix("map[") {
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' if depth == 0 => return Some(rest[i + 1..].to_string()),
+                ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        return None;
+    }
+    // `[N]T` — a fixed-size array, whose length is digits between the brackets.
+    let rest = ty.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    rest[..close]
+        .chars()
+        .all(|c| c.is_ascii_digit())
+        .then(|| rest[close + 1..].to_string())
+}
+
+/// The map key type of a written `map[K]V`, or `None` for any other type.
+fn key_ty_spelling(ty: &str) -> Option<String> {
+    let rest = ty.strip_prefix("map[")?;
+    let mut depth = 0usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' if depth == 0 => return Some(rest[..i].to_string()),
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// [`GELEM_TAG`] — stamp the written element type on every slice inside a `fmt`
+/// argument. Stack `[value, type]`, where `type` is the operand's written type.
+fn b_elem_tag(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let ty = args.get(1).map(go_str).unwrap_or_default();
+    tag_elem_ty(&v, &ty)
+}
+
+/// Rebuild `v` with each slice node carrying the element type `ty` names at that
+/// depth. Like the width boxes, the result is a display copy: the program's own
+/// slice keeps no tag, so nothing it can observe changes.
+fn tag_elem_ty(v: &Value, ty: &str) -> Value {
+    let Some(elem) = elem_ty_spelling(ty) else {
+        return v.clone();
+    };
+    // A nil slice or map is not a rebuildable composite: it prints as `[]` /
+    // `map[]` but `%#v` names it `[]int(nil)`, which only the nil object knows.
+    if nil_composite_kind(v).is_some() {
+        return v.clone();
+    }
+    if let Some(pairs) = map_pairs(v) {
+        let key = key_ty_spelling(ty).unwrap_or_default();
+        let tagged = pairs
+            .into_iter()
+            .map(|(k, val)| (tag_elem_ty(&k, &key), tag_elem_ty(&val, &elem)))
+            .collect();
+        return Value::Obj(heap_alloc(HostObj::Map(tagged)));
+    }
+    let Some(es) = slice_elems(v) else {
+        return v.clone();
+    };
+    let elems: Vec<Value> = es.iter().map(|e| tag_elem_ty(e, &elem)).collect();
+    // The rebuild keeps the `[N]T` tag, or `%T` on a tagged array would fall
+    // back to naming it a slice.
+    let arr_ty = match v {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Slice { arr_ty, .. }) => arr_ty.clone(),
+            _ => None,
+        }),
+        _ => None,
+    };
+    Value::Obj(heap_alloc(HostObj::Slice {
+        elems,
+        arr_ty,
+        elem_ty: Some(elem),
+    }))
 }
 
 /// The elements of a slice value (materialising a sub-slice view), or `None`
@@ -2800,12 +3031,21 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
-            Some(HostObj::Slice { elems: a, .. }) => {
-                if sharp {
-                    format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
-                } else {
-                    format!("[{}]", elems(a))
+            Some(HostObj::Slice {
+                elems: a, elem_ty, ..
+            }) => {
+                if !sharp {
+                    return format!("[{}]", elems(a));
                 }
+                // `%#v` of a byte slice writes Go source for one: the alias name
+                // `[]byte` (where `%T` prints `[]uint8`) and hex element
+                // literals.
+                if elem_ty.as_deref().is_some_and(is_byte_elem) {
+                    let bytes: Vec<String> =
+                        a.iter().map(|e| format!("{:#04x}", e.to_int())).collect();
+                    return format!("[]byte{{{}}}", bytes.join(", "));
+                }
+                format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
             }
             Some(HostObj::SliceView {
                 backing,
@@ -3173,9 +3413,28 @@ fn go_print_spacing(args: &[Value]) -> String {
     out
 }
 
-/// A minimal `fmt.Printf`: the first argument is the format string; verbs
-/// `%v %d %s %f %t %q %%` consume successive arguments. Flags, width, and
-/// precision are skipped (slice 1). An unmatched verb falls back to `%v`.
+/// The flags, width and precision of one `%` verb, as written before it.
+#[derive(Clone, Copy, Default)]
+struct Spec {
+    /// `-`: pad on the right instead of the left.
+    left: bool,
+    /// `0`: pad a numeric verb with leading zeros, after any sign.
+    zero: bool,
+    /// `+`: always print a sign.
+    plus: bool,
+    /// `#`: the alternate form (`0x` on hex, back-quotes on `%q`, Go syntax on `%v`).
+    sharp: bool,
+    width: Option<usize>,
+    prec: Option<usize>,
+}
+
+/// `fmt.Printf`: the first argument is the format string and each verb consumes
+/// the next operand.
+///
+/// `%v` and `%T` describe an operand as a whole. Every other verb applies
+/// *element-wise* to a composite operand — [`render_verb`] does that — so the
+/// flags, width and precision parsed here belong to each element rather than to
+/// the whole rendering: `%8q` of a `[]string{"a", "b"}` is `[     "a"      "b"]`.
 fn sprintf(args: &[Value]) -> String {
     let fmt = args.first().map(go_str).unwrap_or_default();
     let mut out = String::new();
@@ -3194,13 +3453,13 @@ fn sprintf(args: &[Value]) -> String {
             break;
         }
         // flags
-        let (mut left, mut zero, mut plus, mut sharp) = (false, false, false, false);
+        let mut spec = Spec::default();
         while i < chars.len() {
             match chars[i] {
-                '-' => left = true,
-                '0' => zero = true,
-                '+' => plus = true,
-                '#' => sharp = true,
+                '-' => spec.left = true,
+                '0' => spec.zero = true,
+                '+' => spec.plus = true,
+                '#' => spec.sharp = true,
                 ' ' => {}
                 _ => break,
             }
@@ -3214,8 +3473,8 @@ fn sprintf(args: &[Value]) -> String {
             width = width * 10 + (chars[i] as usize - '0' as usize);
             i += 1;
         }
+        spec.width = has_width.then_some(width);
         // precision
-        let mut prec: Option<usize> = None;
         if i < chars.len() && chars[i] == '.' {
             i += 1;
             let mut p = 0usize;
@@ -3223,7 +3482,7 @@ fn sprintf(args: &[Value]) -> String {
                 p = p * 10 + (chars[i] as usize - '0' as usize);
                 i += 1;
             }
-            prec = Some(p);
+            spec.prec = Some(p);
         }
         if i >= chars.len() {
             break;
@@ -3231,200 +3490,21 @@ fn sprintf(args: &[Value]) -> String {
         let verb = chars[i];
         i += 1;
 
-        // Render the argument per verb (nil-safe on a missing argument).
-        let body = match verb {
-            '%' => {
-                out.push('%');
-                continue;
-            }
-            't' => rest.next().map(go_str).unwrap_or_default(),
-            // `%q` quotes a string with `strconv.Quote` and an integer as a rune
-            // literal; a composite quotes each element.
-            'q' => match rest.next() {
-                Some(Value::Int(n)) => go_quote_rune(*n),
-                Some(Value::Str(s)) => go_quote(s.as_str()),
-                Some(v) => match bytes_of(v) {
-                    Some(b) => go_quote(&String::from_utf8_lossy(&b)),
-                    None => go_quote(&go_str(v)),
-                },
-                None => "\"\"".to_string(),
-            },
+        match verb {
+            '%' => out.push('%'),
             // `%T` is the operand's type, not its value.
-            'T' => rest.next().map(go_type_name).unwrap_or_default(),
-            'f' | 'F' => {
-                let v = rest.next().map(arg_float).unwrap_or(0.0);
-                let s = if v.is_nan() {
-                    "NaN".to_string()
-                } else if v.is_infinite() {
-                    if v < 0.0 { "-Inf" } else { "+Inf" }.to_string()
-                } else {
-                    format!("{:.*}", prec.unwrap_or(6), v)
-                };
-                if plus && !s.starts_with('-') {
-                    format!("+{s}")
-                } else {
-                    s
-                }
-            }
-            'e' | 'E' => {
-                let v = rest.next().map(arg_float).unwrap_or(0.0);
-                let s = format_float_e(v, Some(prec.unwrap_or(6)), verb == 'E');
-                if plus && !s.starts_with('-') {
-                    format!("+{s}")
-                } else {
-                    s
-                }
-            }
-            // `%g` with no precision is the shortest round-tripping decimal —
-            // computed at the operand's own width, so a `float32` box narrows it.
-            'g' | 'G' => {
-                let arg = rest.next().cloned().unwrap_or(Value::Float(0.0));
-                let s = match (prec, unbox_f32(&arg)) {
-                    (None, Some(f)) => {
-                        let g = format_float32(f);
-                        if verb == 'G' {
-                            g.to_uppercase()
-                        } else {
-                            g
-                        }
-                    }
-                    _ => format_float_g(arg_float(&arg), prec, verb == 'G'),
-                };
-                if plus && !s.starts_with('-') {
-                    format!("+{s}")
-                } else {
-                    s
-                }
-            }
-            'd' => {
-                // `%d` on a slice distributes over the elements: `[1 2 3]`.
-                match rest.next() {
-                    Some(v) => match slice_elems(v) {
-                        Some(es) => format!(
-                            "[{}]",
-                            es.iter()
-                                .map(|e| e.to_int().to_string())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        ),
-                        None => match arg_uint(v) {
-                            Some(u) if plus => format!("+{u}"),
-                            Some(u) => u.to_string(),
-                            None => {
-                                let n = arg_int(v);
-                                if plus && n >= 0 {
-                                    format!("+{n}")
-                                } else {
-                                    n.to_string()
-                                }
-                            }
-                        },
-                    },
-                    None => "0".to_string(),
-                }
-            }
-            // `%x`/`%X` hex-encode a string or byte slice bytewise; on a number
-            // they are base-16 digits.
-            'x' | 'X' => {
-                let upper = verb == 'X';
-                let hex = |n: i64| {
-                    if upper {
-                        format!("{n:X}")
-                    } else {
-                        format!("{n:x}")
-                    }
-                };
-                let body = match rest.next() {
-                    // A string hex-encodes its bytes, two digits each and no
-                    // separator.
-                    Some(Value::Str(s)) => s
-                        .as_str()
-                        .bytes()
-                        .map(|b| {
-                            if upper {
-                                format!("{b:02X}")
-                            } else {
-                                format!("{b:02x}")
-                            }
-                        })
-                        .collect::<String>(),
-                    // A slice distributes the verb over its elements. (Go
-                    // hex-encodes a `[]byte` as one run of digits instead, but
-                    // go-rs carries no static element type to tell `[]byte` from
-                    // `[]int`, and the per-element form is the one that is right
-                    // for `[]int`.)
-                    Some(v) if slice_elems(v).is_some() => {
-                        let es = slice_elems(v).unwrap_or_default();
-                        format!(
-                            "[{}]",
-                            es.iter()
-                                .map(|e| hex(e.to_int()))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        )
-                    }
-                    Some(v) => match arg_uint(v) {
-                        Some(u) if upper => format!("{u:X}"),
-                        Some(u) => format!("{u:x}"),
-                        None => hex(arg_int(v)),
-                    },
-                    None => "0".to_string(),
-                };
-                if sharp {
-                    format!("{}{body}", if upper { "0X" } else { "0x" })
-                } else {
-                    body
-                }
-            }
-            // `%o`/`%b` read an unsigned operand as unsigned: a boxed `uint64`
-            // shows all 64 bits, not a signed `-` form.
-            'o' => match rest.next() {
-                Some(v) => match arg_uint(v) {
-                    Some(u) => format!("{u:o}"),
-                    None => format!("{:o}", arg_int(v)),
-                },
-                None => "0".to_string(),
-            },
-            'b' => match rest.next() {
-                Some(v) => match arg_uint(v) {
-                    Some(u) => format!("{u:b}"),
-                    None => format!("{:b}", arg_int(v)),
-                },
-                None => "0".to_string(),
-            },
-            'c' => char::from_u32(rest.next().map(arg_int).unwrap_or(0) as u32)
-                .map(|c| c.to_string())
-                .unwrap_or_default(),
-            // `%U` is Go's Unicode format: `U+4E16`, at least four hex digits.
-            'U' => {
-                let n = rest.next().map(|v| v.to_int()).unwrap_or(0);
-                format!("U+{:04X}", n.max(0))
-            }
-            // `%s` on a byte slice is its bytes as text, not the `%v` list form.
-            's' => match rest.next() {
-                Some(v) => {
-                    let mut s = match v {
-                        Value::Str(s) => s.as_str().to_string(),
-                        v => match bytes_of(v) {
-                            Some(b) => String::from_utf8_lossy(&b).into_owned(),
-                            None => go_str(v),
-                        },
-                    };
-                    if let Some(p) = prec {
-                        if s.chars().count() > p {
-                            s = s.chars().take(p).collect();
-                        }
-                    }
-                    s
-                }
-                None => String::new(),
-            },
-            // %v and anything else: Go's `%v` rendering (with `+`/`#` selecting
-            // the `%+v`/`%#v` struct forms), precision truncating a string.
-            _ => {
-                let mode = if sharp {
+            'T' => out.push_str(&pad(
+                &rest.next().map(go_type_name).unwrap_or_default(),
+                'T',
+                &spec,
+            )),
+            // `%v` and anything not a known verb render the whole value, with
+            // `+`/`#` selecting the `%+v` / `%#v` forms and precision truncating
+            // a string.
+            _ if !is_verb(verb) => {
+                let mode = if spec.sharp {
                     FmtMode::SharpV
-                } else if plus {
+                } else if spec.plus {
                     FmtMode::PlusV
                 } else {
                     FmtMode::V
@@ -3433,40 +3513,440 @@ fn sprintf(args: &[Value]) -> String {
                     .next()
                     .map(|v| go_str_mode(v, mode))
                     .unwrap_or_default();
-                if let Some(p) = prec {
+                if let Some(p) = spec.prec {
                     if s.chars().count() > p {
                         s = s.chars().take(p).collect();
                     }
                 }
-                s
+                out.push_str(&pad(&s, verb, &spec));
             }
-        };
-
-        // Apply width padding (right-justified by default; `-` left, `0` zero-fill
-        // for numeric verbs, after any sign).
-        let body_len = body.chars().count();
-        if has_width && body_len < width {
-            let pad = width - body_len;
-            if left {
-                out.push_str(&body);
-                out.push_str(&" ".repeat(pad));
-            } else if zero && matches!(verb, 'd' | 'f' | 'F' | 'x' | 'X' | 'o' | 'b') {
-                let (sign, digits) = match body.strip_prefix(['-', '+']) {
-                    Some(d) => (&body[..1], d),
-                    None => ("", body.as_str()),
-                };
-                out.push_str(sign);
-                out.push_str(&"0".repeat(pad));
-                out.push_str(digits);
-            } else {
-                out.push_str(&" ".repeat(pad));
-                out.push_str(&body);
-            }
-        } else {
-            out.push_str(&body);
+            _ => match rest.next() {
+                Some(v) => out.push_str(&render_verb(v, verb, &spec, 0)),
+                None => out.push_str(&pad(missing_operand(verb), verb, &spec)),
+            },
         }
     }
     out
+}
+
+/// Whether `c` is a verb [`render_verb`] renders element-wise. `v` and `T` are
+/// deliberately absent: they describe a composite as a whole.
+fn is_verb(c: char) -> bool {
+    matches!(
+        c,
+        't' | 'q'
+            | 'f'
+            | 'F'
+            | 'e'
+            | 'E'
+            | 'g'
+            | 'G'
+            | 'd'
+            | 'x'
+            | 'X'
+            | 'o'
+            | 'b'
+            | 'c'
+            | 'U'
+            | 's'
+    )
+}
+
+/// What a verb renders with no operand left. (Go writes `%!d(MISSING)`; go-rs
+/// keeps the verb's zero value, which is what the rest of the formatter assumes
+/// for an absent argument.)
+fn missing_operand(verb: char) -> &'static str {
+    match verb {
+        'q' => "\"\"",
+        's' | 'c' | 't' => "",
+        'f' | 'F' => "0.000000",
+        'e' => "0.000000e+00",
+        'E' => "0.000000E+00",
+        'U' => "U+0000",
+        _ => "0",
+    }
+}
+
+/// Render one operand under `verb`, distributing over a composite.
+///
+/// Go applies a verb to each element of a slice, array, map or struct and wraps
+/// the results the way `%v` would — `[e0 e1]`, `map[k0:v0]`, `{f0 f1}` — with
+/// the verb's flags, width and precision applied to each element. The exception
+/// is a byte slice under `%s`/`%q`/`%x`/`%X`, which is the text it holds and not
+/// a list; that holds at every depth, so a `[][]byte` prints its rows as
+/// strings.
+///
+/// `depth` is 0 only for the operand itself: a nil *inside* a composite prints
+/// `<nil>` where a nil operand is the bad-verb form `%!q(<nil>)`.
+fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
+    if matches!(verb, 's' | 'q' | 'x' | 'X') {
+        if let Some(b) = slice_bytes(v) {
+            let text = Value::str(String::from_utf8_lossy(&b).into_owned());
+            return pad(&scalar_verb(&text, verb, spec), verb, spec);
+        }
+    }
+    if let Some(es) = slice_elems(v) {
+        let body: Vec<String> = es
+            .iter()
+            .map(|e| render_verb(e, verb, spec, depth + 1))
+            .collect();
+        return format!("[{}]", body.join(" "));
+    }
+    if let Some(pairs) = map_pairs(v) {
+        // `fmt` orders map output by the *key values*, then renders each key and
+        // value with the verb — so the sort reads the plain `%v` spelling, which
+        // a bad-verb wrapper around the rendered key would otherwise scramble.
+        let mut rows: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, val)| {
+                (
+                    go_str(k),
+                    format!(
+                        "{}:{}",
+                        render_verb(k, verb, spec, depth + 1),
+                        render_verb(val, verb, spec, depth + 1)
+                    ),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
+        let body: Vec<String> = rows.into_iter().map(|(_, r)| r).collect();
+        return format!("map[{}]", body.join(" "));
+    }
+    if let Some(fields) = struct_fields_of(v) {
+        let body: Vec<String> = fields
+            .iter()
+            .map(|(_, f)| render_verb(f, verb, spec, depth + 1))
+            .collect();
+        return format!("{{{}}}", body.join(" "));
+    }
+    // An empty composite still has the shape of one: a nil slice under a
+    // non-string verb is `[]`, a nil map `map[]`.
+    if let Some(kind) = nil_composite_kind(v) {
+        return match kind {
+            NilKind::Slice => "[]".to_string(),
+            NilKind::Map => "map[]".to_string(),
+        };
+    }
+    if let Some(bad) = bad_verb(v, verb, spec, depth) {
+        return bad;
+    }
+    pad(&scalar_verb(v, verb, spec), verb, spec)
+}
+
+/// The bytes of a value `fmt` reads as text under `%s`/`%q`/`%x`: a `[]byte`.
+///
+/// The written element type decides it when the compiler knew one ([`GELEM_TAG`]
+/// stamps it); otherwise the elements are guessed from, which is right for the
+/// `[]byte` an untyped path produced and wrong for a `[]int` that happens to
+/// hold small numbers. An empty untagged slice is *not* guessed to be bytes:
+/// the guess is vacuously true there, and `[]` is the commoner answer.
+fn slice_bytes(v: &Value) -> Option<Vec<u8>> {
+    if let Value::Obj(id) = v {
+        // A nil `[]byte` is the empty string, a nil `[]int` the empty list.
+        let nil_ty = HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Nil { kind, ty }) => Some((*kind, ty.clone())),
+            _ => None,
+        });
+        if let Some((kind, ty)) = nil_ty {
+            let bytes =
+                kind == NilKind::Slice && elem_ty_spelling(&ty).is_some_and(|e| is_byte_elem(&e));
+            return bytes.then(Vec::new);
+        }
+    }
+    let tagged = slice_elem_tag(v);
+    if matches!(&tagged, Some(t) if !is_byte_elem(t)) {
+        return None;
+    }
+    let es = slice_elems(v)?;
+    if tagged.is_none() && es.is_empty() {
+        return None;
+    }
+    es.iter()
+        .map(|e| match e {
+            Value::Int(n) if (0..=255).contains(n) => Some(*n as u8),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a written element type spells one of Go's byte types.
+fn is_byte_elem(t: &str) -> bool {
+    matches!(t, "byte" | "uint8")
+}
+
+/// The element type [`GELEM_TAG`] stamped on a slice, if any.
+fn slice_elem_tag(v: &Value) -> Option<String> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Slice { elem_ty, .. }) => elem_ty.clone(),
+        _ => None,
+    })
+}
+
+/// Which kind of nil composite a value is, or `None` when it is not one.
+fn nil_composite_kind(v: &Value) -> Option<NilKind> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Nil { kind, .. }) => Some(*kind),
+        _ => None,
+    })
+}
+
+/// A struct's `(field, value)` pairs, or `None` when the value is not a struct.
+fn struct_fields_of(v: &Value) -> Option<Vec<(String, Value)>> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Struct { fields, .. }) => Some(fields.clone()),
+        _ => None,
+    })
+}
+
+/// Render one non-composite operand under `verb`, unpadded.
+fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
+    match verb {
+        't' => go_str(v),
+        // `%q` quotes a string with `strconv.Quote` and an integer as a rune
+        // literal. `#` asks for a back-quoted string where one is possible.
+        'q' => match v {
+            Value::Int(n) => go_quote_rune(*n),
+            _ => {
+                let mut s = go_str(v);
+                // Precision truncates the string before it is quoted, so `%.2q`
+                // of `"alpha"` is `"al"` — the quotes are not part of the count.
+                if let Some(p) = spec.prec {
+                    if s.chars().count() > p {
+                        s = s.chars().take(p).collect();
+                    }
+                }
+                if spec.sharp && !s.contains('`') && !s.contains('\n') {
+                    format!("`{s}`")
+                } else {
+                    go_quote(&s)
+                }
+            }
+        },
+        'f' | 'F' => {
+            let x = arg_float(v);
+            let s = if x.is_nan() {
+                "NaN".to_string()
+            } else if x.is_infinite() {
+                if x < 0.0 { "-Inf" } else { "+Inf" }.to_string()
+            } else {
+                format!("{:.*}", spec.prec.unwrap_or(6), x)
+            };
+            signed(s, spec)
+        }
+        'e' | 'E' => signed(
+            format_float_e(arg_float(v), Some(spec.prec.unwrap_or(6)), verb == 'E'),
+            spec,
+        ),
+        // `%g` with no precision is the shortest round-tripping decimal —
+        // computed at the operand's own width, so a `float32` box narrows it.
+        'g' | 'G' => {
+            let s = match (spec.prec, unbox_f32(v)) {
+                (None, Some(f)) => {
+                    let g = format_float32(f);
+                    if verb == 'G' {
+                        g.to_uppercase()
+                    } else {
+                        g
+                    }
+                }
+                _ => format_float_g(arg_float(v), spec.prec, verb == 'G'),
+            };
+            signed(s, spec)
+        }
+        'd' => match arg_uint(v) {
+            Some(u) if spec.plus => format!("+{u}"),
+            Some(u) => u.to_string(),
+            None => {
+                let n = arg_int(v);
+                if spec.plus && n >= 0 {
+                    format!("+{n}")
+                } else {
+                    n.to_string()
+                }
+            }
+        },
+        // `%x`/`%X` hex-encode a string bytewise.
+        'x' | 'X' if matches!(v, Value::Str(_)) => {
+            let upper = verb == 'X';
+            let body: String = go_str(v)
+                .bytes()
+                .map(|b| {
+                    if upper {
+                        format!("{b:02X}")
+                    } else {
+                        format!("{b:02x}")
+                    }
+                })
+                .collect();
+            if spec.sharp {
+                format!("{}{body}", if upper { "0X" } else { "0x" })
+            } else {
+                body
+            }
+        }
+        // The base-N verbs. Go prints a *signed* operand as a sign and the
+        // magnitude — `%x` of `-9` is `-9`, not the two's-complement bit pattern
+        // — and only an unsigned one reads all 64 bits. `#` writes the base
+        // prefix after the sign: `-0x9`, `-0b1001`, and a leading `0` for octal
+        // where the digits do not already start with one.
+        'x' | 'X' | 'o' | 'b' => {
+            let (neg, mag) = match arg_uint(v) {
+                Some(u) => (false, u),
+                None => {
+                    let n = arg_int(v);
+                    (n < 0, n.unsigned_abs())
+                }
+            };
+            let digits = match verb {
+                'x' => format!("{mag:x}"),
+                'X' => format!("{mag:X}"),
+                'o' => format!("{mag:o}"),
+                _ => format!("{mag:b}"),
+            };
+            let prefix = match (spec.sharp, verb) {
+                (false, _) => "",
+                (true, 'x') => "0x",
+                (true, 'X') => "0X",
+                (true, 'b') => "0b",
+                (true, _) if digits.starts_with('0') => "",
+                (true, _) => "0",
+            };
+            let sign = if neg {
+                "-"
+            } else if spec.plus {
+                "+"
+            } else {
+                ""
+            };
+            format!("{sign}{prefix}{digits}")
+        }
+        // A code point outside Unicode — a negative or too-large integer — is
+        // the replacement character, as Go's rune conversion makes it.
+        'c' => u32::try_from(arg_int(v))
+            .ok()
+            .and_then(char::from_u32)
+            .unwrap_or('\u{fffd}')
+            .to_string(),
+        // `%U` is Go's Unicode format: `U+4E16`, at least four hex digits. It
+        // reads the operand's bits unsigned, so a negative integer shows all 64
+        // (`U+FFFFFFFFFFFFFFF7`) rather than clamping to zero.
+        'U' => format!("U+{:04X}", v.to_int() as u64),
+        // `%s` on a byte slice is handled by the caller; here it is the value's
+        // own text, truncated by any precision.
+        's' => {
+            let mut s = match v {
+                Value::Str(s) => s.as_str().to_string(),
+                v => match bytes_of(v) {
+                    Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                    None => go_str(v),
+                },
+            };
+            if let Some(p) = spec.prec {
+                if s.chars().count() > p {
+                    s = s.chars().take(p).collect();
+                }
+            }
+            s
+        }
+        _ => go_str(v),
+    }
+}
+
+/// Go's bad-verb rendering — `%!q(bool=true)` — for the operand kinds a verb
+/// does not accept, or `None` when the verb accepts this one.
+///
+/// Only the kinds go-rs's value model names the same way Go's static types do
+/// are reported: a `Value::Str` is always a Go `string` and a `Value::Bool`
+/// always a `bool`, but a `Value::Int` can be an untyped constant that Go widened
+/// to a `float64` on the way into a `[]float64`, so `%f` of an integer stays a
+/// coercion rather than becoming a (wrong) `%!f(int=…)`.
+///
+/// `%b` and `%x`/`%X` are absent from the float row on purpose: Go accepts a
+/// float under both (`%x` of `1.5` is `0x1.8p+00`), so a float there is a
+/// *valid* operand go-rs renders differently, not a bad verb.
+///
+/// The operand inside the parentheses carries the verb's own width and
+/// precision — `%05d` of `"k"` is `%!d(string=0000k)` — so the bad form is
+/// already padded and the caller must not pad it again.
+fn bad_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> Option<String> {
+    // A nil operand is the bad-verb form on its own; nested in a composite it is
+    // just `<nil>`, which is what Go's `printValue` writes for an invalid entry.
+    if matches!(v, Value::Undef) {
+        return Some(if depth == 0 {
+            format!("%!{verb}(<nil>)")
+        } else {
+            "<nil>".to_string()
+        });
+    }
+    let bad = match verb {
+        'd' | 'o' | 'c' | 'U' => matches!(v, Value::Str(_) | Value::Bool(_) | Value::Float(_)),
+        'b' => matches!(v, Value::Str(_) | Value::Bool(_)),
+        'x' | 'X' => matches!(v, Value::Bool(_)),
+        'f' | 'F' | 'e' | 'E' | 'g' | 'G' => matches!(v, Value::Str(_) | Value::Bool(_)),
+        'q' => matches!(v, Value::Bool(_) | Value::Float(_)),
+        's' => matches!(v, Value::Bool(_) | Value::Int(_) | Value::Float(_)),
+        't' => !matches!(v, Value::Bool(_)),
+        _ => false,
+    };
+    if !bad {
+        return None;
+    }
+    let mut text = go_str(v);
+    if let Some(p) = spec.prec {
+        if text.chars().count() > p {
+            text = text.chars().take(p).collect();
+        }
+    }
+    Some(format!(
+        "%!{verb}({}={})",
+        go_type_name(v),
+        pad(&text, verb, spec)
+    ))
+}
+
+/// Apply `+` to an unsigned float rendering.
+fn signed(s: String, spec: &Spec) -> String {
+    if spec.plus && !s.starts_with('-') {
+        format!("+{s}")
+    } else {
+        s
+    }
+}
+
+/// Pad one rendered value to the verb's width: right-justified by default, `-`
+/// left, `0` zero-filling a numeric verb after any sign.
+fn pad(body: &str, verb: char, spec: &Spec) -> String {
+    let Some(width) = spec.width else {
+        return body.to_string();
+    };
+    let len = body.chars().count();
+    if len >= width {
+        return body.to_string();
+    }
+    let fill = width - len;
+    if spec.left {
+        return format!("{body}{}", " ".repeat(fill));
+    }
+    if spec.zero && matches!(verb, 'd' | 'f' | 'F' | 'x' | 'X' | 'o' | 'b') {
+        let (sign, rest) = match body.strip_prefix(['-', '+']) {
+            Some(d) => (&body[..1], d),
+            None => ("", body),
+        };
+        // A `#` base prefix sits between the sign and the zeros and does not
+        // count toward the width at all: `%#08x` of `-9` is `-0x0000009`, whose
+        // seven digits plus the sign make the eight. (Octal's prefix is a `0`,
+        // which the fill supplies on its own.)
+        let (prefix, digits) = match rest.get(..2) {
+            Some(p @ ("0x" | "0X" | "0b")) => (p, &rest[2..]),
+            _ => ("", rest),
+        };
+        return format!("{sign}{prefix}{}{digits}", "0".repeat(fill + prefix.len()));
+    }
+    format!("{}{body}", " ".repeat(fill))
 }
 
 /// A minimal `strings` and `strconv` standard library. Each exported function

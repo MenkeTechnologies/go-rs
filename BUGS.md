@@ -53,15 +53,22 @@ the name, so nothing downstream — static or dynamic — can recover it. A defi
 Closing it needs the name carried through the parser onto the values of that
 type, which is the same erasure that makes `[]Weekday` print `[]int`.
 
-## `%q` does not distribute over a slice
+## An unassigned code point prints literally where Go escapes it
 
 ```go
-fmt.Printf("%q\n", []string{"a", "b"})   // go: ["a" "b"]   go-rs: "[a b]"
+fmt.Printf("%q\n", 0x378)   // go: '͸'   go-rs: '͸'
 ```
 
-`%d` and `%x` distribute over a slice's elements (`slice_elems`, `src/host.rs`)
-but `%q` renders the container's `%v` form and quotes that one string. Go
-applies the verb elementwise for every verb, not just the numeric ones.
+`strconv.Quote` writes a rune literally when `unicode.IsPrint` accepts it —
+every letter, mark, number, punctuation and symbol, plus the ASCII space.
+`go_is_print` (`src/host.rs`) decides three of the four non-printable classes
+exactly: the C0 and C1 controls are `char::is_control`, every separator but the
+ASCII space is `char::is_whitespace`, and the private-use areas are three fixed
+ranges. The fourth is `Cn`, the code points Unicode has not assigned, which is
+neither a fixed range nor derivable from anything Rust's standard library
+exposes — it needs the general-category tables, and those change with the
+Unicode version. Closing it means carrying a category table (or a generated
+`IsPrint` range list) in the frontend.
 
 ## A call passes at most 255 arguments
 

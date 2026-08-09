@@ -4185,6 +4185,10 @@ impl Compiler {
                     .unwrap_or_default()
             }
             Expr::Call { func, .. } => match func.as_ref() {
+                // `[]byte(s)` / `[]rune(s)` name the slice type they convert to,
+                // which is what tells `fmt` the result is text rather than a
+                // list of numbers.
+                Expr::Ident(name) if matches!(name.as_str(), "[]byte" | "[]rune") => name.clone(),
                 Expr::Ident(name) => self
                     .funcs
                     .get(name)
@@ -4572,6 +4576,19 @@ impl Compiler {
         true
     }
 
+    /// The written type a `fmt` argument's slices should be tagged with, or
+    /// `None` when the operand is not a container the compiler has a static type
+    /// for. Only containers need the tag: it exists so the formatter can tell a
+    /// `[]byte` (text under `%s`/`%q`/`%x`) from a `[]int` (which those verbs
+    /// distribute over), and an operand with no static type is left untagged,
+    /// where the guess from the element values stands in.
+    fn elem_tag_spec(&self, e: &Expr) -> Option<String> {
+        let ty = self.type_name(e);
+        let ty = ty.trim_start_matches('*');
+        (ty.starts_with("[]") || ty.starts_with("map[") || array_elem_ty(ty).is_some())
+            .then(|| ty.to_string())
+    }
+
     /// How a `fmt` argument's `float32`s should be tagged, or `None` when it has
     /// none. `Some("")` tags the value (or each element of a `[]float32` /
     /// `map[K]float32`); `Some("x,y")` names the `float32` fields of a struct
@@ -4939,6 +4956,15 @@ impl Compiler {
                             let t = self.b.add_constant(Value::str(ty));
                             self.b.emit(Op::LoadConst(t), line);
                             self.b.emit(Op::CallBuiltin(host::GU64_BOX, 3), line);
+                        }
+                        // `%s`/`%q`/`%x` read a `[]byte` as text and distribute
+                        // over the elements of every other slice, and the values
+                        // alone cannot tell the two apart — so a container
+                        // operand carries its written type in.
+                        if let Some(ty) = self.elem_tag_spec(a) {
+                            let t = self.b.add_constant(Value::str(ty));
+                            self.b.emit(Op::LoadConst(t), line);
+                            self.b.emit(Op::CallBuiltin(host::GELEM_TAG, 2), line);
                         }
                     }
                     let argc = Self::call_arity(args.len(), &format!("fmt.{field}"), line)?;
