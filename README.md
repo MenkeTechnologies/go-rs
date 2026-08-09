@@ -124,7 +124,7 @@ Real Go, executed on fusevm:
 | Types          | `int` family, `float32/64`, `string`, `bool`, defined types (`type Celsius float64`) — tracked statically so `int / int` truncates and `float / float` stays exact, and so a `float32` expression is computed *at 32-bit width* and printed with the shortest decimal that round-trips at 32 bits; conversions `T(x)` (`int(f)`, `float64(n)`, `string(rune)`, `byte`/`rune`/…), conversion to an interface type (`error(e)`, `any(x)`, a declared `I(x)` — the identity), and slice conversions `[]byte(s)` / `[]rune(s)` (and `string([]byte)` / `string([]rune)` back) |
 | Constants      | `const x = …` and grouped `const ( … )` blocks with `iota` (auto-increment, expression repetition, `1 << iota` flag patterns) |
 | Slices         | `[]T{…}`, `make([]T, n)` / `make([]T, n, cap)` (spare capacity is real backing-array room), `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` / three-index `s[lo:hi:max]` (the capacity bound is applied: the result's `cap` is `max - lo`, so a later `append` reallocates instead of clobbering the parent; two-index also on strings) that **share the backing array** (writes alias the parent; a re-slice is bounded by `cap`, not `len`; `append` writes in place when the backing has room, else reallocates by Go's `runtime.nextslicecap` growth so `cap` doubles the way Go's does), `len` / `cap` / `append`, `for i, v := range s`, `for i := range n` over an int (Go 1.22); a nested element type may be elided inside a literal (`[][]int{{1, 2}}`, `[]T{{…}}`); ranging a **string** yields runes (byte offset + code point, once per rune) |
-| Arrays         | fixed-size `[N]T` / `[...]T` (modeled as slices): sequential `[3]int{…}`, sparse index-keyed `[N]T{3: v}` with zero-fill, struct elements with elided `{…}`, and bare `var buf [N]scalar` zero-filled to N |
+| Arrays         | fixed-size `[N]T` / `[...]T`: sequential `[3]int{…}`, sparse index-keyed `[N]T{3: v}` with zero-fill, elided element literals (`[2][2]int{{1, 2}, …}`, `[N]T{{…}}`), and bare `var buf [N]T` zero-filled to N element zeros. An array is a **value**, like a struct and unlike a slice: it is copied — elementwise, so nested arrays and struct elements separate at every depth, while slice/map/pointer elements stay shared — on assign, argument bind, return, container store and read, `append` (including a spread), channel send, and `range` (which walks a copy, so a write inside the loop is not seen by the remaining iterations). `==` compares elementwise, which makes an array a usable map key (`m[[2]int{1, 2}]`); `a[:]` yields a slice over that array's storage |
 | Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m`; element types may be elided inside a literal (`map[string][]int{"a": {1, 2}}`). The zero value is a **typed nil** — it prints `map[]`, reads as empty, is `== nil`, and panics `assignment to entry in nil map` on a write, exactly as Go's does (a nil slice is the same: `[]`, `len` 0, appendable) |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** — transitive through nested struct fields — on assign, argument bind, return, container store and read, `range` binding, `append`, channel send and value-receiver calls, while pointer/slice/map fields stay shared; **embedded fields** (`struct { Base }`, including `*Base`) whose fields and methods are **promoted** onto the outer type through any depth of embedding — an outer declaration shadows a promoted one, and a promoted method satisfies an interface |
 | Methods        | value/pointer receivers (named or unnamed — `func (T) m()`), `recv.m(args)` dispatch by receiver type |
@@ -304,10 +304,11 @@ superset):
   decimal for a statically-`float32` operand (including `[]float32`,
   `map[K]float32` and the operand struct's own fields), but the width is read
   from the static type at the `fmt` call site, so it does not survive erasure.
-- **Fixed-size arrays are reference values.** `[N]T` is erased to `[]T` at parse
-  time, so `b := a` on an array aliases instead of copying and `==` compares
-  handles instead of elements. Struct values are unaffected — those are copied
-  at every site Go copies them (see [`BUGS.md`](BUGS.md)).
+- **`%T` names an array by its runtime object, so it prints `[]int` for a
+  `[3]int`.** An array and a slice are the same heap object, and `%T` reads the
+  value rather than the static type. Only the *name* is affected: the value
+  semantics, `==`, map-key use and every copy site are the array's (see
+  [`BUGS.md`](BUGS.md)).
 
 ## License
 

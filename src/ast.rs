@@ -304,10 +304,19 @@ pub enum Expr {
         high: Option<Box<Expr>>,
         max: Option<Box<Expr>>,
     },
-    /// A slice composite literal `[]T{elems}`.
+    /// A slice composite literal `[]T{elems}`, or — when `array_len` is set — a
+    /// fixed-size array literal `[N]T{elems}` / `[...]T{elems}`.
+    ///
+    /// Both build the same heap object; the length is what separates them, and
+    /// it is what the *static* type says. A Go array is a **value**: it is
+    /// copied at assignment, argument bind, return, container read/store,
+    /// channel send, `append` and `range`. A slice is a reference. Carrying the
+    /// length here is what lets the compiler name the type `[N]T` rather than
+    /// `[]T` and so fire those copies (`Compiler::emit_copy_for`).
     SliceLit {
         elem_ty: String,
         elems: Vec<Expr>,
+        array_len: Option<usize>,
     },
     /// A map composite literal `map[K]V{k: v, …}`.
     MapLit {
@@ -409,4 +418,30 @@ pub fn set_stmt_label(s: &mut Stmt, name: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// The element type of a written fixed-size array type `[N]T`, or `None` for
+/// anything else — including the slice type `[]T`, whose empty bracket is the
+/// one thing that distinguishes the two spellings.
+///
+/// `[N]T` is the *value* form and `[]T` the reference form, so this predicate is
+/// what every copy site consults. `N` is already folded to a decimal literal by
+/// the parser, so it never contains a bracket of its own and the first `]` is
+/// the closing one. A size the parser could not fold is written `[]T`, which
+/// reads here as a slice — the pre-array behaviour, not a wrong answer about a
+/// different type.
+pub fn array_elem_ty(ty: &str) -> Option<&str> {
+    let rest = ty.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    if close == 0 {
+        return None; // `[]T` — a slice.
+    }
+    Some(&rest[close + 1..])
+}
+
+/// The length of a written fixed-size array type `[N]T`, or `None`.
+pub fn array_len_of(ty: &str) -> Option<usize> {
+    let rest = ty.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    rest[..close].parse().ok()
 }

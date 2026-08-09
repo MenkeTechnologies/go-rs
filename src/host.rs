@@ -108,6 +108,14 @@ pub const GCHAN_VAL: u16 = 963;
 /// `[received]` → `Bool`: the `ok` of `v, ok := <-ch`. False exactly when the
 /// receive found the channel closed and drained.
 pub const GCHAN_OK: u16 = 964;
+/// `[array, elemType]` → a copy of a fixed-size array value (Go array value
+/// semantics on assign / pass / return / container read / container store /
+/// channel send / `append` / `range`).
+///
+/// The element type is passed because an array and a slice are the same heap
+/// object here, so only the written type says whether an element is itself a
+/// value (copy) or a reference (share).
+pub const GARRAY_COPY: u16 = 965;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -274,6 +282,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GFIELD_GET, b_field_get);
     vm.register_builtin(GFIELD_SET, b_field_set);
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
+    vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
     vm.register_builtin(GMIN, b_min);
@@ -1383,17 +1392,22 @@ thread_local! {
     /// use and dropped by [`heap_reset`] along with the heap slot it names.
     static CHAN_CLOSED: RefCell<Option<Value>> = const { RefCell::new(None) };
 
-    /// Struct type name → the names of its fields that hold a struct **value**
-    /// (a field declared `T` where `T` is a struct type, not `*T`). Written once
-    /// per compile by [`set_struct_plan`], read by [`b_struct_copy`] so a copy
-    /// recurses exactly as far as Go's value semantics reach and no further: a
-    /// `*T` field is a pointer and must stay aliased, and slices/maps/channels
-    /// are reference types whose handle the copy shares.
+    /// Struct type name → the `(name, written type)` of each of its fields that
+    /// holds a **value**: a field declared `T` where `T` is a struct type (not
+    /// `*T`), or a fixed-size array `[N]T`. Written once per compile by
+    /// [`set_struct_plan`], read by [`b_struct_copy`] so a copy recurses exactly
+    /// as far as Go's value semantics reach and no further: a `*T` field is a
+    /// pointer and must stay aliased, and slices/maps/channels are reference
+    /// types whose handle the copy shares.
+    ///
+    /// The field's type is carried, not just its name, because an array field's
+    /// copy needs its element type — the heap cannot tell `[2][3]int` (copy the
+    /// inner arrays) from `[2][]int` (share the inner slices).
     ///
     /// Keyed by field *name* rather than position: a keyed composite literal
     /// (`T{B: 1, A: 2}`) may build the field vector in written order, so a
     /// positional plan would recurse into the wrong field.
-    static STRUCT_PLAN: RefCell<HashMap<String, Vec<String>>> =
+    static STRUCT_PLAN: RefCell<HashMap<String, Vec<(String, String)>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -1401,7 +1415,7 @@ thread_local! {
 /// compiler, which is the only place the declared field types are known — the
 /// runtime sees a `Value::Obj` handle with no type information beyond the
 /// struct's own name.
-pub fn set_struct_plan(plan: HashMap<String, Vec<String>>) {
+pub fn set_struct_plan(plan: HashMap<String, Vec<(String, String)>>) {
     STRUCT_PLAN.with(|p| *p.borrow_mut() = plan);
 }
 
@@ -1549,6 +1563,14 @@ fn key_eq(a: &Value, b: &Value) -> bool {
                             && fx.len() == fy.len()
                             && fx.iter().zip(fy).all(|((_, va), (_, vb))| key_eq(va, vb))
                     }
+                    // An *array* key compares elementwise, which is why
+                    // `m[[2]int{1, 2}]` finds the entry a differently-allocated
+                    // `[2]int{1, 2}` stored. Reaching a slice here is not
+                    // possible in a program `go` accepts — a slice is not a
+                    // comparable type and so cannot be a map key at all.
+                    (Some(HostObj::Slice(ex)), Some(HostObj::Slice(ey))) => {
+                        ex.len() == ey.len() && ex.iter().zip(ey).all(|(a, b)| key_eq(a, b))
+                    }
                     _ => false,
                 }
             })
@@ -1591,11 +1613,13 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
             }
             let (len, cap) = (n as usize, if c < 0 { n as usize } else { c as usize });
             // Each element gets its *own* zero value. Cloning one `Value` would
-            // share a struct zero's handle across every slot, so a write to
-            // `s[0].f` would appear in every element. `struct_copy` is the
-            // identity on a scalar zero, so the scalar case is unchanged.
-            let fill =
-                |k: usize| -> Vec<Value> { (0..k).map(|_| struct_copy(zero.clone())).collect() };
+            // share a struct (or array) zero's handle across every slot, so a
+            // write to `s[0].f` would appear in every element. `value_copy` is
+            // the identity on a scalar zero, so the scalar case is unchanged.
+            let elem_ty = args.get(4).map(go_str).unwrap_or_default();
+            let fill = |k: usize| -> Vec<Value> {
+                (0..k).map(|_| value_copy(zero.clone(), &elem_ty)).collect()
+            };
             if cap == len {
                 return Value::Obj(heap_alloc(HostObj::Slice(fill(len))));
             }
@@ -1701,11 +1725,12 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
 /// observable result (a caller reassigns the return value).
 fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    // Argument 0 is the compiler's answer to "is the element type a struct
-    // value?", from the static type of the spread operand. Deciding it here
-    // instead — by looking at what the elements happen to be — would copy a
-    // `[]*T`'s pointers, which Go shares.
-    let copy_elems = matches!(args.first(), Some(Value::Bool(true)));
+    // Argument 0 is the compiler's answer to "is the element type a Go *value*
+    // type, and if so which?", from the static type of the spread operand —
+    // empty when it is a reference type. Deciding it here instead, by looking at
+    // what the elements happen to be, would copy a `[]*T`'s pointers and share a
+    // `[][2]int`'s arrays; Go does the opposite of both.
+    let elem_ty = args.first().map(go_str).unwrap_or_default();
     let mut out: Vec<Value> = Vec::new();
     let mut extend_from = |v: &Value| {
         if let Value::Obj(id) = v {
@@ -1713,8 +1738,12 @@ fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
                 for i in 0..len {
                     if let Some(e) = slice_get(*id, i) {
                         // `append(dst, src...)` copies each element of `src`, so a
-                        // struct element in the result is independent of `src`'s.
-                        out.push(if copy_elems { struct_copy(e) } else { e });
+                        // value element in the result is independent of `src`'s.
+                        out.push(if elem_ty.is_empty() {
+                            e
+                        } else {
+                            value_copy(e, &elem_ty)
+                        });
                     }
                 }
             }
@@ -2204,6 +2233,45 @@ fn b_struct_copy(vm: &mut VM, argc: u8) -> Value {
     struct_copy(args.first().cloned().unwrap_or(Value::Undef))
 }
 
+/// Copy a fixed-size array value (Go array value semantics), given its written
+/// element type. Non-array values pass through unchanged.
+fn b_array_copy(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let elem_ty = args.get(1).map(go_str).unwrap_or_default();
+    array_copy(args.first().cloned().unwrap_or(Value::Undef), &elem_ty)
+}
+
+/// One value copy for a value of written type `ty`: an array copy when `ty` is
+/// `[N]T`, a struct copy otherwise (which is the identity on anything that is
+/// not a struct, so a scalar or a reference passes straight through).
+fn value_copy(v: Value, ty: &str) -> Value {
+    match crate::ast::array_elem_ty(ty) {
+        Some(elem) => array_copy(v, elem),
+        None => struct_copy(v),
+    }
+}
+
+/// One fixed-size array copy, recursing into elements that are themselves
+/// values.
+///
+/// Go copies an array elementwise: `b := a` on a `[2][3]int` gives two
+/// independent 2×3 arrays, and on a `[2]pt` two independent structs — while a
+/// `[2][]int`'s two slices stay shared, because a slice is a reference. Which of
+/// those an element is cannot be read off the heap (an array and a slice are the
+/// same [`HostObj::Slice`]), so `elem_ty` — the *written* element type — decides
+/// it. A struct element needs no such hint: [`struct_copy`] recognises one at
+/// run time and is the identity on everything else.
+fn array_copy(v: Value, elem_ty: &str) -> Value {
+    let Value::Obj(id) = v else { return v };
+    let Some((_, _, len)) = slice_backing(id) else {
+        return v;
+    };
+    let elems: Vec<Value> = (0..len)
+        .map(|i| value_copy(slice_get(id, i).unwrap_or(Value::Undef), elem_ty))
+        .collect();
+    Value::Obj(heap_alloc(HostObj::Slice(elems)))
+}
+
 /// One struct value copy, recursing into the fields [`STRUCT_PLAN`] records as
 /// struct-valued.
 ///
@@ -2231,8 +2299,8 @@ fn struct_copy(v: Value) -> Value {
     };
     let nested = STRUCT_PLAN.with(|p| p.borrow().get(&type_name).cloned().unwrap_or_default());
     for (name, fv) in fields.iter_mut() {
-        if nested.iter().any(|n| n == name) {
-            *fv = struct_copy(fv.clone());
+        if let Some((_, fty)) = nested.iter().find(|(n, _)| n == name) {
+            *fv = value_copy(fv.clone(), fty);
         }
     }
     // The copy is a struct *value*, never the pointer it was taken from, so it

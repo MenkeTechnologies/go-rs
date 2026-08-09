@@ -2667,3 +2667,102 @@ func main() {
         "1 10 30 40 50\n1\n70\n70 11\n[{{21} 0} {{0} 0} {{0} 0}]\n",
     );
 }
+
+/// A fixed-size array is a Go *value*: `[N]T` is copied at assignment, argument
+/// bind, return, container read and store, `append`, channel send and `range`,
+/// and elementwise — so an array of arrays or of structs separates at every
+/// depth. `[]T` is the same heap object here and must keep sharing at all of
+/// them, so both halves are pinned in one program: getting either wrong is
+/// silent data corruption in the opposite direction.
+#[test]
+fn array_copy_is_elementwise_but_its_slice_elements_stay_shared() {
+    let src = "package main
+
+import \"fmt\"
+
+type pt struct{ X, Y int }
+
+type grid struct {
+	A [2]int
+	Q [2]pt
+	S []int
+}
+
+func bump(a [3]int, d int) [3]int {
+	a[0] += d
+	return a
+}
+
+func main() {
+	a := [3]int{1, 2, 3}
+	b := a
+	b[0] = 9
+	fmt.Println(a, b, bump(a, 5), a)
+
+	n := [2][2]int{{1, 2}, {3, 4}}
+	m := n
+	m[0][0] = 8
+	fmt.Println(n, m, n == m, [2]int{1, 2} == [2]int{1, 2})
+
+	g := grid{A: [2]int{1, 2}, Q: [2]pt{{3, 4}, {5, 6}}, S: []int{7}}
+	h := g
+	h.A[1] = 20
+	h.Q[1].Y = 60
+	h.S[0] = 70
+	fmt.Println(g.A, h.A, g.Q, h.Q, g.S, h.S)
+
+	xs := [][2]int{{1, 2}, {3, 4}}
+	r := xs[0]
+	r[0] = 11
+	q := [2]int{5, 6}
+	xs[1] = q
+	q[0] = 12
+	fmt.Println(xs, r, q)
+
+	zs := append([][2]int{}, xs...)
+	zs[0][0] = 14
+	fmt.Println(xs[0], zs[0])
+
+	ch := make(chan [3]int, 1)
+	ch <- a
+	rv := <-ch
+	rv[1] = 16
+	fmt.Println(a, rv)
+
+	sum := 0
+	for i, ev := range a {
+		if i == 0 {
+			a[1] = 100
+		}
+		sum += ev
+	}
+	fmt.Println(sum, a)
+
+	sh := [2][]int{{1, 2}, {3}}
+	sk := sh
+	sk[0][0] = 40
+	sk[1] = []int{8}
+	fmt.Println(sh, sk)
+
+	var z [2][2]int
+	var zg grid
+	fmt.Println(z, zg)
+
+	km := map[[2]int]string{{1, 2}: \"a\"}
+	fmt.Println(km[[2]int{1, 2}], len(km))
+}
+";
+    assert_stdout(
+        src,
+        "[1 2 3] [9 2 3] [6 2 3] [1 2 3]\n\
+         [[1 2] [3 4]] [[8 2] [3 4]] false true\n\
+         [1 2] [1 20] [{3 4} {5 6}] [{3 4} {5 60}] [70] [70]\n\
+         [[1 2] [5 6]] [11 2] [12 6]\n\
+         [1 2] [14 2]\n\
+         [1 2 3] [1 16 3]\n\
+         6 [1 100 3]\n\
+         [[40 2] [3]] [[40 2] [8]]\n\
+         [[0 0] [0 0]] {[0 0] [{0 0} {0 0}] []}\n\
+         a 1\n",
+    );
+}

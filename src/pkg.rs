@@ -546,6 +546,12 @@ impl Qualifier {
         if let Some(rest) = ty.strip_prefix("[]") {
             return format!("[]{}", self.qual_type(rest));
         }
+        // `[N]T` — the length is part of the type and is kept verbatim; only the
+        // element name is a candidate for qualification.
+        if let (Some(rest), Some(n)) = (crate::ast::array_elem_ty(ty), crate::ast::array_len_of(ty))
+        {
+            return format!("[{n}]{}", self.qual_type(rest));
+        }
         // `alias.T` — a type from an imported source package.
         if let Some((a, t)) = ty.split_once('.') {
             if let Some(p) = self.aliases.get(a) {
@@ -774,7 +780,7 @@ impl Qualifier {
                     *ty = self.qual_type(ty);
                 }
             }
-            Expr::SliceLit { elem_ty, elems } => {
+            Expr::SliceLit { elem_ty, elems, .. } => {
                 *elem_ty = self.qual_type(elem_ty);
                 elems.iter_mut().for_each(|e| self.expr(e, bound));
             }

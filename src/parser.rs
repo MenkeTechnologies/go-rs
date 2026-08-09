@@ -805,18 +805,27 @@ impl Parser {
         match self.peek() {
             Tok::LBracket => {
                 self.advance();
-                // A fixed-size array type `[N]T` or `[...]T` — go-rs represents
-                // arrays as slices for the value model, so the size is consumed
-                // and the type erases to `[]T`.
+                // A fixed-size array type `[N]T` keeps its length: `[N]T` is a
+                // *value* type in Go and `[]T` a reference one, and the written
+                // length is the only thing that tells them apart downstream. A
+                // length go-rs cannot fold to a constant (`[...]T` in a type
+                // position, or `[n]T` for an `n` this parser does not evaluate)
+                // has no name to keep, so it falls back to `[]T` — the older,
+                // reference-typed behaviour rather than a wrong length.
+                let mut len = None;
                 if !matches!(self.peek(), Tok::RBracket) {
                     if matches!(self.peek(), Tok::Ellipsis) {
                         self.advance();
                     } else {
-                        let _ = self.expr()?;
+                        len = const_int_of(&self.expr()?).filter(|n| *n >= 0);
                     }
                 }
                 self.expect(&Tok::RBracket)?;
-                Ok(format!("[]{}", self.type_name()?))
+                let elem = self.type_name()?;
+                Ok(match len {
+                    Some(n) => format!("[{n}]{elem}"),
+                    None => format!("[]{elem}"),
+                })
             }
             Tok::Star => {
                 self.advance();
@@ -1040,34 +1049,79 @@ impl Parser {
                 self.advance();
                 None
             } else {
-                const_int_of(&self.expr()?).map(|n| n as usize)
+                const_int_of(&self.expr()?)
+                    .filter(|n| *n >= 0)
+                    .map(|n| n as usize)
             };
             self.expect(&Tok::RBracket)?;
             let elem = self.type_name()?;
-            return Ok((Some(format!("[]{elem}")), array_len));
+            // The written type keeps the length, so the variable's static type
+            // is the array value type `[N]T` and every copy site fires for it.
+            return Ok((
+                Some(match array_len {
+                    Some(n) => format!("[{n}]{elem}"),
+                    None => format!("[]{elem}"),
+                }),
+                array_len,
+            ));
         }
         Ok((Some(self.type_name()?), None))
     }
 
-    /// Bare `var x [N]T` → an N-element slice of the element zero value.
+    /// Bare `var x [N]T` → an N-element array of the element zero value.
     fn bare_array_init(&self, ty: &Option<String>, array_len: Option<usize>) -> Option<Expr> {
         let (len, t) = (array_len?, ty.as_ref()?);
-        let elem = t.strip_prefix("[]").unwrap_or(t).to_string();
-        let zero = if self.struct_names.contains(&elem) {
-            Expr::StructLit {
-                type_name: elem.clone(),
-                fields: Vec::new(),
-            }
-        } else {
-            zero_expr(&elem)
-        };
+        let elem = array_elem_ty(t)
+            .or_else(|| t.strip_prefix("[]"))
+            .unwrap_or(t)
+            .to_string();
         Some(Expr::Make {
             is_map: false,
+            elem_zero: Box::new(self.zero_value_expr(&elem)),
             elem_ty: elem,
             len: Some(Box::new(Expr::Int(len as i64))),
             cap: None,
-            elem_zero: Box::new(zero),
         })
+    }
+
+    /// The zero-value expression for a written Go type — the one place that
+    /// decision is made, so a `make` fill, an array-literal gap and an elided
+    /// composite all agree.
+    ///
+    /// A struct zero is a zero-valued struct (not `0`, which the first `s[i].f =
+    /// v` would nil-dereference), a slice or map zero is that type's empty
+    /// literal (which prints and measures as empty rather than as the scalar
+    /// zero), a fixed-size array zero is an N-element array of its own element's
+    /// zero, and everything else is the scalar zero.
+    fn zero_value_expr(&self, ty: &str) -> Expr {
+        if let (Some(elem), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
+            return Expr::SliceLit {
+                elems: (0..n).map(|_| self.zero_value_expr(elem)).collect(),
+                elem_ty: elem.to_string(),
+                array_len: Some(n),
+            };
+        }
+        if let Some(inner) = ty.strip_prefix("[]") {
+            return Expr::SliceLit {
+                elem_ty: inner.to_string(),
+                elems: Vec::new(),
+                array_len: None,
+            };
+        }
+        if let Some((key_ty, val_ty)) = split_map_type(ty) {
+            return Expr::MapLit {
+                key_ty,
+                val_ty,
+                pairs: Vec::new(),
+            };
+        }
+        if self.struct_names.contains(ty) {
+            return Expr::StructLit {
+                type_name: ty.to_string(),
+                fields: Vec::new(),
+            };
+        }
+        zero_expr(ty)
     }
 
     /// `var a, b [T] [= e, f]` — a specification binding several names.
@@ -2059,11 +2113,16 @@ impl Parser {
         // Each element may elide the type: `[]T{ {…}, {…} }` means
         // `[]T{ T{…}, T{…} }`, for a struct `T` and for a container `T` alike.
         let elems = self.brace_list(|p| p.elem_or_expr(&elem_ty))?;
-        Ok(Expr::SliceLit { elem_ty, elems })
+        Ok(Expr::SliceLit {
+            elem_ty,
+            elems,
+            array_len: None,
+        })
     }
 
-    /// `[N]T{ … }` / `[...]T{ … }` fixed-size array literal. go-rs represents an
-    /// array as a slice, so this builds a `SliceLit` of the array's length.
+    /// `[N]T{ … }` / `[...]T{ … }` fixed-size array literal — a `SliceLit`
+    /// carrying the array's length, which is what makes its static type the
+    /// value type `[N]T` rather than the reference type `[]T`.
     /// Elements may be sequential (`v0, v1, …`) or index-keyed (`3: v`), the
     /// latter zero-filling any gaps; a `[...]` array is sized by its elements.
     fn array_literal(&mut self) -> Result<Expr, String> {
@@ -2115,38 +2174,17 @@ impl Parser {
         self.expect(&Tok::RBrace)?;
         // Final length: the declared `[N]`, else one past the highest index.
         let len = fixed_len.unwrap_or_else(|| placed.iter().map(|(i, _)| i + 1).max().unwrap_or(0));
-        // Zero value for any gap: an empty struct literal for a struct element
-        // type (the compiler zero-fills), else the scalar zero.
-        let zero = |ety: &str| -> Expr {
-            if let Some(inner) = ety.strip_prefix("[]") {
-                // A gap in an array of slices is a nil slice, which prints and
-                // measures as empty — not the scalar zero.
-                Expr::SliceLit {
-                    elem_ty: inner.to_string(),
-                    elems: Vec::new(),
-                }
-            } else if let Some((key_ty, val_ty)) = split_map_type(ety) {
-                Expr::MapLit {
-                    key_ty,
-                    val_ty,
-                    pairs: Vec::new(),
-                }
-            } else if self.struct_names.contains(ety) {
-                Expr::StructLit {
-                    type_name: ety.to_string(),
-                    fields: Vec::new(),
-                }
-            } else {
-                zero_expr(ety)
-            }
-        };
-        let mut elems: Vec<Expr> = (0..len).map(|_| zero(&elem_ty)).collect();
+        let mut elems: Vec<Expr> = (0..len).map(|_| self.zero_value_expr(&elem_ty)).collect();
         for (idx, v) in placed {
             if idx < elems.len() {
                 elems[idx] = v;
             }
         }
-        Ok(Expr::SliceLit { elem_ty, elems })
+        Ok(Expr::SliceLit {
+            elem_ty,
+            elems,
+            array_len: Some(len),
+        })
     }
 
     /// `map[K]V{ k0: v0, … }` (already consumed the `map` ident).
@@ -2189,11 +2227,27 @@ impl Parser {
     /// Reconstructs which literal form `ty` calls for, since the type text was
     /// written once on the outer literal and elided on every element.
     fn elided_literal(&mut self, ty: &str) -> Result<Expr, String> {
+        // `[][2]int{{1, 2}}` elides an *array* element, which keeps its length
+        // (and so its value semantics); a gap left by a short `{…}` is the
+        // element type's own zero, exactly as in the written `[N]T{…}` form.
+        if let (Some(inner), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
+            let mut elems = self.brace_list(|p| p.elem_or_expr(inner))?;
+            elems.truncate(n);
+            while elems.len() < n {
+                elems.push(self.zero_value_expr(inner));
+            }
+            return Ok(Expr::SliceLit {
+                elem_ty: inner.to_string(),
+                elems,
+                array_len: Some(n),
+            });
+        }
         if let Some(inner) = ty.strip_prefix("[]") {
             let elems = self.brace_list(|p| p.elem_or_expr(inner))?;
             return Ok(Expr::SliceLit {
                 elem_ty: inner.to_string(),
                 elems,
+                array_len: None,
             });
         }
         if let Some((key_ty, val_ty)) = split_map_type(ty) {
@@ -2330,17 +2384,10 @@ impl Parser {
             } else {
                 elem_ty.to_string()
             },
-            // A struct element's zero is a zero-valued struct, not `0` — without
-            // it `make([]T, n)` fills with integers and the first `s[i].f = v`
-            // panics on a nil dereference. Same rule as `bare_array_init`.
-            elem_zero: Box::new(if self.struct_names.contains(elem_ty) {
-                Expr::StructLit {
-                    type_name: elem_ty.to_string(),
-                    fields: Vec::new(),
-                }
-            } else {
-                zero_expr(elem_ty)
-            }),
+            // Every element gets its own zero, built by the one rule in
+            // `zero_value_expr` — without it `make([]T, n)` fills with integers
+            // and the first `s[i].f = v` panics on a nil dereference.
+            elem_zero: Box::new(self.zero_value_expr(elem_ty)),
         })
     }
 }

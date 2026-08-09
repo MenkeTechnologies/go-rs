@@ -87,6 +87,9 @@ fn numtype_of_ty(ty: &str) -> NumType {
 /// The element type named by a container type — `[]T` and `map[K]V` both yield
 /// `T`/`V`. `None` for anything that is not a container.
 fn elem_of_type(ty: &str) -> Option<String> {
+    if let Some(t) = array_elem_ty(ty) {
+        return Some(t.to_string());
+    }
     if let Some(t) = ty.strip_prefix("[]") {
         return Some(t.to_string());
     }
@@ -1201,6 +1204,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // declared as a struct type by value. A `*T` field keeps its raw `*` here, so
     // it is not in the plan and stays aliased — Go copies a pointer, not what it
     // points at.
+    // A fixed-size array field is a value too, and the plan carries its written
+    // type so the copy knows whether the array's own elements are values.
     host::set_struct_plan(
         struct_fields
             .iter()
@@ -1209,8 +1214,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                     name.clone(),
                     fields
                         .iter()
-                        .filter(|(_, ty)| structs.contains(ty.as_str()))
-                        .map(|(f, _)| f.clone())
+                        .filter(|(_, ty)| {
+                            structs.contains(ty.as_str()) || array_elem_ty(ty).is_some()
+                        })
+                        .map(|(f, ty)| (f.clone(), ty.clone()))
                         .collect(),
                 )
             })
@@ -3239,7 +3246,19 @@ impl Compiler {
         let i = format!("$i{n}");
 
         // $it = iter; $keys = GRANGE_KEYS($it); $i = 0
+        //
+        // `range` over an *array* walks a copy: Go evaluates the range
+        // expression once, and for an array that evaluation is a value copy, so
+        // a write to the array inside the loop is not seen by the remaining
+        // iterations. Over a slice it is the shared handle, and a write *is*
+        // seen — the same expression, two behaviours, decided by the static
+        // type. (Not `emit_value`, which would also copy a struct: `range` over
+        // a struct is not a thing Go has.)
         self.expr(iter)?;
+        let iter_ty = self.type_name(iter);
+        if array_elem_ty(&iter_ty).is_some() {
+            self.emit_copy_for(&iter_ty);
+        }
         self.emit_set(&it, 0);
         self.emit_get(&it, 0);
         self.b.emit(Op::CallBuiltin(host::GRANGE_KEYS, 1), 0);
@@ -3282,9 +3301,7 @@ impl Compiler {
             // place aliasing showed up, because Go programs rely on it to mean
             // "read-only walk".
             let elem = self.elem_type_of(&self.type_name(iter));
-            if self.structs.contains(&elem) {
-                self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
-            }
+            self.emit_copy_for(&elem);
             self.emit_set(v, 0);
             self.types.insert(v.clone(), NumType::Unknown);
             // Only when the element type is actually known: recording an empty
@@ -3390,6 +3407,24 @@ impl Compiler {
     /// erased [`NumType`] cannot express, since it collapses `[]T`, `map[K]V` and
     /// `any` into one `Unknown`. Everything else falls through to [`Self::emit_default`].
     fn emit_zero(&mut self, ty: &str, line: u32) {
+        // A fixed-size array's zero is N element zeros, not nil: `var a [3]int`
+        // is `[0 0 0]` and `type s struct{ a [2]string }` zeroes to `{[ ]}`.
+        if let (Some(elem), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
+            let (elem, n) = (elem.to_string(), n);
+            let c = self.b.add_constant(Value::str("slice"));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::LoadInt(n as i64), line);
+            if self.structs.contains(&elem) {
+                let _ = self.struct_lit(&elem, &[]);
+            } else {
+                self.emit_zero(&elem, line);
+            }
+            self.b.emit(Op::LoadInt(-1), line);
+            let ec = self.b.add_constant(Value::str(elem));
+            self.b.emit(Op::LoadConst(ec), line);
+            self.b.emit(Op::CallBuiltin(host::GMAKE, 5), line);
+            return;
+        }
         if ty.starts_with("[]") || ty.starts_with("map[") {
             let c = self.b.add_constant(Value::str(ty.to_string()));
             self.b.emit(Op::LoadConst(c), line);
@@ -3561,7 +3596,7 @@ impl Compiler {
                 }
                 self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 4), 0);
             }
-            Expr::SliceLit { elem_ty, elems } => {
+            Expr::SliceLit { elem_ty, elems, .. } => {
                 for e in elems {
                     self.emit_typed(e, elem_ty)?;
                 }
@@ -3586,7 +3621,7 @@ impl Compiler {
                 len,
                 cap,
                 elem_zero,
-                ..
+                elem_ty,
             } => {
                 if *is_map {
                     let c = self.b.add_constant(Value::str("map"));
@@ -3609,7 +3644,12 @@ impl Compiler {
                             self.b.emit(Op::LoadInt(-1), 0);
                         }
                     }
-                    self.b.emit(Op::CallBuiltin(host::GMAKE, 4), 0);
+                    // The element type, so replicating the one zero gives each
+                    // slot its own value when the element is itself a value type
+                    // (`make([][2]int, n)`, `var a [3]pt`).
+                    let ec = self.b.add_constant(Value::str(elem_ty.clone()));
+                    self.b.emit(Op::LoadConst(ec), 0);
+                    self.b.emit(Op::CallBuiltin(host::GMAKE, 5), 0);
                 }
             }
             Expr::MakeChan { cap, .. } => {
@@ -3767,13 +3807,36 @@ impl Compiler {
     /// are reference types and pass through the copy unchanged).
     fn emit_value(&mut self, e: &Expr) -> Result<(), String> {
         self.expr(e)?;
-        // Struct values are copied on assign/pass/return (Go value semantics) —
-        // but `&x` is a pointer (a reference), so it is never copied.
+        // Struct and array values are copied on assign/pass/return (Go value
+        // semantics) — but `&x` is a pointer (a reference), so it is never
+        // copied.
         let is_pointer = matches!(e, Expr::Unary { op: UnOp::Addr, .. });
-        if !is_pointer && self.structs.contains(&self.type_name(e)) {
-            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+        if !is_pointer {
+            self.emit_copy_for(&self.type_name(e));
         }
         Ok(())
+    }
+
+    /// Emit the value-copy a Go *value* type needs, for a value already on the
+    /// stack whose static type is `ty`. A no-op for every reference type.
+    ///
+    /// Go has exactly two composite value types: the struct and the fixed-size
+    /// array. Both are shared heap handles in go-rs, so both need an explicit
+    /// copy at each site Go copies; slices, maps, channels, pointers and
+    /// functions are references and must keep their handle.
+    ///
+    /// The array copy carries its *element* type, because the recursion cannot
+    /// be decided at run time: an array and a slice are the same heap object, so
+    /// only the written type says whether an element is itself an array (copy)
+    /// or a slice (share).
+    fn emit_copy_for(&mut self, ty: &str) {
+        if let Some(elem) = array_elem_ty(ty) {
+            let c = self.b.add_constant(Value::str(elem.to_string()));
+            self.b.emit(Op::LoadConst(c), 0);
+            self.b.emit(Op::CallBuiltin(host::GARRAY_COPY, 2), 0);
+        } else if self.structs.contains(ty) {
+            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+        }
     }
 
     /// Copy the receiver already on the stack when `ty.method` was declared with
@@ -3982,6 +4045,14 @@ impl Compiler {
             },
             // A slice literal names its own type, so a variable bound to one
             // records `[]T` and an element's declared type is recoverable.
+            // A slice literal names its own reference type; an array literal
+            // names the *value* type `[N]T`, which is what makes a binding to
+            // one copy at every site Go copies.
+            Expr::SliceLit {
+                elem_ty,
+                array_len: Some(n),
+                ..
+            } => format!("[{n}]{elem_ty}"),
             Expr::SliceLit { elem_ty, .. } => format!("[]{elem_ty}"),
             Expr::Make {
                 is_map, elem_ty, ..
@@ -4007,6 +4078,9 @@ impl Compiler {
     /// The element type of a written container type: `[]T` and `map[K]V` name
     /// `T` and `V`. Anything else has no element type.
     fn elem_type_of(&self, container: &str) -> String {
+        if let Some(elem) = array_elem_ty(container) {
+            return base_type(elem);
+        }
         if let Some(elem) = container.strip_prefix("[]") {
             return base_type(elem);
         }
@@ -4655,6 +4729,7 @@ impl Compiler {
                                     Expr::SliceLit {
                                         elem_ty: "error".to_string(),
                                         elems: wrapped,
+                                        array_len: None,
                                     },
                                 ));
                                 "$wrapErrors"
@@ -4798,21 +4873,22 @@ impl Compiler {
             // `append(base, xs...)` — spread every element of the slice `xs`
             // into the result (not append the slice as a single element).
             if name == "append" && spread {
-                // Whether the elements being spread are struct *values*, which
-                // `append` copies. Read from the static element type here because
-                // the runtime cannot tell a `[]T` element from a `[]*T` one.
+                // The element type when it is a Go *value* type (a struct or a
+                // fixed-size array), which `append` copies — empty otherwise.
+                // Read from the static type here because the runtime cannot tell
+                // a `[]T` element from a `[]*T` one, nor a `[][2]int` element
+                // from a `[][]int` one.
                 let elem = args
                     .last()
                     .map(|a| self.elem_type_of(&self.type_name(a)))
                     .unwrap_or_default();
-                self.b.emit(
-                    if self.structs.contains(&elem) {
-                        Op::LoadTrue
-                    } else {
-                        Op::LoadFalse
-                    },
-                    line,
-                );
+                let copy_ty = if self.structs.contains(&elem) || array_elem_ty(&elem).is_some() {
+                    elem
+                } else {
+                    String::new()
+                };
+                let c = self.b.add_constant(Value::str(copy_ty));
+                self.b.emit(Op::LoadConst(c), line);
                 for a in args {
                     self.expr(a)?;
                 }
@@ -5269,7 +5345,9 @@ fn wrap_operands(format: &str) -> Vec<usize> {
 /// (which matches any value).
 fn type_to_tag(ty: &str) -> String {
     let ty = ty.trim_start_matches('*');
-    if ty.starts_with("[]") {
+    // A fixed-size array shares the slice's runtime object, so it shares the
+    // runtime tag: `[3]int` and `[]int` both answer `[]`.
+    if ty.starts_with("[]") || array_elem_ty(ty).is_some() {
         "[]".to_string()
     } else if ty.starts_with("map[") {
         "map".to_string()

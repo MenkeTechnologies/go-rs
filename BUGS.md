@@ -36,45 +36,32 @@ other channel operation is correct. Closing this needs a fusevm release
 carrying a channel-length op; vendoring or path-overriding fusevm to add one is
 not an option — the published pin is the contract.
 
-## Arrays are modeled as slices, so they are reference values
+## `%T` names an array after its runtime object, not its static type
 
 ```go
 a := [3]int{1, 2, 3}
-b := a
-b[0] = 9
-fmt.Println(a, b, a == b)   // go: [1 2 3] [9 2 3] false   go-rs: [9 2 3] [9 2 3] true
+fmt.Printf("%T\n", a)   // go: [3]int     go-rs: []int
 ```
 
-`[N]T` is erased to `[]T` at parse time (`var_decl_type` / `array_literal` in
-`src/parser.rs`), so an array is the same heap handle a slice is. Go's arrays
-are **values**, and every place that implies is wrong here — each of these was
-measured against `go1.26.5`:
+A `[N]T` and a `[]T` are the same [`HostObj::Slice`] on go-rs's heap, and `%T`
+answers from the value (`go_type_name`, `src/host.rs`), which has no length to
+report and no way to tell the two spellings apart. The rest of the array's
+behaviour is *not* affected — value semantics, `==`, map-key use and every copy
+site are driven by the static type, and a `case [3]int` in a type switch still
+matches, because the type tag for both spellings is `[]`.
 
-| construct | go | go-rs |
-|---|---|---|
-| `b := a; b[0] = 9` | `a` unchanged | `a` changed |
-| `f(a)` mutating its parameter | `a` unchanged | `a` changed |
-| `return g` then writing the result | `g` unchanged | `g` changed |
-| `var s [2]int = g; s[1] = 8` | `g` unchanged | `g` changed |
-| an array-typed struct field, copied with the struct | independent | shared |
-| `a == b` | element-wise | handle identity |
-| `for i, v := range a` with `a` written mid-loop | iterates a copy | reads the live array |
-| `m[[2]int{1,2}]` | hit | miss |
+Closing it means carrying the written type in at `fmt` argument positions the
+way `float32` and `uint64` already do (`GF32_BOX` / `GU64_BOX`). Those two box a
+*scalar* into a one-field heap object; an array would need a wrapper that every
+`fmt` path unwraps, which is a wider change than the one verb it fixes.
 
-The mutation rows are silent: the program keeps running with corrupted data.
-
-Closing it means carrying the length in the static type — `[N]T` rather than
-`[]T` — through `type_name`, `struct_fields` and the composite-literal path, so
-the copy sites that already exist for structs (see below) can fire for arrays
-too. The runtime side is nearly free: a copy is the same recursive walk
-`struct_copy` already does, and the heap object is already the right shape. It
-is the type-erasure in the parser that has to be undone first.
-
-Struct value semantics, by contrast, *are* implemented at every copy site —
-assignment, argument bind, return, container store, container read, `range`
-binding, channel send, `append`, value-receiver call — and recurse through
-nested struct fields while leaving pointer, slice and map fields shared. The
-gate for that is `parity-scripts/struct_value_semantics.go`.
+Array **value** semantics *are* implemented, at every copy site — assignment,
+argument bind, return, container store, container read, `range` (over the array
+and for the element binding), channel send, `append` including a spread, and the
+zero value — recursing elementwise through nested arrays and struct elements
+while leaving slice, map and pointer elements shared. The gate is
+`parity-scripts/array_value_semantics.go`. Struct value semantics are the same
+at the same sites, gated by `parity-scripts/struct_value_semantics.go`.
 
 ## `map` operations are O(n) each, so building one is O(n²)
 

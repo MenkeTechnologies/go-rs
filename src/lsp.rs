@@ -423,7 +423,7 @@ const CORPUS: &[Entry] = &[
         "[N]T",
         "Type",
         "[N]T   |   [...]T",
-        "Fixed-size array. go-rs consumes the size and erases the type to `[]T`, so an array is a slice: it has reference rather than value semantics, and `var a [N]S` for a struct type `S` fills every element with the same handle.",
+        "Fixed-size array — a value type, unlike the slice `[]T`. It is copied elementwise on assign, argument bind, return, container store and read, `append`, channel send and `range`, so a write through a copy is invisible to the original at every depth; slice, map and pointer elements stay shared. `==` compares elementwise, which is what makes an array usable as a map key. `a[:]` yields a slice over the array's storage.",
         "var a [3]int",
     ),
     e(
@@ -2164,11 +2164,11 @@ const CORPUS: &[Entry] = &[
         "for i := 0; i < n; i++ { … }",
     ),
     e(
-        "arrays of structs",
+        "%T on an array",
         "Divergence from Go",
-        "var a [N]T",
-        "An array type is erased to a slice and filled by repeating one zero value. For a struct element type that zero value is a single handle, so every element aliases it: writing `a[0].n = 7` makes every element read 7. Build such an array element by element with a composite literal or a loop that assigns a fresh struct.",
-        "a := []Point{{}, {}, {}}   // distinct elements",
+        "fmt.Printf(\"%T\", a)",
+        "An array and a slice are the same heap object here, and `%T` answers from the value rather than the static type, so a `[3]int` prints as `[]int`. Only the name is affected — the value semantics, `==`, map-key use and every copy site are the array's, and a `case [3]int` in a type switch still matches.",
+        "fmt.Printf(\"%v %d\", a, len(a))",
     ),
     e(
         "func init",
