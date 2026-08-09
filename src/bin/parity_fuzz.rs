@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 36;
+const SHAPES: u64 = 37;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -693,6 +693,64 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                  \tbm{n} := map[int]int{{{mps}}}\n\
                  \tfmt.Println(\"bigmap\", len(bm{n}), bm{n}[0], bm{n}[126], bm{n}[127], bm{n}[{plast}])\n\
                  \tfmt.Println(\"bigsum\", sumAll(bs{n}...), sumAll({elems}))\n"
+            )
+        }
+        // Every `fmt` verb except `%v` and `%T` applies *element-wise* to a
+        // composite operand: `%q` of a `[]string` quotes each element, `%d` of a
+        // map renders each key and value, `%f` of a `[]float64` formats each
+        // number — and the flags, width and precision belong to each element,
+        // not to the whole rendering. A verb that renders the composite as one
+        // value instead prints something shaped nothing like Go's answer.
+        //
+        // The one operand that is *not* a list is a `[]byte` under `%s`, `%q`,
+        // `%x` or `%X`: it is the text it holds, at every depth (a `[][]byte`
+        // prints its rows as strings). Nothing in the values separates a
+        // `[]byte` from a `[]int` of small numbers, so both halves are only
+        // right at once if the written element type reaches the formatter —
+        // which is why the two are always printed side by side here.
+        36 => {
+            uses.structs = true;
+            let (w1, w2) = (rng.pick(WORDS), rng.pick(WORDS));
+            // `%c`/`%q`/`%U` on the rune classes whose printability go-rs
+            // decides exactly: C0 and C1 controls, the ASCII range, a non-ASCII
+            // separator, printable symbols in and above the basic plane, the
+            // replacement character, both private-use planes, one past the last
+            // code point, and a negative (which `%U` reads as all 64 bits).
+            // Deliberately absent: a code point Unicode has not assigned, whose
+            // category needs tables go-rs does not carry — see BUGS.md.
+            let a = rng.int(-9, 120);
+            let b = *rng.pick(&[
+                0, 7, 0x1f, 0x20, 0x41, 0x7f, 0x80, 0x85, 0x9f, 0xa0, 0xa9, 0x2764, 0x4e16, 0xfffd,
+                0x1f600, 0xe000, 0x10fffd, 1114112,
+            ]);
+            let f = rng.pick(&["1.5", "2.25", "-0.75", "10", "0.125"]);
+            let wd = rng.int(2, 9);
+            format!(
+                "\tqw{n} := []string{{\"{w1}\", \"{w2}\"}}\n\
+                 \tqi{n} := []int{{{a}, {b}}}\n\
+                 \tqb{n} := []byte(\"{w1}\")\n\
+                 \tqm{n} := map[string]string{{\"{w1}\": \"{w2}\", \"z\": \"{w1}\"}}\n\
+                 \tqn{n} := map[string]int{{\"{w2}\": {a}}}\n\
+                 \tqa{n} := [2]string{{\"{w1}\", \"{w2}\"}}\n\
+                 \tqf{n} := []float64{{{f}, 2.5}}\n\
+                 \tqz{n} := [][]string{{{{\"{w1}\"}}, {{\"{w2}\", \"z\"}}}}\n\
+                 \tqy{n} := [2][]byte{{[]byte(\"{w1}\"), []byte(\"{w2}\")}}\n\
+                 \tvar qs{n} []string\n\tvar qc{n} []byte\n\
+                 \tqp{n} := pt{{{a}, {b}}}\n\
+                 \tfmt.Printf(\"%q|%q|%q|%q\\n\", qw{n}, qi{n}, qb{n}, qm{n})\n\
+                 \tfmt.Printf(\"%q|%q|%q|%q\\n\", qa{n}, qf{n}, qz{n}, qy{n})\n\
+                 \tfmt.Printf(\"%q|%q|%q\\n\", qs{n}, qc{n}, qp{n})\n\
+                 \tfmt.Printf(\"%d|%d|%d|%d\\n\", qi{n}, qn{n}, qz{n}, qp{n})\n\
+                 \tfmt.Printf(\"%s|%s|%s|%s\\n\", qw{n}, qi{n}, qb{n}, qm{n})\n\
+                 \tfmt.Printf(\"%x|%X|%x|%x\\n\", qb{n}, qi{n}, qm{n}, qy{n})\n\
+                 \tfmt.Printf(\"%f|%e|%g\\n\", qf{n}, qf{n}, qf{n})\n\
+                 \tfmt.Printf(\"%o|%b|%c|%U\\n\", qi{n}, qi{n}, qi{n}, qi{n})\n\
+                 \tfmt.Printf(\"%t|%t\\n\", []bool{{true, false}}, qi{n})\n\
+                 \tfmt.Printf(\"%{wd}q|%-{wd}q|%#q|%{wd}d|%0{wd}d\\n\", qw{n}, qw{n}, qw{n}, qi{n}, qi{n})\n\
+                 \tfmt.Printf(\"%.2q|%.1s|%6.2f\\n\", qw{n}, qw{n}, qf{n})\n\
+                 \tfmt.Printf(\"%T|%T|%T|%T\\n\", qb{n}, qi{n}, qc{n}, qy{n})\n\
+                 \tfmt.Printf(\"%v|%+v|%#v|%#v\\n\", qb{n}, qp{n}, qb{n}, qm{n})\n\
+                 \tfmt.Printf(\"%q|%s|%x\\n\", qc{n}, qs{n}, qc{n})\n"
             )
         }
         // new(T) — a zero-valued struct pointer.
