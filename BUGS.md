@@ -9,36 +9,62 @@ Found by the differential harnesses:
 - `bash parity-scripts/run.sh` — byte-diffs every `parity-scripts/**/*.go`
   against `go run`, and prints the rate. It is a green gate: every file matches.
 - `cargo build --bin parity-fuzz && ./target/debug/parity-fuzz --count 20000`
-  — generated deterministic-output programs, byte-diffed the same way.
+  — generated deterministic-output programs, byte-diffed the same way. A case
+  counts only when the reference itself ran (exit 0, non-empty stdout); the
+  rest are reported as `skipped`, so a generator slip that makes `go` reject
+  the program cannot read as agreement. `--only N` pins the generated shape and
+  `--ours PATH` runs a binary from another commit, which is how a new shape is
+  shown to fail against the code from *before* the fix it claims to cover.
 
 A gap listed here is deliberately **not** represented by a corpus file, because
 the corpus is a green byte-parity gate. Close the gap and add the corpus file in
 the same change.
 
-## `for v := range ch` yields nothing — waiting on a fusevm release
+## `len(ch)` / `cap(ch)` report 0 — waiting on a fusevm release
 
 ```go
-ch := make(chan int, 3)
-ch <- 1; ch <- 2; ch <- 3
-close(ch)
-for v := range ch { fmt.Println(v) }   // go: 1 2 3     go-rs: (no iterations)
+ch := make(chan int, 1)
+ch <- 1
+fmt.Println(len(ch), cap(ch))   // go: 1 1     go-rs: 0 0
 ```
 
-Ranging a channel silently produces no values (the channel is a `Value::Int`
-handle, so the range lowers onto Go 1.22's range-over-int and iterates the
-handle's *id*). Every other channel operation — send, receive, `close`,
-`select`, buffered and unbuffered — is correct; receive in a counted loop
-meanwhile.
+The scheduler owns the channel buffer, and fusevm 0.17.0's channel surface is
+`Op::ChanMake` / `ChanSend` / `ChanRecv` / `ChanClose` / `Select` — there is no
+op that reads a channel's length or capacity, so the frontend has nothing to
+ask and `len`/`cap` fall through to their "not a container" answer of 0. Every
+other channel operation is correct. Closing this needs a fusevm release
+carrying a channel-length op; vendoring or path-overriding fusevm to add one is
+not an option — the published pin is the contract.
 
-The substrate gap is closed but not yet reachable. `Scheduler::recv` returned
-the frontend's `recv_zero` for a drained closed channel with no "closed" flag,
-so a receive could not tell a closed channel from one that delivered a real
-zero. fusevm landed `Op::ChanRecvOk` (commit `ff299f4a8a`) for exactly this,
-but `Cargo.toml` pins `fusevm = "0.17.0"` from crates.io, which predates it.
-**This stays open until fusevm publishes a release carrying `Op::ChanRecvOk`**;
-the fix is then a `v, ok := <-ch` lowering in `compile_for_range`, not new
-design work. Vendoring or path-overriding fusevm to reach the op early is not
-an option — the published pin is the contract.
+## `map` operations are O(n) each, so building one is O(n²)
+
+```go
+m := make(map[int]int)
+for i := 0; i < n; i++ { m[i] = i }
+```
+
+| n      | go-rs insert-only | go-rs insert + `range` |
+|--------|-------------------|------------------------|
+| 4,000  | 0.17s             | 0.44s                  |
+| 8,000  | 0.66s             | 1.80s                  |
+| 16,000 | 2.62s             | 6.98s                  |
+| 32,000 | —                 | 28.32s                 |
+
+Time quadruples when `n` doubles. Every value is correct — this is a cost, not a
+divergence — but a map big enough makes a program that finishes instantly under
+`go` look hung.
+
+The cause is local to go-rs: `HostObj::Map` is a `Vec<(Value, Value)>` kept in
+insertion order (`src/host.rs`), so every lookup, insert and `delete` is a
+linear scan comparing keys by value. Insertion order is not incidental — it is
+what makes iteration stable, and `fmt` sorts keys when printing regardless — so
+closing this means a hash index *beside* the ordered vector rather than
+replacing it.
+
+For comparison, ranging a **slice** is linear (32k/64k/128k/256k elements →
+0.10s/0.19s/0.39s/0.77s), because a go-rs slice is a `Value::Obj` handle into
+the frontend's own heap rather than a `fusevm::Value::Array`, so loading one
+copies a `u32` instead of deep-cloning the backing `Vec`.
 
 ## A pointer to a struct prints without `&`
 
@@ -133,6 +159,21 @@ conversion silently truncates instead of failing the build. The same pass would
 catch `float32(1e20) * float32(1e20)` (constant overflow of `float32`) and
 `x / 0` on constants.
 
+The same missing pass makes a constant expression that *leaves* `int64` range
+mid-way wrong even when its result fits:
+
+```go
+var e uint64 = 1<<64 - 1
+fmt.Println(e)   // go: 18446744073709551615   go-rs: 0
+```
+
+Go's constants are arbitrary-precision, so `1<<64` is exact and subtracting 1
+lands back inside `uint64`. go-rs folds constants in `i64`, where `1<<64` is
+already 0. Writing the value as the decimal literal `18446744073709551615`, or
+as `1 << 63`, is correct — only an intermediate that exceeds the width is not.
+Closing it needs the constant evaluator to work in a wider (or arbitrary
+precision) type, which is the same pass the overflow diagnosis above wants.
+
 ## Constant folding keeps a signed zero
 
 ```go
@@ -168,3 +209,22 @@ fields, but does not recurse into a struct-typed field).
 
 Closing it needs the width to live on the value rather than at the call site —
 a `Value` variant, which is the same change `%T`-through-`any` would want.
+
+## `uint64` loses its signedness through an `any` parameter
+
+```go
+var x uint64 = 1 << 63
+var a any = x
+fmt.Println(x)   // go: 9223372036854775808   go-rs: 9223372036854775808
+fmt.Println(a)   // go: 9223372036854775808   go-rs: -9223372036854775808
+```
+
+The same erasure, for the same reason. `uint64`, `uint` and `uintptr` share
+`Value::Int`'s 64-bit two's-complement bit pattern, so the operations that read
+the sign bit (`/`, `%`, `>>`, the ordered comparisons, the conversion to a
+float) are emitted unsigned from the static type, and a `fmt` argument is
+tagged with its signedness on the way in (`GU64_BOX`) so it prints unsigned —
+including through slice elements, map values and struct fields. The tag is
+applied from the static type at the call site, so a value that has passed
+through an `any`/interface parameter has no width left to read. It wants the
+same `Value` variant the `float32` gap above does.

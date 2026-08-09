@@ -86,6 +86,27 @@ pub const GPANIC_ACTIVE: u16 = 887;
 pub const GRECOVER: u16 = 888;
 /// If a panic is still propagating at program end, print it and exit non-zero.
 pub const GPANIC_FINISH: u16 = 889;
+/// Park the in-flight panic for the duration of one deferred call. Emitted by
+/// the drain loop immediately before invoking a deferred closure.
+///
+/// Go runs a deferred function *normally* even while a panic is propagating: it
+/// may call other functions, and only a `recover()` the deferred function makes
+/// **itself** stops the panic. Leaving the panic flagged would make the unwind
+/// check after each of those inner calls throw the deferred function out before
+/// it reaches its `recover()`. Parking also records the call depth, which is
+/// what makes the "directly" rule enforceable.
+pub const GDEFER_PARK: u16 = 961;
+/// Restore a parked panic after its deferred call returns, unless that call
+/// recovered it (or panicked afresh, which supersedes).
+pub const GDEFER_UNPARK: u16 = 962;
+
+/// `[received, zero]` → `zero` when `received` is the drained-closed-channel
+/// sentinel, else `received` itself. Every receive goes through this, so the
+/// sentinel never escapes into a Go value.
+pub const GCHAN_VAL: u16 = 963;
+/// `[received]` → `Bool`: the `ok` of `v, ok := <-ch`. False exactly when the
+/// receive found the channel closed and drained.
+pub const GCHAN_OK: u16 = 964;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -194,6 +215,36 @@ pub mod f32_op {
     pub const DIV: i64 = 3;
 }
 
+/// `[value]` → the same number tagged `uint64` (`HostObj::U64`) for `fmt`, so it
+/// renders as an unsigned 64-bit integer. Emitted only at `fmt` argument
+/// positions, and — like [`GF32_BOX`] — element-wise through a slice or map.
+///
+/// `uint64` / `uint` / `uintptr` share `Value::Int`'s 64-bit two's-complement
+/// representation, so `+ - * << & | ^ &^` need nothing: the bit pattern is
+/// already Go's answer. Only the operations that *read* the sign differ, and
+/// display is one of them — `uint64(0) - 1` holds `-1i64` and must print
+/// `18446744073709551615`.
+pub const GU64_BOX: u16 = 959;
+
+/// `[lhs, rhs, op]` → one operation performed at unsigned 64-bit width, `op`
+/// being a [`u64_op`] code: the operations whose result depends on the sign bit
+/// (`/`, `%`, `>>`, the four ordered comparisons, and the conversion to
+/// `float64`).
+pub const GU64_ARITH: u16 = 960;
+
+/// The [`GU64_ARITH`] operator codes, shared with the compiler.
+pub mod u64_op {
+    pub const DIV: i64 = 0;
+    pub const MOD: i64 = 1;
+    pub const SHR: i64 = 2;
+    pub const LT: i64 = 3;
+    pub const LE: i64 = 4;
+    pub const GT: i64 = 5;
+    pub const GE: i64 = 6;
+    /// Unary: `float64(u)` — the unsigned value widened, not the signed one.
+    pub const TOFLOAT: i64 = 7;
+}
+
 /// `["[]T" | "map[K]V"]` → the typed nil that is that type's zero value
 /// (`HostObj::Nil`). Emitted wherever the compiler needs a slice's or map's
 /// zero value, so `fmt` can print `[]` / `map[]` rather than `<nil>`.
@@ -234,6 +285,10 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GDEFER_LEN, b_defer_len);
     vm.register_builtin(GDEFER_POP, b_defer_pop);
     vm.register_builtin(GDEFER_LEAVE, b_defer_leave);
+    vm.register_builtin(GDEFER_PARK, b_defer_park);
+    vm.register_builtin(GDEFER_UNPARK, b_defer_unpark);
+    vm.register_builtin(GCHAN_VAL, b_chan_val);
+    vm.register_builtin(GCHAN_OK, b_chan_ok);
     vm.register_builtin(GPANIC, b_panic);
     vm.register_builtin(GPANIC_ACTIVE, b_panic_active);
     vm.register_builtin(GRECOVER, b_recover);
@@ -261,6 +316,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GNIL_OF, b_nil_of);
     vm.register_builtin(GF32_BOX, b_f32_box);
     vm.register_builtin(GF32_ARITH, b_f32_arith);
+    vm.register_builtin(GU64_BOX, b_u64_box);
+    vm.register_builtin(GU64_ARITH, b_u64_arith);
     vm.register_builtin(GREG_METHODS, b_reg_methods);
     vm.register_builtin(GIFACE_OK, b_iface_ok);
     vm.register_builtin(GASSERT_IFACE, b_assert_iface);
@@ -645,10 +702,101 @@ fn b_panic_active(_vm: &mut VM, _argc: u8) -> Value {
 
 /// Go's `recover()`: return the propagating panic value and stop the panic, or
 /// nil when nothing is panicking.
-fn b_recover(_vm: &mut VM, _argc: u8) -> Value {
-    PANIC
-        .with(|p| p.borrow_mut().take())
-        .unwrap_or(Value::Undef)
+fn b_recover(vm: &mut VM, _argc: u8) -> Value {
+    // Go: `recover()` is only effective when the function calling it was itself
+    // invoked directly as a deferred call of a panicking frame. The drain loop
+    // parks the panic at the draining frame's depth, so the deferred function's
+    // own body runs exactly [`DEFERRED_BODY_DEPTH`] frames deeper; anything it
+    // calls in turn is deeper still and gets nil.
+    PARKED.with(|p| {
+        let mut parked = p.borrow_mut();
+        let Some(top) = parked.last_mut() else {
+            return Value::Undef;
+        };
+        if top.recovered || vm.frames.len() != top.depth + DEFERRED_BODY_DEPTH {
+            return Value::Undef;
+        }
+        match top.val.take() {
+            Some(v) => {
+                top.recovered = true;
+                v
+            }
+            None => Value::Undef,
+        }
+    })
+}
+
+/// [`GDEFER_PARK`] — take the in-flight panic out of circulation for one
+/// deferred call, remembering the depth its `recover()` must be called from.
+fn b_defer_park(vm: &mut VM, _argc: u8) -> Value {
+    let val = PANIC.with(|p| p.borrow_mut().take());
+    PARKED.with(|p| {
+        p.borrow_mut().push(Park {
+            val,
+            depth: vm.frames.len(),
+            recovered: false,
+        })
+    });
+    Value::Undef
+}
+
+/// The value a receive on a **closed and drained** channel yields, installed on
+/// the scheduler with `Scheduler::with_recv_zero`.
+///
+/// `Scheduler::recv` returns this — and only this — for the one case Go reports
+/// as `ok == false`, so it is the exact signal `v, ok := <-ch` and
+/// `for v := range ch` need, decided atomically inside the scheduler rather than
+/// by a racy "is it closed *and* empty?" check afterwards. It is a fresh heap
+/// handle, and `Value::Obj` is identity-comparable, so no Go value can collide
+/// with it — unlike the default `Value::Int(0)`, which a channel carrying a real
+/// `0` produces all the time.
+pub fn chan_closed_sentinel() -> Value {
+    CHAN_CLOSED.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| Value::Obj(heap_alloc(HostObj::ChanClosed)))
+            .clone()
+    })
+}
+
+/// Whether `v` is the drained-closed-channel sentinel.
+fn is_chan_closed(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::ChanClosed)))
+}
+
+/// [`GCHAN_VAL`] — a receive's value: the element type's zero when the channel
+/// was closed and drained, else what the channel delivered.
+fn b_chan_val(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    if is_chan_closed(&v) {
+        return args.get(1).cloned().unwrap_or(Value::Undef);
+    }
+    v
+}
+
+/// [`GCHAN_OK`] — a receive's `ok`.
+fn b_chan_ok(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    Value::bool(!args.first().map(is_chan_closed).unwrap_or(false))
+}
+
+/// [`GDEFER_UNPARK`] — the deferred call has returned. Resume the panic it was
+/// running under unless that call recovered it, or unless the call raised a
+/// panic of its own, which Go lets supersede the one it was deferred for.
+fn b_defer_unpark(_vm: &mut VM, _argc: u8) -> Value {
+    let Some(park) = PARKED.with(|p| p.borrow_mut().pop()) else {
+        return Value::Undef;
+    };
+    if let Some(v) = park.val {
+        PANIC.with(|p| {
+            let mut slot = p.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(v);
+            }
+        });
+    }
+    Value::Undef
 }
 
 /// At program end, a still-propagating panic is fatal: print it like Go's first
@@ -916,6 +1064,17 @@ pub(crate) enum HostObj {
     /// width, so the compiler boxes a statically-`float32` operand here on its
     /// way into `fmt` — and nowhere else, which keeps the box out of arithmetic.
     F32(f32),
+    /// A `uint64` / `uint` / `uintptr` at a `fmt` argument position. The value
+    /// model holds one integer width (`Value::Int`, an `i64`) whose bit pattern
+    /// is already right for unsigned arithmetic; only *rendering* reads the sign
+    /// bit, so the compiler boxes a statically-unsigned operand on its way into
+    /// `fmt` — and nowhere else, which keeps the box out of arithmetic. `ty` is
+    /// the written type so `%T` names it exactly.
+    U64 { val: u64, ty: String },
+    /// The unique marker a receive on a closed, drained channel yields — see
+    /// [`chan_closed_sentinel`]. It is never stored in a Go variable: every
+    /// receive site maps it to the element type's zero immediately.
+    ChanClosed,
     /// The zero value of a slice or map type — Go's *typed* nil. It is not
     /// `Value::Undef`, because Go distinguishes a nil slice (`[]`, `len` 0,
     /// appendable) and a nil map (`map[]`, readable, not writable) from a nil
@@ -971,29 +1130,113 @@ fn b_f32_box(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let v = args.first().cloned().unwrap_or(Value::Undef);
     let spec = args.get(1).map(go_str).unwrap_or_default();
-    box_for_fmt(&v, &spec)
+    box_for_fmt(&v, &spec, BoxTag::F32)
+}
+
+/// [`GU64_BOX`] — tag the unsigned 64-bit integers in a `fmt` argument. Stack
+/// `[value, spec, ty]`, with `spec` read exactly as [`b_f32_box`] reads it.
+fn b_u64_box(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let spec = args.get(1).map(go_str).unwrap_or_default();
+    let ty = args
+        .get(2)
+        .map(go_str)
+        .unwrap_or_else(|| "uint64".to_string());
+    box_for_fmt(&v, &spec, BoxTag::U64(&ty))
+}
+
+/// Which width tag [`box_for_fmt`] applies to the leaves it reaches.
+#[derive(Clone, Copy)]
+enum BoxTag<'a> {
+    F32,
+    U64(&'a str),
+}
+
+/// Apply `tag` to one leaf value.
+fn box_leaf(v: &Value, tag: BoxTag) -> Value {
+    match tag {
+        BoxTag::F32 => box_f32(v),
+        BoxTag::U64(ty) => box_u64(v, ty),
+    }
+}
+
+/// One value tagged as an unsigned 64-bit integer. A non-integer passes through
+/// untouched, so the box is safe wherever the static type says `uint64`.
+fn box_u64(v: &Value, ty: &str) -> Value {
+    match v {
+        Value::Int(n) => Value::Obj(heap_alloc(HostObj::U64 {
+            val: *n as u64,
+            ty: ty.to_string(),
+        })),
+        other => other.clone(),
+    }
+}
+
+/// The `u64` a value carries when it is a [`HostObj::U64`] box.
+fn unbox_u64(v: &Value) -> Option<u64> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::U64 { val, .. }) => Some(*val),
+        _ => None,
+    })
+}
+
+/// [`GU64_ARITH`] — one operation at unsigned 64-bit width. Both operands are
+/// read as the `u64` their `i64` bit pattern denotes, so no caller has to have
+/// boxed them.
+fn b_u64_arith(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().map(arg_int).unwrap_or(0) as u64;
+    let b = args.get(1).map(arg_int).unwrap_or(0) as u64;
+    match args.get(2).map(Value::to_int).unwrap_or(u64_op::DIV) {
+        // Go panics on a zero divisor whatever the signedness.
+        u64_op::DIV => match a.checked_div(b) {
+            Some(q) => Value::Int(q as i64),
+            None => {
+                runtime_panic(vm, "integer divide by zero");
+                Value::Int(0)
+            }
+        },
+        u64_op::MOD => match a.checked_rem(b) {
+            Some(r) => Value::Int(r as i64),
+            None => {
+                runtime_panic(vm, "integer divide by zero");
+                Value::Int(0)
+            }
+        },
+        // A shift count at or past the width yields 0 in Go, where Rust's `>>`
+        // would panic on overflow.
+        u64_op::SHR => Value::Int(if b >= 64 { 0 } else { (a >> b) as i64 }),
+        u64_op::LT => Value::bool(a < b),
+        u64_op::LE => Value::bool(a <= b),
+        u64_op::GT => Value::bool(a > b),
+        u64_op::GE => Value::bool(a >= b),
+        // Unary — `b` is unused.
+        _ => Value::Float(a as f64),
+    }
 }
 
 /// Tag every `float32` a `fmt` argument holds, per [`b_f32_box`]'s `spec`.
 /// Composites are rebuilt rather than mutated — the tag is a display detail and
 /// must not be visible to the program that owns the original.
-fn box_for_fmt(v: &Value, spec: &str) -> Value {
+fn box_for_fmt(v: &Value, spec: &str, tag: BoxTag) -> Value {
     if let Some(es) = slice_elems(v) {
-        let boxed = es.iter().map(|e| box_for_fmt(e, spec)).collect();
+        let boxed = es.iter().map(|e| box_for_fmt(e, spec, tag)).collect();
         return Value::Obj(heap_alloc(HostObj::Slice(boxed)));
     }
     if let Some(pairs) = map_pairs(v) {
         let boxed = pairs
             .into_iter()
-            .map(|(k, val)| (k, box_for_fmt(&val, spec)))
+            .map(|(k, val)| (k, box_for_fmt(&val, spec, tag)))
             .collect();
         return Value::Obj(heap_alloc(HostObj::Map(boxed)));
     }
     if spec.is_empty() {
-        return box_f32(v);
+        return box_leaf(v, tag);
     }
     let Value::Obj(id) = v else { return v.clone() };
-    // Snapshot before boxing: `box_f32` allocates, and the heap borrow is not
+    // Snapshot before boxing: `box_leaf` allocates, and the heap borrow is not
     // re-entrant.
     let snapshot = HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HostObj::Struct {
@@ -1009,8 +1252,8 @@ fn box_for_fmt(v: &Value, spec: &str) -> Value {
     let fields = fields
         .into_iter()
         .map(|(n, fv)| {
-            let tag = spec.split(',').any(|f| f == n);
-            let fv = if tag { box_f32(&fv) } else { fv };
+            let named = spec.split(',').any(|f| f == n);
+            let fv = if named { box_leaf(&fv, tag) } else { fv };
             (n, fv)
         })
         .collect();
@@ -1054,9 +1297,21 @@ fn arg_float(v: &Value) -> f64 {
     unbox_f32(v).map_or_else(|| v.to_float(), f64::from)
 }
 
-/// A `fmt` argument's integer value, seeing through a [`HostObj::F32`] box.
+/// A `fmt` argument's integer value, seeing through a [`HostObj::F32`] or
+/// [`HostObj::U64`] box. The `u64` is returned as its `i64` bit pattern, which
+/// is what every unsigned operation consumes; only *rendering* re-reads it as
+/// unsigned (see [`arg_uint`]).
 fn arg_int(v: &Value) -> i64 {
+    if let Some(u) = unbox_u64(v) {
+        return u as i64;
+    }
     unbox_f32(v).map_or_else(|| v.to_int(), |f| f as i64)
+}
+
+/// A `fmt` argument's value as an unsigned 64-bit integer when it is tagged one
+/// — the only thing that makes `%d`/`%x`/`%o`/`%b` print the unsigned digits.
+fn arg_uint(v: &Value) -> Option<u64> {
+    unbox_u64(v)
 }
 
 /// [`GF32_ARITH`] — one arithmetic operation at 32-bit width.
@@ -1082,6 +1337,27 @@ fn nil_kind(v: &Value) -> Option<NilKind> {
     })
 }
 
+/// How many VM frames deeper than the draining frame a deferred function's own
+/// body runs. `defer f(a)` never calls `f` from the drain loop directly: the
+/// compiler snapshots the callee and arguments into a synthesized zero-argument
+/// closure (see `compile_defer`) and the drain loop calls *that*, which then
+/// calls `f`. So the chain is always `draining frame → snapshot closure → f`,
+/// two frames, whatever `f` is — a function literal, a named function, a
+/// func-valued variable, or a method value. `recover()` is Go's "direct" one
+/// exactly at this depth.
+const DEFERRED_BODY_DEPTH: usize = 2;
+
+/// A panic parked for the duration of one deferred call — see [`GDEFER_PARK`].
+struct Park {
+    /// The panic value, taken by the `recover()` that claims it.
+    val: Option<Value>,
+    /// The VM call depth of the frame that is draining defers. A `recover()` is
+    /// Go's "direct" one exactly when it runs at `depth + 1`.
+    depth: usize,
+    /// Whether a `recover()` has already claimed this panic.
+    recovered: bool,
+}
+
 thread_local! {
     /// The host-owned Go object heap. `Value::Obj(id)` indexes this slab; it
     /// grows per run and is cleared by [`heap_reset`] at the start of every
@@ -1096,6 +1372,15 @@ thread_local! {
     /// The value of an in-flight `panic`, or `None`. Set by `panic()`, cleared by
     /// `recover()`; the compiler unwinds through defer drains while it is `Some`.
     static PANIC: RefCell<Option<Value>> = const { RefCell::new(None) };
+
+    /// One entry per deferred call currently running, innermost last. A drain
+    /// loop parks the propagating panic here before each deferred call and
+    /// restores it after, so `recover()` can be answered by frame depth.
+    static PARKED: RefCell<Vec<Park>> = const { RefCell::new(Vec::new()) };
+
+    /// The per-run drained-closed-channel sentinel handle, allocated on first
+    /// use and dropped by [`heap_reset`] along with the heap slot it names.
+    static CHAN_CLOSED: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Clear the object heap, defer stack, and panic state. Called at each run start.
@@ -1104,6 +1389,8 @@ pub fn heap_reset() {
     METHOD_SETS.with(|m| m.borrow_mut().clear());
     DEFERS.with(|d| d.borrow_mut().clear());
     PANIC.with(|p| *p.borrow_mut() = None);
+    PARKED.with(|p| p.borrow_mut().clear());
+    CHAN_CLOSED.with(|c| *c.borrow_mut() = None);
     PANIC_MODE.with(|m| *m.borrow_mut() = false);
     NILS.with(|n| n.borrow_mut().clear());
     stdlib::sentinels_reset();
@@ -2145,6 +2432,10 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 // populated slice or map it needs no guess from its contents.
                 Some(HostObj::Nil { ty, .. }) => ty.clone(),
                 Some(HostObj::F32(_)) => "float32".to_string(),
+                Some(HostObj::U64 { ty, .. }) => ty.clone(),
+                // Every receive site maps the sentinel away, so it is only
+                // reachable if one was missed; name it after what it stands for.
+                Some(HostObj::ChanClosed) => "<nil>".to_string(),
                 None => "<nil>".to_string(),
             }
         }),
@@ -2268,6 +2559,11 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             }
             // A `float32` prints its own width's shortest decimal.
             Some(HostObj::F32(f)) => format_float32(*f),
+            // An unsigned 64-bit integer prints its unsigned digits.
+            Some(HostObj::U64 { val, .. }) => val.to_string(),
+            // Only reachable if a receive site failed to map the sentinel away;
+            // it stands for "no value", which is what Go's nil prints as.
+            Some(HostObj::ChanClosed) => "<nil>".to_string(),
             // Go prints a nil slice as `[]` and a nil map as `map[]` — the same
             // as an empty one — and `%#v` as the type followed by `(nil)`.
             Some(HostObj::Nil { kind, ty }) => match (mode, kind) {
@@ -2725,14 +3021,18 @@ fn sprintf(args: &[Value]) -> String {
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         ),
-                        None => {
-                            let n = arg_int(v);
-                            if plus && n >= 0 {
-                                format!("+{n}")
-                            } else {
-                                n.to_string()
+                        None => match arg_uint(v) {
+                            Some(u) if plus => format!("+{u}"),
+                            Some(u) => u.to_string(),
+                            None => {
+                                let n = arg_int(v);
+                                if plus && n >= 0 {
+                                    format!("+{n}")
+                                } else {
+                                    n.to_string()
+                                }
                             }
-                        }
+                        },
                     },
                     None => "0".to_string(),
                 }
@@ -2777,7 +3077,11 @@ fn sprintf(args: &[Value]) -> String {
                                 .join(" ")
                         )
                     }
-                    Some(v) => hex(arg_int(v)),
+                    Some(v) => match arg_uint(v) {
+                        Some(u) if upper => format!("{u:X}"),
+                        Some(u) => format!("{u:x}"),
+                        None => hex(arg_int(v)),
+                    },
                     None => "0".to_string(),
                 };
                 if sharp {
@@ -2786,8 +3090,22 @@ fn sprintf(args: &[Value]) -> String {
                     body
                 }
             }
-            'o' => format!("{:o}", rest.next().map(arg_int).unwrap_or(0)),
-            'b' => format!("{:b}", rest.next().map(arg_int).unwrap_or(0)),
+            // `%o`/`%b` read an unsigned operand as unsigned: a boxed `uint64`
+            // shows all 64 bits, not a signed `-` form.
+            'o' => match rest.next() {
+                Some(v) => match arg_uint(v) {
+                    Some(u) => format!("{u:o}"),
+                    None => format!("{:o}", arg_int(v)),
+                },
+                None => "0".to_string(),
+            },
+            'b' => match rest.next() {
+                Some(v) => match arg_uint(v) {
+                    Some(u) => format!("{u:b}"),
+                    None => format!("{:b}", arg_int(v)),
+                },
+                None => "0".to_string(),
+            },
             'c' => char::from_u32(rest.next().map(arg_int).unwrap_or(0) as u32)
                 .map(|c| c.to_string())
                 .unwrap_or_default(),

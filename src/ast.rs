@@ -228,7 +228,13 @@ pub struct SelectClause {
 #[derive(Debug, Clone)]
 pub enum SelectComm {
     /// `case [v :=] <-ch:` — receive, optionally binding the value.
-    Recv { bind: Option<String>, chan: Expr },
+    Recv {
+        bind: Option<String>,
+        /// The `ok` of `case v, ok := <-ch:` — false when the channel is closed
+        /// and drained, which is a *ready* case rather than a blocked one.
+        ok_bind: Option<String>,
+        chan: Expr,
+    },
     /// `case ch <- val:` — send.
     Send { chan: Expr, val: Expr },
 }
@@ -328,8 +334,11 @@ pub enum Expr {
         elem_zero: Box<Expr>,
     },
     /// `make(chan T, cap)` — a channel with buffer capacity `cap` (0 if omitted).
+    /// `elem_ty` is the written `T`: a receive from a closed channel yields that
+    /// type's zero value, which the compiler can only emit if it kept the type.
     MakeChan {
         cap: Option<Box<Expr>>,
+        elem_ty: String,
     },
     /// `<-ch` — receive a value from channel `ch`.
     Recv {

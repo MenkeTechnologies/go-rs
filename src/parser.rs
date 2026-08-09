@@ -1523,10 +1523,36 @@ impl Parser {
             self.advance();
             return Ok(SelectComm::Recv {
                 bind: None,
+                ok_bind: None,
                 chan: self.expr()?,
             });
         }
         let first = self.expr()?;
+        // `v, ok := <-ch` — the comma-ok receive, whose `ok` is false when the
+        // channel is closed and drained (which makes the case *ready*, so this
+        // form is how a select loop learns a channel is finished).
+        if matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            let second = self.expr()?;
+            if !matches!(self.peek(), Tok::Define | Tok::Assign) {
+                return Err(format!(
+                    "go-rs: expected `:=` after `v, ok` in select case, found `{}`",
+                    self.peek()
+                ));
+            }
+            self.advance();
+            self.expect(&Tok::Arrow)?;
+            let chan = self.expr()?;
+            let name = |e: Expr| match e {
+                Expr::Ident(n) if n != "_" => Some(n),
+                _ => None,
+            };
+            return Ok(SelectComm::Recv {
+                bind: name(first),
+                ok_bind: name(second),
+                chan,
+            });
+        }
         match self.peek() {
             // `v := <-ch` / `v = <-ch` (receive with bind).
             Tok::Define | Tok::Assign => {
@@ -1537,7 +1563,11 @@ impl Parser {
                     Expr::Ident(n) if n != "_" => Some(n),
                     _ => None,
                 };
-                Ok(SelectComm::Recv { bind, chan })
+                Ok(SelectComm::Recv {
+                    bind,
+                    ok_bind: None,
+                    chan,
+                })
             }
             // `ch <- val` (send).
             Tok::Arrow => {
@@ -2266,14 +2296,15 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let ty = self.type_name()?;
         // `make(chan T, cap)` — a channel.
-        if ty.starts_with("chan ") {
+        if let Some(elem) = ty.strip_prefix("chan ") {
+            let elem_ty = elem.trim().to_string();
             let cap = if self.eat(&Tok::Comma) {
                 Some(Box::new(self.expr()?))
             } else {
                 None
             };
             self.expect(&Tok::RParen)?;
-            return Ok(Expr::MakeChan { cap });
+            return Ok(Expr::MakeChan { cap, elem_ty });
         }
         let is_map = ty.starts_with("map[");
         let mut len = None;

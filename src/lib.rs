@@ -77,7 +77,13 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
 fn run_scheduled(chunk: fusevm::Chunk) -> Result<Value, String> {
     let main_vm = configure_vm(chunk.clone());
     let make_vm = move || configure_vm(chunk.clone());
-    match Scheduler::new(make_vm).run(main_vm) {
+    // A receive on a closed, drained channel is the one case Go reports as
+    // `ok == false`. The scheduler decides it atomically and yields whatever
+    // value the frontend nominates, so nominating a unique heap handle (rather
+    // than the default `Int(0)`, which a real zero is indistinguishable from)
+    // is what makes `v, ok := <-ch` and `for v := range ch` expressible.
+    let sched = Scheduler::new(make_vm).with_recv_zero(host::chan_closed_sentinel());
+    match sched.run(main_vm) {
         Ok(()) => match host::take_ffi_error() {
             Some(e) => Err(e),
             None => Ok(Value::Undef),

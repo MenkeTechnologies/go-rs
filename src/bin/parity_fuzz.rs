@@ -214,9 +214,183 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 
 // ── statement-block generators (each prints deterministic output) ───────────
 
-/// Emit a random block of statements. `n` is a fresh var-name suffix.
-fn block(rng: &mut Rng, n: u64, uses: &mut Uses) -> String {
-    match rng.below(27) {
+/// How many statement-block shapes [`block`] can emit. `--only N` pins every
+/// block of every program to shape `N`, which is what makes a newly added shape
+/// measurable on its own: mixed into the other 31 it would contribute a handful
+/// of statements per program and its divergence rate would be unreadable.
+const SHAPES: u64 = 32;
+
+/// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
+/// pins the shape instead of drawing one.
+fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
+    match only.unwrap_or_else(|| rng.below(SHAPES)) {
+        // ── unsigned 64-bit integers ──────────────────────────────────────
+        // `uint64`/`uint`/`uintptr` share `int64`'s bit pattern, so every
+        // operation that reads the sign bit — `/`, `%`, `>>`, the ordered
+        // comparisons, the conversion to a float, and printing — is a place a
+        // frontend that stores one `i64` can silently produce a negative answer.
+        27 => {
+            // Every literal here must fit an `int64` as written: `1<<64 - 1`
+            // names the same value but only an arbitrary-precision constant
+            // evaluator can fold it, which is a separate documented gap (see
+            // BUGS.md) and would keep this shape permanently red for a reason
+            // that has nothing to do with unsigned *runtime* semantics.
+            let big = *rng.pick(&[
+                "18446744073709551615",
+                "9223372036854775808",
+                "12297829382473034410",
+                "1 << 63",
+                "1 << 62",
+                "1 << 61",
+            ]);
+            let (small, sh) = (rng.int(1, 97), rng.int(0, 5));
+            format!(
+                "\tvar ua{n} uint64 = {big}\n\
+                 \tvar ub{n} uint64 = {small}\n\
+                 \tfmt.Println(ua{n}-ub{n}, ua{n}+ub{n}, ua{n}*3, ua{n}/ub{n}, ua{n}%ub{n})\n\
+                 \tfmt.Println(ua{n}>>{sh}, ua{n}<<{sh}, ua{n} < ub{n}, ua{n} > ub{n}, ua{n} == ub{n}, ua{n} >= ub{n})\n\
+                 \tfmt.Printf(\"%d|%x|%o|%b|%v\\n\", ua{n}, ua{n}, ua{n}, ua{n}, ua{n})\n\
+                 \tvar uc{n} uint = {big}\n\
+                 \tuc{n} /= {small}\n\
+                 \tfmt.Println(uc{n}, uc{n}>>{sh}, uc{n} > {small})\n\
+                 \tvar up{n} uintptr = {big}\n\
+                 \tfmt.Println(up{n}, up{n}/7, float64(ua{n}))\n"
+            )
+        }
+        // ── narrow fixed-width integers ───────────────────────────────────
+        // Wrapping at 8/16/32 bits, arithmetic vs logical `>>`, shifts at or
+        // past the width (defined in Go, unlike C), and conversion truncation.
+        // Every operand is a *variable*, because Go rejects an out-of-range
+        // constant conversion at compile time and go-rs has no such pass.
+        28 => {
+            // `b` is the divisor of `i8_{n}/j8_{n}` further down, so it must
+            // never be 0: Go panics on integer divide-by-zero, which would end
+            // the program early and make the case a mutual crash rather than a
+            // comparison of printed values.
+            let a = rng.int(-128, 127);
+            let b = {
+                let v = rng.int(-127, 126);
+                if v >= 0 {
+                    v + 1
+                } else {
+                    v
+                }
+            };
+            let (c, d) = (rng.int(0, 255), rng.int(0, 255));
+            let (e, f) = (rng.int(-32768, 32767), rng.int(0, 65535));
+            let (g, sh) = (rng.int(-2147483648, 2147483647), rng.int(0, 40));
+            format!(
+                "\tvar i8_{n} int8 = {a}\n\tvar j8_{n} int8 = {b}\n\
+                 \tvar u8_{n} uint8 = {c}\n\tvar v8_{n} uint8 = {d}\n\
+                 \tvar i16_{n} int16 = {e}\n\tvar u16_{n} uint16 = {f}\n\
+                 \tvar i32_{n} int32 = {g}\n\
+                 \ti8_{n} += j8_{n}\n\tu8_{n} *= v8_{n}\n\ti16_{n} -= int16(i8_{n})\n\
+                 \tfmt.Println(i8_{n}, u8_{n}, i16_{n}, u16_{n}, i32_{n})\n\
+                 \tfmt.Println(i8_{n}>>{sh}, u8_{n}>>{sh}, i8_{n}<<{sh}, u8_{n}<<{sh}, i32_{n}>>{sh})\n\
+                 \tfmt.Println(int8(i16_{n}), uint8(i32_{n}), int16(u16_{n}), int32(i16_{n}), uint16(i32_{n}))\n\
+                 \tfmt.Println(int64(i8_{n}), uint32(u16_{n}), i8_{n}/j8_{n}|1, i16_{n}%7)\n\
+                 \tcap{n} := func() {{\n\
+                 \t\ti8_{n} += j8_{n}\n\tu8_{n} *= v8_{n}\n\
+                 \t\tfmt.Println(i8_{n}, u8_{n}, i8_{n}>>{sh}, u8_{n}<<{sh}, i32_{n}>>{sh})\n\
+                 \t}}\n\tcap{n}()\n\
+                 \tfmt.Println(i8_{n}, u8_{n})\n"
+            )
+        }
+        // ── break / continue, labelled and not ────────────────────────────
+        // Six sibling frontends have each hit a different variant of a loop
+        // signal escaping the wrong chunk, so every form is exercised nested.
+        29 => {
+            let (x, y) = (rng.int(2, 5), rng.int(2, 5));
+            let (p, q, r, s) = (rng.int(0, 4), rng.int(0, 12), rng.int(0, 4), rng.int(0, 4));
+            format!(
+                "\tL{n}:\n\
+                 \tfor a{n} := 0; a{n} < {x}; a{n}++ {{\n\
+                 \t\tfor b{n} := 0; b{n} < {y}; b{n}++ {{\n\
+                 \t\t\tif b{n} == {p} {{\n\t\t\t\tcontinue L{n}\n\t\t\t}}\n\
+                 \t\t\tif a{n}*{y}+b{n} > {q} {{\n\t\t\t\tbreak L{n}\n\t\t\t}}\n\
+                 \t\t\tif b{n} == {r} {{\n\t\t\t\tcontinue\n\t\t\t}}\n\
+                 \t\t\tif a{n} == {s} {{\n\t\t\t\tbreak\n\t\t\t}}\n\
+                 \t\t\tfmt.Println(\"ab\", a{n}, b{n})\n\
+                 \t\t}}\n\t}}\n\
+                 \tw{n} := 0\n\tk{n} := 0\n\
+                 \tfor {{\n\t\tk{n}++\n\
+                 \t\tif k{n} > {x}*{y} {{\n\t\t\tbreak\n\t\t}}\n\
+                 \t\tif k{n}%2 == 0 {{\n\t\t\tcontinue\n\t\t}}\n\
+                 \t\tw{n} += k{n}\n\t}}\n\
+                 \tfor z{n} := 0; z{n} < {x}; z{n}++ {{\n\
+                 \t\tswitch z{n} % 3 {{\n\
+                 \t\tcase 0:\n\t\t\tfmt.Println(\"zero\")\n\t\t\tfallthrough\n\
+                 \t\tcase 1:\n\t\t\tfmt.Println(\"one\")\n\
+                 \t\tcase 2:\n\t\t\tfmt.Println(\"two\")\n\t\t\tfallthrough\n\
+                 \t\tdefault:\n\t\t\tfmt.Println(\"def\")\n\t\t}}\n\t}}\n\
+                 \tfmt.Println(\"w\", w{n})\n"
+            )
+        }
+        // ── defer / panic / recover ───────────────────────────────────────
+        // LIFO order, a `defer` that runs on the panic path, a `recover()` made
+        // *after* the deferred function has called something else, and a
+        // `recover()` from a nested call — which Go defines as ineffective.
+        30 => {
+            uses.deferred = true;
+            let (v, do_panic) = (rng.int(0, 99), rng.below(2) == 0);
+            let cond = if do_panic { "true" } else { "false" };
+            format!(
+                "\tfunc() {{\n\
+                 \t\tdefer fmt.Println(\"last{n}\")\n\
+                 \t\tdefer func() {{\n\
+                 \t\t\tnoise()\n\
+                 \t\t\tif rec := recover(); rec != nil {{\n\t\t\t\tfmt.Println(\"rec{n}\", rec)\n\t\t\t}}\n\
+                 \t\t}}()\n\
+                 \t\tdefer fmt.Println(\"first{n}\")\n\
+                 \t\tif {cond} {{\n\t\t\tpanic({v})\n\t\t}}\n\
+                 \t\tfmt.Println(\"fell through{n}\")\n\
+                 \t}}()\n\
+                 \tfmt.Println(doubled({v}))\n\
+                 \tfunc() {{\n\
+                 \t\tdefer func() {{\n\
+                 \t\t\tf := func() any {{ return recover() }}\n\
+                 \t\t\tfmt.Println(\"nested{n}\", f())\n\
+                 \t\t\tfmt.Println(\"direct{n}\", recover())\n\
+                 \t\t}}()\n\
+                 \t\tpanic({v} + 1)\n\
+                 \t}}()\n\
+                 \tfor q{n} := 0; q{n} < 3; q{n}++ {{\n\t\tdefer fmt.Println(\"loopdefer{n}\", q{n})\n\t}}\n"
+            )
+        }
+        // ── channels ──────────────────────────────────────────────────────
+        // Deterministic by construction: every channel is filled to capacity
+        // and closed before it is read, so no output depends on scheduling.
+        // Covers `range ch`, `v, ok := <-ch`, `select` with `default`, and the
+        // comma-ok `select` case a closed channel makes ready.
+        31 => {
+            let cap = rng.int(1, 5);
+            let (m, k) = (rng.int(-9, 9), rng.int(0, 40));
+            let w = rng.pick(WORDS);
+            format!(
+                "\tch{n} := make(chan int, {cap})\n\
+                 \tfor i{n} := 0; i{n} < {cap}; i{n}++ {{\n\t\tch{n} <- i{n} * {m}\n\t}}\n\
+                 \tclose(ch{n})\n\
+                 \tsum{n} := 0\n\tcnt{n} := 0\n\
+                 \tfor v{n} := range ch{n} {{\n\t\tsum{n} += v{n}\n\t\tcnt{n}++\n\t}}\n\
+                 \tfmt.Println(\"range\", sum{n}, cnt{n})\n\
+                 \tsc{n} := make(chan string, 1)\n\tsc{n} <- \"{w}\"\n\tclose(sc{n})\n\
+                 \ts1{n}, o1{n} := <-sc{n}\n\ts2{n}, o2{n} := <-sc{n}\n\
+                 \tfmt.Println(s1{n}, o1{n}, s2{n}, o2{n}, len(s2{n}))\n\
+                 \tbc{n} := make(chan bool, 1)\n\tbc{n} <- false\n\tclose(bc{n})\n\
+                 \tb1{n}, p1{n} := <-bc{n}\n\tb2{n}, p2{n} := <-bc{n}\n\
+                 \tfmt.Println(b1{n}, p1{n}, b2{n}, p2{n})\n\
+                 \tdc{n} := make(chan int, 1)\n\
+                 \tselect {{\n\tcase x{n} := <-dc{n}:\n\t\tfmt.Println(\"got\", x{n})\n\tdefault:\n\t\tfmt.Println(\"empty\")\n\t}}\n\
+                 \tdc{n} <- {k}\n\
+                 \tselect {{\n\tcase x{n} := <-dc{n}:\n\t\tfmt.Println(\"got\", x{n})\n\tdefault:\n\t\tfmt.Println(\"empty\")\n\t}}\n\
+                 \tec{n} := make(chan int, 1)\n\tclose(ec{n})\n\
+                 \tselect {{\n\tcase y{n}, ok{n} := <-ec{n}:\n\t\tfmt.Println(\"closed\", y{n}, ok{n})\n\tdefault:\n\t\tfmt.Println(\"default\")\n\t}}\n\
+                 \tgc{n} := make(chan int, {cap})\n\
+                 \tgo func() {{\n\t\tfor i{n} := 1; i{n} <= {cap}; i{n}++ {{\n\t\t\tgc{n} <- i{n}\n\t\t}}\n\t\tclose(gc{n})\n\t}}()\n\
+                 \tgs{n} := 0\n\tfor v{n} := range gc{n} {{\n\t\tgs{n} += v{n}\n\t}}\n\
+                 \tfmt.Println(\"goroutine\", gs{n})\n"
+            )
+        }
         // Shortest-representation float output (`%v`, `Println`, `%g`). This is
         // the form that switches to `1e+06`-style exponent notation, so it
         // exercises strconv's 'g' thresholds rather than a fixed `%.4f`.
@@ -438,16 +612,18 @@ struct Uses {
     errors: bool,
     structs: bool,
     generic: bool,
+    /// The defer/panic/recover shape's top-level helpers.
+    deferred: bool,
 }
 
 /// Build a complete, deterministic-output Go program for `seed`.
-fn program(seed: u64) -> String {
+fn program(seed: u64, only: Option<u64>) -> String {
     let mut rng = Rng::seed(seed);
     let mut uses = Uses::default();
     let nblocks = rng.int(3, 8) as u64;
     let mut body = String::new();
     for i in 0..nblocks {
-        body.push_str(&block(&mut rng, i, &mut uses));
+        body.push_str(&block(&mut rng, i, &mut uses, only));
     }
     let mut imports = vec!["\"fmt\""];
     if uses.errors {
@@ -482,6 +658,19 @@ fn program(seed: u64) -> String {
         preamble.push_str(
             "func imax[T int | float64](a, b T) T {\n\
              \tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n",
+        );
+    }
+    if uses.deferred {
+        // `noise` is called by a deferred function *before* its `recover()`:
+        // Go keeps the panic recoverable across it, so a frontend that treats
+        // "a panic is in flight" as a post-call unwind trigger throws the
+        // deferred function out before it reaches the `recover()`.
+        // `doubled` returns through a `defer` that mutates a named result.
+        preamble.push_str(
+            "func noise() { fmt.Println(\"noise\") }\n\n\
+             func doubled(v int) (r int) {\n\
+             \tdefer func() { r *= 2 }()\n\
+             \tr = v\n\treturn r\n}\n\n",
         );
     }
     format!("package main\n\n{import_block}\n{preamble}func main() {{\n{body}}}\n")
@@ -545,6 +734,8 @@ fn main() {
         .unwrap_or(4);
     let mut once_seed: Option<u64> = None;
     let mut start_seed = 0u64;
+    let mut only: Option<u64> = None;
+    let mut ours_override: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -566,17 +757,38 @@ fn main() {
                 i += 1;
                 start_seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
+            // `--only N`: pin every generated block to statement shape N, so a
+            // single shape's divergence rate is measurable rather than diluted
+            // across the other 31.
+            // `--ours PATH`: run a different go-rs binary than this build's.
+            // Pointing it at a binary built from an earlier commit is how a new
+            // generator shape is shown to be non-blind — a shape that does not
+            // fail against the code from *before* the fix was not testing it.
+            "--ours" => {
+                i += 1;
+                ours_override = args.get(i).cloned();
+            }
+            "--only" => {
+                i += 1;
+                only = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| *n < SHAPES);
+            }
             _ => {}
         }
         i += 1;
     }
 
-    let ours = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/go");
+    let ours: &str = match &ours_override {
+        Some(p) => p,
+        None => concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/go"),
+    };
     let oracle = "go";
 
     // `--seed N --once`: print one program and both outputs, then exit.
     if let Some(seed) = once_seed {
-        let src = program(seed);
+        let src = program(seed, only);
         let path = write_tmp(&src, seed);
         print!("{src}");
         let (g, grc) = run(oracle, &path);
@@ -590,7 +802,16 @@ fn main() {
     let end = start_seed + count;
     let pass = AtomicU64::new(0);
     let fail = AtomicU64::new(0);
+    // Cases the reference itself refused (an invalid generated program). Go
+    // rejects an unused import or unused variable at *compile* time, so a
+    // generator slip produces a program `go` never runs — and since go-rs would
+    // usually reject it too, "both produced no stdout and both failed" would be
+    // scored as agreement. Two failures agreeing is not a comparison, so these
+    // are excluded from the rate and counted on their own: a mode with a large
+    // skip count is measuring nothing, which is invisible in a pass rate.
+    let skipped = AtomicU64::new(0);
     let divergences: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let bad_seeds: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let start = std::time::Instant::now();
 
     std::thread::scope(|scope| {
@@ -600,20 +821,39 @@ fn main() {
                 if seed >= end {
                     break;
                 }
-                let src = program(seed);
+                let src = program(seed, only);
                 let path = write_tmp(&src, seed);
                 let (g, grc) = run(oracle, &path);
+                // The reference must have actually run the program for the case
+                // to be a comparison at all: exit 0 with something on stdout.
+                if !grc || g.is_empty() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    bad_seeds.lock().expect("bad-seed lock").push(seed);
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
                 let (r, rrc) = run(ours, &path);
                 let _ = std::fs::remove_file(&path);
                 if g == r && grc == rrc {
                     pass.fetch_add(1, Ordering::Relaxed);
                 } else {
                     fail.fetch_add(1, Ordering::Relaxed);
-                    divergences.lock().unwrap().push(seed);
+                    divergences.lock().expect("divergence lock").push(seed);
                 }
             });
         }
     });
+
+    let skip = skipped.load(Ordering::Relaxed);
+    if skip > 0 {
+        let mut bad = bad_seeds.into_inner().expect("bad seeds");
+        bad.sort_unstable();
+        eprintln!(
+            "SKIPPED {skip} case(s) the reference `{oracle}` refused to run \
+             (invalid generated program — NOT a comparison). First: {:?}",
+            &bad[..bad.len().min(5)]
+        );
+    }
 
     let p = pass.load(Ordering::Relaxed);
     let f = fail.load(Ordering::Relaxed);
@@ -621,9 +861,14 @@ fn main() {
     divs.sort_unstable();
     let secs = start.elapsed().as_secs_f64();
 
+    // The rate is over *compared* cases — the ones the reference actually ran.
+    // Skipped cases are reported alongside rather than folded in, so a mode
+    // that mostly generated programs `go` rejected cannot read as a clean run.
+    let compared = p + f;
     println!("\n════════════════════════════════════════════");
+    println!("PARITY FUZZ: {p} / {compared} match  ({skip} skipped of {count} generated)",);
     println!(
-        "PARITY FUZZ: {p} / {count} match  ({jobs} jobs, {:.0}s, {:.0} cases/s, oracle: {oracle})",
+        "             {jobs} jobs, {:.0}s, {:.0} cases/s, oracle: {oracle}",
         secs,
         count as f64 / secs.max(0.001)
     );

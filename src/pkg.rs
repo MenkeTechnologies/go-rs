@@ -650,9 +650,13 @@ impl Qualifier {
             Stmt::Select { cases, default, .. } => {
                 for c in cases {
                     match &mut c.comm {
-                        SelectComm::Recv { chan, bind } => {
+                        SelectComm::Recv {
+                            chan,
+                            bind,
+                            ok_bind,
+                        } => {
                             self.expr(chan, bound);
-                            if let Some(b) = bind {
+                            for b in [bind, ok_bind].into_iter().flatten() {
                                 bound.insert(b.clone());
                             }
                         }
@@ -798,7 +802,7 @@ impl Qualifier {
                 }
                 self.expr(elem_zero, bound);
             }
-            Expr::MakeChan { cap } => {
+            Expr::MakeChan { cap, .. } => {
                 if let Some(c) = cap {
                     self.expr(c, bound);
                 }

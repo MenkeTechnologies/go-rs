@@ -130,13 +130,13 @@ Real Go, executed on fusevm:
 | Methods        | value/pointer receivers (named or unnamed — `func (T) m()`), `recv.m(args)` dispatch by receiver type |
 | Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref, `new(T)` (a pointer to a zero value of `T`); a pointer shares the pointed-to struct, and `==` on an allocated pointer compares **identity** (two `errors.New("x")` are distinct) while struct values still compare field by field |
 | Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type; `any`/`interface{}` values, type assertions `x.(T)` (+ comma-ok `v, ok := x.(T)`), and type switches `switch v := x.(type) { case T: … }`. An interface **with a method set** — named or anonymous (`err.(interface{ Unwrap() error })`) — is matched by *method-set containment* on signatures, so `Unwrap() error` and `Unwrap() []error` are told apart, and embedded methods count |
-| Closures       | function literals `func(…){…}` with **capture-by-reference** (a closure mutating a captured variable propagates, and closures share captured state); `f := func(){…}; f()`, IIFE, `go func(){…}()`; Go 1.22 per-iteration loop-variable capture |
+| Closures       | function literals `func(…){…}` with **capture-by-reference** (a closure mutating a captured variable propagates, and closures share captured state); `f := func(){…}; f()`, IIFE, `go func(){…}()`; Go 1.22 per-iteration loop-variable capture. A captured variable keeps its **declared type** inside the body, so a `uint8` still wraps at 8 bits, a `float32` still computes and prints at 32, a `uint64` still reads unsigned, and a captured channel is still a channel |
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
 | Functions      | multiple parameters, variadic `func f(x ...int)` + spread `f(xs...)`, `(T, U)` multi-value results, named results (`func f() (n int, err error)` — zero-initialized, bare `return`, deferred/`recover` mutation), `return a, b`, `x, y := f()` destructuring, multi-value spread `f(g())`, calling a function value from an index (`fns[i](x)`, `ops["k"](a, b)`) |
 | Generics       | type parameters on funcs, types, and methods (`func F[T Number]`, `type Stack[T any]`, `Pair[K, V]{…}`), constraint interfaces (`~int \| ~float64`), inferred + explicit instantiation — **erased** onto the dynamic value model (no monomorphization) |
 | defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
-| panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; **runtime faults** (integer divide-by-zero, index-out-of-range, nil dereference) are recoverable too — `recover()` returns the `runtime error: …` value; an unrecovered panic prints `panic: <value>` and exits non-zero (matching Go, minus the goroutine trace) |
-| Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported. `sync` (`WaitGroup`, `Mutex` + `TryLock`, `RWMutex`, `Once`) is vendored on top of it |
+| panic / recover | `panic(v)` unwinds through defer drains, `recover()` stops it — with Go's frame rule: the panic is parked for the duration of each deferred call, so the deferred function runs normally (it may call other functions before recovering) and only a `recover()` it makes **itself** is effective; one from a function it called in turn returns nil. A deferred closure may set a named result on the panic path. **Runtime faults** (integer divide-by-zero, index-out-of-range, nil dereference) are recoverable too — `recover()` returns the `runtime error: …` value; an unrecovered panic prints `panic: <value>` and exits non-zero (matching Go, minus the goroutine trace) |
+| Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `for v := range ch` (receives until the channel is closed **and** drained), the comma-ok receive `v, ok := <-ch`, and `select` (with `default`, and the comma-ok case `case v, ok := <-ch:` that a closed channel makes ready) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported. `sync` (`WaitGroup`, `Mutex` + `TryLock`, `RWMutex`, `Once`) is vendored on top of it |
 | Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %+v %#v %T %d %s %f %e %E %g %G %t %q %x %X %o %b %c %U %%` with width / `.precision` / `-` / `+` / `0` / `#` flags, floats rendered with strconv shortest-`g` semantics, and `Errorf` — builds a real `error` value, with `%w` recording the wrapped error(s) so `errors.Is`/`As`/`Unwrap` walk the chain); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/Replace/ReplaceAll/Title/EqualFold); `strconv` (Itoa/FormatInt/Quote, plus Atoi/ParseInt/ParseFloat returning Go's `(value, error)` pair — a real `*strconv.NumError` with its `Func`/`Num`/`Err` fields, wrapping the `ErrSyntax`/`ErrRange` sentinels, so `errors.Is`/`As`/`Unwrap` all work on it); `math` (Abs/Sqrt/Cbrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min, trig Sin/Cos/Tan/Asin/Acos/Atan/Atan2/Sinh/Cosh/Tanh, Exp/Log/Log2/Log10 + consts Pi/E/Sqrt2/MaxInt/MinInt/MaxInt64/MinInt64); `sort` (Ints/Strings/Float64s + Slice/SliceStable, which take a closure comparator and lower to an in-language stable insertion sort); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`new`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
@@ -210,15 +210,38 @@ The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
 slices/maps (including the typed nil a slice or map zero value is), structs/
 methods, interfaces and interface conversions, multi-name `var` declarations,
 `float32` width, `strconv`'s `*NumError`, closures, generics, goroutines/channels,
-and `select`. The fuzzer generates arithmetic / float / boolean / string / slice /
+`select`, channel `range`/comma-ok receive, `recover()`'s frame rules, unsigned
+64-bit integers, labelled loop signals, and the declared type a captured
+variable keeps inside a closure (a `uint8` still wraps, a `float32` still
+rounds to 32 bits, a captured channel is still a channel). The fuzzer generates arithmetic /
+float / boolean / string / slice /
 map / control-flow / stdlib blocks plus rune arithmetic, fixed-size arrays
 (sequential + sparse), `[]byte`/`[]rune` conversions, string-range-by-rune,
 three-index slices, structs with value/pointer-receiver methods, `new(T)`,
 `fmt.Errorf`/`errors.New`, `defer`/`recover` on runtime panics, type switches,
 capturing closures, bitwise operators, shortest-representation float output
 (`%v`/`%g`/`%e`, where exponent notation appears), integer division through a
-slice element, and generic instantiation — and diffs both interpreters
-byte-for-byte (stdout + exit status).
+slice element, and generic instantiation. Five further shapes cover unsigned
+64-bit integers, the narrow fixed widths (`int8`…`uint32`: wrapping, arithmetic
+vs logical `>>`, shifts at or past the width, conversion truncation), labelled
+and unlabelled `break`/`continue` nested two deep plus `switch` fallthrough,
+`defer`/`panic`/`recover` frame rules, and channels (`range`, comma-ok receive,
+`select` with `default`). The fixed-width shape runs its arithmetic both
+directly and inside a capturing closure, which are separate code paths. It
+diffs both interpreters byte-for-byte (stdout + exit status).
+
+`--only N` pins every generated block to statement shape `N`, so one shape's
+divergence rate is measurable instead of diluted across the other 31, and
+`--ours PATH` runs a go-rs binary built from another commit — together they are
+how a newly added shape is shown to actually exercise what it claims to.
+
+A case only counts as a comparison when the **reference itself succeeded**:
+exit 0 with something on stdout. Go rejects an unused import or an unused
+variable at compile time, so a generator slip yields a program `go` never runs
+— and since go-rs would usually reject it too, "neither printed anything and
+both failed" would otherwise score as agreement. Those cases are reported as
+`skipped` and excluded from the rate, because two failures agreeing is not a
+comparison and a mode that mostly generates them is measuring nothing.
 
 Differences that are known and still open are written down in
 [`BUGS.md`](BUGS.md) with a reproducer and what closing each one needs. The
@@ -257,16 +280,20 @@ superset):
 - **Generics are erased, so a type-parameter zero value is untyped** — `var zero
   T; x != zero` (e.g. `cmp.Or`) compares against `nil` rather than the
   instantiated type's zero. Needs monomorphization or a typed-zero sentinel.
-- **`uint64` values above `i64::MAX`** print as their signed `i64` (the bit
-  pattern is correct for bitwise use). The narrower widths — `int8`/`int16`/
-  `int32`, `uint8`/`uint16`/`uint32`, `byte`, `rune` — do wrap at their declared
-  width, through `++`, compound assignment, binary and unary operators, struct
-  fields, slice elements and function results.
-- **`for v := range ch`** silently yields nothing: the loop cannot tell a drained
-  closed channel from a real zero. fusevm has since landed the `Op::ChanRecvOk`
-  that fixes it, but `Cargo.toml` pins a published crates.io release that
-  predates the op, so this is **waiting on a fusevm release** rather than on
-  design work. Receive in a counted loop until it lands (see
+- **`uint64` loses its signedness through an `any` parameter.** `uint64`, `uint`
+  and `uintptr` are correct on their own: `/`, `%`, `>>`, the ordered
+  comparisons and the conversion to a float are done unsigned, and `fmt` prints
+  the unsigned digits for `%d`/`%v`/`%x`/`%o`/`%b` — including through slice
+  elements, map values and struct fields. As with `float32`, the width is read
+  from the static type at the `fmt` call site, so a value that has passed
+  through an `any`/interface parameter prints as its signed `i64`. The narrower
+  widths — `int8`/`int16`/`int32`, `uint8`/`uint16`/`uint32`, `byte`, `rune` —
+  wrap at their declared width through `++`, compound assignment, binary and
+  unary operators, struct fields, slice elements and function results.
+- **`len(ch)` / `cap(ch)` report 0.** The scheduler owns the channel buffer and
+  fusevm 0.17.0 exposes no op to read its length or capacity, so the frontend
+  has nothing to ask. Every other channel operation is correct. This is
+  **waiting on a fusevm release** rather than on design work (see
   [`BUGS.md`](BUGS.md)).
 - **`float32` loses its width through an `any` parameter or a nested struct
   field.** Arithmetic runs at 32-bit width and `fmt` prints the 32-bit shortest

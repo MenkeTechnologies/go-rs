@@ -49,6 +49,29 @@ fn int_width(ty: &str) -> Option<(u32, bool)> {
     })
 }
 
+/// Whether `ty` is one of Go's unsigned 64-bit integer types. They are the
+/// widths `Value::Int` (an `i64`) holds bit-identically but *reads* differently:
+/// every operation that consults the sign bit needs an unsigned form.
+fn is_uint64_ty(ty: &str) -> bool {
+    matches!(ty, "uint64" | "uint" | "uintptr")
+}
+
+/// The [`host::u64_op`] code for an operator whose result depends on the sign
+/// bit, or `None` for the ones two's complement already makes signedness-blind
+/// (`+ - * << & | ^ &^`) and for the operators that are not arithmetic at all.
+fn u64_op_code(op: BinOp) -> Option<i64> {
+    Some(match op {
+        BinOp::Div => host::u64_op::DIV,
+        BinOp::Mod => host::u64_op::MOD,
+        BinOp::Shr => host::u64_op::SHR,
+        BinOp::Lt => host::u64_op::LT,
+        BinOp::Le => host::u64_op::LE,
+        BinOp::Gt => host::u64_op::GT,
+        BinOp::Ge => host::u64_op::GE,
+        _ => return None,
+    })
+}
+
 /// Map a Go type name to its numeric category.
 fn numtype_of_ty(ty: &str) -> NumType {
     match ty {
@@ -106,6 +129,13 @@ struct LambdaInfo {
     /// Aligned with `captures`: whether each was captured by reference (a shared
     /// heap cell) versus by value. Reads/writes of a cell capture go through it.
     cell_captures: Vec<bool>,
+    /// Aligned with `captures`: each one's declared Go type as the *enclosing*
+    /// scope knew it. A lambda body is compiled with a fresh symbol table, so
+    /// without this a captured `chan int` or `float32` would be untyped inside
+    /// the closure and lower as if it were an untyped value — which silently
+    /// turned `for j := range jobs` on a captured channel into a range over the
+    /// channel handle's integer id.
+    capture_types: Vec<String>,
 }
 
 /// A lexical scope inside a subroutine: local/parameter name → frame slot.
@@ -439,8 +469,8 @@ fn collect_captured(s: &Stmt, out: &mut HashSet<String>) {
                 }
                 ex(elem_zero, out);
             }
-            Expr::MakeChan { cap: Some(c) } => ex(c, out),
-            Expr::MakeChan { cap: None } => {}
+            Expr::MakeChan { cap: Some(c), .. } => ex(c, out),
+            Expr::MakeChan { cap: None, .. } => {}
             Expr::Recv { chan } => ex(chan, out),
             _ => {}
         }
@@ -484,8 +514,10 @@ fn collect_locals(s: &Stmt, out: &mut HashSet<String>) {
         Stmt::Block(b) => b.iter().for_each(|s| collect_locals(s, out)),
         Stmt::Select { cases, default, .. } => {
             for c in cases {
-                if let SelectComm::Recv { bind: Some(b), .. } = &c.comm {
-                    out.insert(b.clone());
+                if let SelectComm::Recv { bind, ok_bind, .. } = &c.comm {
+                    for b in [bind, ok_bind].into_iter().flatten() {
+                        out.insert(b.clone());
+                    }
                 }
                 c.body.iter().for_each(|s| collect_locals(s, out));
             }
@@ -593,9 +625,13 @@ fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
         Stmt::Select { cases, default, .. } => {
             for c in cases {
                 match &c.comm {
-                    SelectComm::Recv { bind, chan } => {
+                    SelectComm::Recv {
+                        bind,
+                        ok_bind,
+                        chan,
+                    } => {
                         fe(chan, bound, out);
-                        if let Some(b) = bind {
+                        for b in [bind, ok_bind].into_iter().flatten() {
                             bound.insert(b.clone());
                         }
                     }
@@ -693,8 +729,8 @@ fn free_expr(e: &Expr, bound: &HashSet<String>, out: &mut HashSet<String>) {
             }
             free_expr(elem_zero, bound, out);
         }
-        Expr::MakeChan { cap: Some(c) } => free_expr(c, bound, out),
-        Expr::MakeChan { cap: None } => {}
+        Expr::MakeChan { cap: Some(c), .. } => free_expr(c, bound, out),
+        Expr::MakeChan { cap: None, .. } => {}
         Expr::Recv { chan } => free_expr(chan, bound, out),
         // A nested function literal: its free names (minus its own params) are
         // free in the enclosing one too.
@@ -1370,11 +1406,16 @@ impl Compiler {
             Op::CallBuiltin(host::GCLOSURE_NEW, captures.len() as u8 + 1),
             0,
         );
+        let capture_types = captures
+            .iter()
+            .map(|c| self.decl_types.get(c).cloned().unwrap_or_default())
+            .collect();
         self.lambdas.push(LambdaInfo {
             params: params.to_vec(),
             body: body.to_vec(),
             captures,
             cell_captures,
+            capture_types,
         });
         id
     }
@@ -1473,11 +1514,20 @@ impl Compiler {
         let done = self.b.emit(Op::JumpIfFalse(0), 0);
         self.b.emit(Op::CallBuiltin(host::GDEFER_POP, 0), 0);
         self.emit_set("$dcpop", 0);
+        // Park any propagating panic across the call: a deferred function runs
+        // normally in Go, so the post-call unwind checks inside it must not see
+        // the panic it was deferred for. Park records this frame's depth, which
+        // is what lets `recover()` tell its *direct* deferred caller from a
+        // helper that deferred function called in turn.
+        self.b.emit(Op::CallBuiltin(host::GDEFER_PARK, 0), 0);
+        self.b.emit(Op::Pop, 0);
         self.emit_get("$dcpop", 0); // the closure, as its own "self"
         self.emit_get("$dcpop", 0);
         self.b.emit(Op::CallBuiltin(host::GCLOSURE_NAMEIDX, 1), 0);
         self.b.emit(Op::CallDynamic(1), 0);
         self.b.emit(Op::Pop, 0); // discard the deferred call's result
+        self.b.emit(Op::CallBuiltin(host::GDEFER_UNPARK, 0), 0);
+        self.b.emit(Op::Pop, 0);
         self.b.emit(Op::Jump(start), 0);
         let end = self.b.current_pos();
         self.b.patch_jump(done, end);
@@ -1594,6 +1644,7 @@ impl Compiler {
         let body = self.lambdas[id].body.clone();
         let captures = self.lambdas[id].captures.clone();
         let cell_captures = self.lambdas[id].cell_captures.clone();
+        let capture_types = self.lambdas[id].capture_types.clone();
 
         let entry = self.b.current_pos();
         let name_idx = self.b.add_name(&format!("$lambda_{id}"));
@@ -1602,6 +1653,14 @@ impl Compiler {
         let mut scope = Scope::new();
         self.types.clear();
         self.decl_types.clear();
+        // Re-seed the captured names with the types the enclosing scope had, so
+        // a captured channel, `float32` or `uint64` keeps lowering by its type.
+        for (name, ty) in captures.iter().zip(&capture_types) {
+            if !ty.is_empty() {
+                self.types.insert(name.clone(), numtype_of_ty(ty));
+                self.decl_types.insert(name.clone(), ty.clone());
+            }
+        }
         let mut slot = 1u16; // slot 0 reserved for the closure ("self")
         for p in &params {
             scope.slots.insert(p.name.clone(), slot);
@@ -1784,9 +1843,13 @@ impl Compiler {
             Stmt::Select { cases, default, .. } => {
                 for c in cases {
                     match &c.comm {
-                        SelectComm::Recv { bind, chan } => {
+                        SelectComm::Recv {
+                            bind,
+                            ok_bind,
+                            chan,
+                        } => {
                             self.fv_expr(chan, bound, caps);
-                            if let Some(v) = bind {
+                            for v in [bind, ok_bind].into_iter().flatten() {
                                 bound.insert(v.clone());
                             }
                         }
@@ -1923,7 +1986,7 @@ impl Compiler {
                     self.fv_expr(l, bound, caps);
                 }
             }
-            Expr::MakeChan { cap } => {
+            Expr::MakeChan { cap, .. } => {
                 if let Some(c) = cap {
                     self.fv_expr(c, bound, caps);
                 }
@@ -2148,6 +2211,33 @@ impl Compiler {
                         self.b.patch_jump(done, end);
                         self.types.insert(names[0].clone(), numtype_of_ty(ty));
                         self.decl_types.insert(names[0].clone(), base_type(ty));
+                        self.emit_declare(&names[0], *line);
+                        return Ok(());
+                    }
+                    // `v, ok := <-ch` — comma-ok channel receive. `ok` is false
+                    // exactly when the channel was closed and drained, which the
+                    // scheduler signals with the sentinel; `v` is then the
+                    // element type's zero.
+                    if let Expr::Recv { chan } = &values[0] {
+                        let n = self.temp_counter;
+                        self.temp_counter += 1;
+                        let raw = format!("$cr{n}");
+                        let elem = self.chan_elem_ty(chan);
+                        self.expr(chan)?;
+                        self.b.emit(Op::ChanRecv, *line);
+                        self.types.insert(raw.clone(), NumType::Unknown);
+                        self.emit_set(&raw, *line);
+                        // ok = the receive did not find the channel drained.
+                        self.emit_get(&raw, *line);
+                        self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), *line);
+                        self.types.insert(names[1].clone(), NumType::Bool);
+                        self.emit_declare(&names[1], *line);
+                        // v = received, or the element zero when not ok.
+                        self.emit_get(&raw, *line);
+                        self.emit_elem_zero(&elem, *line)?;
+                        self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), *line);
+                        self.types.insert(names[0].clone(), numtype_of_ty(&elem));
+                        self.decl_types.insert(names[0].clone(), elem);
                         self.emit_declare(&names[0], *line);
                         return Ok(());
                     }
@@ -2819,10 +2909,33 @@ impl Compiler {
             self.b.emit(Op::LoadInt(i as i64), line);
             self.b.emit(Op::NumEq, line);
             let jf = self.b.emit(Op::JumpIfFalse(0), line);
-            if let SelectComm::Recv { bind: Some(v), .. } = &c.comm {
-                self.emit_get(&sv, line);
-                self.emit_set(v, line);
-                self.types.insert(v.clone(), NumType::Unknown);
+            if let SelectComm::Recv {
+                bind,
+                ok_bind,
+                chan,
+            } = &c.comm
+            {
+                let elem = self.chan_elem_ty(chan);
+                // `case v, ok := <-ch:` — a closed channel makes its receive case
+                // *ready*, so this is how a select loop learns a channel is
+                // finished. `ok` is false exactly for that delivery.
+                if let Some(o) = ok_bind {
+                    self.emit_get(&sv, line);
+                    self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), line);
+                    self.emit_set(o, line);
+                    self.types.insert(o.clone(), NumType::Bool);
+                }
+                if let Some(v) = bind {
+                    // The value a closed channel delivers is the element type's
+                    // zero, so this binding needs the same sentinel mapping
+                    // every other receive gets.
+                    self.emit_get(&sv, line);
+                    self.emit_elem_zero(&elem, line)?;
+                    self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), line);
+                    self.emit_set(v, line);
+                    self.types.insert(v.clone(), NumType::Unknown);
+                    self.decl_types.insert(v.clone(), elem);
+                }
             }
             for s in &c.body {
                 self.stmt(s)?;
@@ -2851,6 +2964,38 @@ impl Compiler {
     fn assign_multi(&mut self, targets: &[Expr], values: &[Expr], line: u32) -> Result<(), String> {
         let n = self.temp_counter;
         self.temp_counter += 1;
+
+        // `v, ok = <-ch` — the comma-ok receive assigning to *existing*
+        // variables. Same lowering as the `:=` form, only assigning rather than
+        // declaring.
+        if targets.len() == 2 && values.len() == 1 {
+            if let Expr::Recv { chan } = &values[0] {
+                let raw = format!("$cra{n}");
+                let elem = self.chan_elem_ty(chan);
+                self.expr(chan)?;
+                self.b.emit(Op::ChanRecv, line);
+                self.types.insert(raw.clone(), NumType::Unknown);
+                self.emit_set(&raw, line);
+
+                let okt = format!("$crok{n}");
+                self.emit_get(&raw, line);
+                self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), line);
+                self.types.insert(okt.clone(), NumType::Bool);
+                self.emit_set(&okt, line);
+
+                let valt = format!("$crv{n}");
+                self.emit_get(&raw, line);
+                self.emit_elem_zero(&elem, line)?;
+                self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), line);
+                self.types.insert(valt.clone(), numtype_of_ty(&elem));
+                self.decl_types.insert(valt.clone(), elem);
+                self.emit_set(&valt, line);
+
+                self.assign(&targets[0], AssignOp::Set, &Expr::Ident(valt), line)?;
+                self.assign(&targets[1], AssignOp::Set, &Expr::Ident(okt), line)?;
+                return Ok(());
+            }
+        }
 
         // `a, b = f()` — one call yielding len(targets) values.
         if targets.len() >= 2
@@ -2938,7 +3083,12 @@ impl Compiler {
                     let l = self.types.get(name).copied().unwrap_or(NumType::Unknown);
                     let r = self.infer(value);
                     let f32ish = self.is_f32(&Expr::Ident(name.clone())) || self.is_f32(value);
-                    if !self.emit_f32_arith(assign_binop(op), f32ish, line) {
+                    // `u /= n` / `u >>= n` read the sign bit; the target's own
+                    // declared type decides, as it is the left operand.
+                    let u64ish = self.is_u64(&Expr::Ident(name.clone()));
+                    if !self.emit_f32_arith(assign_binop(op), f32ish, line)
+                        && !self.emit_u64_arith(assign_binop(op), u64ish, line)
+                    {
                         self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
                         // `u8++` / `i8 += n` wrap at the variable's declared width.
                         if let Some(ty) = self.decl_types.get(name).cloned() {
@@ -2958,7 +3108,10 @@ impl Compiler {
                     self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
                     self.expr(value)?;
                     let f32ish = self.is_f32(target) || self.is_f32(value);
-                    if !self.emit_f32_arith(assign_binop(op), f32ish, line) {
+                    let u64ish = self.is_u64(target);
+                    if !self.emit_f32_arith(assign_binop(op), f32ish, line)
+                        && !self.emit_u64_arith(assign_binop(op), u64ish, line)
+                    {
                         self.emit_arith(
                             assign_binop(op),
                             NumType::Unknown,
@@ -2987,7 +3140,10 @@ impl Compiler {
                     self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), line);
                     self.expr(value)?;
                     let f32ish = self.is_f32(target) || self.is_f32(value);
-                    if !self.emit_f32_arith(assign_binop(op), f32ish, line) {
+                    let u64ish = self.is_u64(target);
+                    if !self.emit_f32_arith(assign_binop(op), f32ish, line)
+                        && !self.emit_u64_arith(assign_binop(op), u64ish, line)
+                    {
                         self.emit_arith(
                             assign_binop(op),
                             NumType::Unknown,
@@ -3025,6 +3181,13 @@ impl Compiler {
         body: &[Stmt],
         label: &Option<String>,
     ) -> Result<(), String> {
+        // `for v := range ch` is not an indexed walk: it receives until the
+        // channel is closed and drained. Nothing about the generic path applies,
+        // so it gets its own loop.
+        if self.type_name(iter).starts_with("chan ") {
+            return self.compile_for_range_chan(key, iter, body, label);
+        }
+
         let n = self.temp_counter;
         self.temp_counter += 1;
         let it = format!("$it{n}");
@@ -3088,6 +3251,71 @@ impl Compiler {
         let end = self.b.current_pos();
 
         let scope = self.loops.pop().unwrap();
+        for j in scope.continues {
+            self.b.patch_jump(j, post_pos);
+        }
+        for j in scope.breaks {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Lower `for v := range ch`: receive until the channel is closed *and*
+    /// drained, binding `v` to each value received. Go allows only the one
+    /// range variable here, and it is the value, not an index.
+    ///
+    /// The termination test is the receive itself: the scheduler answers a
+    /// drained closed channel with the sentinel (see `host::chan_closed_sentinel`),
+    /// which is the same signal `v, ok := <-ch` reads. Testing "closed and
+    /// empty" separately after the receive would be a race.
+    fn compile_for_range_chan(
+        &mut self,
+        val: &Option<String>,
+        chan: &Expr,
+        body: &[Stmt],
+        label: &Option<String>,
+    ) -> Result<(), String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        let ch = format!("$rch{n}");
+        let raw = format!("$rcv{n}");
+        let elem = self.chan_elem_ty(chan);
+
+        // Evaluate the channel once, as Go does.
+        self.expr(chan)?;
+        self.emit_set(&ch, 0);
+
+        self.loops.push(LoopScope {
+            label: label.clone(),
+            ..Default::default()
+        });
+        let top = self.b.current_pos();
+        self.emit_get(&ch, 0);
+        self.b.emit(Op::ChanRecv, 0);
+        self.types.insert(raw.clone(), NumType::Unknown);
+        self.emit_set(&raw, 0);
+        // Closed and drained ends the loop.
+        self.emit_get(&raw, 0);
+        self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), 0);
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.loops.last_mut().expect("loop scope").breaks.push(jf);
+        if let Some(v) = val {
+            self.emit_get(&raw, 0);
+            self.emit_set(v, 0);
+            self.types.insert(v.clone(), numtype_of_ty(&elem));
+            self.decl_types.insert(v.clone(), elem);
+        }
+
+        for s in body {
+            self.stmt(s)?;
+        }
+
+        // `continue` re-enters at the next receive, which is also the loop top.
+        let post_pos = self.b.current_pos();
+        self.b.emit(Op::Jump(top), 0);
+        let end = self.b.current_pos();
+
+        let scope = self.loops.pop().expect("loop scope");
         for j in scope.continues {
             self.b.patch_jump(j, post_pos);
         }
@@ -3326,7 +3554,7 @@ impl Compiler {
                     self.b.emit(Op::CallBuiltin(host::GMAKE, 4), 0);
                 }
             }
-            Expr::MakeChan { cap } => {
+            Expr::MakeChan { cap, .. } => {
                 match cap {
                     Some(e) => self.expr(e)?,
                     None => {
@@ -3335,10 +3563,7 @@ impl Compiler {
                 }
                 self.b.emit(Op::ChanMake, 0);
             }
-            Expr::Recv { chan } => {
-                self.expr(chan)?;
-                self.b.emit(Op::ChanRecv, 0);
-            }
+            Expr::Recv { chan } => self.emit_recv(chan, 0)?,
             Expr::FuncLit { params, body, .. } => {
                 self.emit_funclit(params, body);
             }
@@ -3690,6 +3915,11 @@ impl Compiler {
             Expr::MapLit { key_ty, val_ty, .. } => format!("map[{key_ty}]{val_ty}"),
             // A map `make` records the whole written type in `elem_ty`.
             Expr::Make { elem_ty, .. } => elem_ty.clone(),
+            // `make(chan T)` names `chan T`, so a variable bound to one keeps the
+            // element type a closed receive needs the zero value of.
+            Expr::MakeChan { elem_ty, .. } => format!("chan {elem_ty}"),
+            // `<-ch` has the channel's element type.
+            Expr::Recv { chan } => self.chan_elem_ty(chan),
             _ => String::new(),
         }
     }
@@ -3811,10 +4041,17 @@ impl Compiler {
             // comparing the `f32` against the `f64` 0.1 would be false. Only one
             // side can be untyped in a legal program, so rounding both is safe.
             let f32ish = self.is_f32(lhs) || self.is_f32(rhs);
+            // An ordered comparison of unsigned 64-bit operands reads the sign
+            // bit, so it goes through the unsigned builtin. `==`/`!=` do not —
+            // equal bit patterns are equal at either signedness.
+            let u64ish = !is_str && (self.is_u64(lhs) || self.is_u64(rhs));
             self.emit_compare_operand(lhs)?;
             self.emit_f32_round(f32ish && !self.is_f32(lhs));
             self.emit_compare_operand(rhs)?;
             self.emit_f32_round(f32ish && !self.is_f32(rhs));
+            if self.emit_u64_arith(op, u64ish, 0) {
+                return Ok(());
+            }
             self.b
                 .emit(if is_str { strcmp } else { num_compare_op(op) }, 0);
             return Ok(());
@@ -3829,6 +4066,17 @@ impl Compiler {
         self.expr(lhs)?;
         self.expr(rhs)?;
         if self.emit_f32_arith(op, f32ish, 0) {
+            return Ok(());
+        }
+        // `/`, `%` and `>>` are the arithmetic operators whose result depends on
+        // the sign bit; at an unsigned 64-bit type they take the unsigned form.
+        // A shift's type is the left operand's alone — `int8 >> uint` is a
+        // signed (arithmetic) shift however the *count* is typed.
+        let u64ish = match op {
+            BinOp::Shl | BinOp::Shr => self.is_u64(lhs),
+            _ => self.is_u64(lhs) || self.is_u64(rhs),
+        };
+        if self.emit_u64_arith(op, u64ish, 0) {
             return Ok(());
         }
         self.emit_arith(op, l, r, is_nonzero_const(rhs), 0);
@@ -3868,6 +4116,133 @@ impl Compiler {
             Expr::Index { recv, .. } => self.elem_ty_of(recv).as_deref() == Some("float32"),
             _ => false,
         }
+    }
+
+    /// The unsigned 64-bit Go type `e` statically has (`uint64`, `uint` or
+    /// `uintptr`), or `None`.
+    ///
+    /// These three share `Value::Int`'s 64-bit two's-complement bit pattern, so
+    /// unlike the narrow widths they need no wrapping. What they need is the
+    /// operations that read the sign bit — `/`, `%`, `>>`, the ordered
+    /// comparisons, the conversion to a float, and display — done unsigned.
+    /// The traversal mirrors [`Self::sized_int_ty`]: Go's untyped constants take
+    /// the type of the other operand, so one unsigned operand fixes the whole
+    /// expression, and a shift takes its type from the left operand alone.
+    fn u64_ty(&self, e: &Expr) -> Option<String> {
+        let named = |t: &str| is_uint64_ty(t).then(|| t.to_string());
+        if let Some(t) = named(&base_type(&self.type_name(e))) {
+            return Some(t);
+        }
+        match e {
+            Expr::Ident(n) => self.decl_types.get(n).and_then(|t| named(&base_type(t))),
+            Expr::Unary {
+                op: UnOp::Neg | UnOp::BitNot,
+                rhs,
+            } => self.u64_ty(rhs),
+            Expr::Binary {
+                op: BinOp::Shl | BinOp::Shr,
+                lhs,
+                ..
+            } => self.u64_ty(lhs),
+            Expr::Binary { op, lhs, rhs } if str_compare_op(*op).is_none() => {
+                self.u64_ty(lhs).or_else(|| self.u64_ty(rhs))
+            }
+            Expr::Call { func, .. } => match func.as_ref() {
+                // A conversion `uint64(x)` names its own type.
+                Expr::Ident(n) if is_uint64_ty(n) => Some(n.clone()),
+                Expr::Ident(n) => self
+                    .funcs
+                    .get(n)
+                    .and_then(|s| named(&base_type(&s.result_ty))),
+                _ => None,
+            },
+            // A slice/map element takes its type from the container's.
+            Expr::Index { recv, .. } => self.elem_ty_of(recv).and_then(|t| named(&base_type(&t))),
+            _ => None,
+        }
+    }
+
+    /// The element type of a channel-valued expression, or `""` when go-rs never
+    /// recorded one (a channel reached through an untyped binding). The zero of
+    /// an unknown type is `emit_zero`'s default, which is what an untyped
+    /// receive would have produced anyway.
+    fn chan_elem_ty(&self, e: &Expr) -> String {
+        let t = self.type_name(e);
+        t.strip_prefix("chan ").unwrap_or_default().to_string()
+    }
+
+    /// Emit the zero value of a channel's element type. Unlike [`Self::emit_zero`]
+    /// this also builds a struct type's zero (all fields at their own zero),
+    /// which is what a receive from a closed `chan T` must yield for a struct `T`.
+    fn emit_elem_zero(&mut self, ty: &str, line: u32) -> Result<(), String> {
+        if self.structs.contains(ty) {
+            return self.struct_lit(ty, &[]);
+        }
+        self.emit_zero(ty, line);
+        Ok(())
+    }
+
+    /// Emit one channel receive: `Op::ChanRecv`, then map the drained-closed
+    /// sentinel to the element type's zero so it never reaches a Go value.
+    /// The received value is left on the stack.
+    fn emit_recv(&mut self, chan: &Expr, line: u32) -> Result<(), String> {
+        let elem = self.chan_elem_ty(chan);
+        self.expr(chan)?;
+        self.b.emit(Op::ChanRecv, line);
+        self.emit_elem_zero(&elem, line)?;
+        self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), line);
+        Ok(())
+    }
+
+    /// Whether `e`'s static Go type is one of the unsigned 64-bit types.
+    fn is_u64(&self, e: &Expr) -> bool {
+        self.u64_ty(e).is_some()
+    }
+
+    /// How a `fmt` argument's unsigned 64-bit integers should be tagged, read
+    /// exactly as [`Self::f32_box_spec`] reads its own: `Some(("", ty))` tags the
+    /// value or each element of a container, `Some(("x,y", ty))` names the
+    /// unsigned fields of a struct operand.
+    fn u64_box_spec(&self, e: &Expr) -> Option<(String, String)> {
+        if let Some(ty) = self.u64_ty(e) {
+            return Some((String::new(), ty));
+        }
+        let elem = self
+            .elem_ty_of(e)
+            .map(|t| base_type(&t).to_string())
+            .unwrap_or_else(|| base_type(&self.type_name(e)).to_string());
+        if is_uint64_ty(&elem) {
+            return Some((String::new(), elem));
+        }
+        let fields = self.struct_fields.get(&elem)?;
+        let unsigned: Vec<&(String, String)> = fields
+            .iter()
+            .filter(|(_, ft)| is_uint64_ty(&base_type(ft)))
+            .collect();
+        let ty = unsigned.first()?.1.clone();
+        let spec = unsigned
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Some((spec, base_type(&ty).to_string()))
+    }
+
+    /// Emit `op` as a single unsigned 64-bit operation when the expression is
+    /// statically unsigned and the operator reads the sign bit, and report
+    /// whether it did (the caller emits the ordinary native op otherwise).
+    /// `+ - * << & | ^ &^` are sign-agnostic in two's complement and never come
+    /// through here.
+    fn emit_u64_arith(&mut self, op: BinOp, is_u64: bool, line: u32) -> bool {
+        let Some(code) = u64_op_code(op).filter(|_| is_u64) else {
+            return false;
+        };
+        self.b.emit(Op::LoadInt(code), line);
+        self.b.emit(Op::CallBuiltin(host::GU64_ARITH, 3), line);
+        if matches!(op, BinOp::Div | BinOp::Mod) {
+            self.emit_panic_check(line);
+        }
+        true
     }
 
     /// How a `fmt` argument's `float32`s should be tagged, or `None` when it has
@@ -4227,6 +4602,16 @@ impl Compiler {
                             self.b.emit(Op::LoadConst(c), line);
                             self.b.emit(Op::CallBuiltin(host::GF32_BOX, 2), line);
                         }
+                        // Likewise for width's other half: an unsigned 64-bit
+                        // operand holds the right bits but reads negative, so it
+                        // carries its signedness in the same way.
+                        if let Some((spec, ty)) = self.u64_box_spec(a) {
+                            let c = self.b.add_constant(Value::str(spec));
+                            self.b.emit(Op::LoadConst(c), line);
+                            let t = self.b.add_constant(Value::str(ty));
+                            self.b.emit(Op::LoadConst(t), line);
+                            self.b.emit(Op::CallBuiltin(host::GU64_BOX, 3), line);
+                        }
                     }
                     self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
                     return Ok(());
@@ -4260,6 +4645,18 @@ impl Compiler {
             // applied to a single value.
             if args.len() == 1 && is_conversion_type(name) {
                 self.expr(&args[0])?;
+                // `float64(u)` on an unsigned 64-bit operand widens the
+                // *unsigned* value: `float64(uint64(1)<<63)` is 9.22e+18, where
+                // reading the same bits as an `i64` would give -9.22e+18.
+                if matches!(name.as_str(), "float32" | "float64") && self.is_u64(&args[0]) {
+                    self.b.emit(Op::LoadInt(0), line);
+                    self.b.emit(Op::LoadInt(host::u64_op::TOFLOAT), line);
+                    self.b.emit(Op::CallBuiltin(host::GU64_ARITH, 3), line);
+                    if name == "float32" {
+                        self.emit_f32_round(true);
+                    }
+                    return Ok(());
+                }
                 let c = self.b.add_constant(Value::str(name.clone()));
                 self.b.emit(Op::LoadConst(c), line);
                 self.b.emit(Op::CallBuiltin(host::GCONV, 2), line);

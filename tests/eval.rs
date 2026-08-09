@@ -2303,3 +2303,306 @@ func main() {
 ";
     assert_stdout(src, "55 1 true\n");
 }
+
+#[test]
+fn unsigned_64_bit_reads_the_sign_bit_unsigned() {
+    // `uint64`/`uint`/`uintptr` share `int64`'s bit pattern, so `+ - * << & |`
+    // need nothing — but `/`, `%`, `>>`, the ordered comparisons, the widening
+    // to a float, and printing all consult the sign bit and must not read the
+    // top-bit-set value as negative. Every number here was taken from `go run`.
+    let src = "\
+package main
+import \"fmt\"
+type box struct {
+	u uint64
+	n int
+}
+func half(x uint64) uint64 { return x / 2 }
+func main() {
+	var z uint64 = 0
+	z--
+	var u uint = 0
+	u--
+	fmt.Println(z, u)
+	var x uint64 = 1 << 63
+	fmt.Println(x, x > 100, x/3, x%7, x>>1)
+	fmt.Printf(\"%d|%x|%o|%T\\n\", x, x, x, x)
+	fmt.Println(half(x))
+	fmt.Println(box{u: x, n: -1})
+	fmt.Println([]uint64{x, 1}, map[string]uint64{\"a\": x})
+	var c uint64 = 10
+	c -= 20
+	fmt.Println(c, c/3)
+	fmt.Println(float64(x), int64(x))
+	// A shift's type is the left operand's alone: a `uint` count must not turn
+	// a signed shift into a logical one.
+	var sh uint = 3
+	var g int8 = -128
+	fmt.Println(g >> sh)
+}
+";
+    assert_stdout(
+        src,
+        "18446744073709551615 18446744073709551615\n\
+         9223372036854775808 true 3074457345618258602 1 4611686018427387904\n\
+         9223372036854775808|8000000000000000|1000000000000000000000|uint64\n\
+         4611686018427387904\n\
+         {9223372036854775808 -1}\n\
+         [9223372036854775808 1] map[a:9223372036854775808]\n\
+         18446744073709551606 6148914691236517202\n\
+         9.223372036854776e+18 -9223372036854775808\n\
+         -16\n",
+    );
+}
+
+#[test]
+fn recover_is_effective_only_in_the_directly_deferred_function() {
+    // Go parks a propagating panic for the duration of each deferred call: the
+    // deferred function runs normally and may call other functions before
+    // recovering, but a `recover()` one frame deeper than the deferred call
+    // returns nil. Both halves are load-bearing — treating "a panic is in
+    // flight" as a post-call unwind trigger throws the deferred function out
+    // before it reaches its own `recover()`.
+    let src = "\
+package main
+import \"fmt\"
+func helper() { fmt.Println(\"helper\") }
+func indirect() (ok bool) {
+	defer func() {
+		helper()
+		ok = recover() != nil
+	}()
+	panic(\"x\")
+}
+func doubled(v int) (r int) {
+	defer func() { r *= 2 }()
+	r = v
+	return r
+}
+func main() {
+	fmt.Println(indirect())
+	fmt.Println(doubled(21))
+	func() {
+		defer func() {
+			f := func() any { return recover() }
+			fmt.Println(\"nested:\", f())
+			fmt.Println(\"direct:\", recover())
+		}()
+		panic(\"p\")
+	}()
+	fmt.Println(\"bare:\", recover())
+	func() {
+		defer fmt.Println(\"d1\")
+		defer fmt.Println(\"d2\")
+		defer fmt.Println(\"d3\")
+	}()
+}
+";
+    assert_stdout(
+        src,
+        "helper\ntrue\n42\nnested: <nil>\ndirect: p\nbare: <nil>\nd3\nd2\nd1\n",
+    );
+}
+
+#[test]
+fn channel_receive_reports_closed_and_drained() {
+    // `ok` is false exactly when the channel is closed AND drained — which a
+    // channel delivering a real zero (`0`, `false`, `""`, a zero struct) must
+    // not be confused with, and which is what ends a `range` over a channel.
+    let src = "\
+package main
+import \"fmt\"
+type pt struct{ x, y int }
+func main() {
+	z := make(chan int, 3)
+	z <- 0
+	z <- 0
+	z <- 5
+	close(z)
+	sum, cnt := 0, 0
+	for v := range z {
+		sum += v
+		cnt++
+	}
+	fmt.Println(sum, cnt)
+	pc := make(chan pt, 1)
+	pc <- pt{1, 2}
+	close(pc)
+	p1, ok1 := <-pc
+	p2, ok2 := <-pc
+	fmt.Println(p1, ok1, p2, ok2)
+	bc := make(chan bool, 1)
+	bc <- false
+	close(bc)
+	b1, k1 := <-bc
+	b2, k2 := <-bc
+	fmt.Println(b1, k1, b2, k2)
+	// A closed channel makes its select case ready; comma-ok reports it, which
+	// is how a select loop learns the channel is finished.
+	d := make(chan int, 2)
+	d <- 7
+	d <- 8
+	close(d)
+	acc := 0
+loop:
+	for {
+		select {
+		case v, ok := <-d:
+			if !ok {
+				break loop
+			}
+			acc += v
+		}
+	}
+	fmt.Println(\"acc\", acc)
+	// A goroutine producer that closes ends the consumer's range.
+	gc := make(chan int)
+	go func() {
+		for i := 1; i <= 4; i++ {
+			gc <- i
+		}
+		close(gc)
+	}()
+	gs := 0
+	for v := range gc {
+		gs += v
+	}
+	fmt.Println(\"gs\", gs)
+}
+";
+    assert_stdout(
+        src,
+        "5 3\n{1 2} true {0 0} false\nfalse true false false\nacc 15\ngs 10\n",
+    );
+}
+
+#[test]
+fn captured_variables_keep_their_declared_type_inside_a_closure() {
+    // A lambda body is compiled with a fresh symbol table, so a captured
+    // variable's declared type has to be carried in explicitly. Without it a
+    // captured `chan int` is untyped inside the closure and `range` over it
+    // lowers as a range over the channel handle's integer id — which silently
+    // ran zero times instead of consuming the channel.
+    let src = "\
+package main
+import (
+	\"fmt\"
+	\"sync\"
+)
+func main() {
+	jobs := make(chan int, 8)
+	out := make(chan int, 8)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := range jobs {
+			out <- j * j
+		}
+	}()
+	for i := 1; i <= 4; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	close(out)
+	total := 0
+	for r := range out {
+		total += r
+	}
+	fmt.Println(total)
+	// A captured `uint64` likewise keeps reading unsigned inside the closure.
+	var big uint64 = 1 << 63
+	show := func() { fmt.Println(big, big/2, big > 1) }
+	show()
+}
+";
+    assert_stdout(src, "30\n9223372036854775808 4611686018427387904 true\n");
+}
+
+#[test]
+fn comma_ok_receive_assigns_to_existing_variables() {
+    // `v, ok = <-ch` (plain `=`) is the same lowering as the `:=` form but goes
+    // through parallel assignment, which would otherwise reject it as an
+    // arity mismatch. The element zero a closed receive yields must also be the
+    // *typed* nil for a slice or map element, not an untyped nil.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	c := make(chan int, 1)
+	c <- 5
+	close(c)
+	var v int
+	var ok bool
+	v, ok = <-c
+	fmt.Println(v, ok)
+	v, ok = <-c
+	fmt.Println(v, ok)
+	d := make(chan int, 1)
+	d <- 3
+	close(d)
+	_, o := <-d
+	x, _ := <-d
+	fmt.Println(o, x)
+	m := make(chan map[string]int, 1)
+	close(m)
+	mv, mok := <-m
+	fmt.Println(mv, mok, mv == nil, len(mv))
+	s := make(chan []int, 1)
+	close(s)
+	sv, sok := <-s
+	fmt.Println(sv, sok, sv == nil, len(sv))
+}
+";
+    assert_stdout(
+        src,
+        "5 true\n0 false\ntrue 0\nmap[] false true 0\n[] false true 0\n",
+    );
+}
+
+#[test]
+fn captured_narrow_widths_still_wrap_inside_a_closure() {
+    // The widest blast radius of the fresh-symbol-table problem: without the
+    // captured variable's declared type, `uint8` arithmetic inside a closure
+    // stopped wrapping (250+10 printed 260) and `float32` stopped rounding to
+    // 32 bits. Goroutine bodies and deferred closures are closures too, so this
+    // reached most concurrent code.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	var b uint8 = 250
+	h := func() uint8 { b += 10; return b }
+	fmt.Println(h(), b)
+	var i8 int8 = 120
+	k := func() { i8 += 20; fmt.Println(i8, i8>>2, i8/3) }
+	k()
+	var u16 uint16 = 65530
+	l := func() { u16 += 10; fmt.Println(u16) }
+	l()
+	var f float32 = 1.0 / 3.0
+	g := func() { fmt.Println(f, f*3) }
+	g()
+	var u uint64 = 1 << 63
+	outer := func() {
+		inner := func() { fmt.Println(u, u/2, u > 1) }
+		inner()
+	}
+	outer()
+	done := make(chan uint8, 1)
+	var gb uint8 = 200
+	go func() { gb *= 2; done <- gb }()
+	fmt.Println(<-done)
+	func() {
+		var db int8 = 100
+		defer func() { db += 100; fmt.Println(\"deferred\", db) }()
+	}()
+}
+";
+    assert_stdout(
+        src,
+        "4 4\n-116 -29 -38\n4\n0.33333334 1\n\
+         9223372036854775808 4611686018427387904 true\n144\ndeferred -56\n",
+    );
+}
