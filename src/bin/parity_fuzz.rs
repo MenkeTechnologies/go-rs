@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 37;
+const SHAPES: u64 = 38;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -753,6 +753,48 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                  \tfmt.Printf(\"%q|%s|%x\\n\", qc{n}, qs{n}, qc{n})\n"
             )
         }
+        // A defined type — `type Weekday int` — is a *distinct* type in Go with
+        // its base's representation. Everything it does at run time is the
+        // base's behaviour, and the one thing that is not is its name: `%T`
+        // prints `main.Weekday`, `%#v` writes the name on a composite, and a
+        // method declared on it is reached through it. A frontend that drops the
+        // name at the declaration cannot recover any of that, and one that
+        // treats the type as opaque loses the base's arithmetic — so both halves
+        // are printed for every base kind here.
+        37 => {
+            uses.defined = true;
+            let (a, b) = (rng.int(-9, 40), rng.int(1, 9));
+            let w = rng.pick(WORDS);
+            let f = rng.pick(&["1.5", "2.25", "-0.75", "10"]);
+            format!(
+                "\tdi{n} := myInt({a})\n\
+                 \tfmt.Printf(\"%T %v %d %q\\n\", di{n}, di{n}, di{n}, di{n})\n\
+                 \tfmt.Printf(\"%T %v %d\\n\", di{n}+{b}, di{n}*2, di{n}-{b})\n\
+                 \tfmt.Printf(\"%T %v\\n\", di{n}.triple(), int(di{n}))\n\
+                 \tvar ds{n} myStr = \"{w}\"\n\
+                 \tfmt.Printf(\"%T %q %s %v\\n\", ds{n}, ds{n}, ds{n}, ds{n}+\"z\")\n\
+                 \tdf{n} := myFloat({f})\n\
+                 \tfmt.Printf(\"%T %v %.2f\\n\", df{n}, df{n}, df{n})\n\
+                 \tdb{n} := myBool({a} > 0)\n\
+                 \tfmt.Printf(\"%T %v %t\\n\", db{n}, db{n}, db{n})\n\
+                 \tdl{n} := mySlice{{{a}, {b}}}\n\
+                 \tfmt.Printf(\"%T %v %d %#v\\n\", dl{n}, dl{n}, dl{n}, dl{n})\n\
+                 \tfmt.Printf(\"%v %v\\n\", len(dl{n}), dl{n}[0])\n\
+                 \tdm{n} := myMap{{\"{w}\": {a}}}\n\
+                 \tfmt.Printf(\"%T %v %d\\n\", dm{n}, dm{n}, dm{n}[\"{w}\"])\n\
+                 \tda{n} := myArr{{{a}, {b}, {a}}}\n\
+                 \tfmt.Printf(\"%T %v\\n\", da{n}, da{n})\n\
+                 \tvar dn{n} mySlice\n\tvar dq{n} myMap\n\
+                 \tfmt.Printf(\"%T %v %T %v\\n\", dn{n}, dn{n}, dq{n}, dq{n})\n\
+                 \tvar dfn{n} myFunc\n\tvar dch{n} myChan\n\
+                 \tfmt.Printf(\"%T %T\\n\", dfn{n}, dch{n})\n\
+                 \tfmt.Printf(\"%T %v\\n\", []myInt{{myInt({a})}}, []myInt{{myInt({a})}})\n\
+                 \tfmt.Printf(\"%T\\n\", map[myStr]myInt{{\"{w}\": myInt({b})}})\n\
+                 \tds2{n} := ds{n}\n\tdi2{n} := di{n}\n\
+                 \tfmt.Printf(\"%T %T %v %v\\n\", ds2{n}, di2{n}, ds2{n} == ds{n}, di2{n} == di{n})\n\
+                 \tfmt.Printf(\"%T %v\\n\", bump(di{n}), bump(di{n}))\n"
+            )
+        }
         // new(T) — a zero-valued struct pointer.
         18 => {
             uses.structs = true;
@@ -833,6 +875,9 @@ struct Uses {
     generic: bool,
     /// The defer/panic/recover shape's top-level helpers.
     deferred: bool,
+    /// The defined types the `%T`-over-a-defined-type shape declares, one per
+    /// base kind, plus a method on one of them and a function taking it.
+    defined: bool,
 }
 
 /// Build a complete, deterministic-output Go program for `seed`.
@@ -902,6 +947,26 @@ fn program(seed: u64, only: Option<u64>) -> String {
         preamble.push_str(
             "func sumAll(xs ...int) int {\n\
              \tt := 0\n\tfor _, x := range xs {\n\t\tt += x\n\t}\n\treturn t\n}\n\n",
+        );
+    }
+    if uses.defined {
+        // One defined type per base kind. `triple` is a method on a defined
+        // *non-struct* type — the receiver is reached through the name, which is
+        // the other thing a frontend that erases the declaration loses — and
+        // `bump` takes and returns one, so the name has to survive a parameter
+        // bind and a return.
+        preamble.push_str(
+            "type myInt int\n\
+             type myStr string\n\
+             type myFloat float64\n\
+             type myBool bool\n\
+             type mySlice []int\n\
+             type myMap map[string]int\n\
+             type myArr [3]int\n\
+             type myFunc func(int) int\n\
+             type myChan chan int\n\n\
+             func (m myInt) triple() myInt { return m * 3 }\n\n\
+             func bump(m myInt) myInt { return m + 1 }\n\n",
         );
     }
     if uses.generic {
