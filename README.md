@@ -229,17 +229,26 @@ and unlabelled `break`/`continue` nested two deep plus `switch` fallthrough,
 `select` with `default`). A further shape covers **struct value semantics**
 through a nested struct: copy on assignment, argument bind, return, slice and
 map store, indexed read, `range` binding, `append` (including a spread),
-channel send, value- vs pointer-receiver calls, and field-wise `==`. A last one
+channel send, value- vs pointer-receiver calls, and field-wise `==`. Another
 covers **array value semantics** over the same sites, plus the depths a struct
 does not reach: nested `[N][M]T`, an array of structs, an array-typed struct
 field, `range` over an array written mid-loop, an array map key, and the
-reference half (an array of slices keeps sharing its slices). The
+reference half (an array of slices keeps sharing its slices). A further shape
+covers the **fixed-size array's type name**, which rides on the value rather
+than the static type: `%T`/`%#v`/`%v` on an array beside the slice spelling that
+must still name a slice, through an assignment, an `any` box, a nested
+`[2][3]int`, an array of structs, an array of slices, a slice and a map *of*
+arrays, and the `float32`/`uint64` widths whose `fmt` boxing rebuilds the value.
+A last one covers **composite literals past fusevm's 255-value call arity**,
+which are built in chunks: a slice, an array, a map and a variadic spread all
+sized over the cut, checking an element *past* the cut rather than only the
+length — the old wrap-around silently produced a short literal. The
 fixed-width shape runs its arithmetic both directly and inside a capturing
 closure, which are separate code paths. It diffs both interpreters
 byte-for-byte (stdout + exit status).
 
 `--only N` pins every generated block to statement shape `N`, so one shape's
-divergence rate is measurable instead of diluted across the other 33, and
+divergence rate is measurable instead of diluted across the other 35, and
 `--ours PATH` runs a go-rs binary built from another commit — together they are
 how a newly added shape is shown to actually exercise what it claims to.
 
@@ -308,11 +317,16 @@ superset):
   decimal for a statically-`float32` operand (including `[]float32`,
   `map[K]float32` and the operand struct's own fields), but the width is read
   from the static type at the `fmt` call site, so it does not survive erasure.
-- **`%T` names an array by its runtime object, so it prints `[]int` for a
-  `[3]int`.** An array and a slice are the same heap object, and `%T` reads the
-  value rather than the static type. Only the *name* is affected: the value
-  semantics, `==`, map-key use and every copy site are the array's (see
-  [`BUGS.md`](BUGS.md)).
+- **`%T` erases a defined type over a non-struct base**, so `type Weekday int`
+  prints as `int` — the parser discards the base type, and nothing at run time
+  records the name. A defined *struct* type is named correctly.
+- **`%q` does not distribute over a slice**, so `[]string{"a","b"}` prints
+  `"[a b]"` where Go prints `["a" "b"]` (see [`BUGS.md`](BUGS.md)).
+- **A call passes at most 255 arguments.** fusevm carries a call's argument
+  count in a `u8`, and unlike a composite literal a call site has nothing to
+  build up in chunks, so `fmt.Println` with 256 arguments is a compile error.
+  Go itself has no such limit. A composite literal is *not* bounded this way —
+  it is built in chunks at any size.
 
 ## License
 

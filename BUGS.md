@@ -36,32 +36,62 @@ other channel operation is correct. Closing this needs a fusevm release
 carrying a channel-length op; vendoring or path-overriding fusevm to add one is
 not an option — the published pin is the contract.
 
-## `%T` names an array after its runtime object, not its static type
+## `%T` erases a defined type over a non-struct base
 
 ```go
-a := [3]int{1, 2, 3}
-fmt.Printf("%T\n", a)   // go: [3]int     go-rs: []int
+type Weekday int
+var d Weekday = 3
+fmt.Printf("%T\n", d)   // go: main.Weekday   go-rs: int
 ```
 
-A `[N]T` and a `[]T` are the same [`HostObj::Slice`] on go-rs's heap, and `%T`
-answers from the value (`go_type_name`, `src/host.rs`), which has no length to
-report and no way to tell the two spellings apart. The rest of the array's
-behaviour is *not* affected — value semantics, `==`, map-key use and every copy
-site are driven by the static type, and a `case [3]int` in a type switch still
-matches, because the type tag for both spellings is `[]`.
+`type_decl` (`src/parser.rs`) keeps a defined type only when its base is a
+struct or an interface; over any other base it consumes the base and discards
+the name, so nothing downstream — static or dynamic — can recover it. A defined
+*struct* type is named correctly (`main.pt`), including inside a composite
+(`[2]main.pt`, `map[string]main.pt`).
 
-Closing it means carrying the written type in at `fmt` argument positions the
-way `float32` and `uint64` already do (`GF32_BOX` / `GU64_BOX`). Those two box a
-*scalar* into a one-field heap object; an array would need a wrapper that every
-`fmt` path unwraps, which is a wider change than the one verb it fixes.
+Closing it needs the name carried through the parser onto the values of that
+type, which is the same erasure that makes `[]Weekday` print `[]int`.
 
-Array **value** semantics *are* implemented, at every copy site — assignment,
-argument bind, return, container store, container read, `range` (over the array
-and for the element binding), channel send, `append` including a spread, and the
-zero value — recursing elementwise through nested arrays and struct elements
-while leaving slice, map and pointer elements shared. The gate is
-`parity-scripts/array_value_semantics.go`. Struct value semantics are the same
-at the same sites, gated by `parity-scripts/struct_value_semantics.go`.
+## `%q` does not distribute over a slice
+
+```go
+fmt.Printf("%q\n", []string{"a", "b"})   // go: ["a" "b"]   go-rs: "[a b]"
+```
+
+`%d` and `%x` distribute over a slice's elements (`slice_elems`, `src/host.rs`)
+but `%q` renders the container's `%v` form and quotes that one string. Go
+applies the verb elementwise for every verb, not just the numeric ones.
+
+## A call passes at most 255 arguments
+
+```go
+fmt.Println(0, 1, 2, /* … 256 arguments in total … */)
+// go:    prints them all
+// go-rs: compile error — `fmt.Println` takes at most 255 arguments here
+```
+
+fusevm 0.17.0's `Op::CallBuiltin` carries its argument count in a `u8`
+(`CallBuiltin(u16, u8)`, and `BuiltinHandler = fn(&mut VM, u8)`), so one call
+can take at most 255 stack values. A *composite literal* is not bounded by this
+— it is built in chunks, the first through its literal builtin and each later
+one through `GLIT_EXTEND`, so `[]int{…}` and `map[K]V{…}` and a struct literal
+work at any size. A call site has no container to build up, so the count cannot
+be chunked away and go-rs refuses to build instead.
+
+This was a silent truncation until the count was checked: the byte wrapped, and
+`fmt.Println` with 256 arguments printed a blank line. Raising the bound needs a
+fusevm release with a wider arity encoding; the published pin is the contract.
+
+Array and struct **value** semantics are implemented at every copy site —
+assignment, argument bind, return, container store, container read, `range`
+(over the array and for the element binding), channel send, `append` including
+a spread, and the zero value — recursing elementwise through nested arrays and
+struct elements while leaving slice, map and pointer elements shared. The gates
+are `parity-scripts/array_value_semantics.go` and
+`parity-scripts/struct_value_semantics.go`. A `[N]T`'s written type is carried
+on the object, so `%T` and `%#v` name the array at every depth
+(`parity-scripts/array_type_name.go`).
 
 ## `map` operations are O(n) each, so building one is O(n²)
 
@@ -237,7 +267,10 @@ argument's own type (the tag walks slices, maps and the argument struct's own
 fields, but does not recurse into a struct-typed field).
 
 Closing it needs the width to live on the value rather than at the call site —
-a `Value` variant, which is the same change `%T`-through-`any` would want.
+a `Value` variant. A fixed-size array solved the same erasure the other way, by
+stamping its written type on the heap object where the value is born and copying
+the tag along with it — which works there because an array is a heap object with
+a copy at every site, and does not transfer to a scalar held in `Value::Float`.
 
 ## `uint64` loses its signedness through an `any` parameter
 

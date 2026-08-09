@@ -2164,11 +2164,18 @@ const CORPUS: &[Entry] = &[
         "for i := 0; i < n; i++ { … }",
     ),
     e(
-        "%T on an array",
+        "%T on a defined type",
         "Divergence from Go",
-        "fmt.Printf(\"%T\", a)",
-        "An array and a slice are the same heap object here, and `%T` answers from the value rather than the static type, so a `[3]int` prints as `[]int`. Only the name is affected — the value semantics, `==`, map-key use and every copy site are the array's, and a `case [3]int` in a type switch still matches.",
-        "fmt.Printf(\"%v %d\", a, len(a))",
+        "fmt.Printf(\"%T\", d)",
+        "A defined type over a non-struct base (`type Weekday int`) is erased by the parser, so `%T` names the base: `int`, not `main.Weekday`. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.",
+        "fmt.Printf(\"%T\", a) // [3]int",
+    ),
+    e(
+        "call argument limit",
+        "Divergence from Go",
+        "fmt.Println(a1, a2, /* … 256 … */)",
+        "A call passes at most 255 arguments: fusevm holds a call's argument count in a `u8`. Over that is a compile error rather than a silently short call. Go has no such limit. A composite literal is not bounded this way — it is built in chunks, so `[]T{…}`, `map[K]V{…}` and a struct literal work at any size.",
+        "fmt.Println(xs) // pass the slice",
     ),
     e(
         "func init",

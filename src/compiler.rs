@@ -1491,11 +1491,10 @@ impl Compiler {
         }
         let names = self.named_results.clone();
         if names.len() >= 2 {
-            for r in &names {
-                self.emit_get(r, line);
-            }
-            self.b
-                .emit(Op::CallBuiltin(host::GSLICE_LIT, names.len() as u8), line);
+            let _ = self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, names.len(), line, |c, i| {
+                c.emit_get(&names[i], line);
+                Ok(())
+            });
         } else if let Some(r) = names.first() {
             self.emit_get(r, line);
         } else {
@@ -1527,11 +1526,11 @@ impl Compiler {
             return;
         }
         if results.len() >= 2 {
-            for ty in results {
-                self.emit_zero(ty, line);
-            }
-            self.b
-                .emit(Op::CallBuiltin(host::GSLICE_LIT, results.len() as u8), line);
+            let results = results.to_vec();
+            let _ = self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, results.len(), line, |c, i| {
+                c.emit_zero(&results[i], line);
+                Ok(())
+            });
         } else if let Some(ty) = results.first() {
             self.emit_zero(ty, line);
         } else {
@@ -2215,6 +2214,14 @@ impl Compiler {
                         None => self.emit_default(nt, *line),
                     },
                 }
+                // `var a [N]T` is an array slot however it was initialized, so
+                // it stamps the written type for `%T`/`%#v`. The form without an
+                // initializer lowers to a `make`, which carries no type of its
+                // own; the other forms re-stamp the type they already have.
+                if let Some(t) = ty.as_deref().filter(|t| array_elem_ty(t).is_some()) {
+                    let t = t.to_string();
+                    self.emit_array_tag(&t, *line);
+                }
                 self.types.insert(name.clone(), nt);
                 self.decl_types.insert(name.clone(), decl_ty);
                 self.emit_declare(name, *line);
@@ -2425,11 +2432,10 @@ impl Compiler {
                         // heap value), destructured at the call site.
                         n => {
                             let tys = self.fn_results.clone();
-                            for (i, e) in vals.iter().enumerate() {
-                                self.emit_result(e, i, &tys)?;
-                            }
-                            self.b
-                                .emit(Op::CallBuiltin(host::GSLICE_LIT, n as u8), *line);
+                            let vals = vals.clone();
+                            self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, n, *line, |c, i| {
+                                c.emit_result(&vals[i], i, &tys)
+                            })?;
                         }
                     }
                     self.emit_return(*line);
@@ -3423,6 +3429,9 @@ impl Compiler {
             let ec = self.b.add_constant(Value::str(elem));
             self.b.emit(Op::LoadConst(ec), line);
             self.b.emit(Op::CallBuiltin(host::GMAKE, 5), line);
+            // The zero value is another of the places an array is born, so it
+            // too carries the written type onto the object for `%T`/`%#v`.
+            self.emit_array_tag(ty, line);
             return;
         }
         if ty.starts_with("[]") || ty.starts_with("map[") {
@@ -3596,24 +3605,32 @@ impl Compiler {
                 }
                 self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 4), 0);
             }
-            Expr::SliceLit { elem_ty, elems, .. } => {
-                for e in elems {
-                    self.emit_typed(e, elem_ty)?;
+            Expr::SliceLit {
+                elem_ty,
+                elems,
+                array_len,
+            } => {
+                let (elem_ty, elems) = (elem_ty.clone(), elems.clone());
+                self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, elems.len(), 0, |c, i| {
+                    c.emit_typed(&elems[i], &elem_ty)
+                })?;
+                // `[N]T{…}` is one of the three places an array value is born,
+                // so it carries the written type onto the object for `%T`/`%#v`.
+                if let Some(n) = array_len {
+                    self.emit_array_tag(&format!("[{n}]{elem_ty}"), 0);
                 }
-                self.b
-                    .emit(Op::CallBuiltin(host::GSLICE_LIT, elems.len() as u8), 0);
             }
             Expr::MapLit {
                 key_ty,
                 val_ty,
                 pairs,
             } => {
-                for (k, v) in pairs {
-                    self.emit_typed(k, key_ty)?;
-                    self.emit_typed(v, val_ty)?;
-                }
-                self.b
-                    .emit(Op::CallBuiltin(host::GMAP_LIT, (pairs.len() * 2) as u8), 0);
+                let (key_ty, val_ty, pairs) = (key_ty.clone(), val_ty.clone(), pairs.clone());
+                self.emit_lit_chunked(host::GMAP_LIT, 0, 2, pairs.len(), 0, |c, i| {
+                    let (k, v) = &pairs[i];
+                    c.emit_typed(k, &key_ty)?;
+                    c.emit_typed(v, &val_ty)
+                })?;
             }
             Expr::StructLit { type_name, fields } => self.struct_lit(type_name, fields)?,
             Expr::Make {
@@ -3686,9 +3703,13 @@ impl Compiler {
 
         let tc = self.b.add_constant(Value::str(type_name.to_string()));
         self.b.emit(Op::LoadConst(tc), 0);
-        for (i, (fname, fty)) in decl.iter().enumerate() {
-            let fc = self.b.add_constant(Value::str(fname.clone()));
-            self.b.emit(Op::LoadConst(fc), 0);
+        let given = given.to_vec();
+        // The type name is the one fixed stack value `GSTRUCT_NEW` spends
+        // before its `name,value` field pairs.
+        self.emit_lit_chunked(host::GSTRUCT_NEW, 1, 2, decl.len(), 0, |c, i| {
+            let (fname, fty) = &decl[i];
+            let fc = c.b.add_constant(Value::str(fname.clone()));
+            c.b.emit(Op::LoadConst(fc), 0);
             let value: Option<&Expr> = if keyed {
                 given
                     .iter()
@@ -3698,19 +3719,17 @@ impl Compiler {
                 given.get(i).map(|(_, v)| v)
             };
             match value {
-                Some(e) => self.emit_typed(e, fty)?,
+                Some(e) => c.emit_typed(e, fty),
                 // A struct-typed field's zero value is a zero struct, not nil —
                 // `var c counter` gives `c.mu` a usable `sync.Mutex`. A pointer
                 // field (`*T`) is nil, so only the bare type recurses.
-                None if self.structs.contains(fty) => self.struct_lit(fty, &[])?,
-                None => self.emit_zero(fty, 0),
+                None if c.structs.contains(fty) => c.struct_lit(fty, &[]),
+                None => {
+                    c.emit_zero(fty, 0);
+                    Ok(())
+                }
             }
-        }
-        self.b.emit(
-            Op::CallBuiltin(host::GSTRUCT_NEW, (1 + decl.len() * 2) as u8),
-            0,
-        );
-        Ok(())
+        })
     }
 
     /// Emit the right-hand side of a binding to `name`, additionally tracking
@@ -3813,6 +3832,136 @@ impl Compiler {
         let is_pointer = matches!(e, Expr::Unary { op: UnOp::Addr, .. });
         if !is_pointer {
             self.emit_copy_for(&self.type_name(e));
+        }
+        Ok(())
+    }
+
+    /// Stamp the written `[N]T` on the fixed-size array on top of the stack, so
+    /// `%T` and `%#v` can name it — an array and a slice are the same heap
+    /// object, and the length is not recoverable from the elements.
+    ///
+    /// Only the three places an array is *born* need this: a composite literal
+    /// (`[N]T{…}`), a zero value ([`Self::emit_zero`], which covers a struct
+    /// field and a named result), and a `var a [N]T` declaration — whose
+    /// initializer-less form lowers to a `make` that carries no type of its own.
+    /// Every other array is a copy of one of those, and [`host::GARRAY_COPY`]
+    /// carries the tag across.
+    fn emit_array_tag(&mut self, ty: &str, line: u32) {
+        let shown = self.go_type_display(ty);
+        let c = self.b.add_constant(Value::str(shown));
+        self.b.emit(Op::LoadConst(c), line);
+        self.b.emit(Op::CallBuiltin(host::GARRAY_TAG, 2), line);
+    }
+
+    /// A written type as Go's `fmt` spells it: a declared type is qualified by
+    /// its package (go-rs only compiles `package main`), and the two spelling
+    /// aliases are resolved — `byte` is `uint8` and `rune` is `int32`.
+    ///
+    /// The rewrite is structural, so a name nested any distance inside a
+    /// composite is qualified too: `[2]map[string]pt` shows as
+    /// `[2]map[string]main.pt`. `%T` on a struct reads the same qualification
+    /// off the object ([`host::go_type_name`]), so the two agree.
+    fn go_type_display(&self, ty: &str) -> String {
+        let ty = ty.trim();
+        if let (Some(elem), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
+            return format!("[{n}]{}", self.go_type_display(elem));
+        }
+        if let Some(elem) = ty.strip_prefix("[]") {
+            return format!("[]{}", self.go_type_display(elem));
+        }
+        if let Some(elem) = ty.strip_prefix('*') {
+            return format!("*{}", self.go_type_display(elem));
+        }
+        if let Some(rest) = ty.strip_prefix("map[") {
+            // The key may itself be a composite, so the key's own brackets have
+            // to be balanced off before the closing one is the map's.
+            let mut depth = 0usize;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' if depth == 0 => {
+                        return format!(
+                            "map[{}]{}",
+                            self.go_type_display(&rest[..i]),
+                            self.go_type_display(&rest[i + 1..])
+                        );
+                    }
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            return ty.to_string();
+        }
+        match ty {
+            "byte" => "uint8".to_string(),
+            "rune" => "int32".to_string(),
+            "any" | "interface{}" => "interface {}".to_string(),
+            // The parser erases a function type's signature, and `%T` on a
+            // closure names it `func()` for the same reason — so an array of
+            // them agrees with the element it holds.
+            "func" => "func()".to_string(),
+            _ if self.structs.contains(ty) => format!("main.{ty}"),
+            _ => ty.to_string(),
+        }
+    }
+
+    /// `n` as the arity byte a `CallBuiltin` carries, or a compile error.
+    ///
+    /// fusevm holds the count in a `u8`, and a call site — unlike a composite
+    /// literal — has no container to build up in chunks, so an over-long one
+    /// cannot be lowered. Wrapping the count instead would drop arguments
+    /// silently: `fmt.Println` with 256 of them printed a blank line. Refusing
+    /// to build is the honest answer; Go itself puts no limit here, so this is
+    /// a stated go-rs bound rather than a diagnosis of the program.
+    fn call_arity(n: usize, what: &str, line: u32) -> Result<u8, String> {
+        u8::try_from(n).map_err(|_| {
+            format!(
+                "go-rs: `{what}` takes at most {} arguments here, got {n} (line {line})",
+                u8::MAX
+            )
+        })
+    }
+
+    /// Emit a composite literal of `items` items, `slots` stack values each,
+    /// splitting it across as many calls as fusevm's `u8` arity byte requires.
+    ///
+    /// One `Op::CallBuiltin` carries at most 255 stack values, `fixed` of which
+    /// the literal builtin already spends on something else (the struct
+    /// literal's type name). A Go literal has no such bound — `[]int{…}` with
+    /// 256 elements is ordinary — so the first chunk goes to `lit` and each
+    /// later one to [`host::GLIT_EXTEND`], which appends to the container the
+    /// first call left on the stack. Emitting the count as a plain `as u8`
+    /// wrapped it instead, and the literal silently lost everything past the
+    /// first 255 values.
+    fn emit_lit_chunked(
+        &mut self,
+        lit: u16,
+        fixed: usize,
+        slots: usize,
+        items: usize,
+        line: u32,
+        mut emit_item: impl FnMut(&mut Self, usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        const ARITY_MAX: usize = u8::MAX as usize;
+        let head = items.min((ARITY_MAX - fixed) / slots);
+        for i in 0..head {
+            emit_item(self, i)?;
+        }
+        self.b
+            .emit(Op::CallBuiltin(lit, (fixed + head * slots) as u8), line);
+        // Each later chunk spends one slot on the container it extends.
+        let per_chunk = (ARITY_MAX - 1) / slots;
+        let mut done = head;
+        while done < items {
+            let k = (items - done).min(per_chunk);
+            for i in done..done + k {
+                emit_item(self, i)?;
+            }
+            self.b.emit(
+                Op::CallBuiltin(host::GLIT_EXTEND, (1 + k * slots) as u8),
+                line,
+            );
+            done += k;
         }
         Ok(())
     }
@@ -4792,7 +4941,8 @@ impl Compiler {
                             self.b.emit(Op::CallBuiltin(host::GU64_BOX, 3), line);
                         }
                     }
-                    self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+                    let argc = Self::call_arity(args.len(), &format!("fmt.{field}"), line)?;
+                    self.b.emit(Op::CallBuiltin(id, argc), line);
                     return Ok(());
                 }
                 // Standard-library package calls.
@@ -4810,7 +4960,8 @@ impl Compiler {
                     for a in args {
                         self.expr(a)?;
                     }
-                    self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+                    let argc = Self::call_arity(args.len(), &format!("{pkg}.{field}"), line)?;
+                    self.b.emit(Op::CallBuiltin(id, argc), line);
                     return Ok(());
                 }
             }
@@ -4847,8 +4998,8 @@ impl Compiler {
                 for a in args {
                     self.emit_value(a)?;
                 }
-                self.b
-                    .emit(Op::CallBuiltin(host::GPANIC, args.len() as u8), line);
+                let argc = Self::call_arity(args.len(), "panic", line)?;
+                self.b.emit(Op::CallBuiltin(host::GPANIC, argc), line);
                 let j = self.b.emit(Op::Jump(0), line);
                 self.panic_jumps.push(j);
                 return Ok(());
@@ -4892,10 +5043,9 @@ impl Compiler {
                 for a in args {
                     self.expr(a)?;
                 }
-                self.b.emit(
-                    Op::CallBuiltin(host::GAPPEND_SPREAD, args.len() as u8 + 1),
-                    line,
-                );
+                let argc = Self::call_arity(args.len() + 1, "append", line)?;
+                self.b
+                    .emit(Op::CallBuiltin(host::GAPPEND_SPREAD, argc), line);
                 return Ok(());
             }
             // `errors.As(err, &target)` — Go recovers the target's type from the
@@ -4941,7 +5091,8 @@ impl Compiler {
                         self.expr(a)?;
                     }
                 }
-                self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+                let argc = Self::call_arity(args.len(), name, line)?;
+                self.b.emit(Op::CallBuiltin(id, argc), line);
                 return Ok(());
             }
             // A variable statically known to hold a closure — dispatch directly.
@@ -5008,12 +5159,10 @@ impl Compiler {
                         self.emit_value(&args[fixed])?;
                     } else {
                         // Pack the remaining arguments into a fresh slice.
-                        let rest = &args[fixed..];
-                        for a in rest {
-                            self.emit_value(a)?;
-                        }
-                        self.b
-                            .emit(Op::CallBuiltin(host::GSLICE_LIT, rest.len() as u8), line);
+                        let rest = args[fixed..].to_vec();
+                        self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, rest.len(), line, |c, i| {
+                            c.emit_value(&rest[i])
+                        })?;
                     }
                     let idx = self.b.add_name(name);
                     self.b.emit(Op::Call(idx, arity as u8), line);
@@ -5047,8 +5196,8 @@ impl Compiler {
                 }
                 let c = self.b.add_constant(Value::str(name.clone()));
                 self.b.emit(Op::LoadConst(c), line);
-                self.b
-                    .emit(Op::CallBuiltin(host::GFFI_CALL, args.len() as u8 + 1), line);
+                let argc = Self::call_arity(args.len() + 1, name, line)?;
+                self.b.emit(Op::CallBuiltin(host::GFFI_CALL, argc), line);
                 return Ok(());
             }
             return Err(format!("go-rs: undefined: {name} (line {line})"));

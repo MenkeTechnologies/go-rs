@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 34;
+const SHAPES: u64 = 36;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -631,6 +631,70 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                  \tfmt.Println(\"eq\", [2]int{{{a}, {b}}} == [2]int{{{a}, {b}}}, a{n} == b{n}, nz{n} == mz{n})\n"
             )
         }
+        // `%T` / `%#v` name a fixed-size array by its length, and the length is
+        // part of the type. go-rs holds a `[N]T` and a `[]T` in the same heap
+        // object, so the name has to ride on the value itself — through an
+        // assignment, an `any` box, a container read and a `fmt` width box —
+        // while the slice spellings alongside must still name a slice.
+        34 => {
+            uses.structs = true;
+            let (a, b, c) = (rng.int(-9, 20), rng.int(-9, 20), rng.int(-9, 20));
+            let k = rng.int(0, 4);
+            let w = rng.pick(WORDS);
+            format!(
+                "\ta{n} := [3]int{{{a}, {b}, {c}}}\n\ts{n} := []int{{{a}, {b}, {c}}}\n\
+                 \tfmt.Printf(\"%T %T\\n\", a{n}, s{n})\n\
+                 \tfmt.Printf(\"%#v %#v\\n\", a{n}, s{n})\n\
+                 \tfmt.Printf(\"%v %v\\n\", a{n}, s{n})\n\
+                 \tvar z{n} [{k}]string\n\tfmt.Printf(\"%T %v\\n\", z{n}, z{n})\n\
+                 \tb{n} := a{n}\n\tfmt.Printf(\"%T\\n\", b{n})\n\
+                 \tvar i{n} any = a{n}\n\tfmt.Printf(\"%T\\n\", i{n})\n\
+                 \tn{n} := [2][3]int{{{{{a}, {b}, {c}}}, {{{c}, {a}, {b}}}}}\n\
+                 \tfmt.Printf(\"%T %#v\\n\", n{n}, n{n})\n\
+                 \tp{n} := [2]pt{{{{{a}, {b}}}, {{{c}, {a}}}}}\n\
+                 \tfmt.Printf(\"%T %#v\\n\", p{n}, p{n})\n\
+                 \tq{n} := [2][]int{{{{{a}}}, {{{b}}}}}\n\tfmt.Printf(\"%T\\n\", q{n})\n\
+                 \tr{n} := [][2]int{{{{{a}, {b}}}}}\n\tfmt.Printf(\"%T %T\\n\", r{n}, r{n}[0])\n\
+                 \tm{n} := map[string][2]int{{\"{w}\": {{{a}, {b}}}}}\n\
+                 \tfmt.Printf(\"%T\\n\", m{n}[\"{w}\"])\n\
+                 \tvar f{n} [2]float32\n\tvar u{n} [2]uint64\n\
+                 \tfmt.Printf(\"%T %T\\n\", f{n}, u{n})\n\
+                 \tfmt.Printf(\"%T\\n\", a{n}[:])\n"
+            )
+        }
+        // A composite literal is not bounded by the 255 stack values one
+        // fusevm `CallBuiltin` carries, so one past that is built in chunks.
+        // The count used to wrap, and the literal silently came out short —
+        // hence the checks on an element past the cut, not just the length.
+        35 => {
+            uses.bulk = true;
+            // At least 256, so the literal is over the limit *and* the index
+            // just past it below is in range — Go rejects a constant index off
+            // the end at compile time, which would only ever be a skip.
+            let k = rng.int(256, 320) as usize;
+            let pairs = rng.int(120, 140) as usize;
+            let base = rng.int(-9, 9);
+            let (last, plast) = (k - 1, pairs - 1);
+            let elems = (0..k)
+                .map(|i| (i as i64 + base).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mps = (0..pairs)
+                .map(|i| format!("{i}: {}", i as i64 * 2 + base))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\tbs{n} := []int{{{elems}}}\n\
+                 \tfmt.Println(\"biglen\", len(bs{n}), bs{n}[0], bs{n}[254], bs{n}[255], bs{n}[{last}])\n\
+                 \tba{n} := [{k}]int{{{elems}}}\n\
+                 \tfmt.Println(\"bigarr\", len(ba{n}), ba{n}[255], ba{n}[{last}])\n\
+                 \tbc{n} := ba{n}\n\tbc{n}[{last}] = 0\n\
+                 \tfmt.Println(\"bigcopy\", ba{n}[{last}], bc{n}[{last}])\n\
+                 \tbm{n} := map[int]int{{{mps}}}\n\
+                 \tfmt.Println(\"bigmap\", len(bm{n}), bm{n}[0], bm{n}[126], bm{n}[127], bm{n}[{plast}])\n\
+                 \tfmt.Println(\"bigsum\", sumAll(bs{n}...), sumAll({elems}))\n"
+            )
+        }
         // new(T) — a zero-valued struct pointer.
         18 => {
             uses.structs = true;
@@ -705,6 +769,9 @@ struct Uses {
     /// The array-valued struct and the array-taking helper the array
     /// value-semantics shape copies through.
     arrays: bool,
+    /// The variadic helper the over-long-literal shape spreads into, which is
+    /// the other way a literal past the arity limit is built.
+    bulk: bool,
     generic: bool,
     /// The defer/panic/recover shape's top-level helpers.
     deferred: bool,
@@ -768,6 +835,15 @@ fn program(seed: u64, only: Option<u64>) -> String {
         preamble.push_str(
             "type grid struct {\n\ta [2]int\n\tq [2]pt\n}\n\n\
              func bumpArr(a [3]int, d int) [3]int { a[0] += d; return a }\n\n",
+        );
+    }
+    if uses.bulk {
+        // Called both with a spread and with the arguments written out, which
+        // is a slice literal built at the call site — the same chunking as the
+        // written literal, by a different route.
+        preamble.push_str(
+            "func sumAll(xs ...int) int {\n\
+             \tt := 0\n\tfor _, x := range xs {\n\t\tt += x\n\t}\n\treturn t\n}\n\n",
         );
     }
     if uses.generic {

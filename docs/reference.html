@@ -1964,71 +1964,77 @@ println(addrs(2, 3))</code></pre>
           <pre><code class="lang-go">for i := 0; i &lt; n; i++ { … }</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-4">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-4">#</a> <code>%T on an array</code></h3>
-          <pre><code class="lang-go">fmt.Printf("%T", a)</code></pre>
-          <p>An array and a slice are the same heap object here, and `%T` answers from the value rather than the static type, so a `[3]int` prints as `[]int`. Only the name is affected — the value semantics, `==`, map-key use and every copy site are the array's, and a `case [3]int` in a type switch still matches.</p>
-          <pre><code class="lang-go">fmt.Printf("%v %d", a, len(a))</code></pre>
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-4">#</a> <code>%T on a defined type</code></h3>
+          <pre><code class="lang-go">fmt.Printf("%T", d)</code></pre>
+          <p>A defined type over a non-struct base (`type Weekday int`) is erased by the parser, so `%T` names the base: `int`, not `main.Weekday`. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.</p>
+          <pre><code class="lang-go">fmt.Printf("%T", a) // [3]int</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-5">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-5">#</a> <code>func init</code></h3>
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-5">#</a> <code>call argument limit</code></h3>
+          <pre><code class="lang-go">fmt.Println(a1, a2, /* … 256 … */)</code></pre>
+          <p>A call passes at most 255 arguments: fusevm holds a call's argument count in a `u8`. Over that is a compile error rather than a silently short call. Go has no such limit. A composite literal is not bounded this way — it is built in chunks, so `[]T{…}`, `map[K]V{…}` and a struct literal work at any size.</p>
+          <pre><code class="lang-go">fmt.Println(xs) // pass the slice</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-divergence-from-go-6">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-6">#</a> <code>func init</code></h3>
           <pre><code class="lang-go">func init()</code></pre>
           <p>Parsed as an ordinary function and never called. Package-level `var` initializers do run before `main`, so move initialization there.</p>
           <pre><code class="lang-go">var registry = buildRegistry()</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-6">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-6">#</a> <code>append aliasing</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-7">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-7">#</a> <code>append aliasing</code></h3>
           <pre><code class="lang-go">append(s, v)</code></pre>
           <p>The non-spread form extends the backing array in place and returns the same handle, so the append is visible through every alias of `s`. Go copies to a new array once capacity is exceeded, which detaches the result. Code that relies on that detachment behaves differently here.</p>
           <pre><code class="lang-go">b := append(a, 1)   // a and b stay the same slice</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-7">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-7">#</a> <code>interface{} in a type position</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-8">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-8">#</a> <code>interface{} in a type position</code></h3>
           <pre><code class="lang-go">var x interface{}</code></pre>
           <p>Not parsed. `interface{ … }` is accepted in a `type` declaration and as a generic constraint, but not where a variable, parameter or field type is expected. Write `any`.</p>
           <pre><code class="lang-go">var x any</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-8">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-8">#</a> <code>embedded fields</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-9">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-9">#</a> <code>embedded fields</code></h3>
           <pre><code class="lang-go">type D struct { Base }</code></pre>
           <p>Anonymous (embedded) struct fields are not parsed — every field needs a name. There is no field or method promotion; write the field explicitly and forward the methods.</p>
           <pre><code class="lang-go">type D struct { base Base }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-9">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-9">#</a> <code>local type declarations</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-10">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-10">#</a> <code>local type declarations</code></h3>
           <pre><code class="lang-go">func f() { type T … }</code></pre>
           <p>Only top-level `type` declarations are parsed. A `type` inside a function body is a syntax error; move it to file scope.</p>
           <pre><code class="lang-go">type T struct{ a int }
 
 func f() { … }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-10">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-10">#</a> <code>elided composite element types</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-11">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-11">#</a> <code>elided composite element types</code></h3>
           <pre><code class="lang-go">[][]int{{1, 2}}</code></pre>
           <p>Go lets a nested composite literal omit its element type. go-rs requires it in both slice and map literals.</p>
           <pre><code class="lang-go">[][]int{[]int{1, 2}}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-11">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-11">#</a> <code>generics are erased</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-12">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>generics are erased</code></h3>
           <pre><code class="lang-go">func F[T any](…)</code></pre>
           <p>Type parameters, constraint interfaces and type arguments are parsed and discarded — the dynamic value model runs one compiled body for every instantiation. The visible consequence is that `var zero T` is nil rather than the concrete type's zero value, which is what breaks `cmp.Or`.</p>
           <pre><code class="lang-go">func Sum[T Number](xs []T) T</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-12">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>labels and goto</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-13">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-13">#</a> <code>labels and goto</code></h3>
           <pre><code class="lang-go">L: for { break L }</code></pre>
           <p>Statement labels, labelled `break`/`continue`, and `goto` are not implemented. Restructure with a flag or an extra function.</p>
           <pre><code class="lang-go">done := false
 for !done { … }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-13">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-13">#</a> <code>unsupported package calls</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-14">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-14">#</a> <code>unsupported package calls</code></h3>
           <pre><code class="lang-go">pkg.Func(…)</code></pre>
           <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`fmt.Fprintln\``. The wired sets are exactly the ones this reference lists — 6 in fmt, 20 in strings, 6 in strconv, 26 functions and 7 constants in math, 5 in sort, and 1 in os.</p>
           <pre><code class="lang-go">fmt.Sprintf(…)   // wired
 fmt.Fprintf(…)   // not</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-14">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-14">#</a> <code>map iteration order</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-15">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-15">#</a> <code>map iteration order</code></h3>
           <pre><code class="lang-go">for k := range m</code></pre>
           <p>Go deliberately randomizes map iteration order. go-rs stores a map as an association list and ranges it in insertion order, so iteration is deterministic. Do not rely on that determinism in code meant to also build with the Go toolchain.</p>
           <pre><code class="lang-go">for k, v := range m { … }   // insertion order</code></pre>

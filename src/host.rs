@@ -116,6 +116,27 @@ pub const GCHAN_OK: u16 = 964;
 /// object here, so only the written type says whether an element is itself a
 /// value (copy) or a reference (share).
 pub const GARRAY_COPY: u16 = 965;
+/// `[container, item…]` → the same container with the items appended.
+///
+/// fusevm's `Op::CallBuiltin` carries its argument count in a `u8`, so one call
+/// can take at most 255 stack values. A composite literal is not bounded by
+/// that — `[]int{…}` with 256 elements is ordinary Go — so a literal longer
+/// than one call can carry is built in chunks: the first chunk goes to
+/// [`GSLICE_LIT`] / [`GMAP_LIT`] / [`GSTRUCT_NEW`] and each later chunk to this,
+/// which dispatches on what it is handed (slice elements, `k,v` map pairs, or
+/// `name,value` struct fields). Before this existed the count wrapped and the
+/// literal silently lost every element past the first 255.
+pub const GLIT_EXTEND: u16 = 966;
+/// `[array, type]` → the same object, tagged as the fixed-size array type it
+/// was written as, so `%T` and `%#v` can name it.
+///
+/// A `[N]T` and a `[]T` are the same [`HostObj::Slice`], and the length is not
+/// recoverable from the elements (`[3]int` and a 3-element `[]int` hold the
+/// same thing), so the *written* type is stamped on the object where an array
+/// value is born — a composite literal and a zero value. Every other array is a
+/// copy of one of those, and [`GARRAY_COPY`] carries the tag across, so the tag
+/// survives assignment, a parameter bind, a return and an `any` box alike.
+pub const GARRAY_TAG: u16 = 967;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -283,6 +304,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GFIELD_SET, b_field_set);
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
+    vm.register_builtin(GLIT_EXTEND, b_lit_extend);
+    vm.register_builtin(GARRAY_TAG, b_array_tag);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
     vm.register_builtin(GMIN, b_min);
@@ -428,7 +451,7 @@ fn type_tag_of(v: &Value) -> String {
         Value::Bool(_) => "bool".to_string(),
         Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
             Some(HostObj::Struct { type_name, .. }) => type_name.clone(),
-            Some(HostObj::Slice(_)) | Some(HostObj::SliceView { .. }) => "[]".to_string(),
+            Some(HostObj::Slice { .. }) | Some(HostObj::SliceView { .. }) => "[]".to_string(),
             Some(HostObj::Map(_)) => "map".to_string(),
             // A typed nil keeps its type's tag, so a type switch on a nil slice
             // still picks the `[]T` case rather than the nil default.
@@ -472,7 +495,7 @@ fn b_conv(vm: &mut VM, argc: u8) -> Value {
         "[]byte" => match &v {
             Value::Str(s) => {
                 let elems = s.bytes().map(|b| Value::Int(b as i64)).collect();
-                Value::Obj(heap_alloc(HostObj::Slice(elems)))
+                Value::Obj(heap_alloc(HostObj::slice(elems)))
             }
             _ => v,
         },
@@ -480,7 +503,7 @@ fn b_conv(vm: &mut VM, argc: u8) -> Value {
         "[]rune" => match &v {
             Value::Str(s) => {
                 let elems = s.chars().map(|c| Value::Int(c as i64)).collect();
-                Value::Obj(heap_alloc(HostObj::Slice(elems)))
+                Value::Obj(heap_alloc(HostObj::slice(elems)))
             }
             _ => v,
         },
@@ -991,7 +1014,7 @@ fn b_range_keys(vm: &mut VM, argc: u8) -> Value {
         Some(Value::Int(n)) => (0..*n).map(Value::Int).collect(),
         _ => Vec::new(),
     };
-    Value::Obj(heap_alloc(HostObj::Slice(keys)))
+    Value::Obj(heap_alloc(HostObj::slice(keys)))
 }
 
 /// `[iter, key]` → the loop value for `for key := range iter`. A string yields
@@ -1032,7 +1055,19 @@ fn b_range_val(vm: &mut VM, argc: u8) -> Value {
 /// One object on the host-owned Go heap.
 pub(crate) enum HostObj {
     /// A slice that owns its backing array. Go slices are reference types.
-    Slice(Vec<Value>),
+    ///
+    /// `arr_ty` is `Some` when the object is a fixed-size **array** rather than
+    /// a slice, and holds the type as written (`[3]int`, `[2][3]int`). The two
+    /// are the same object here — a `[N]T` is a value and a `[]T` a reference,
+    /// which the *static* type drives at every copy site — but `%T` and `%#v`
+    /// read the run-time value, and nothing in the elements distinguishes a
+    /// `[3]int` from a 3-element `[]int`. The tag is set where an array is born
+    /// (a composite literal, a zero value) and carried by [`array_copy`], so it
+    /// survives into an `any` where a `fmt`-position box could not.
+    Slice {
+        elems: Vec<Value>,
+        arr_ty: Option<String>,
+    },
     /// A sub-slice view `s[lo:hi]` sharing another slice's backing array at an
     /// offset, so element writes are visible through the parent (and vice versa).
     /// `backing` indexes a [`HostObj::Slice`]. `cap` is the view's own capacity:
@@ -1094,6 +1129,18 @@ pub(crate) enum HostObj {
     /// It still compares equal to `nil`: [`numeric_hook`] answers `Eq`/`Ne`
     /// against [`Value::Undef`] for these handles, so `s == nil` stays true.
     Nil { kind: NilKind, ty: String },
+}
+
+impl HostObj {
+    /// A plain slice — the untagged [`HostObj::Slice`] every slice-producing
+    /// path wants. An array is this plus a tag, which [`b_array_tag`] stamps on
+    /// where the array is born and [`array_copy`] carries across.
+    fn slice(elems: Vec<Value>) -> HostObj {
+        HostObj::Slice {
+            elems,
+            arr_ty: None,
+        }
+    }
 }
 
 /// Which kind of typed nil a [`HostObj::Nil`] is — the two Go composite types
@@ -1232,8 +1279,17 @@ fn b_u64_arith(vm: &mut VM, argc: u8) -> Value {
 /// must not be visible to the program that owns the original.
 fn box_for_fmt(v: &Value, spec: &str, tag: BoxTag) -> Value {
     if let Some(es) = slice_elems(v) {
-        let boxed = es.iter().map(|e| box_for_fmt(e, spec, tag)).collect();
-        return Value::Obj(heap_alloc(HostObj::Slice(boxed)));
+        let elems = es.iter().map(|e| box_for_fmt(e, spec, tag)).collect();
+        // The rebuild keeps the `[N]T` tag, or `%T` on an array of `float32` /
+        // `uint64` would fall back to naming it a slice.
+        let arr_ty = match v {
+            Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+                Some(HostObj::Slice { arr_ty, .. }) => arr_ty.clone(),
+                _ => None,
+            }),
+            _ => None,
+        };
+        return Value::Obj(heap_alloc(HostObj::Slice { elems, arr_ty }));
     }
     if let Some(pairs) = map_pairs(v) {
         let boxed = pairs
@@ -1447,7 +1503,7 @@ fn heap_alloc(obj: HostObj) -> u32 {
 /// names the backing it shares. `None` if `id` is not a slice.
 fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
     HEAP.with(|h| match h.borrow().get(id as usize) {
-        Some(HostObj::Slice(a)) => Some((id, 0, a.len())),
+        Some(HostObj::Slice { elems: a, .. }) => Some((id, 0, a.len())),
         Some(HostObj::SliceView {
             backing,
             offset,
@@ -1468,7 +1524,7 @@ fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
 /// recorded `cap` for a view. `None` if `id` is not a slice.
 fn slice_cap(id: u32) -> Option<usize> {
     HEAP.with(|h| match h.borrow().get(id as usize) {
-        Some(HostObj::Slice(a)) => Some(a.len()),
+        Some(HostObj::Slice { elems: a, .. }) => Some(a.len()),
         Some(HostObj::SliceView { cap, .. }) => Some(*cap),
         Some(HostObj::Nil {
             kind: NilKind::Slice,
@@ -1485,7 +1541,7 @@ fn slice_get(id: u32, i: usize) -> Option<Value> {
         return None;
     }
     HEAP.with(|h| match h.borrow().get(backing as usize) {
-        Some(HostObj::Slice(a)) => a.get(offset + i).cloned(),
+        Some(HostObj::Slice { elems: a, .. }) => a.get(offset + i).cloned(),
         _ => None,
     })
 }
@@ -1500,7 +1556,7 @@ fn slice_set(id: u32, i: usize, v: Value) -> bool {
         return false;
     }
     HEAP.with(|h| {
-        if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+        if let Some(HostObj::Slice { elems: a, .. }) = h.borrow_mut().get_mut(backing as usize) {
             if let Some(slot) = a.get_mut(offset + i) {
                 *slot = v;
                 return true;
@@ -1568,9 +1624,10 @@ fn key_eq(a: &Value, b: &Value) -> bool {
                     // `[2]int{1, 2}` stored. Reaching a slice here is not
                     // possible in a program `go` accepts — a slice is not a
                     // comparable type and so cannot be a map key at all.
-                    (Some(HostObj::Slice(ex)), Some(HostObj::Slice(ey))) => {
-                        ex.len() == ey.len() && ex.iter().zip(ey).all(|(a, b)| key_eq(a, b))
-                    }
+                    (
+                        Some(HostObj::Slice { elems: ex, .. }),
+                        Some(HostObj::Slice { elems: ey, .. }),
+                    ) => ex.len() == ey.len() && ex.iter().zip(ey).all(|(a, b)| key_eq(a, b)),
                     _ => false,
                 }
             })
@@ -1621,12 +1678,12 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
                 (0..k).map(|_| value_copy(zero.clone(), &elem_ty)).collect()
             };
             if cap == len {
-                return Value::Obj(heap_alloc(HostObj::Slice(fill(len))));
+                return Value::Obj(heap_alloc(HostObj::slice(fill(len))));
             }
             // A `cap > len` slice is a view over a longer backing array — the
             // same shape Go's slice header has, so `cap` reports the spare room
             // and an append that fits writes into it instead of reallocating.
-            let backing = heap_alloc(HostObj::Slice(fill(cap)));
+            let backing = heap_alloc(HostObj::slice(fill(cap)));
             Value::Obj(heap_alloc(HostObj::SliceView {
                 backing,
                 offset: 0,
@@ -1640,13 +1697,13 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
 /// `[]T{a, b, …}` — build a slice from the popped element values.
 fn b_slice_lit(vm: &mut VM, argc: u8) -> Value {
     let elems = pop_args(vm, argc);
-    Value::Obj(heap_alloc(HostObj::Slice(elems)))
+    Value::Obj(heap_alloc(HostObj::slice(elems)))
 }
 
-/// `map[K]V{k0: v0, …}` — build a map from popped `k0,v0,k1,v1,…` pairs.
-fn b_map_lit(vm: &mut VM, argc: u8) -> Value {
-    let flat = pop_args(vm, argc);
-    let mut pairs = Vec::with_capacity(flat.len() / 2);
+/// Insert a flat `k0,v0,k1,v1,…` run into `pairs`, a duplicate key overwriting
+/// in place so the map keeps its first-mention order — Go's literal rule, and
+/// the same one whether the run is the whole literal or a later chunk of it.
+fn map_insert_all(pairs: &mut Vec<(Value, Value)>, flat: Vec<Value>) {
     let mut it = flat.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
         if let Some(slot) = pairs.iter_mut().find(|(ek, _)| key_eq(ek, &k)) {
@@ -1655,7 +1712,96 @@ fn b_map_lit(vm: &mut VM, argc: u8) -> Value {
             pairs.push((k, v));
         }
     }
+}
+
+/// `map[K]V{k0: v0, …}` — build a map from popped `k0,v0,k1,v1,…` pairs.
+fn b_map_lit(vm: &mut VM, argc: u8) -> Value {
+    let flat = pop_args(vm, argc);
+    let mut pairs = Vec::with_capacity(flat.len() / 2);
+    map_insert_all(&mut pairs, flat);
     Value::Obj(heap_alloc(HostObj::Map(pairs)))
+}
+
+/// [`GLIT_EXTEND`] — append a further chunk of a composite literal to the
+/// container the earlier chunks built, and hand the container back.
+///
+/// The three literal builtins each take their items as call arguments, and
+/// fusevm's arity byte stops one call at 255 stack values, so a longer literal
+/// arrives here in pieces. What a piece means is read off the container: slice
+/// elements, `k,v` map pairs, or `name,value` struct fields.
+fn b_lit_extend(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc);
+    if args.is_empty() {
+        return Value::Undef;
+    }
+    let container = args.remove(0);
+    let Value::Obj(id) = container else {
+        return container;
+    };
+    // Which composite this is, read and released before anything is written:
+    // a map merge calls `key_eq` and a struct field name calls `go_str`, both
+    // of which read the heap themselves, and the borrow is not re-entrant.
+    enum Kind {
+        Slice,
+        Map,
+        Struct,
+        Other,
+    }
+    let kind = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Slice { .. }) => Kind::Slice,
+        Some(HostObj::Map(_)) => Kind::Map,
+        Some(HostObj::Struct { .. }) => Kind::Struct,
+        _ => Kind::Other,
+    });
+    match kind {
+        Kind::Slice => HEAP.with(|h| {
+            if let Some(HostObj::Slice { elems, .. }) = h.borrow_mut().get_mut(id as usize) {
+                elems.append(&mut args);
+            }
+        }),
+        Kind::Map => {
+            let mut pairs = HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
+                Some(HostObj::Map(p)) => std::mem::take(p),
+                _ => Vec::new(),
+            });
+            map_insert_all(&mut pairs, args);
+            HEAP.with(|h| {
+                if let Some(HostObj::Map(slot)) = h.borrow_mut().get_mut(id as usize) {
+                    *slot = pairs;
+                }
+            });
+        }
+        Kind::Struct => {
+            let mut more = Vec::with_capacity(args.len() / 2);
+            let mut it = args.into_iter();
+            while let (Some(name), Some(val)) = (it.next(), it.next()) {
+                more.push((go_str(&name), val));
+            }
+            HEAP.with(|h| {
+                if let Some(HostObj::Struct { fields, .. }) = h.borrow_mut().get_mut(id as usize) {
+                    fields.append(&mut more);
+                }
+            });
+        }
+        Kind::Other => {}
+    }
+    container
+}
+
+/// [`GARRAY_TAG`] — stamp the written `[N]T` on an array object, so `%T` and
+/// `%#v` name the array rather than guessing a slice from its elements.
+fn b_array_tag(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let ty = args.get(1).map(go_str).unwrap_or_default();
+    let val = args.first().cloned().unwrap_or(Value::Undef);
+    if let Value::Obj(id) = val {
+        HEAP.with(|h| {
+            if let Some(HostObj::Slice { arr_ty, .. }) = h.borrow_mut().get_mut(id as usize) {
+                *arr_ty = Some(ty);
+            }
+        });
+    }
+    val
 }
 
 /// `x[i]` — slice index (bounds-checked) or map lookup (zero value if absent).
@@ -1754,7 +1900,7 @@ fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
     for a in args.iter().skip(1) {
         extend_from(a);
     }
-    Value::Obj(heap_alloc(HostObj::Slice(out)))
+    Value::Obj(heap_alloc(HostObj::slice(out)))
 }
 
 /// `[map, key]` → `[value, present]` for the comma-ok map lookup `v, ok := m[k]`.
@@ -1772,7 +1918,7 @@ fn b_map_get2(vm: &mut VM, argc: u8) -> Value {
         },
         _ => (Value::Undef, false),
     };
-    Value::Obj(heap_alloc(HostObj::Slice(vec![val, Value::bool(present)])))
+    Value::Obj(heap_alloc(HostObj::slice(vec![val, Value::bool(present)])))
 }
 
 /// `x[i] = v` — slice element write (bounds-checked) or map insert. Returns `v`.
@@ -1793,7 +1939,9 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
         let i = key.to_int();
         let err = match usize::try_from(i).ok().filter(|&i| i < len) {
             Some(i) => HEAP.with(|h| {
-                if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+                if let Some(HostObj::Slice { elems: a, .. }) =
+                    h.borrow_mut().get_mut(backing as usize)
+                {
                     a[offset + i] = val.clone();
                 }
                 None::<String>
@@ -1923,7 +2071,7 @@ fn grow_slice(elems: Vec<Value>, old_cap: usize) -> Value {
     // re-slice within `cap` can reach it, and both overwrite it first.
     let mut backing = elems;
     backing.resize(cap, Value::Int(0));
-    let id = heap_alloc(HostObj::Slice(backing));
+    let id = heap_alloc(HostObj::slice(backing));
     Value::Obj(heap_alloc(HostObj::SliceView {
         backing: id,
         offset: 0,
@@ -1950,7 +2098,7 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
             if is_view {
                 let (backing, offset, len) = match slice_backing(id) {
                     Some(t) => t,
-                    None => return Value::Obj(heap_alloc(HostObj::Slice(args))),
+                    None => return Value::Obj(heap_alloc(HostObj::slice(args))),
                 };
                 let new_len = len + args.len();
                 // Go semantics: if the view has spare capacity, the new elements
@@ -1962,7 +2110,9 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                 let cap = slice_cap(id).unwrap_or(0);
                 if new_len <= cap {
                     HEAP.with(|h| {
-                        if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+                        if let Some(HostObj::Slice { elems: a, .. }) =
+                            h.borrow_mut().get_mut(backing as usize)
+                        {
                             for (k, v) in args.into_iter().enumerate() {
                                 a[offset + len + k] = v;
                             }
@@ -1976,7 +2126,7 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                     }));
                 }
                 let mut out = HEAP.with(|h| match h.borrow().get(backing as usize) {
-                    Some(HostObj::Slice(a)) => a[offset..offset + len].to_vec(),
+                    Some(HostObj::Slice { elems: a, .. }) => a[offset..offset + len].to_vec(),
                     _ => Vec::new(),
                 });
                 out.extend(args);
@@ -1988,7 +2138,7 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
             // so the following appends land in place and `cap` doubles the way
             // Go's does.
             let existing = HEAP.with(|h| match h.borrow().get(id as usize) {
-                Some(HostObj::Slice(a)) => Some(a.clone()),
+                Some(HostObj::Slice { elems: a, .. }) => Some(a.clone()),
                 // `append` to a nil slice allocates, exactly as Go's does.
                 Some(HostObj::Nil {
                     kind: NilKind::Slice,
@@ -2009,7 +2159,7 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                 Value::Undef
             }
         }
-        _ => Value::Obj(heap_alloc(HostObj::Slice(args))),
+        _ => Value::Obj(heap_alloc(HostObj::slice(args))),
     }
 }
 
@@ -2261,6 +2411,9 @@ fn value_copy(v: Value, ty: &str) -> Value {
 /// same [`HostObj::Slice`]), so `elem_ty` — the *written* element type — decides
 /// it. A struct element needs no such hint: [`struct_copy`] recognises one at
 /// run time and is the identity on everything else.
+/// The copy also inherits the source's `[N]T` tag, so `%T` still names the
+/// array after it has been assigned, passed, returned or boxed into an `any` —
+/// every one of which goes through a copy.
 fn array_copy(v: Value, elem_ty: &str) -> Value {
     let Value::Obj(id) = v else { return v };
     let Some((_, _, len)) = slice_backing(id) else {
@@ -2269,7 +2422,11 @@ fn array_copy(v: Value, elem_ty: &str) -> Value {
     let elems: Vec<Value> = (0..len)
         .map(|i| value_copy(slice_get(id, i).unwrap_or(Value::Undef), elem_ty))
         .collect();
-    Value::Obj(heap_alloc(HostObj::Slice(elems)))
+    let arr_ty = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Slice { arr_ty, .. }) => arr_ty.clone(),
+        _ => None,
+    });
+    Value::Obj(heap_alloc(HostObj::Slice { elems, arr_ty }))
 }
 
 /// One struct value copy, recursing into the fields [`STRUCT_PLAN`] records as
@@ -2515,6 +2672,10 @@ pub(crate) fn go_quote_rune(n: i64) -> String {
 /// `%T`: the value's Go type name. go-rs carries no static element type for a
 /// slice or map, so those are described from the values actually present and an
 /// empty one falls back to `interface {}`.
+///
+/// A fixed-size array is the exception: its written `[N]T` is stamped on the
+/// object, because the length is not recoverable from the elements and a
+/// `[3]int` would otherwise be indistinguishable from a 3-element `[]int`.
 pub(crate) fn go_type_name(v: &Value) -> String {
     match v {
         Value::Bool(_) => "bool".to_string(),
@@ -2525,14 +2686,20 @@ pub(crate) fn go_type_name(v: &Value) -> String {
         Value::Obj(id) => HEAP.with(|h| {
             let h = h.borrow();
             match h.get(*id as usize) {
-                Some(HostObj::Slice(a)) => {
+                Some(HostObj::Slice {
+                    elems: a,
+                    arr_ty: None,
+                }) => {
                     format!("[]{}", elem_type_name(a.first()))
                 }
+                Some(HostObj::Slice {
+                    arr_ty: Some(ty), ..
+                }) => ty.clone(),
                 Some(HostObj::SliceView {
                     backing, offset, ..
                 }) => {
                     let e = match h.get(*backing as usize) {
-                        Some(HostObj::Slice(a)) => a.get(*offset).cloned(),
+                        Some(HostObj::Slice { elems: a, .. }) => a.get(*offset).cloned(),
                         _ => None,
                     };
                     format!("[]{}", elem_type_name(e.as_ref()))
@@ -2577,14 +2744,14 @@ pub(crate) fn slice_elems(v: &Value) -> Option<Vec<Value>> {
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(*id as usize) {
-            Some(HostObj::Slice(a)) => Some(a.clone()),
+            Some(HostObj::Slice { elems: a, .. }) => Some(a.clone()),
             Some(HostObj::SliceView {
                 backing,
                 offset,
                 len,
                 ..
             }) => match h.get(*backing as usize) {
-                Some(HostObj::Slice(a)) => Some(a[*offset..*offset + *len].to_vec()),
+                Some(HostObj::Slice { elems: a, .. }) => Some(a[*offset..*offset + *len].to_vec()),
                 _ => Some(Vec::new()),
             },
             Some(HostObj::Nil {
@@ -2633,7 +2800,7 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
-            Some(HostObj::Slice(a)) => {
+            Some(HostObj::Slice { elems: a, .. }) => {
                 if sharp {
                     format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
                 } else {
@@ -2647,7 +2814,7 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                 ..
             }) => {
                 let view: Vec<Value> = match h.get(*backing as usize) {
-                    Some(HostObj::Slice(a)) => a[*offset..*offset + *len].to_vec(),
+                    Some(HostObj::Slice { elems: a, .. }) => a[*offset..*offset + *len].to_vec(),
                     _ => Vec::new(),
                 };
                 if sharp {
@@ -3588,7 +3755,9 @@ pub mod stdlib {
             // sorting a view (`sort.Ints(s[1:4])`) sorts through the parent.
             if let Some((backing, offset, len)) = super::slice_backing(*id) {
                 HEAP.with(|h| {
-                    if let Some(HostObj::Slice(a)) = h.borrow_mut().get_mut(backing as usize) {
+                    if let Some(HostObj::Slice { elems: a, .. }) =
+                        h.borrow_mut().get_mut(backing as usize)
+                    {
                         a[offset..offset + len].sort_by(cmp);
                     }
                 });
@@ -3730,14 +3899,14 @@ pub mod stdlib {
         } else {
             s.split(&sep).map(Value::str).collect()
         };
-        Value::Obj(heap_alloc(HostObj::Slice(parts)))
+        Value::Obj(heap_alloc(HostObj::slice(parts)))
     }
 
     fn b_fields(vm: &mut VM, argc: u8) -> Value {
         let args = pop_args(vm, argc);
         let s = args.first().map(go_str).unwrap_or_default();
         let parts: Vec<Value> = s.split_whitespace().map(Value::str).collect();
-        Value::Obj(heap_alloc(HostObj::Slice(parts)))
+        Value::Obj(heap_alloc(HostObj::slice(parts)))
     }
 
     fn b_join(vm: &mut VM, argc: u8) -> Value {
@@ -3747,14 +3916,14 @@ pub mod stdlib {
             Some(Value::Obj(id)) => HEAP.with(|h| {
                 let h = h.borrow();
                 let elems: &[Value] = match h.get(*id as usize) {
-                    Some(HostObj::Slice(a)) => a,
+                    Some(HostObj::Slice { elems: a, .. }) => a,
                     Some(HostObj::SliceView {
                         backing,
                         offset,
                         len,
                         ..
                     }) => match h.get(*backing as usize) {
-                        Some(HostObj::Slice(a)) => &a[*offset..*offset + *len],
+                        Some(HostObj::Slice { elems: a, .. }) => &a[*offset..*offset + *len],
                         _ => &[],
                     },
                     _ => &[],
@@ -3776,7 +3945,7 @@ pub mod stdlib {
     /// destructures, with `err` nil on success.
     fn parsed(value: Value, err: Option<Value>) -> Value {
         let e = err.unwrap_or(Value::Undef);
-        Value::Obj(heap_alloc(HostObj::Slice(vec![value, e])))
+        Value::Obj(heap_alloc(HostObj::slice(vec![value, e])))
     }
 
     thread_local! {
