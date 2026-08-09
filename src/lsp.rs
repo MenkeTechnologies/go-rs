@@ -388,7 +388,7 @@ const CORPUS: &[Entry] = &[
         "float32",
         "Type",
         "float32",
-        "32-bit float. Values are carried as f64; a `float32(x)` conversion rounds through a real f32 so the narrower precision is reproduced.",
+        "32-bit float. Every operation on a float32 is performed at 32-bit width (not rounded afterwards, which would round twice), and fmt prints the shortest decimal that round-trips at 32 bits: 1.0/3.0 is 0.33333334, not 0.3333333333333333.",
         "var f float32 = 1.5",
     ),
     e(

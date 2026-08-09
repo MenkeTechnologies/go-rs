@@ -118,14 +118,14 @@ Real Go, executed on fusevm:
 | Area           | Supported                                                              |
 | -------------- | --------------------------------------------------------------------- |
 | Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
-| Variables      | `:=`, `var x [T] [= e]`, assignment to lvalues (ident / `x[i]` / `x.f`), parallel assignment `a, b = x, y` (swap/rotate; RHS evaluated first), `a, b = f()`, `+= -= *= /= %=`, `x++` / `x--` |
+| Variables      | `:=`, `var x [T] [= e]` and the multi-name forms (`var a, b int = 1, 2`, `var a, b = f()`, `var a, b int`), assignment to lvalues (ident / `x[i]` / `x.f`), parallel assignment `a, b = x, y` (swap/rotate; RHS evaluated first), `a, b = f()`, `+= -= *= /= %=`, `x++` / `x--` |
 | Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause / `fallthrough`) and type switch, `break`, `continue`, `return`, and **labeled** `break L` / `continue L` naming an enclosing `for` or `switch` |
 | Expressions    | int / float / string / bool literals (incl. `0x` / `0o` / `0b` bases, `_` separators, and uint64 masks above `i64::MAX` stored by bit pattern), rune literals as int32 code points (`'A'` == 65, `'z' - '0'`) with the full escape set (`\n \t \xHH \uHHHH \UHHHHHHHH` + octal, in rune **and** string literals), arithmetic, bitwise `& \| ^ << >> &^` (+ `^x` complement, compound `&= \|= ^= <<= >>= &^=`), comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
-| Types          | `int` family, `float32/64`, `string`, `bool`, defined types (`type Celsius float64`) — tracked statically so `int / int` truncates and `float / float` stays exact; conversions `T(x)` (`int(f)`, `float64(n)`, `string(rune)`, `byte`/`rune`/…) and slice conversions `[]byte(s)` / `[]rune(s)` (and `string([]byte)` / `string([]rune)` back) |
+| Types          | `int` family, `float32/64`, `string`, `bool`, defined types (`type Celsius float64`) — tracked statically so `int / int` truncates and `float / float` stays exact, and so a `float32` expression is computed *at 32-bit width* and printed with the shortest decimal that round-trips at 32 bits; conversions `T(x)` (`int(f)`, `float64(n)`, `string(rune)`, `byte`/`rune`/…), conversion to an interface type (`error(e)`, `any(x)`, a declared `I(x)` — the identity), and slice conversions `[]byte(s)` / `[]rune(s)` (and `string([]byte)` / `string([]rune)` back) |
 | Constants      | `const x = …` and grouped `const ( … )` blocks with `iota` (auto-increment, expression repetition, `1 << iota` flag patterns) |
 | Slices         | `[]T{…}`, `make([]T, n)` / `make([]T, n, cap)` (spare capacity is real backing-array room), `s[i]`, `s[i] = v`, slice expressions `s[lo:hi]` / `s[:hi]` / `s[lo:]` / three-index `s[lo:hi:max]` (the capacity bound is applied: the result's `cap` is `max - lo`, so a later `append` reallocates instead of clobbering the parent; two-index also on strings) that **share the backing array** (writes alias the parent; a re-slice is bounded by `cap`, not `len`; `append` writes in place when the backing has room, else reallocates by Go's `runtime.nextslicecap` growth so `cap` doubles the way Go's does), `len` / `cap` / `append`, `for i, v := range s`, `for i := range n` over an int (Go 1.22); a nested element type may be elided inside a literal (`[][]int{{1, 2}}`, `[]T{{…}}`); ranging a **string** yields runes (byte offset + code point, once per rune) |
 | Arrays         | fixed-size `[N]T` / `[...]T` (modeled as slices): sequential `[3]int{…}`, sparse index-keyed `[N]T{3: v}` with zero-fill, struct elements with elided `{…}`, and bare `var buf [N]scalar` zero-filled to N |
-| Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m`; element types may be elided inside a literal (`map[string][]int{"a": {1, 2}}`) |
+| Maps           | `map[K]V{…}`, `make(map[K]V)`, `m[k]`, `m[k] = v`, `delete`, `len`, `for k, v := range m`; element types may be elided inside a literal (`map[string][]int{"a": {1, 2}}`). The zero value is a **typed nil** — it prints `map[]`, reads as empty, is `== nil`, and panics `assignment to entry in nil map` on a write, exactly as Go's does (a nil slice is the same: `[]`, `len` 0, appendable) |
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** on assign/pass/return, **embedded fields** (`struct { Base }`, including `*Base`) whose fields and methods are **promoted** onto the outer type through any depth of embedding — an outer declaration shadows a promoted one, and a promoted method satisfies an interface |
 | Methods        | value/pointer receivers (named or unnamed — `func (T) m()`), `recv.m(args)` dispatch by receiver type |
 | Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref, `new(T)` (a pointer to a zero value of `T`); a pointer shares the pointed-to struct, and `==` on an allocated pointer compares **identity** (two `errors.New("x")` are distinct) while struct values still compare field by field |
@@ -137,7 +137,7 @@ Real Go, executed on fusevm:
 | defer          | `defer f(args)` — arguments snapshotted at defer time, deferred calls run LIFO on every return path; a deferred pointer-receiver method sees mutations made after the `defer` |
 | panic / recover | `panic(v)` unwinds through defer drains, `recover()` (in a deferred closure) stops it; **runtime faults** (integer divide-by-zero, index-out-of-range, nil dereference) are recoverable too — `recover()` returns the `runtime error: …` value; an unrecovered panic prints `panic: <value>` and exits non-zero (matching Go, minus the goroutine trace) |
 | Concurrency    | `go f(…)` goroutines, `make(chan T[, cap])`, `ch <- v` / `<-ch`, `close`, `select` (with `default`) — buffered + unbuffered — on fusevm's cooperative scheduler; deadlocks are reported. `sync` (`WaitGroup`, `Mutex` + `TryLock`, `RWMutex`, `Once`) is vendored on top of it |
-| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %+v %#v %T %d %s %f %e %E %g %G %t %q %x %X %o %b %c %U %%` with width / `.precision` / `-` / `+` / `0` / `#` flags, floats rendered with strconv shortest-`g` semantics, and `Errorf` — builds a real `error` value, with `%w` recording the wrapped error(s) so `errors.Is`/`As`/`Unwrap` walk the chain); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/Replace/ReplaceAll/Title/EqualFold); `strconv` (Itoa/FormatInt/Quote, plus Atoi/ParseInt/ParseFloat returning Go's `(value, error)` pair with Go's `strconv.Atoi: parsing "x": invalid syntax` text); `math` (Abs/Sqrt/Cbrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min, trig Sin/Cos/Tan/Asin/Acos/Atan/Atan2/Sinh/Cosh/Tanh, Exp/Log/Log2/Log10 + consts Pi/E/Sqrt2/MaxInt/MinInt/MaxInt64/MinInt64); `sort` (Ints/Strings/Float64s + Slice/SliceStable, which take a closure comparator and lower to an in-language stable insertion sort); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`new`/`close`/`min`/`max`/`println`/`print` |
+| Standard lib   | `fmt` (Println/Print/Printf + Sprintf/Sprint/Sprintln `%v %+v %#v %T %d %s %f %e %E %g %G %t %q %x %X %o %b %c %U %%` with width / `.precision` / `-` / `+` / `0` / `#` flags, floats rendered with strconv shortest-`g` semantics, and `Errorf` — builds a real `error` value, with `%w` recording the wrapped error(s) so `errors.Is`/`As`/`Unwrap` walk the chain); `strings` (ToUpper/ToLower/Contains/HasPrefix/HasSuffix/Trim/TrimPrefix/TrimSuffix/TrimSpace/Split/Fields/Join/Repeat/Index/LastIndex/Count/Replace/ReplaceAll/Title/EqualFold); `strconv` (Itoa/FormatInt/Quote, plus Atoi/ParseInt/ParseFloat returning Go's `(value, error)` pair — a real `*strconv.NumError` with its `Func`/`Num`/`Err` fields, wrapping the `ErrSyntax`/`ErrRange` sentinels, so `errors.Is`/`As`/`Unwrap` all work on it); `math` (Abs/Sqrt/Cbrt/Pow/Floor/Ceil/Round/Trunc/Mod/Hypot/Max/Min, trig Sin/Cos/Tan/Asin/Acos/Atan/Atan2/Sinh/Cosh/Tanh, Exp/Log/Log2/Log10 + consts Pi/E/Sqrt2/MaxInt/MinInt/MaxInt64/MinInt64); `sort` (Ints/Strings/Float64s + Slice/SliceStable, which take a closure comparator and lower to an in-language stable insertion sort); `os.Getenv`; builtins `len`/`cap`/`append`/`delete`/`make`/`new`/`close`/`min`/`max`/`println`/`print` |
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
 Goroutines, channels, and `select` run on a **cooperative scheduler in the
@@ -207,7 +207,9 @@ cargo run --bin parity-fuzz -- --seed 1234 --once   # replay one divergence
 ```
 
 The corpus covers arithmetic, control flow, recursion, `Printf` format specs,
-slices/maps, structs/methods, interfaces, closures, generics, goroutines/channels,
+slices/maps (including the typed nil a slice or map zero value is), structs/
+methods, interfaces and interface conversions, multi-name `var` declarations,
+`float32` width, `strconv`'s `*NumError`, closures, generics, goroutines/channels,
 and `select`. The fuzzer generates arithmetic / float / boolean / string / slice /
 map / control-flow / stdlib blocks plus rune arithmetic, fixed-size arrays
 (sequential + sparse), `[]byte`/`[]rune` conversions, string-range-by-rune,
@@ -260,9 +262,17 @@ superset):
   `int32`, `uint8`/`uint16`/`uint32`, `byte`, `rune` — do wrap at their declared
   width, through `++`, compound assignment, binary and unary operators, struct
   fields, slice elements and function results.
-- **`for v := range ch`** silently yields nothing: fusevm's channel receive has no
-  "closed" flag, so the loop cannot tell a drained closed channel from a real zero.
-  Receive in a counted loop until it lands (see [`BUGS.md`](BUGS.md)).
+- **`for v := range ch`** silently yields nothing: the loop cannot tell a drained
+  closed channel from a real zero. fusevm has since landed the `Op::ChanRecvOk`
+  that fixes it, but `Cargo.toml` pins a published crates.io release that
+  predates the op, so this is **waiting on a fusevm release** rather than on
+  design work. Receive in a counted loop until it lands (see
+  [`BUGS.md`](BUGS.md)).
+- **`float32` loses its width through an `any` parameter or a nested struct
+  field.** Arithmetic runs at 32-bit width and `fmt` prints the 32-bit shortest
+  decimal for a statically-`float32` operand (including `[]float32`,
+  `map[K]float32` and the operand struct's own fields), but the width is read
+  from the static type at the `fmt` call site, so it does not survive erasure.
 - **Struct value semantics have a replication boundary** — a bare `var a [N]Struct`
   (no literal) and circular self-referential structures share one element handle
   rather than N distinct zero values; array/slice literals with explicit struct

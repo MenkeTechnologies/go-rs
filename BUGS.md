@@ -15,58 +15,30 @@ A gap listed here is deliberately **not** represented by a corpus file, because
 the corpus is a green byte-parity gate. Close the gap and add the corpus file in
 the same change.
 
-## `float32` prints with `float64` precision
+## `for v := range ch` yields nothing — waiting on a fusevm release
 
 ```go
-var f := float32(1.0 / 3.0)
-fmt.Println(f)  // go: 0.33333334     go-rs: 0.3333333333333333
+ch := make(chan int, 3)
+ch <- 1; ch <- 2; ch <- 3
+close(ch)
+for v := range ch { fmt.Println(v) }   // go: 1 2 3     go-rs: (no iterations)
 ```
 
-The conversion itself is right — `float32(x)` does round to `f32` — but `fmt`
-formats every float with the shortest representation that round-trips as an
-`f64`. Go picks the shortest that round-trips at the value's own width.
+Ranging a channel silently produces no values (the channel is a `Value::Int`
+handle, so the range lowers onto Go 1.22's range-over-int and iterates the
+handle's *id*). Every other channel operation — send, receive, `close`,
+`select`, buffered and unbuffered — is correct; receive in a counted loop
+meanwhile.
 
-Unlike the integer case — now closed by `emit_narrow` in `src/compiler.rs` —
-this one cannot be fixed by emitting ops around
-the arithmetic: the width is not needed at the *operation*, it is needed at the
-*print*, which happens in a host builtin that only ever sees a `Value::Float`.
-Closing it needs the value itself to carry its width — a `Value` variant or a
-compile-time-known formatting hint threaded into `fmt` — not a lowering trick.
-
-## A nil slice or nil map prints as `<nil>`
-
-```go
-var s []int
-var m map[string]int
-fmt.Println(s, m)   // go: [] map[]     go-rs: <nil> <nil>
-fmt.Println(m["x"]) // go: 0            go-rs: go-rs: invalid index of nil
-```
-
-`len`, `cap` and `append` on a nil slice are already correct. The zero value is
-`Value::Undef`, which carries no element type, so the printer cannot tell a nil
-slice from a nil map from a nil interface.
-
-**Tractability of the equality hook (assessed).** The blocker recorded here
-previously was that a distinguished nil object would print right but `s == nil`
-would then be false, and that go-rs installs no equality hook to fix it. That is
-no longer true: `numeric_hook` in `src/host.rs` already receives `NumOp::Eq` /
-`NumOp::Ne` for every comparison whose operands are not both numeric, and the
-pointer-identity rule added for `errors.Is` (`ptr_eq`) is exactly such a hook.
-A `HostObj::NilSlice` / `HostObj::NilMap` comparing equal to `Value::Undef` is
-the same three lines. So the hook is **not** the obstacle.
-
-What remains is plumbing, and it is the larger half:
-
-- `emit_default` (`src/compiler.rs`) is handed a `NumType`, which has collapsed
-  `[]int`, `map[K]V` and `any` into one `Unknown`. It needs the written type to
-  choose which distinguished nil to emit, so its callers must pass it.
-- Every builtin that consumes a slice or map (`GLEN`, `GCAP`, `GAPPEND`,
-  `GINDEX_GET`, `GRANGE_KEYS`, `GCOPY`, `GMAP_GET2`, `GDELETE`) has to treat the
-  new objects as empty, and `GINDEX_SET` on a nil map has to panic with Go's
-  "assignment to entry in nil map" rather than go-rs's current fault text.
-
-Both are mechanical; neither is a substrate gap. This is a plumbing task, not a
-blocked one.
+The substrate gap is closed but not yet reachable. `Scheduler::recv` returned
+the frontend's `recv_zero` for a drained closed channel with no "closed" flag,
+so a receive could not tell a closed channel from one that delivered a real
+zero. fusevm landed `Op::ChanRecvOk` (commit `ff299f4a8a`) for exactly this,
+but `Cargo.toml` pins `fusevm = "0.17.0"` from crates.io, which predates it.
+**This stays open until fusevm publishes a release carrying `Op::ChanRecvOk`**;
+the fix is then a `v, ok := <-ch` lowering in `compile_for_range`, not new
+design work. Vendoring or path-overriding fusevm to reach the op early is not
+an option — the published pin is the contract.
 
 ## A pointer to a struct prints without `&`
 
@@ -106,56 +78,25 @@ so it cannot compute the byte size. Sniffing it from the element values would
 give the wrong answer for `[]byte` (1 byte) and for struct elements, so it is
 left unrounded rather than confidently wrong.
 
-## `for v := range ch` yields nothing
+## `%T` after `fmt`'s `Stringer` dispatch names the rendered type
 
 ```go
-ch := make(chan int, 3)
-ch <- 1; ch <- 2; ch <- 3
-close(ch)
-for v := range ch { fmt.Println(v) }   // go: 1 2 3     go-rs: (no iterations)
+var v any = myErr{"e"}       // myErr has an Error() string method
+fmt.Printf("%T\n", v)        // go: main.myErr    go-rs: string
 ```
 
-Ranging a channel silently produces no values (the channel is a `Value::Int`
-handle, so the range lowers onto Go 1.22's range-over-int and iterates the
-handle's *id*). Every other channel operation — send, receive, `close`,
-`select`, buffered and unbuffered — is correct; receive in a counted loop
-meanwhile.
+Every `fmt` argument is wrapped in the linker-synthesized `$stringify`, which
+calls `Error()`/`String()` on the types that have one — that is how a value
+implementing `error` prints through its method. `%T` is the one verb that wants
+the operand *before* that dispatch, and it sees the `string` the wrapper
+returned. A value whose type has no such method is unaffected, as is `%T` on a
+concrete variable.
 
-Closing it needs fusevm, not go-rs: `Scheduler::recv` returns the frontend's
-`recv_zero` for a drained closed channel and reports no "closed" flag, so a
-receive cannot tell a closed channel from one that delivered a real zero. A
-`v, ok := <-ch` result (or a `chan_closed(ch)` query paired with a length query)
-would make the loop expressible; setting `recv_zero` to a sentinel instead would
-regress plain `<-ch` on a closed `chan int`, which correctly yields `0` today.
-
-## A `strconv` error is not a `*strconv.NumError`
-
-```go
-_, err := strconv.Atoi("xx")
-fmt.Println(err)                            // matches Go exactly
-errors.Is(err, strconv.ErrSyntax)           // go: true    go-rs: undefined
-var ne *strconv.NumError; errors.As(err, &ne)  // go: true  go-rs: undefined
-```
-
-The error *text* is Go's, and the value is a real error (non-nil, printable,
-compares by identity). What is missing is its type: Go returns a
-`*strconv.NumError` wrapping `strconv.ErrSyntax` / `strconv.ErrRange`, whereas
-go-rs returns the same `&$errorString{s: …}` that `fmt.Errorf` builds. Closing
-it needs `strconv` vendored as Go source (it is a native host package today,
-because it reaches the float-formatting runtime), or a host-side `NumError`
-struct plus the two sentinel errors exported as package constants.
-
-## `var a, b int = 1, 2` does not parse
-
-```go
-var wide, wider int = 300, 5000000000
-// go-rs: unexpected token `Comma` in expression
-```
-
-A `var` declaration binds one name. The multi-name forms — with or without an
-initializer list — are unsupported; `a, b := 1, 2` and separate `var`
-statements both work. `Stmt::Var` holds a single `name`, so closing it means
-either widening that node or desugaring one declaration into several.
+Closing it means not wrapping the arguments a literal format string sends to
+`%T`: the compiler already has the format string at the call site, so it can map
+verb positions to argument positions and skip the wrapper for those. It needs a
+format-string scan in `src/compiler.rs`, and a non-literal format string (a
+variable) would still go through the wrapper.
 
 ## A failed anonymous-interface assertion names its method set, not its signature
 
@@ -174,19 +115,6 @@ differs, because the parser canonicalizes an inline interface to
 [`method_sig`]-encoded names (`src/ast.rs`) rather than keeping the written
 source, which it cannot recover: tokens carry a line but no byte offset.
 
-## A conversion to an interface type is rejected
-
-```go
-_ = error(myErr{})   // go-rs: undefined: error
-_ = any(3)
-```
-
-`T(x)` is accepted for the builtin scalar types and `[]byte`/`[]rune`; naming an
-interface type in call position is read as a call to an undefined function.
-Assigning through a declared variable (`var e error = myErr{}`) is the working
-spelling. Closing it means treating a known interface name in call position as
-the identity conversion it is.
-
 ## Unsupported stdlib calls
 
 `fmt.Fprintln` / `fmt.Fprintf` (writer-directed output) and
@@ -201,4 +129,42 @@ fmt.Println(int8(300))
 ```
 
 go-rs has no constant-range checking pass, so an out-of-range constant
-conversion silently truncates instead of failing the build.
+conversion silently truncates instead of failing the build. The same pass would
+catch `float32(1e20) * float32(1e20)` (constant overflow of `float32`) and
+`x / 0` on constants.
+
+## Constant folding keeps a signed zero
+
+```go
+fmt.Println(-float32(0))   // go: 0     go-rs: -0
+```
+
+Go's constants are exact rationals with no signed zero, so `-float32(0)` folds
+to `0` at compile time. go-rs evaluates the negation at run time on an IEEE
+`f64`, which does have `-0`. A *variable* zero is right in both (`z := float32(0);
+-z` prints `-0` in each). Closing it needs the same constant-evaluation pass the
+overflow diagnosis above wants.
+
+## `float32` precision is not tracked across a function boundary or a nested struct
+
+```go
+func id(v any) any { return v }
+var f float32 = 1.0 / 3.0
+fmt.Println(id(f))                    // go: 0.33333334     go-rs: 0.3333333432674408
+fmt.Println(outer{in: inner{f: f}})   // go: {{0.33333334}}  go-rs: {{0.3333333432674408}}
+```
+
+The *value* is right in both cases — the conversion rounded to `f32` — it is
+only rendered at 64-bit shortest precision.
+
+`float32` arithmetic and printing are otherwise correct: every operation runs at
+32-bit width (`GF32_ARITH`), and a statically-`float32` `fmt` argument is tagged
+with its width on the way in (`GF32_BOX`) so `fmt` renders the 32-bit shortest
+decimal. The tag is applied from the *static* type at the call site, so the two
+places the static type is gone are the two gaps: a value that has passed through
+an `any`/interface parameter, and a `float32` field one struct deeper than the
+argument's own type (the tag walks slices, maps and the argument struct's own
+fields, but does not recurse into a struct-typed field).
+
+Closing it needs the width to live on the value rather than at the call site —
+a `Value` variant, which is the same change `%T`-through-`any` would want.

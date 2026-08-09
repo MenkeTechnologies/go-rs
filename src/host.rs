@@ -171,6 +171,34 @@ pub const GASSERT_IFACE: u16 = 954;
 /// divisor is a provably-nonzero constant, and falls back here otherwise.
 pub const GFDIV: u16 = 951;
 
+/// `[value]` → the same number tagged `float32` (`HostObj::F32`) for `fmt`, or
+/// a fresh slice of tagged elements when the operand is a `[]float32`. Emitted
+/// only at `fmt` argument positions.
+pub const GF32_BOX: u16 = 957;
+
+/// `[lhs, rhs, op]` → one arithmetic operation performed at 32-bit width, `op`
+/// being an [`f32_op`] code.
+///
+/// Rounding an `f64` result to `f32` afterwards is a *different* computation:
+/// the double rounding can land a ulp away. `float32(16777217) * float32(0.2)`
+/// is `3.3554432e+06` rounded once and `3.3554434e+06` rounded twice. So a
+/// `float32` operation is done in `f32` throughout, which is why it costs a
+/// builtin rather than a native op.
+pub const GF32_ARITH: u16 = 958;
+
+/// The [`GF32_ARITH`] operator codes, shared with the compiler.
+pub mod f32_op {
+    pub const ADD: i64 = 0;
+    pub const SUB: i64 = 1;
+    pub const MUL: i64 = 2;
+    pub const DIV: i64 = 3;
+}
+
+/// `["[]T" | "map[K]V"]` → the typed nil that is that type's zero value
+/// (`HostObj::Nil`). Emitted wherever the compiler needs a slice's or map's
+/// zero value, so `fmt` can print `[]` / `map[]` rather than `<nil>`.
+pub const GNIL_OF: u16 = 956;
+
 /// Register every go-rs builtin on a VM. This is the single install choke point
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
 pub fn install(vm: &mut VM) {
@@ -230,6 +258,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GDYNDIV, b_dyndiv);
     vm.register_builtin(GFDIV, b_fdiv);
     vm.register_builtin(GPTR_MARK, b_ptr_mark);
+    vm.register_builtin(GNIL_OF, b_nil_of);
+    vm.register_builtin(GF32_BOX, b_f32_box);
+    vm.register_builtin(GF32_ARITH, b_f32_arith);
     vm.register_builtin(GREG_METHODS, b_reg_methods);
     vm.register_builtin(GIFACE_OK, b_iface_ok);
     vm.register_builtin(GASSERT_IFACE, b_assert_iface);
@@ -332,6 +363,12 @@ fn type_tag_of(v: &Value) -> String {
             Some(HostObj::Struct { type_name, .. }) => type_name.clone(),
             Some(HostObj::Slice(_)) | Some(HostObj::SliceView { .. }) => "[]".to_string(),
             Some(HostObj::Map(_)) => "map".to_string(),
+            // A typed nil keeps its type's tag, so a type switch on a nil slice
+            // still picks the `[]T` case rather than the nil default.
+            Some(HostObj::Nil { kind, .. }) => match kind {
+                NilKind::Slice => "[]".to_string(),
+                NilKind::Map => "map".to_string(),
+            },
             Some(HostObj::Closure { .. }) => "func".to_string(),
             _ => "nil".to_string(),
         }),
@@ -872,6 +909,177 @@ pub(crate) enum HostObj {
     /// A one-slot mutable box for a variable captured by reference: the enclosing
     /// scope and every capturing closure share this handle, so writes propagate.
     Cell(Value),
+    /// A `float32` at a `fmt` argument position. Go's `fmt` renders a float with
+    /// the shortest decimal that round-trips **at the value's own width**, so a
+    /// `float32` and the `float64` holding the same bits print differently
+    /// (`0.33333334` vs `0.3333333333333333`). The value model has one float
+    /// width, so the compiler boxes a statically-`float32` operand here on its
+    /// way into `fmt` — and nowhere else, which keeps the box out of arithmetic.
+    F32(f32),
+    /// The zero value of a slice or map type — Go's *typed* nil. It is not
+    /// `Value::Undef`, because Go distinguishes a nil slice (`[]`, `len` 0,
+    /// appendable) and a nil map (`map[]`, readable, not writable) from a nil
+    /// interface (`<nil>`), and prints all three differently. `ty` is the written
+    /// type, so `%T` and `%#v` name it exactly.
+    ///
+    /// It still compares equal to `nil`: [`numeric_hook`] answers `Eq`/`Ne`
+    /// against [`Value::Undef`] for these handles, so `s == nil` stays true.
+    Nil { kind: NilKind, ty: String },
+}
+
+/// Which kind of typed nil a [`HostObj::Nil`] is — the two Go composite types
+/// whose zero value is usable rather than a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NilKind {
+    Slice,
+    Map,
+}
+
+thread_local! {
+    /// One [`HostObj::Nil`] handle per written type. Nil slices and maps are
+    /// immutable (an `append` reallocates, a map write panics), so every
+    /// `var s []int` can share a handle; memoizing keeps a loop that declares one
+    /// per iteration from growing the heap. Cleared by [`heap_reset`].
+    static NILS: RefCell<std::collections::HashMap<String, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// `[typeName]` → the typed nil for that slice or map type.
+fn b_nil_of(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let ty = args.first().map(go_str).unwrap_or_default();
+    NILS.with(|n| {
+        n.borrow_mut()
+            .entry(ty.clone())
+            .or_insert_with(|| {
+                let kind = if ty.starts_with("map[") {
+                    NilKind::Map
+                } else {
+                    NilKind::Slice
+                };
+                Value::Obj(heap_alloc(HostObj::Nil { kind, ty }))
+            })
+            .clone()
+    })
+}
+
+/// [`GF32_BOX`] — tag the `float32`s in a `fmt` argument. Stack `[value, spec]`:
+/// an empty `spec` tags the value itself, otherwise `spec` names the struct
+/// fields to tag (`"x,y"`). Either way a slice or map operand is handled
+/// element-wise, so `[]float32`, `map[string]float32` and `[]point` all work.
+fn b_f32_box(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let spec = args.get(1).map(go_str).unwrap_or_default();
+    box_for_fmt(&v, &spec)
+}
+
+/// Tag every `float32` a `fmt` argument holds, per [`b_f32_box`]'s `spec`.
+/// Composites are rebuilt rather than mutated — the tag is a display detail and
+/// must not be visible to the program that owns the original.
+fn box_for_fmt(v: &Value, spec: &str) -> Value {
+    if let Some(es) = slice_elems(v) {
+        let boxed = es.iter().map(|e| box_for_fmt(e, spec)).collect();
+        return Value::Obj(heap_alloc(HostObj::Slice(boxed)));
+    }
+    if let Some(pairs) = map_pairs(v) {
+        let boxed = pairs
+            .into_iter()
+            .map(|(k, val)| (k, box_for_fmt(&val, spec)))
+            .collect();
+        return Value::Obj(heap_alloc(HostObj::Map(boxed)));
+    }
+    if spec.is_empty() {
+        return box_f32(v);
+    }
+    let Value::Obj(id) = v else { return v.clone() };
+    // Snapshot before boxing: `box_f32` allocates, and the heap borrow is not
+    // re-entrant.
+    let snapshot = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Struct {
+            type_name,
+            fields,
+            by_ref,
+        }) => Some((type_name.clone(), fields.clone(), *by_ref)),
+        _ => None,
+    });
+    let Some((type_name, fields, by_ref)) = snapshot else {
+        return v.clone();
+    };
+    let fields = fields
+        .into_iter()
+        .map(|(n, fv)| {
+            let tag = spec.split(',').any(|f| f == n);
+            let fv = if tag { box_f32(&fv) } else { fv };
+            (n, fv)
+        })
+        .collect();
+    Value::Obj(heap_alloc(HostObj::Struct {
+        type_name,
+        fields,
+        by_ref,
+    }))
+}
+
+/// A map value's `(key, value)` pairs, or `None` when it is not a map.
+fn map_pairs(v: &Value) -> Option<Vec<(Value, Value)>> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map(m)) => Some(m.clone()),
+        _ => None,
+    })
+}
+
+/// One value tagged `float32`. A non-float (a nil, a string in an `any`) passes
+/// through untouched, so the box is safe wherever the static type says `float32`.
+fn box_f32(v: &Value) -> Value {
+    match v {
+        Value::Float(f) => Value::Obj(heap_alloc(HostObj::F32(*f as f32))),
+        Value::Int(n) => Value::Obj(heap_alloc(HostObj::F32(*n as f32))),
+        other => other.clone(),
+    }
+}
+
+/// The `f32` a value carries when it is a [`HostObj::F32`] box.
+fn unbox_f32(v: &Value) -> Option<f32> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::F32(f)) => Some(*f),
+        _ => None,
+    })
+}
+
+/// A `fmt` argument's numeric value, seeing through a [`HostObj::F32`] box.
+fn arg_float(v: &Value) -> f64 {
+    unbox_f32(v).map_or_else(|| v.to_float(), f64::from)
+}
+
+/// A `fmt` argument's integer value, seeing through a [`HostObj::F32`] box.
+fn arg_int(v: &Value) -> i64 {
+    unbox_f32(v).map_or_else(|| v.to_int(), |f| f as i64)
+}
+
+/// [`GF32_ARITH`] — one arithmetic operation at 32-bit width.
+fn b_f32_arith(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().map(Value::to_float).unwrap_or(0.0) as f32;
+    let b = args.get(1).map(Value::to_float).unwrap_or(0.0) as f32;
+    let r = match args.get(2).map(Value::to_int).unwrap_or(f32_op::ADD) {
+        f32_op::SUB => a - b,
+        f32_op::MUL => a * b,
+        f32_op::DIV => a / b,
+        _ => a + b,
+    };
+    Value::Float(f64::from(r))
+}
+
+/// The kind of typed nil `v` is, if it is one.
+fn nil_kind(v: &Value) -> Option<NilKind> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Nil { kind, .. }) => Some(*kind),
+        _ => None,
+    })
 }
 
 thread_local! {
@@ -897,6 +1105,8 @@ pub fn heap_reset() {
     DEFERS.with(|d| d.borrow_mut().clear());
     PANIC.with(|p| *p.borrow_mut() = None);
     PANIC_MODE.with(|m| *m.borrow_mut() = false);
+    NILS.with(|n| n.borrow_mut().clear());
+    stdlib::sentinels_reset();
 }
 
 /// Allocate `obj` on the heap and return its handle.
@@ -921,6 +1131,12 @@ fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
             len,
             ..
         }) => Some((*backing, *offset, *len)),
+        // A nil slice is a zero-length slice for every read: `len`, `cap`,
+        // `range`, `copy` and indexing all behave as Go's do.
+        Some(HostObj::Nil {
+            kind: NilKind::Slice,
+            ..
+        }) => Some((id, 0, 0)),
         _ => None,
     })
 }
@@ -931,6 +1147,10 @@ fn slice_cap(id: u32) -> Option<usize> {
     HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Slice(a)) => Some(a.len()),
         Some(HostObj::SliceView { cap, .. }) => Some(*cap),
+        Some(HostObj::Nil {
+            kind: NilKind::Slice,
+            ..
+        }) => Some(0),
         _ => None,
     })
 }
@@ -1134,7 +1354,18 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             }
         };
     }
-    let is_map = HEAP.with(|h| matches!(h.borrow().get(id as usize), Some(HostObj::Map(_))));
+    // A nil map reads like an empty one (every key is absent, yielding the
+    // value type's zero); only writing to it is a fault.
+    let is_map = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(id as usize),
+            Some(HostObj::Map(_))
+                | Some(HostObj::Nil {
+                    kind: NilKind::Map,
+                    ..
+                })
+        )
+    });
     if !is_map {
         ffi_fault(vm, "go-rs: invalid index target".to_string());
         return Value::Undef;
@@ -1225,6 +1456,11 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
                 Value::Undef
             }
         };
+    }
+    // Go's nil map is readable but not writable.
+    if nil_kind(&recv) == Some(NilKind::Map) {
+        plain_panic(vm, "assignment to entry in nil map".to_string());
+        return Value::Undef;
     }
     // Find an existing key (by value) without holding the borrow across key_eq,
     // then insert/overwrite under a fresh mutable borrow.
@@ -1402,6 +1638,11 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
             // Go's does.
             let existing = HEAP.with(|h| match h.borrow().get(id as usize) {
                 Some(HostObj::Slice(a)) => Some(a.clone()),
+                // `append` to a nil slice allocates, exactly as Go's does.
+                Some(HostObj::Nil {
+                    kind: NilKind::Slice,
+                    ..
+                }) => Some(Vec::new()),
                 _ => None,
             });
             if let Some(mut out) = existing {
@@ -1456,12 +1697,11 @@ fn b_struct_new(vm: &mut VM, argc: u8) -> Value {
     }))
 }
 
-/// The error value a host builtin returns for a failed conversion: the same
-/// `&$errorString{s: …}` shape `fmt.Errorf` builds, so `fmt` renders it through
-/// the synthesized `Error()` method and `err != nil` and `err == err` behave like
-/// any other Go error. (Go returns a `*strconv.NumError` here, whose `Error()`
-/// produces exactly this text; its `Func`/`Num`/`Err` fields are not modelled,
-/// so `errors.Is(err, strconv.ErrSyntax)` does not work — see BUGS.md.)
+/// A host-built error value: the same `&$errorString{s: …}` shape `fmt.Errorf`
+/// builds and `errors.New` returns, so `fmt` renders it through the synthesized
+/// `Error()` method and `err != nil` and `err == err` behave like any other Go
+/// error. `strconv`'s `ErrSyntax` / `ErrRange` sentinels are these; the
+/// `*strconv.NumError` wrapping them is [`stdlib::num_error`].
 pub(crate) fn make_error(msg: String) -> Value {
     Value::Obj(heap_alloc(HostObj::Struct {
         type_name: "$errorString".to_string(),
@@ -1704,7 +1944,12 @@ fn ffi_fault(vm: &mut VM, msg: impl Into<String>) {
 /// yields) and let the compiler-emitted unwind checks handle it. Otherwise abort
 /// the run with a terse `go-rs:` diagnostic, as before.
 fn runtime_panic(vm: &mut VM, msg: impl Into<String>) {
-    let full = format!("runtime error: {}", msg.into());
+    plain_panic(vm, format!("runtime error: {}", msg.into()));
+}
+
+/// A runtime fault whose message Go does *not* prefix with `runtime error: ` —
+/// its `runtime.plainError` cases, such as writing to a nil map.
+fn plain_panic(vm: &mut VM, full: String) {
     if PANIC_MODE.with(|m| *m.borrow()) {
         // Recoverable: record it and let the compiler's unwind checks run.
         PANIC.with(|p| *p.borrow_mut() = Some(Value::str(full)));
@@ -1896,6 +2141,10 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 Some(HostObj::Struct { type_name, .. }) => format!("main.{type_name}"),
                 Some(HostObj::Closure { .. }) => "func()".to_string(),
                 Some(HostObj::Cell(v)) => go_type_name(v),
+                // A typed nil records the type it was written as, so unlike a
+                // populated slice or map it needs no guess from its contents.
+                Some(HostObj::Nil { ty, .. }) => ty.clone(),
+                Some(HostObj::F32(_)) => "float32".to_string(),
                 None => "<nil>".to_string(),
             }
         }),
@@ -1928,6 +2177,10 @@ pub(crate) fn slice_elems(v: &Value) -> Option<Vec<Value>> {
                 Some(HostObj::Slice(a)) => Some(a[*offset..*offset + *len].to_vec()),
                 _ => Some(Vec::new()),
             },
+            Some(HostObj::Nil {
+                kind: NilKind::Slice,
+                ..
+            }) => Some(Vec::new()),
             _ => None,
         }
     })
@@ -2013,6 +2266,15 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     format!("map[{body}]")
                 }
             }
+            // A `float32` prints its own width's shortest decimal.
+            Some(HostObj::F32(f)) => format_float32(*f),
+            // Go prints a nil slice as `[]` and a nil map as `map[]` — the same
+            // as an empty one — and `%#v` as the type followed by `(nil)`.
+            Some(HostObj::Nil { kind, ty }) => match (mode, kind) {
+                (FmtMode::SharpV, _) => format!("{ty}(nil)"),
+                (_, NilKind::Slice) => "[]".to_string(),
+                (_, NilKind::Map) => "map[]".to_string(),
+            },
             Some(HostObj::Struct {
                 type_name, fields, ..
             }) => match mode {
@@ -2078,6 +2340,111 @@ pub(crate) fn format_float(f: f64) -> String {
         // round-tripping decimal Go computes, and never switches to exponent
         // notation itself.
         format!("{f}")
+    }
+}
+
+/// Go's `strconv.FormatFloat(f, 'g', -1, 32)` — the same rendering as
+/// [`format_float`], but the shortest decimal is computed against **32-bit**
+/// precision. That is the whole difference: the `f64` nearest `1/3` prints as
+/// `0.3333333333333333` at 64 bits and `0.33333334` at 32.
+pub(crate) fn format_float32(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Inf" } else { "+Inf" }.to_string();
+    }
+    let (mant, exp) = shortest_sci_32(f);
+    if !(-4..6).contains(&exp) {
+        format_e(&mant, exp, 'e')
+    } else {
+        plain_form(&mant, exp)
+    }
+}
+
+/// A finite `f32`'s shortest round-tripping decimal mantissa and exponent.
+///
+/// Rust's `{:e}` picks the same *length* Go does — both emit the shortest
+/// decimal that round-trips — but breaks a tie the other way, so the result is
+/// passed through [`go_even_tie`].
+fn shortest_sci_32(f: f32) -> (String, i32) {
+    let s = format!("{f:e}");
+    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
+    (go_even_tie(mant, f), exp.parse().unwrap_or(0))
+}
+
+/// Go breaks a shortest-decimal tie towards the **even** last digit; Rust's
+/// formatter breaks it away from zero. They can only differ when Rust's last
+/// digit is odd, so only then is the exact expansion consulted — and a tie is
+/// exactly "the digits past the shortest form are a single 5".
+///
+/// `float32(4025693.25)` is such a value: Go prints `4.0256932e+06`, Rust
+/// `4.0256933e+06`.
+fn go_even_tie(mant: &str, f: f32) -> String {
+    let Some(last) = mant.chars().last() else {
+        return mant.to_string();
+    };
+    if !matches!(last, '1' | '3' | '5' | '7' | '9') {
+        return mant.to_string();
+    }
+    let digits: String = mant.chars().filter(char::is_ascii_digit).collect();
+    let exact = exact_sig_digits(f);
+    // A tie: one more exact digit than the shortest form, and it is a 5 over the
+    // shortest form's *lower* neighbour (Rust rounded up to reach `digits`).
+    let lower = format!("{}{}", &digits[..digits.len() - 1], step_down(last));
+    if exact.len() != digits.len() + 1 || !exact.ends_with('5') || exact[..digits.len()] != lower {
+        return mant.to_string();
+    }
+    let mut out: Vec<char> = mant.chars().collect();
+    if let Some(c) = out.last_mut() {
+        *c = step_down(last);
+    }
+    out.into_iter().collect()
+}
+
+/// The digit one below `d`. Only called on an odd digit, so it never borrows.
+fn step_down(d: char) -> char {
+    char::from(d as u8 - 1)
+}
+
+/// Every significant digit of a finite `f32`'s **exact** value, leading and
+/// trailing zeros trimmed. A binary float's decimal expansion terminates, and
+/// the longest an `f32`'s can be is the 149 fractional digits of the smallest
+/// subnormal — so 160 places renders every one of them exactly.
+fn exact_sig_digits(f: f32) -> String {
+    let s = format!("{:.*}", 160, f64::from(f).abs());
+    let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+    digits
+        .trim_start_matches('0')
+        .trim_end_matches('0')
+        .to_string()
+}
+
+/// Assemble the plain (non-exponent) rendering of a mantissa and exponent —
+/// `("1.5", 3)` is `1500`, `("1.5", -2)` is `0.015`.
+fn plain_form(mant: &str, exp: i32) -> String {
+    let (sign, m) = match mant.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mant),
+    };
+    let digits: String = m.chars().filter(char::is_ascii_digit).collect();
+    let point = exp + 1; // digits before the decimal point
+    if point <= 0 {
+        format!(
+            "{sign}0.{}{digits}",
+            "0".repeat(point.unsigned_abs() as usize)
+        )
+    } else if point as usize >= digits.len() {
+        format!(
+            "{sign}{digits}{}",
+            "0".repeat(point as usize - digits.len())
+        )
+    } else {
+        format!(
+            "{sign}{}.{}",
+            &digits[..point as usize],
+            &digits[point as usize..]
+        )
     }
 }
 
@@ -2303,7 +2670,7 @@ fn sprintf(args: &[Value]) -> String {
             // `%T` is the operand's type, not its value.
             'T' => rest.next().map(go_type_name).unwrap_or_default(),
             'f' | 'F' => {
-                let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
+                let v = rest.next().map(arg_float).unwrap_or(0.0);
                 let s = if v.is_nan() {
                     "NaN".to_string()
                 } else if v.is_infinite() {
@@ -2318,7 +2685,7 @@ fn sprintf(args: &[Value]) -> String {
                 }
             }
             'e' | 'E' => {
-                let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
+                let v = rest.next().map(arg_float).unwrap_or(0.0);
                 let s = format_float_e(v, Some(prec.unwrap_or(6)), verb == 'E');
                 if plus && !s.starts_with('-') {
                     format!("+{s}")
@@ -2326,9 +2693,21 @@ fn sprintf(args: &[Value]) -> String {
                     s
                 }
             }
+            // `%g` with no precision is the shortest round-tripping decimal —
+            // computed at the operand's own width, so a `float32` box narrows it.
             'g' | 'G' => {
-                let v = rest.next().map(|v| v.to_float()).unwrap_or(0.0);
-                let s = format_float_g(v, prec, verb == 'G');
+                let arg = rest.next().cloned().unwrap_or(Value::Float(0.0));
+                let s = match (prec, unbox_f32(&arg)) {
+                    (None, Some(f)) => {
+                        let g = format_float32(f);
+                        if verb == 'G' {
+                            g.to_uppercase()
+                        } else {
+                            g
+                        }
+                    }
+                    _ => format_float_g(arg_float(&arg), prec, verb == 'G'),
+                };
                 if plus && !s.starts_with('-') {
                     format!("+{s}")
                 } else {
@@ -2347,7 +2726,7 @@ fn sprintf(args: &[Value]) -> String {
                                 .join(" ")
                         ),
                         None => {
-                            let n = v.to_int();
+                            let n = arg_int(v);
                             if plus && n >= 0 {
                                 format!("+{n}")
                             } else {
@@ -2398,7 +2777,7 @@ fn sprintf(args: &[Value]) -> String {
                                 .join(" ")
                         )
                     }
-                    Some(v) => hex(v.to_int()),
+                    Some(v) => hex(arg_int(v)),
                     None => "0".to_string(),
                 };
                 if sharp {
@@ -2407,9 +2786,9 @@ fn sprintf(args: &[Value]) -> String {
                     body
                 }
             }
-            'o' => format!("{:o}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
-            'b' => format!("{:b}", rest.next().map(|v| v.to_int()).unwrap_or(0)),
-            'c' => char::from_u32(rest.next().map(|v| v.to_int()).unwrap_or(0) as u32)
+            'o' => format!("{:o}", rest.next().map(arg_int).unwrap_or(0)),
+            'b' => format!("{:b}", rest.next().map(arg_int).unwrap_or(0)),
+            'c' => char::from_u32(rest.next().map(arg_int).unwrap_or(0) as u32)
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
             // `%U` is Go's Unicode format: `U+4E16`, at least four hex digits.
@@ -2492,6 +2871,7 @@ fn sprintf(args: &[Value]) -> String {
 pub mod stdlib {
     use super::{go_str, heap_alloc, pop_args, HostObj, HEAP};
     use fusevm::{Value, VM};
+    use std::cell::RefCell;
 
     // strings.*
     pub const TO_UPPER: u16 = 830;
@@ -2521,6 +2901,8 @@ pub mod stdlib {
     pub const PARSE_FLOAT: u16 = 853;
     pub const FORMAT_INT: u16 = 854;
     pub const QUOTE: u16 = 855;
+    /// `strconv.ErrSyntax` / `strconv.ErrRange` — the sentinel by name.
+    pub const STRCONV_ERR: u16 = 856;
     // math.*
     pub const ABS: u16 = 860;
     pub const SQRT: u16 = 861;
@@ -2685,6 +3067,7 @@ pub mod stdlib {
         // `strconv.Quote` is the same double-quoted Go literal `%q` produces —
         // escapes and all, which wrapping the raw string in quotes was not.
         vm.register_builtin(QUOTE, |vm, a| s1(vm, a, super::go_quote));
+        vm.register_builtin(STRCONV_ERR, b_strconv_err);
         // math.*
         vm.register_builtin(ABS, |vm, a| math1(vm, a, f64::abs));
         vm.register_builtin(SQRT, |vm, a| math1(vm, a, f64::sqrt));
@@ -2954,19 +3337,63 @@ pub mod stdlib {
 
     /// A `(value, error)` result as the 2-element tuple the compiler
     /// destructures, with `err` nil on success.
-    fn parsed(value: Value, err: Option<String>) -> Value {
-        let e = match err {
-            Some(msg) => super::make_error(msg),
-            None => Value::Undef,
-        };
+    fn parsed(value: Value, err: Option<Value>) -> Value {
+        let e = err.unwrap_or(Value::Undef);
         Value::Obj(heap_alloc(HostObj::Slice(vec![value, e])))
     }
 
-    /// Go's `strconv` error text: `strconv.<Func>: parsing <quoted>: <reason>`
-    /// (the `Error()` of the `*strconv.NumError` Go returns).
-    fn num_error(func: &str, num: &str, reason: &str) -> String {
-        format!("strconv.{func}: parsing {}: {reason}", super::go_quote(num))
+    thread_local! {
+        /// The two `strconv` sentinel errors, allocated once per run so every
+        /// `NumError.Err` and every `strconv.ErrSyntax` mention is the *same*
+        /// pointer — which is what `errors.Is` compares. Cleared by
+        /// [`super::heap_reset`] along with the heap the handles index.
+        static SENTINELS: RefCell<std::collections::HashMap<&'static str, Value>> =
+            RefCell::new(std::collections::HashMap::new());
     }
+
+    pub(super) fn sentinels_reset() {
+        SENTINELS.with(|s| s.borrow_mut().clear());
+    }
+
+    /// `strconv.ErrSyntax` / `strconv.ErrRange` — Go's `errors.New` sentinels,
+    /// memoized so repeated mentions compare equal by pointer.
+    fn sentinel(reason: &'static str) -> Value {
+        SENTINELS.with(|s| {
+            s.borrow_mut()
+                .entry(reason)
+                .or_insert_with(|| super::make_error(reason.to_string()))
+                .clone()
+        })
+    }
+
+    /// `strconv.ErrSyntax` / `strconv.ErrRange` read as a value (stack: name).
+    fn b_strconv_err(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        match args.first().map(go_str).unwrap_or_default().as_str() {
+            "ErrRange" => sentinel(RANGE),
+            _ => sentinel(SYNTAX),
+        }
+    }
+
+    /// The `*strconv.NumError` Go returns from a failed conversion: the function
+    /// name, the input, and the `ErrSyntax`/`ErrRange` sentinel it wraps. Its
+    /// `Error()` and `Unwrap()` are synthesized as Go source by `crate::pkg`, so
+    /// the message text, `errors.Is` and `errors.As` all come off the real type.
+    fn num_error(func: &str, num: &str, reason: &'static str) -> Value {
+        Value::Obj(heap_alloc(HostObj::Struct {
+            type_name: NUM_ERROR.to_string(),
+            fields: vec![
+                ("Func".to_string(), Value::str(func.to_string())),
+                ("Num".to_string(), Value::str(num.to_string())),
+                ("Err".to_string(), sentinel(reason)),
+            ],
+            by_ref: true,
+        }))
+    }
+
+    /// The linked name of `strconv`'s `NumError` — `strconv` is a native package,
+    /// so its one source-level type is synthesized under its qualified name.
+    pub const NUM_ERROR: &str = "strconv.NumError";
 
     const SYNTAX: &str = "invalid syntax";
     const RANGE: &str = "value out of range";
@@ -3031,6 +3458,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         }
         NumOp::Neg if matches!(a, Value::Int(_)) => Ok(Value::Int(a.to_int().wrapping_neg())),
         NumOp::Add => Ok(Value::str(format!("{}{}", go_str(a), go_str(b)))),
+        // A typed nil (a nil slice or map) equals `nil` and nothing else — Go
+        // permits no other comparison for those types.
+        NumOp::Eq | NumOp::Ne if nil_kind(a).is_some() || nil_kind(b).is_some() => {
+            let same = matches!((a, b), (Value::Undef, _) | (_, Value::Undef))
+                || matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x == y);
+            Ok(Value::bool(if op == NumOp::Eq { same } else { !same }))
+        }
         // A pointer compares by address, a struct value field by field.
         NumOp::Eq | NumOp::Ne if ptr_eq(a, b).is_some() => {
             let same = ptr_eq(a, b).unwrap_or(false);

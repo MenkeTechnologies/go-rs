@@ -767,6 +767,11 @@ impl Parser {
                 Tok::LParen | Tok::LBracket => depth += 1,
                 Tok::RParen if depth == 1 => break,
                 Tok::RParen | Tok::RBracket => depth -= 1,
+                // `map` is a predeclared identifier, not a keyword, so a
+                // `map[K]V` *type* looks like a name followed by a type start.
+                // Skipping it is what keeps `(map[string]int, error)` an
+                // unnamed result list.
+                Tok::Ident(n) if n == "map" => {}
                 Tok::Ident(_) if depth == 1 && self.type_starts_at(i + 1) => return true,
                 _ => {}
             }
@@ -994,53 +999,24 @@ impl Parser {
         self.var_spec(line)
     }
 
-    /// One `name [type] [= init]` variable specification.
+    /// One `name {, name} [type] [= init {, init}]` variable specification.
+    ///
+    /// Go binds a whole name list per spec. A multi-name spec desugars to one
+    /// `Stmt::Var` per name (so each keeps the written type, which drives the
+    /// fixed-width narrowing and float-conversion paths), except for the
+    /// `var a, b = f()` form — a single multi-value right-hand side — which
+    /// reuses the `Stmt::Short` destructuring already built for `a, b := f()`.
     fn var_spec(&mut self, line: u32) -> Result<Stmt, String> {
-        let name = self.ident()?;
-        // A fixed-size array type `[N]T` is captured specially so a bare
-        // `var x [N]T` (no initializer) can be zero-filled to N elements — go-rs
-        // models arrays as slices, and the erased size would otherwise be lost.
-        let mut array_len: Option<usize> = None;
-        let ty = if self.type_starts() && !matches!(self.peek(), Tok::Assign) {
-            if matches!(self.peek(), Tok::LBracket) && !matches!(self.peek2(), Tok::RBracket) {
-                self.advance(); // `[`
-                array_len = if matches!(self.peek(), Tok::Ellipsis) {
-                    self.advance();
-                    None
-                } else {
-                    const_int_of(&self.expr()?).map(|n| n as usize)
-                };
-                self.expect(&Tok::RBracket)?;
-                let elem = self.type_name()?;
-                Some(format!("[]{elem}"))
-            } else {
-                Some(self.type_name()?)
-            }
-        } else {
-            None
-        };
+        let names = self.ident_list()?;
+        if names.len() > 1 {
+            return self.var_spec_multi(names, line);
+        }
+        let name = names.into_iter().next().expect("ident_list is non-empty");
+        let (ty, array_len) = self.var_decl_type()?;
         let init = if self.eat(&Tok::Assign) {
             Some(self.expr()?)
-        } else if let (Some(len), Some(t)) = (array_len, ty.as_ref()) {
-            // Bare `var x [N]T` → an N-element slice of the element zero value.
-            let elem = t.strip_prefix("[]").unwrap_or(t).to_string();
-            let zero = if self.struct_names.contains(&elem) {
-                Expr::StructLit {
-                    type_name: elem.clone(),
-                    fields: Vec::new(),
-                }
-            } else {
-                zero_expr(&elem)
-            };
-            Some(Expr::Make {
-                is_map: false,
-                elem_ty: elem,
-                len: Some(Box::new(Expr::Int(len as i64))),
-                cap: None,
-                elem_zero: Box::new(zero),
-            })
         } else {
-            None
+            self.bare_array_init(&ty, array_len)
         };
         Ok(Stmt::Var {
             name,
@@ -1048,6 +1024,95 @@ impl Parser {
             init,
             line,
         })
+    }
+
+    /// The `[type]` of a variable specification. A fixed-size array type `[N]T`
+    /// is captured specially — its length is returned alongside — so a bare
+    /// `var x [N]T` (no initializer) can be zero-filled to N elements: go-rs
+    /// models arrays as slices, and the erased size would otherwise be lost.
+    fn var_decl_type(&mut self) -> Result<(Option<String>, Option<usize>), String> {
+        if !self.type_starts() || matches!(self.peek(), Tok::Assign) {
+            return Ok((None, None));
+        }
+        if matches!(self.peek(), Tok::LBracket) && !matches!(self.peek2(), Tok::RBracket) {
+            self.advance(); // `[`
+            let array_len = if matches!(self.peek(), Tok::Ellipsis) {
+                self.advance();
+                None
+            } else {
+                const_int_of(&self.expr()?).map(|n| n as usize)
+            };
+            self.expect(&Tok::RBracket)?;
+            let elem = self.type_name()?;
+            return Ok((Some(format!("[]{elem}")), array_len));
+        }
+        Ok((Some(self.type_name()?), None))
+    }
+
+    /// Bare `var x [N]T` → an N-element slice of the element zero value.
+    fn bare_array_init(&self, ty: &Option<String>, array_len: Option<usize>) -> Option<Expr> {
+        let (len, t) = (array_len?, ty.as_ref()?);
+        let elem = t.strip_prefix("[]").unwrap_or(t).to_string();
+        let zero = if self.struct_names.contains(&elem) {
+            Expr::StructLit {
+                type_name: elem.clone(),
+                fields: Vec::new(),
+            }
+        } else {
+            zero_expr(&elem)
+        };
+        Some(Expr::Make {
+            is_map: false,
+            elem_ty: elem,
+            len: Some(Box::new(Expr::Int(len as i64))),
+            cap: None,
+            elem_zero: Box::new(zero),
+        })
+    }
+
+    /// `var a, b [T] [= e, f]` — a specification binding several names.
+    fn var_spec_multi(&mut self, names: Vec<String>, line: u32) -> Result<Stmt, String> {
+        let (ty, array_len) = self.var_decl_type()?;
+        let mut values = Vec::new();
+        if self.eat(&Tok::Assign) {
+            values.push(self.expr()?);
+            while self.eat(&Tok::Comma) {
+                values.push(self.expr()?);
+            }
+        }
+        // `var a, b = f()` — one multi-value right-hand side destructured over
+        // the whole name list, exactly like `a, b := f()`.
+        if values.len() == 1 && names.len() > 1 {
+            return Ok(Stmt::Short {
+                names,
+                values,
+                line,
+            });
+        }
+        if !values.is_empty() && values.len() != names.len() {
+            return Err(format!(
+                "go-rs: assignment mismatch: {} variables but {} values on line {line}",
+                names.len(),
+                values.len()
+            ));
+        }
+        let mut values = values.into_iter();
+        let decls = names
+            .into_iter()
+            .map(|name| {
+                let init = match values.next() {
+                    Some(e) => Some(e),
+                    None => self.bare_array_init(&ty, array_len),
+                };
+                Stmt::Var {
+                    name,
+                    ty: ty.clone(),
+                    init,
+                    line,
+                }
+            })
+            .collect();
+        Ok(Stmt::Block(decls))
     }
 
     /// `const NAME [type] = expr` or a grouped `const ( … )` block with `iota`.
@@ -2220,12 +2285,20 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen)?;
+        // A slice records its element type (which fills `elem_zero`); a map has
+        // no element zero to build, so it records the whole written `map[K]V` —
+        // the only place that type survives, and what lets a `m[k]` element be
+        // typed at a use site.
         let elem_ty = ty.strip_prefix("[]").unwrap_or("");
         Ok(Expr::Make {
             is_map,
             len,
             cap,
-            elem_ty: elem_ty.to_string(),
+            elem_ty: if is_map {
+                ty.clone()
+            } else {
+                elem_ty.to_string()
+            },
             elem_zero: Box::new(zero_expr(elem_ty)),
         })
     }

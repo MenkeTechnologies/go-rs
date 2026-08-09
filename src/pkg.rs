@@ -61,10 +61,16 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     }
     init_globals.extend(std::mem::take(&mut main.main));
     main.main = init_globals;
-    // `fmt.Errorf` builds a real error value — synthesize its type before
-    // `$stringify` so the helper picks up its `Error()` method.
-    if uses_errorf(&main) {
+    // `fmt.Errorf` and the `strconv` conversions build real error values —
+    // synthesize their types before `$stringify` so the helper picks up each
+    // `Error()` method. The `strconv` sentinels are `errors.New`-shaped, so
+    // `NumError` implies the `fmt.Errorf` types too.
+    let strconv_errors = uses_strconv_error(&main);
+    if uses_errorf(&main) || strconv_errors {
         add_errorf_type(&mut main);
+    }
+    if strconv_errors {
+        add_num_error_type(&mut main);
     }
     add_sort_slice(&mut main);
     add_stringify(&mut main);
@@ -92,6 +98,126 @@ fn add_sort_slice(prog: &mut Program) {
     }
 }
 
+/// Whether any expression anywhere in `prog` — `main`'s body, every function
+/// body, and every nested statement or sub-expression of either — satisfies
+/// `pred`. Drives the "does this program need type X synthesized" questions.
+fn program_has_expr(prog: &Program, pred: &dyn Fn(&Expr) -> bool) -> bool {
+    fn in_expr(e: &Expr, pred: &dyn Fn(&Expr) -> bool) -> bool {
+        if pred(e) {
+            return true;
+        }
+        let sub = |e: &Expr| in_expr(e, pred);
+        match e {
+            Expr::Call { func, args, .. } => sub(func) || args.iter().any(sub),
+            Expr::Selector { recv, .. } => sub(recv),
+            Expr::Unary { rhs, .. } => sub(rhs),
+            Expr::Binary { lhs, rhs, .. } => sub(lhs) || sub(rhs),
+            Expr::Index { recv, index } => sub(recv) || sub(index),
+            Expr::Slice {
+                recv,
+                low,
+                high,
+                max,
+            } => {
+                sub(recv)
+                    || low.as_deref().is_some_and(sub)
+                    || high.as_deref().is_some_and(sub)
+                    || max.as_deref().is_some_and(sub)
+            }
+            Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| sub(v)),
+            Expr::SliceLit { elems, .. } => elems.iter().any(sub),
+            Expr::MapLit { pairs, .. } => pairs.iter().any(|(k, v)| sub(k) || sub(v)),
+            Expr::FuncLit { body, .. } => body.iter().any(|s| in_stmt(s, pred)),
+            _ => false,
+        }
+    }
+    fn in_stmt(s: &Stmt, pred: &dyn Fn(&Expr) -> bool) -> bool {
+        let ex = |e: &Expr| in_expr(e, pred);
+        let st = |s: &Stmt| in_stmt(s, pred);
+        match s {
+            Stmt::ExprStmt(e) => ex(e),
+            Stmt::Return(es, ..) => es.iter().any(ex),
+            Stmt::Var { init, .. } => init.as_ref().is_some_and(ex),
+            Stmt::Short { values, .. } => values.iter().any(ex),
+            Stmt::Assign { target, value, .. } => ex(target) || ex(value),
+            Stmt::AssignMulti {
+                targets, values, ..
+            } => targets.iter().chain(values).any(ex),
+            Stmt::IncDec { target, .. } => ex(target),
+            Stmt::If {
+                init,
+                cond,
+                then,
+                els,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || ex(cond)
+                    || then.iter().any(st)
+                    || els.iter().any(st)
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || cond.as_ref().is_some_and(ex)
+                    || post.as_deref().is_some_and(st)
+                    || body.iter().any(st)
+            }
+            Stmt::ForRange { iter, body, .. } => ex(iter) || body.iter().any(st),
+            Stmt::Block(b) => b.iter().any(st),
+            Stmt::Defer { call, .. } | Stmt::Go { call, .. } => ex(call),
+            Stmt::Send { chan, val, .. } => ex(chan) || ex(val),
+            Stmt::Switch {
+                init,
+                tag,
+                cases,
+                default,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || tag.as_ref().is_some_and(ex)
+                    || cases
+                        .iter()
+                        .any(|c| c.exprs.iter().any(ex) || c.body.iter().any(st))
+                    || default.as_ref().is_some_and(|d| d.iter().any(st))
+            }
+            Stmt::TypeSwitch {
+                init,
+                expr,
+                cases,
+                default,
+                ..
+            } => {
+                init.as_deref().is_some_and(st)
+                    || ex(expr)
+                    || cases.iter().any(|c| c.body.iter().any(st))
+                    || default.as_ref().is_some_and(|d| d.iter().any(st))
+            }
+            Stmt::Select { cases, default, .. } => {
+                cases.iter().any(|c| c.body.iter().any(st))
+                    || default.as_ref().is_some_and(|d| d.iter().any(st))
+            }
+            _ => false,
+        }
+    }
+    prog.main.iter().any(|s| in_stmt(s, pred))
+        || prog
+            .funcs
+            .iter()
+            .any(|f| f.body.iter().any(|s| in_stmt(s, pred)))
+}
+
+/// Whether `e` is the selector `pkg.name`.
+fn is_selector(e: &Expr, pkg: &str, name: &str) -> bool {
+    matches!(e, Expr::Selector { recv, field }
+        if field == name && matches!(recv.as_ref(), Expr::Ident(p) if p == pkg))
+}
+
 /// Whether the program calls anything that yields a host-built error value —
 /// `fmt.Errorf`, or a `strconv` conversion whose second result is one — which
 /// drives synthesis of the error types those values use.
@@ -103,110 +229,21 @@ fn uses_errorf(prog: &Program) -> bool {
         ("strconv", "ParseInt"),
         ("strconv", "ParseFloat"),
     ];
-    fn in_expr(e: &Expr) -> bool {
-        match e {
-            Expr::Call { func, args, .. } => {
-                let is_errorf = matches!(func.as_ref(),
-                    Expr::Selector { recv, field }
-                        if matches!(recv.as_ref(), Expr::Ident(p)
-                            if ERROR_MAKERS.contains(&(p.as_str(), field.as_str()))));
-                is_errorf || in_expr(func) || args.iter().any(in_expr)
-            }
-            Expr::Selector { recv, .. } => in_expr(recv),
-            Expr::Unary { rhs, .. } => in_expr(rhs),
-            Expr::Binary { lhs, rhs, .. } => in_expr(lhs) || in_expr(rhs),
-            Expr::Index { recv, index } => in_expr(recv) || in_expr(index),
-            Expr::Slice {
-                recv,
-                low,
-                high,
-                max,
-            } => {
-                in_expr(recv)
-                    || low.as_deref().is_some_and(in_expr)
-                    || high.as_deref().is_some_and(in_expr)
-                    || max.as_deref().is_some_and(in_expr)
-            }
-            Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| in_expr(v)),
-            Expr::SliceLit { elems, .. } => elems.iter().any(in_expr),
-            Expr::MapLit { pairs, .. } => pairs.iter().any(|(k, v)| in_expr(k) || in_expr(v)),
-            Expr::FuncLit { body, .. } => body.iter().any(in_stmt),
-            _ => false,
-        }
-    }
-    fn in_stmt(s: &Stmt) -> bool {
-        match s {
-            Stmt::ExprStmt(e) => in_expr(e),
-            Stmt::Return(es, ..) => es.iter().any(in_expr),
-            Stmt::Var { init, .. } => init.as_ref().is_some_and(in_expr),
-            Stmt::Short { values, .. } => values.iter().any(in_expr),
-            Stmt::Assign { target, value, .. } => in_expr(target) || in_expr(value),
-            Stmt::AssignMulti {
-                targets, values, ..
-            } => targets.iter().chain(values).any(in_expr),
-            Stmt::IncDec { target, .. } => in_expr(target),
-            Stmt::If {
-                init,
-                cond,
-                then,
-                els,
-                ..
-            } => {
-                init.as_deref().is_some_and(in_stmt)
-                    || in_expr(cond)
-                    || then.iter().any(in_stmt)
-                    || els.iter().any(in_stmt)
-            }
-            Stmt::For {
-                init,
-                cond,
-                post,
-                body,
-                ..
-            } => {
-                init.as_deref().is_some_and(in_stmt)
-                    || cond.as_ref().is_some_and(in_expr)
-                    || post.as_deref().is_some_and(in_stmt)
-                    || body.iter().any(in_stmt)
-            }
-            Stmt::ForRange { iter, body, .. } => in_expr(iter) || body.iter().any(in_stmt),
-            Stmt::Block(b) => b.iter().any(in_stmt),
-            Stmt::Defer { call, .. } | Stmt::Go { call, .. } => in_expr(call),
-            Stmt::Send { chan, val, .. } => in_expr(chan) || in_expr(val),
-            Stmt::Switch {
-                init,
-                tag,
-                cases,
-                default,
-                ..
-            } => {
-                init.as_deref().is_some_and(in_stmt)
-                    || tag.as_ref().is_some_and(in_expr)
-                    || cases
-                        .iter()
-                        .any(|c| c.exprs.iter().any(in_expr) || c.body.iter().any(in_stmt))
-                    || default.as_ref().is_some_and(|d| d.iter().any(in_stmt))
-            }
-            Stmt::TypeSwitch {
-                init,
-                expr,
-                cases,
-                default,
-                ..
-            } => {
-                init.as_deref().is_some_and(in_stmt)
-                    || in_expr(expr)
-                    || cases.iter().any(|c| c.body.iter().any(in_stmt))
-                    || default.as_ref().is_some_and(|d| d.iter().any(in_stmt))
-            }
-            Stmt::Select { cases, default, .. } => {
-                cases.iter().any(|c| c.body.iter().any(in_stmt))
-                    || default.as_ref().is_some_and(|d| d.iter().any(in_stmt))
-            }
-            _ => false,
-        }
-    }
-    prog.main.iter().any(in_stmt) || prog.funcs.iter().any(|f| f.body.iter().any(in_stmt))
+    program_has_expr(prog, &|e| {
+        matches!(e, Expr::Call { func, .. }
+            if ERROR_MAKERS.iter().any(|(p, f)| is_selector(func, p, f)))
+    })
+}
+
+/// Whether the program can observe a `*strconv.NumError` — it either runs a
+/// conversion that builds one, or names one of the sentinels such a value wraps.
+fn uses_strconv_error(prog: &Program) -> bool {
+    /// The `strconv` conversions whose second result is a `*NumError`.
+    const PARSERS: &[&str] = &["Atoi", "ParseInt", "ParseFloat"];
+    program_has_expr(prog, &|e| match e {
+        Expr::Call { func, .. } => PARSERS.iter().any(|f| is_selector(func, "strconv", f)),
+        e => is_selector(e, "strconv", "ErrSyntax") || is_selector(e, "strconv", "ErrRange"),
+    })
 }
 
 /// Synthesize the three error types `fmt.Errorf` constructs, mirroring Go's
@@ -263,6 +300,50 @@ fn add_errorf_type(prog: &mut Program) {
             prog.funcs.push(getter(ty, "Unwrap", field, ret));
         }
     }
+}
+
+/// Synthesize `strconv.NumError` — the error type Go's `strconv` conversions
+/// return — from Go's own `strconv/atoi.go`:
+///
+/// ```go
+/// type NumError struct { Func, Num string; Err error }
+/// func (e *NumError) Error() string {
+///     return "strconv." + e.Func + ": " + "parsing " + Quote(e.Num) + ": " + e.Err.Error()
+/// }
+/// func (e *NumError) Unwrap() error { return e.Err }
+/// ```
+///
+/// `strconv` is a native host package ([`NATIVE`]) because its parsers reach the
+/// float runtime, so the one *source-level* type it exports is synthesized here
+/// under its linked name instead of loaded from `goroot`. The host builds the
+/// value ([`crate::host::stdlib::NUM_ERROR`]); this supplies the two methods, so
+/// the message text, `errors.Is` (via `Unwrap`) and `errors.As` (via the type
+/// tag) all come off the real type rather than a stand-in.
+fn add_num_error_type(prog: &mut Program) {
+    let ty = crate::host::stdlib::NUM_ERROR;
+    let src = "package p\n\
+        type NumError struct {\n\
+        \tFunc string\n\
+        \tNum  string\n\
+        \tErr  error\n\
+        }\n\
+        func (e *NumError) Error() string {\n\
+        \treturn \"strconv.\" + e.Func + \": \" + \"parsing \" + strconv.Quote(e.Num) + \": \" + e.Err.Error()\n\
+        }\n\
+        func (e *NumError) Unwrap() error {\n\
+        \treturn e.Err\n\
+        }\n";
+    let Ok(mut p) = crate::parse(src) else { return };
+    for t in &mut p.types {
+        t.name = ty.to_string();
+    }
+    for f in &mut p.funcs {
+        if let Some(r) = &mut f.receiver {
+            r.ty = format!("*{ty}");
+        }
+    }
+    prog.types.append(&mut p.types);
+    prog.funcs.append(&mut p.funcs);
 }
 
 /// Synthesize the `$stringify` helper — a type switch over every type with a

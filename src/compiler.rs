@@ -61,6 +61,29 @@ fn numtype_of_ty(ty: &str) -> NumType {
     }
 }
 
+/// The element type named by a container type — `[]T` and `map[K]V` both yield
+/// `T`/`V`. `None` for anything that is not a container.
+fn elem_of_type(ty: &str) -> Option<String> {
+    if let Some(t) = ty.strip_prefix("[]") {
+        return Some(t.to_string());
+    }
+    ty.strip_prefix("map[")
+        .and_then(|t| t.split_once(']'))
+        .map(|(_, v)| v.to_string())
+}
+
+/// The [`host::f32_op`] code for an arithmetic operator, or `None` for the ones
+/// Go does not define on floats (`%`, the bitwise set).
+fn f32_op_code(op: BinOp) -> Option<i64> {
+    Some(match op {
+        BinOp::Add => host::f32_op::ADD,
+        BinOp::Sub => host::f32_op::SUB,
+        BinOp::Mul => host::f32_op::MUL,
+        BinOp::Div => host::f32_op::DIV,
+        _ => return None,
+    })
+}
+
 /// A top-level function's signature, for call resolution and return typing.
 struct FuncSig {
     arity: usize,
@@ -161,6 +184,10 @@ struct Compiler {
     /// test. A type assertion or type-switch case naming one of these lowers to a
     /// method-set check instead of a type-tag comparison.
     iface_methods: HashMap<String, Vec<String>>,
+    /// Every declared interface type's name, including the method-less ones that
+    /// `iface_methods` omits. Naming one in call position — `error(e)`, `any(3)`,
+    /// `Stringer(v)` — is Go's identity conversion to an interface type.
+    iface_names: HashSet<String>,
     /// The stack of enclosing `for` loops (innermost last).
     loops: Vec<LoopScope>,
     /// `return`/jump-outs emitted inside `main`, patched to the end of `main`.
@@ -204,6 +231,9 @@ struct Compiler {
     /// bare `return`/fall-off/recovered-panic returns their current values, and a
     /// deferred closure may mutate them (they are boxed when captured).
     named_results: Vec<String>,
+    /// The current function's declared result types, so `return nil` for a
+    /// slice/map result emits that type's typed nil rather than a bare `Undef`.
+    fn_results: Vec<String>,
 }
 
 /// Whether the program (a function body, recursing everywhere including nested
@@ -1100,6 +1130,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         })
         .collect();
 
+    // Every interface name usable as an identity conversion, plus the two
+    // predeclared ones (`error` and `any`/`interface{}`) a program never declares.
+    let mut iface_names: HashSet<String> = prog.interfaces.iter().map(|i| i.name.clone()).collect();
+    iface_names.insert("error".into());
+    iface_names.insert("any".into());
+
     let has_ffi = body_has_ffi(&prog.main) || prog.funcs.iter().any(|f| body_has_ffi(&f.body));
     // Package-level names: variables/constants declared at the top level of
     // `main` (which, after linking, holds every package's init-order globals
@@ -1118,6 +1154,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         methods,
         method_nresults,
         iface_methods,
+        iface_names,
         loops: Vec::new(),
         main_exits: Vec::new(),
         temp_counter: 0,
@@ -1133,6 +1170,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         boxed: HashSet::new(),
         active_cell_captures: HashSet::new(),
         named_results: Vec::new(),
+        fn_results: Vec::new(),
     };
 
     // ── main body (global scope) ──
@@ -1232,6 +1270,7 @@ impl Compiler {
         self.scope = Some(scope);
 
         // Named results become zero-initialized locals the body may read/assign.
+        self.fn_results = f.results.clone();
         self.named_results = if f.result_names.iter().any(|n| !n.is_empty()) {
             f.result_names.clone()
         } else {
@@ -1272,7 +1311,7 @@ impl Compiler {
             if self.structs.contains(&base_type(ty)) {
                 self.struct_lit(&base_type(ty), &[])?;
             } else {
-                self.emit_default(numtype_of_ty(ty), f.line);
+                self.emit_zero(ty, f.line);
             }
             self.types.insert(name.clone(), numtype_of_ty(ty));
             self.decl_types.insert(name.clone(), base_type(ty));
@@ -1302,6 +1341,7 @@ impl Compiler {
         self.fn_has_defer = false;
         self.boxed = HashSet::new();
         self.named_results = Vec::new();
+        self.fn_results = Vec::new();
         self.scope = None;
         Ok(())
     }
@@ -1400,12 +1440,12 @@ impl Compiler {
         }
         if results.len() >= 2 {
             for ty in results {
-                self.emit_default(numtype_of_ty(ty), line);
+                self.emit_zero(ty, line);
             }
             self.b
                 .emit(Op::CallBuiltin(host::GSLICE_LIT, results.len() as u8), line);
         } else if let Some(ty) = results.first() {
-            self.emit_default(numtype_of_ty(ty), line);
+            self.emit_zero(ty, line);
         } else {
             self.b.emit(Op::LoadUndef, line);
         }
@@ -2039,16 +2079,31 @@ impl Compiler {
                 match init {
                     // `var x float64 = 3` stores a float, not the raw integer
                     // constant — Go converts on assignment to a declared type.
-                    Some(e) if nt == NumType::Float && self.infer(e) == NumType::Int => {
+                    Some(e)
+                        if (nt == NumType::Float && self.infer(e) == NumType::Int)
+                            || decl_ty == "float32" =>
+                    {
                         let t = ty.clone().unwrap_or_default();
                         self.closure_vars.remove(name);
                         self.emit_typed(e, &t)?;
+                    }
+                    // `var s []int = nil` — the written type makes the `nil` a
+                    // typed one, so it prints `[]` like the initializer-less form.
+                    Some(e) if self.is_nil_literal(e) => {
+                        let t = ty.clone().unwrap_or_default();
+                        self.closure_vars.remove(name);
+                        self.emit_zero(&t, *line);
                     }
                     Some(e) => self.emit_rhs(name, e)?,
                     None if !is_pointer && self.structs.contains(&decl_ty) => {
                         self.struct_lit(&decl_ty, &[])?
                     }
-                    None => self.emit_default(nt, *line),
+                    // `var s []int` / `var m map[string]int` — the written type
+                    // chooses the typed nil; without one there is nothing to type.
+                    None => match ty {
+                        Some(t) => self.emit_zero(t, *line),
+                        None => self.emit_default(nt, *line),
+                    },
                 }
                 self.types.insert(name.clone(), nt);
                 self.decl_types.insert(name.clone(), decl_ty);
@@ -2088,7 +2143,7 @@ impl Compiler {
                         let done = self.b.emit(Op::Jump(0), *line);
                         let zpos = self.b.current_pos();
                         self.b.patch_jump(to_zero, zpos);
-                        self.emit_default(numtype_of_ty(ty), *line);
+                        self.emit_zero(ty, *line);
                         let end = self.b.current_pos();
                         self.b.patch_jump(done, end);
                         self.types.insert(names[0].clone(), numtype_of_ty(ty));
@@ -2212,8 +2267,9 @@ impl Compiler {
                 Some(_) if !self.named_results.is_empty() => {
                     if !vals.is_empty() {
                         let names = self.named_results.clone();
-                        for (name, e) in names.iter().zip(vals) {
-                            self.emit_value(e)?;
+                        let tys = self.fn_results.clone();
+                        for (i, (name, e)) in names.iter().zip(vals).enumerate() {
+                            self.emit_result(e, i, &tys)?;
                             self.emit_set(name, *line);
                         }
                     }
@@ -2224,12 +2280,16 @@ impl Compiler {
                         0 => {
                             self.b.emit(Op::LoadUndef, *line);
                         }
-                        1 => self.emit_value(&vals[0])?,
+                        1 => {
+                            let tys = self.fn_results.clone();
+                            self.emit_result(&vals[0], 0, &tys)?
+                        }
                         // Multiple results are returned as one tuple (a slice
                         // heap value), destructured at the call site.
                         n => {
-                            for e in vals {
-                                self.expr(e)?;
+                            let tys = self.fn_results.clone();
+                            for (i, e) in vals.iter().enumerate() {
+                                self.emit_result(e, i, &tys)?;
                             }
                             self.b
                                 .emit(Op::CallBuiltin(host::GSLICE_LIT, n as u8), *line);
@@ -2877,10 +2937,13 @@ impl Compiler {
                     self.expr(value)?;
                     let l = self.types.get(name).copied().unwrap_or(NumType::Unknown);
                     let r = self.infer(value);
-                    self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
-                    // `u8++` / `i8 += n` wrap at the variable's declared width.
-                    if let Some(ty) = self.decl_types.get(name).cloned() {
-                        self.emit_narrow(&ty, line);
+                    let f32ish = self.is_f32(&Expr::Ident(name.clone())) || self.is_f32(value);
+                    if !self.emit_f32_arith(assign_binop(op), f32ish, line) {
+                        self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
+                        // `u8++` / `i8 += n` wrap at the variable's declared width.
+                        if let Some(ty) = self.decl_types.get(name).cloned() {
+                            self.emit_narrow(&ty, line);
+                        }
                     }
                 }
                 self.emit_set(name, line);
@@ -2894,16 +2957,19 @@ impl Compiler {
                     self.b.emit(Op::Dup2, line);
                     self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
                     self.expr(value)?;
-                    self.emit_arith(
-                        assign_binop(op),
-                        NumType::Unknown,
-                        self.infer(value),
-                        is_nonzero_const(value),
-                        line,
-                    );
-                    // `xs[i] += n` wraps at the element type's width.
-                    if let Some(ty) = self.sized_int_ty(target) {
-                        self.emit_narrow(&ty, line);
+                    let f32ish = self.is_f32(target) || self.is_f32(value);
+                    if !self.emit_f32_arith(assign_binop(op), f32ish, line) {
+                        self.emit_arith(
+                            assign_binop(op),
+                            NumType::Unknown,
+                            self.infer(value),
+                            is_nonzero_const(value),
+                            line,
+                        );
+                        // `xs[i] += n` wraps at the element type's width.
+                        if let Some(ty) = self.sized_int_ty(target) {
+                            self.emit_narrow(&ty, line);
+                        }
                     }
                 }
                 self.b.emit(Op::CallBuiltin(host::GINDEX_SET, 3), line);
@@ -2920,16 +2986,19 @@ impl Compiler {
                     self.b.emit(Op::Dup2, line);
                     self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), line);
                     self.expr(value)?;
-                    self.emit_arith(
-                        assign_binop(op),
-                        NumType::Unknown,
-                        self.infer(value),
-                        is_nonzero_const(value),
-                        line,
-                    );
-                    // `s.f += n` wraps at the field's declared width.
-                    if let Some(ty) = self.sized_int_ty(target) {
-                        self.emit_narrow(&ty, line);
+                    let f32ish = self.is_f32(target) || self.is_f32(value);
+                    if !self.emit_f32_arith(assign_binop(op), f32ish, line) {
+                        self.emit_arith(
+                            assign_binop(op),
+                            NumType::Unknown,
+                            self.infer(value),
+                            is_nonzero_const(value),
+                            line,
+                        );
+                        // `s.f += n` wraps at the field's declared width.
+                        if let Some(ty) = self.sized_int_ty(target) {
+                            self.emit_narrow(&ty, line);
+                        }
                     }
                 }
                 self.b.emit(Op::CallBuiltin(host::GFIELD_SET, 3), line);
@@ -3029,6 +3098,21 @@ impl Compiler {
     }
 
     /// Emit the default zero value for a declared-without-initializer variable.
+    /// Emit the zero value of the *written* type `ty`. A slice or map zero is
+    /// Go's typed nil — it prints as `[]` / `map[]`, has length 0, is appendable
+    /// (slice) and readable (map), and still compares equal to `nil` — which the
+    /// erased [`NumType`] cannot express, since it collapses `[]T`, `map[K]V` and
+    /// `any` into one `Unknown`. Everything else falls through to [`Self::emit_default`].
+    fn emit_zero(&mut self, ty: &str, line: u32) {
+        if ty.starts_with("[]") || ty.starts_with("map[") {
+            let c = self.b.add_constant(Value::str(ty.to_string()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::CallBuiltin(host::GNIL_OF, 1), line);
+            return;
+        }
+        self.emit_default(numtype_of_ty(ty), line);
+    }
+
     fn emit_default(&mut self, nt: NumType, line: u32) {
         match nt {
             NumType::Int => self.b.emit(Op::LoadInt(0), line),
@@ -3146,6 +3230,17 @@ impl Compiler {
                     if let Some(v) = host::stdlib::resolve_const(pkg, field) {
                         let c = self.b.add_constant(v);
                         self.b.emit(Op::LoadConst(c), 0);
+                        return Ok(());
+                    }
+                    // `strconv.ErrSyntax` / `strconv.ErrRange` are error *values*,
+                    // not constants: `errors.Is` compares them by pointer, so each
+                    // mention must yield the one handle the host memoizes rather
+                    // than a fresh chunk constant.
+                    if pkg == "strconv" && matches!(field.as_str(), "ErrSyntax" | "ErrRange") {
+                        let c = self.b.add_constant(Value::str(field.clone()));
+                        self.b.emit(Op::LoadConst(c), 0);
+                        self.b
+                            .emit(Op::CallBuiltin(host::stdlib::STRCONV_ERR, 1), 0);
                         return Ok(());
                     }
                 }
@@ -3285,7 +3380,7 @@ impl Compiler {
                 // `var c counter` gives `c.mu` a usable `sync.Mutex`. A pointer
                 // field (`*T`) is nil, so only the bare type recurses.
                 None if self.structs.contains(fty) => self.struct_lit(fty, &[])?,
-                None => self.emit_default(numtype_of_ty(fty), 0),
+                None => self.emit_zero(fty, 0),
             }
         }
         self.b.emit(
@@ -3299,6 +3394,16 @@ impl Compiler {
     /// when `name` becomes a statically-known closure (so a later `name(args)`
     /// dispatches directly).
     fn emit_rhs(&mut self, name: &str, e: &Expr) -> Result<(), String> {
+        // `s = nil` on a slice- or map-typed variable rebinds it to that type's
+        // typed nil, so it goes on printing `[]` / `map[]` rather than `<nil>`.
+        if self.is_nil_literal(e) {
+            if let Some(ty) = self.decl_types.get(name).cloned() {
+                if ty.starts_with("[]") || ty.starts_with("map[") {
+                    self.emit_zero(&ty, 0);
+                    return Ok(());
+                }
+            }
+        }
         match e {
             Expr::FuncLit { params, body, .. } => {
                 let id = self.emit_funclit(params, body);
@@ -3326,7 +3431,38 @@ impl Compiler {
     /// float for every later operation. go-rs used to store the raw integer,
     /// which made `xs[0] / 2` take the integer-division path and made
     /// `[]float64{1e6}` print as `1000000` instead of `1e+06`.
+    /// Whether `e` is the predeclared `nil` — a bare `nil` that no local or
+    /// global shadows. It has no `Expr` variant of its own: it lowers as an
+    /// unbound identifier, whose empty slot reads back as `Value::Undef`.
+    fn is_nil_literal(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Ident(n)
+            if n == "nil" && !self.types.contains_key(n) && !self.globals.contains(n))
+    }
+
+    /// Emit `return`'s i-th value, typed by the function's i-th declared result.
+    fn emit_result(&mut self, e: &Expr, i: usize, results: &[String]) -> Result<(), String> {
+        match results.get(i) {
+            Some(ty) => self.emit_typed(e, ty),
+            None => self.emit_value(e),
+        }
+    }
+
     fn emit_typed(&mut self, e: &Expr, ty: &str) -> Result<(), String> {
+        // A written `nil` for a slice or map type is that type's typed nil, not
+        // the untyped one — `var s []int = nil` prints `[]`, like `var s []int`.
+        if self.is_nil_literal(e) && (ty.starts_with("[]") || ty.starts_with("map[")) {
+            self.emit_zero(ty, 0);
+            return Ok(());
+        }
+        // A `float32` destination rounds to 32 bits — `var f float32 = 1.0/3.0`
+        // holds the `f32` nearest one third, not the `f64` one.
+        if base_type(ty) == "float32" && !self.is_f32(e) {
+            self.emit_value(e)?;
+            let c = self.b.add_constant(Value::str("float32"));
+            self.b.emit(Op::LoadConst(c), 0);
+            self.b.emit(Op::CallBuiltin(host::GCONV, 2), 0);
+            return Ok(());
+        }
         if numtype_of_ty(ty) != NumType::Float || self.infer(e) != NumType::Int {
             return self.emit_value(e);
         }
@@ -3549,6 +3685,11 @@ impl Compiler {
             Expr::Make {
                 is_map, elem_ty, ..
             } if !is_map => format!("[]{elem_ty}"),
+            // A map literal / `make(map[K]V)` names its own type the same way, so
+            // an element's declared type is recoverable from the variable.
+            Expr::MapLit { key_ty, val_ty, .. } => format!("map[{key_ty}]{val_ty}"),
+            // A map `make` records the whole written type in `elem_ty`.
+            Expr::Make { elem_ty, .. } => elem_ty.clone(),
             _ => String::new(),
         }
     }
@@ -3665,8 +3806,15 @@ impl Compiler {
         // Comparisons pick string vs numeric ops from the operand types.
         if let Some(strcmp) = str_compare_op(op) {
             let is_str = self.infer(lhs) == NumType::Str || self.infer(rhs) == NumType::Str;
+            // Go compares at one type: an untyped constant beside a `float32`
+            // becomes a `float32`, so `float32(0.1) == 0.1` is true where
+            // comparing the `f32` against the `f64` 0.1 would be false. Only one
+            // side can be untyped in a legal program, so rounding both is safe.
+            let f32ish = self.is_f32(lhs) || self.is_f32(rhs);
             self.emit_compare_operand(lhs)?;
+            self.emit_f32_round(f32ish && !self.is_f32(lhs));
             self.emit_compare_operand(rhs)?;
+            self.emit_f32_round(f32ish && !self.is_f32(rhs));
             self.b
                 .emit(if is_str { strcmp } else { num_compare_op(op) }, 0);
             return Ok(());
@@ -3677,8 +3825,12 @@ impl Compiler {
         self.check_single_value(rhs, 0)?;
         let l = self.infer(lhs);
         let r = self.infer(rhs);
+        let f32ish = self.is_f32(lhs) || self.is_f32(rhs);
         self.expr(lhs)?;
         self.expr(rhs)?;
+        if self.emit_f32_arith(op, f32ish, 0) {
+            return Ok(());
+        }
         self.emit_arith(op, l, r, is_nonzero_const(rhs), 0);
         // Go's arithmetic is fixed-width: a sized operand makes the result wrap
         // at its own width, not at 64 bits.
@@ -3690,6 +3842,81 @@ impl Compiler {
             self.emit_narrow(&ty, 0);
         }
         Ok(())
+    }
+
+    /// Whether `e`'s static Go type is `float32`.
+    ///
+    /// It is the one float width whose arithmetic differs from the `f64` the
+    /// value model holds, and — unlike the narrow integer types — it cannot be
+    /// fixed by rounding the `f64` result afterwards, because that rounds twice.
+    /// So the whole operation has to be done in `f32`, which is what this
+    /// predicate selects. Go's untyped constants take the other operand's type,
+    /// so one `float32` operand anywhere makes the expression `float32`.
+    fn is_f32(&self, e: &Expr) -> bool {
+        if self.type_name(e) == "float32" {
+            return true;
+        }
+        match e {
+            Expr::Unary { op: UnOp::Neg, rhs } => self.is_f32(rhs),
+            Expr::Binary { op, lhs, rhs } if str_compare_op(*op).is_none() => {
+                self.is_f32(lhs) || self.is_f32(rhs)
+            }
+            // The conversion `float32(x)` names its own type.
+            Expr::Call { func, args, .. } => {
+                args.len() == 1 && matches!(func.as_ref(), Expr::Ident(n) if n == "float32")
+            }
+            Expr::Index { recv, .. } => self.elem_ty_of(recv).as_deref() == Some("float32"),
+            _ => false,
+        }
+    }
+
+    /// How a `fmt` argument's `float32`s should be tagged, or `None` when it has
+    /// none. `Some("")` tags the value (or each element of a `[]float32` /
+    /// `map[K]float32`); `Some("x,y")` names the `float32` fields of a struct
+    /// operand, which `fmt` renders inline and so must tag one level down.
+    fn f32_box_spec(&self, e: &Expr) -> Option<String> {
+        if self.is_f32(e) {
+            return Some(String::new());
+        }
+        // A container operand is tagged through its element type; anything else
+        // through its own.
+        let elem = self
+            .elem_ty_of(e)
+            .unwrap_or_else(|| base_type(&self.type_name(e)));
+        if elem == "float32" {
+            return Some(String::new());
+        }
+        let spec = self
+            .struct_fields
+            .get(&elem)?
+            .iter()
+            .filter(|(_, ft)| base_type(ft) == "float32")
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        (!spec.is_empty()).then_some(spec)
+    }
+
+    /// Round the value on the stack to 32-bit float width, when `apply`.
+    fn emit_f32_round(&mut self, apply: bool) {
+        if !apply {
+            return;
+        }
+        let c = self.b.add_constant(Value::str("float32"));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(host::GCONV, 2), 0);
+    }
+
+    /// Emit `op` as a single 32-bit-wide float operation when either operand is
+    /// statically `float32`, and report whether it did (the caller emits the
+    /// ordinary native arithmetic otherwise).
+    fn emit_f32_arith(&mut self, op: BinOp, is_f32: bool, line: u32) -> bool {
+        let Some(code) = f32_op_code(op).filter(|_| is_f32) else {
+            return false;
+        };
+        self.b.emit(Op::LoadInt(code), line);
+        self.b.emit(Op::CallBuiltin(host::GF32_ARITH, 3), line);
+        true
     }
 
     /// Wrap the integer on the stack to `ty`'s declared width — Go's fixed-width
@@ -3764,13 +3991,18 @@ impl Compiler {
     /// one — how `xs[i] += n` learns the width to wrap at.
     fn elem_ty_of(&self, e: &Expr) -> Option<String> {
         match e {
-            Expr::Ident(n) => self
-                .decl_types
-                .get(n)
-                .and_then(|t| t.strip_prefix("[]"))
-                .map(str::to_string),
+            Expr::Ident(n) => self.decl_types.get(n).and_then(|t| elem_of_type(t)),
             Expr::SliceLit { elem_ty, .. } => Some(elem_ty.clone()),
-            Expr::Make { elem_ty, .. } => Some(elem_ty.clone()),
+            Expr::MapLit { val_ty, .. } => Some(val_ty.clone()),
+            Expr::Make {
+                is_map, elem_ty, ..
+            } => {
+                if *is_map {
+                    elem_of_type(elem_ty)
+                } else {
+                    Some(elem_ty.clone())
+                }
+            }
             _ => None,
         }
     }
@@ -3986,6 +4218,15 @@ impl Compiler {
                         } else {
                             self.expr(a)?;
                         }
+                        // `fmt` renders a float at its own width's precision, so
+                        // a statically-`float32` operand carries that width in.
+                        // This is the only place the tag is applied — it never
+                        // reaches arithmetic, where it would be a heap value.
+                        if let Some(spec) = self.f32_box_spec(a) {
+                            let c = self.b.add_constant(Value::str(spec));
+                            self.b.emit(Op::LoadConst(c), line);
+                            self.b.emit(Op::CallBuiltin(host::GF32_BOX, 2), line);
+                        }
                     }
                     self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
                     return Ok(());
@@ -4191,6 +4432,11 @@ impl Compiler {
                 self.b.emit(Op::Call(idx, args.len() as u8), line);
                 self.emit_panic_check(line);
                 return Ok(());
+            }
+            // A conversion to an interface type — `error(e)`, `any(3)` — is the
+            // identity: the dynamic value is unchanged, only its static type is.
+            if args.len() == 1 && self.iface_names.contains(name) {
+                return self.expr(&args[0]);
             }
             // With an inline `rust {}` block present, an otherwise-unresolved
             // bare name may be an FFI export — dispatch it by name at runtime.
