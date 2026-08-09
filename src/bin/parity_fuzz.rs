@@ -770,8 +770,27 @@ fn run(bin: &str, src_path: &str) -> (String, bool) {
     }
 }
 
+/// This run's private scratch directory, `…/gors_fuzz_<pid>/`.
+///
+/// The case file used to be named from the seed alone, in the shared temp
+/// directory. Seeds start at 0 every run, so two `parity-fuzz` processes in the
+/// same checkout wrote — and, after each case, *deleted* — the same paths. A
+/// case file removed by the other run while `go run` was still reading it makes
+/// the reference fail, which lands in the `skipped` bucket: the run silently
+/// stops comparing and still reports a clean rate over whatever survived.
+/// Keying the directory on the process id makes two runs unable to see each
+/// other's files at all.
+fn scratch_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("gors_fuzz_{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("create scratch dir");
+        d
+    })
+}
+
 fn write_tmp(src: &str, tag: u64) -> String {
-    let path = std::env::temp_dir().join(format!("gors_fuzz_{tag:016x}.go"));
+    let path = scratch_dir().join(format!("case_{tag:016x}.go"));
     let mut f = std::fs::File::create(&path).expect("create temp");
     f.write_all(src.as_bytes()).expect("write temp");
     path.to_string_lossy().into_owned()
@@ -941,5 +960,22 @@ fn main() {
             println!("  --seed {s} --once");
         }
     }
-    std::process::exit(if f == 0 { 0 } else { 1 });
+    // Every generated case must be accounted for. A case the reference refused
+    // to run is not a comparison, so a run that skipped some compared fewer
+    // programs than it claims to have generated — and exiting 0 on that would
+    // let a run that measured nothing read as a clean one. Unaccounted cases
+    // (neither compared nor skipped: a lost or clobbered case file) are the
+    // same failure and are surfaced by name.
+    let missing = count.saturating_sub(p + f + skip);
+    if missing > 0 {
+        eprintln!(
+            "UNACCOUNTED {missing} of {count} generated case(s) were neither compared \
+             nor skipped — the run did not execute its own corpus."
+        );
+    }
+    std::process::exit(if f == 0 && skip == 0 && missing == 0 {
+        0
+    } else {
+        1
+    });
 }

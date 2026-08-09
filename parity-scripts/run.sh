@@ -52,4 +52,11 @@ if [ $fail -gt 0 ]; then
     echo "  DIFF  $rel  (go rc=$grc, go-rs rc=$rrc)"
   done
 fi
+# A run that compared nothing is not a pass. Without this, an empty or
+# unreadable corpus prints "0 / 0 match" and exits 0 — a wiped tree reading as a
+# clean gate.
+if [ $total -eq 0 ]; then
+  echo "parity: no cases ran — the corpus under $CORPUS is empty or unreadable"
+  exit 2
+fi
 [ $fail -eq 0 ]
