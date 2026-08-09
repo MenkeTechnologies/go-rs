@@ -4,7 +4,9 @@
 //! bytecode can't express directly: the `fmt` print family (`Println`/`Print`/
 //! `Printf`) and the Go builtins `println`/`print`, plus a [`numeric_hook`] that
 //! gives `+` its string-concatenation overload and `<`/`==`/… their string
-//! ordering. Values render with Go's `fmt` `%v` rules ([`go_str`]).
+//! ordering, wraps overflowing integer arithmetic, and decides nil and mixed
+//! `int`/`float64` identity. Values render with Go's `fmt` `%v` rules
+//! ([`go_str`]).
 
 use fusevm::{NumOp, Value, VM};
 use std::cell::RefCell;
@@ -4565,10 +4567,6 @@ pub mod stdlib {
     }
 }
 
-/// Strict numeric hook: fusevm delegates here when an operand of an arithmetic
-/// or comparison op is non-numeric (a string). Implements Go's `+` string
-/// concatenation and string ordering; every other arithmetic op on a string is
-/// a type error, reported rather than coerced (Go rejects `"a" - 1`).
 /// Both operands as `i64`, or `None` if either is not an integer.
 fn int_pair(a: &Value, b: &Value) -> Option<(i64, i64)> {
     match (a, b) {
@@ -4577,6 +4575,33 @@ fn int_pair(a: &Value, b: &Value) -> Option<(i64, i64)> {
     }
 }
 
+/// One operand an `Int` and the other a `Float`. Go's type system never builds
+/// this pair out of a concrete expression — it has no implicit numeric
+/// conversion — so it only arrives from an interface comparison. See
+/// [`numeric_hook`].
+fn mixed_num_pair(a: &Value, b: &Value) -> bool {
+    matches!(
+        (a, b),
+        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_))
+    )
+}
+
+/// Strict numeric hook. fusevm delegates an arithmetic or comparison op here
+/// when it cannot answer it natively, which happens for four reasons:
+///
+/// 1. An operand is non-numeric — a string or a heap object. This is Go's `+`
+///    string-concatenation overload and its string ordering; every other
+///    arithmetic op on a string is a type error, reported rather than coerced
+///    (Go rejects `"a" - 1`).
+/// 2. An all-numeric *integer* pair whose native op overflowed. Go's integers
+///    are fixed-width and wrap, so these are re-done with `wrapping_*`.
+/// 3. An operand is nil (`Undef`) — the erased zero value of a generic type
+///    parameter, or a typed nil being compared for identity.
+/// 4. A mixed `Int`/`Float` pair whose integer is past 2^53, where promoting it
+///    to `f64` would round to a neighbouring value.
+///
+/// So "all-numeric never reaches here" is false in both directions: cases 2 and
+/// 4 are all-numeric, and case 1 is the only one involving a string.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     match op {
         // The zero value of an erased generic type parameter (`var total T`) is
@@ -4599,6 +4624,51 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             }))
         }
         NumOp::Neg if matches!(a, Value::Int(_)) => Ok(Value::Int(a.to_int().wrapping_neg())),
+        // fusevm answers a mixed Int/Float pair natively by promoting the
+        // integer to f64, but past 2^53 that promotion lands on a
+        // *neighbouring* value (3^34 = 16_677_181_699_666_569 has the f64
+        // image …568), so it hands the pair over rather than round it.
+        //
+        // Answering does not need the exact integer. Go has no implicit
+        // numeric conversion, so a mixed pair is unrepresentable in a concrete
+        // expression: with `var i int64; var f float64`, both `i + f` and
+        // `i == f` are compile errors ("mismatched types int64 and float64").
+        // The one construct in valid Go that puts an int beside a float64
+        // under a single operator is comparing two interfaces —
+        // `any(1) == any(1.0)` — and interface equality is decided by dynamic
+        // type before value: different types are never equal, whatever the
+        // numbers are. Go prints `false` there, and would print `false` just
+        // the same for `any(int64(1e18)) == any(float64(1e18))`. The rounding
+        // fusevm was worried about cannot change the answer.
+        NumOp::Eq | NumOp::Ne if mixed_num_pair(a, b) => Ok(Value::bool(op == NumOp::Ne)),
+        // Every other operator on a mixed pair is unreachable from valid Go:
+        // arithmetic needs an explicit conversion, and interfaces are
+        // unordered (`a < b` on two `any` is "operator < not defined on
+        // interface"). There is nothing to promote, so report it the way Go's
+        // type checker does instead of falling through to the string branches
+        // below — which would concatenate `+` into "166771816996665690.5" and
+        // order `<` lexicographically, both silently.
+        NumOp::Add
+        | NumOp::Sub
+        | NumOp::Mul
+        | NumOp::Div
+        | NumOp::Mod
+        | NumOp::Pow
+        | NumOp::Lt
+        | NumOp::Gt
+        | NumOp::Le
+        | NumOp::Ge
+            if mixed_num_pair(a, b) =>
+        {
+            let (x, y) = if matches!(a, Value::Int(_)) {
+                ("int", "float64")
+            } else {
+                ("float64", "int")
+            };
+            Err(format!(
+                "go-rs: invalid operation: operator {op:?} not defined on mismatched types {x} and {y}"
+            ))
+        }
         NumOp::Add => Ok(Value::str(format!("{}{}", go_str(a), go_str(b)))),
         // A typed nil (a nil slice or map) equals `nil` and nothing else — Go
         // permits no other comparison for those types.

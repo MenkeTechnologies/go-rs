@@ -27,7 +27,9 @@ go-rs is a **pure frontend**: it lexes Go (with the language's automatic
 semicolon insertion), parses it, and lowers the AST straight to `fusevm::Chunk`
 bytecode. There is no bespoke interpreter loop — execution and code generation
 are the shared fusevm engine. Go's `+` string-concatenation overload and string
-ordering are dispatched through fusevm's strict numeric hook.
+ordering are dispatched through fusevm's strict numeric hook, which also wraps
+overflowing integer arithmetic and settles nil and mixed `int`/`float64`
+identity.
 
 ## Pipeline
 
