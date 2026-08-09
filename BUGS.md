@@ -36,22 +36,40 @@ other channel operation is correct. Closing this needs a fusevm release
 carrying a channel-length op; vendoring or path-overriding fusevm to add one is
 not an option — the published pin is the contract.
 
-## `%T` erases a defined type over a non-struct base
+## A defined type's name does not survive assignment to an interface
 
 ```go
 type Weekday int
-var d Weekday = 3
-fmt.Printf("%T\n", d)   // go: main.Weekday   go-rs: int
+var a any = Weekday(3)
+fmt.Printf("%T\n", a)   // go: main.Weekday   go-rs: int
 ```
 
-`type_decl` (`src/parser.rs`) keeps a defined type only when its base is a
-struct or an interface; over any other base it consumes the base and discards
-the name, so nothing downstream — static or dynamic — can recover it. A defined
-*struct* type is named correctly (`main.pt`), including inside a composite
-(`[2]main.pt`, `map[string]main.pt`).
+A defined type is represented exactly like its base, so its name lives in the
+static type; `named_box_spec` (`src/compiler.rs`) reads that at the `fmt` call
+site and tags the operand. An operand whose static type is `any` has no name to
+read — the same erasure that makes a `float32` or a `uint64` lose its width
+through an `any` parameter. Closing it needs the name on the value rather than
+at the call site, which is a representation change: a defined type would stop
+being free.
 
-Closing it needs the name carried through the parser onto the values of that
-type, which is the same erasure that makes `[]Weekday` print `[]int`.
+A `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, for the
+reason in the pointer entry below: go-rs holds a pointer and its pointee as one
+handle.
+
+## `%T` of an empty map describes it from its contents
+
+```go
+fmt.Printf("%T\n", map[string]int{})   // go: map[string]int
+                                       // go-rs: map[interface {}]interface {}
+```
+
+A map carries no element type on the object, so `go_type_name` (`src/host.rs`)
+names it from the first pair — and an empty one has none. A map whose written
+type mentions a *defined* type is tagged at the `fmt` call site and so is named
+exactly (`map[main.myStr]main.myInt`, even when empty); a map of predeclared
+types is not, because tagging every map would put a box on the common path for
+a name that is almost always already right. A slice does not have this gap: its
+element type is stamped by `GELEM_TAG`.
 
 ## An unassigned code point prints literally where Go escapes it
 

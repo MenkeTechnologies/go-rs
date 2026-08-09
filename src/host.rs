@@ -151,6 +151,16 @@ pub const GARRAY_TAG: u16 = 967;
 /// operand whose static type the compiler does not know is left untagged, where
 /// the byte-slice guess from the element values stands in.
 pub const GELEM_TAG: u16 = 968;
+/// `[value, type]` → the value tagged with the defined type it was written as,
+/// for a `fmt` argument position only.
+///
+/// `type Weekday int` declares a type distinct from `int` that is represented
+/// exactly like one, so nothing at run time separates a `Weekday` from the `int`
+/// holding the same number — but `%T` prints `main.Weekday` and `%#v` writes the
+/// name too. The compiler knows the static type at the call site and tags the
+/// operand here, the same way the `float32` and `uint64` width tags ride in.
+/// Every verb but `%T` and `%#v` sees straight through it to the value.
+pub const GNAMED_BOX: u16 = 969;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -321,6 +331,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
     vm.register_builtin(GARRAY_TAG, b_array_tag);
     vm.register_builtin(GELEM_TAG, b_elem_tag);
+    vm.register_builtin(GNAMED_BOX, b_named_box);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
     vm.register_builtin(GMIN, b_min);
@@ -1153,6 +1164,12 @@ pub(crate) enum HostObj {
     /// It still compares equal to `nil`: [`numeric_hook`] answers `Eq`/`Ne`
     /// against [`Value::Undef`] for these handles, so `s == nil` stays true.
     Nil { kind: NilKind, ty: String },
+    /// A value at a `fmt` argument position whose static type was a defined one
+    /// (`type Weekday int`). A defined type is represented exactly like its
+    /// base, so this box holds the base value untouched and adds only the name
+    /// `%T` and `%#v` print. [`b_named_box`] applies it; the formatter unwraps
+    /// it everywhere else, and it never reaches the program.
+    Named { ty: String, inner: Value },
 }
 
 impl HostObj {
@@ -2784,6 +2801,9 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 Some(HostObj::Struct { type_name, .. }) => format!("main.{type_name}"),
                 Some(HostObj::Closure { .. }) => "func()".to_string(),
                 Some(HostObj::Cell(v)) => go_type_name(v),
+                // A defined type is named, not described: `main.Weekday`, never
+                // the `int` it is represented as.
+                Some(HostObj::Named { ty, .. }) => go_type_spelling(ty),
                 // A typed nil records the type it was written as, so unlike a
                 // populated slice or map it needs no guess from its contents.
                 Some(HostObj::Nil { ty, .. }) => go_type_spelling(ty),
@@ -2916,6 +2936,26 @@ fn key_ty_spelling(ty: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// [`GNAMED_BOX`] — tag a `fmt` argument with the defined type it was written
+/// as. Stack `[value, type]`.
+fn b_named_box(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let inner = args.first().cloned().unwrap_or(Value::Undef);
+    let ty = args.get(1).map(go_str).unwrap_or_default();
+    Value::Obj(heap_alloc(HostObj::Named { ty, inner }))
+}
+
+/// The value inside a [`HostObj::Named`] tag, or the value itself. Every part of
+/// the formatter but `%T` and `%#v` reads through the tag: a defined type is its
+/// base at run time, so it prints, distributes and coerces as the base does.
+pub(crate) fn unname(v: &Value) -> Value {
+    let Value::Obj(id) = v else { return v.clone() };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Named { inner, .. }) => inner.clone(),
+        _ => v.clone(),
+    })
 }
 
 /// [`GELEM_TAG`] — stamp the written element type on every slice inside a `fmt`
@@ -3124,6 +3164,18 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             Some(HostObj::Closure { .. }) => "<func>".to_string(),
             // A cell is an internal box; render its contents (a captured value).
             Some(HostObj::Cell(v)) => go_str_mode(v, mode),
+            // A defined type prints as its base — except under `%#v`, where a
+            // composite is written as a typed literal and the type is the
+            // defined name (`main.mySlice{1, 2}`). A scalar's `%#v` carries no
+            // type at all, so it needs nothing.
+            Some(HostObj::Named { ty, inner }) => {
+                let body = go_str_mode(inner, mode);
+                let composite = slice_elems(inner).is_some() || map_pairs(inner).is_some();
+                match body.find('{').filter(|_| sharp && composite) {
+                    Some(i) => format!("{}{}", go_type_spelling(ty), &body[i..]),
+                    None => body,
+                }
+            }
             None => "<nil>".to_string(),
         }
     })
@@ -3579,6 +3631,10 @@ fn missing_operand(verb: char) -> &'static str {
 /// `depth` is 0 only for the operand itself: a nil *inside* a composite prints
 /// `<nil>` where a nil operand is the bad-verb form `%!q(<nil>)`.
 fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
+    // A defined type is its base to every verb here — only `%T` and `%#v`, which
+    // do not come through this path, print the name.
+    let unnamed = unname(v);
+    let v = &unnamed;
     if matches!(verb, 's' | 'q' | 'x' | 'X') {
         if let Some(b) = slice_bytes(v) {
             let text = Value::str(String::from_utf8_lossy(&b).into_owned());

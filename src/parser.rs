@@ -40,7 +40,14 @@ pub fn parse(src: &str) -> Result<Program, String> {
         no_composite: false,
         anon_structs: HashMap::new(),
         anon_interfaces: HashMap::new(),
+        defined: HashMap::new(),
     };
+    // Pre-scan `type Name <base>` over a non-struct base, with the real type
+    // grammar rather than a token pattern — the base can be any type expression
+    // (`map[string][]int`, `func(int) (int, error)`). A use site can precede the
+    // declaration, and `Name{…}` only parses as a composite literal if the base
+    // is one, so the names have to be known before the program is walked.
+    p.scan_defined_types();
     p.program()
 }
 
@@ -66,6 +73,12 @@ struct Parser {
     /// [`iface_name`] builds, so an identical method set shares one type. Merged
     /// into the program's interface declarations.
     anon_interfaces: HashMap<String, Vec<String>>,
+    /// Defined types over a non-struct, non-interface base — `type Weekday int`,
+    /// `type mySlice []int` — as name → the base type as written. A defined type
+    /// is a *distinct* type in Go with the same representation as its base, so
+    /// go-rs carries the name only where it is observable: `%T`, `%#v` and method
+    /// dispatch.
+    defined: HashMap<String, String>,
 }
 
 /// The canonical name of an interface type with method set `methods`:
@@ -333,6 +346,8 @@ impl Parser {
             interfaces.push(InterfaceDecl { name, methods });
         }
 
+        let mut defined: Vec<(String, String)> = self.defined.drain().collect();
+        defined.sort();
         Ok(Program {
             package,
             imports,
@@ -340,7 +355,52 @@ impl Parser {
             interfaces,
             main,
             funcs,
+            defined,
         })
+    }
+
+    /// Fill [`Parser::defined`] by parsing every `type Name <base>` declaration
+    /// whose base is neither a struct nor an interface, ahead of the program
+    /// walk. Each is parsed with [`Parser::type_decl`] itself, so the base is
+    /// read by the real type grammar; a declaration that fails to parse here is
+    /// left for the walk to report in source order. The position is restored,
+    /// and struct/interface declarations are skipped rather than parsed twice.
+    fn scan_defined_types(&mut self) {
+        let saved = self.pos;
+        for i in 0..self.tokens.len() {
+            if !matches!(self.tokens[i].kind, Tok::Type) {
+                continue;
+            }
+            self.pos = i;
+            // `type Name` then anything but `struct` / `interface`, looking past
+            // a generic type-parameter list.
+            let mut j = i + 2;
+            if matches!(self.tokens.get(j).map(|t| &t.kind), Some(Tok::LBracket)) {
+                let mut depth = 0usize;
+                while let Some(t) = self.tokens.get(j) {
+                    match t.kind {
+                        Tok::LBracket => depth += 1,
+                        Tok::RBracket => {
+                            depth -= 1;
+                            if depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            }
+            if matches!(
+                self.tokens.get(j).map(|t| &t.kind),
+                Some(Tok::Struct) | Some(Tok::Interface) | None
+            ) {
+                continue;
+            }
+            let _ = self.type_decl();
+        }
+        self.pos = saved;
     }
 
     /// Parse `type T struct { … }`, `type I interface { … }`, or a defined type
@@ -351,13 +411,22 @@ impl Parser {
         self.expect(&Tok::Type)?;
         let name = self.ident()?;
         // Erase a generic type-parameter list: `type Stack[T any] struct{…}`.
-        if matches!(self.peek(), Tok::LBracket) {
+        //
+        // A `[` after the name is a type-parameter list only when what follows
+        // is a parameter name. `type mySlice []int` and `type myArr [3]int`
+        // open the *base* type with the same token, and eating those brackets
+        // would leave the base as its element type — `mySlice` over `int`.
+        if matches!(self.peek(), Tok::LBracket) && !self.brackets_open_a_type() {
             self.skip_type_brackets()?;
         }
         // A defined type over a non-struct base: `type Weekday int`,
-        // `type Celsius float64`, `type ID string`. Consume the base and discard.
+        // `type Celsius float64`, `type ID string`. It has no fields and no
+        // method set of its own, so it declares nothing the program needs beyond
+        // the name — which `%T`, `%#v` and method dispatch do observe, so the
+        // name and its base are recorded rather than dropped.
         if !matches!(self.peek(), Tok::Struct | Tok::Interface) {
-            let _ = self.type_name()?;
+            let base = self.type_name()?;
+            self.defined.insert(name, base);
             return Ok(None);
         }
         match self.peek() {
@@ -1094,6 +1163,14 @@ impl Parser {
     /// zero), a fixed-size array zero is an N-element array of its own element's
     /// zero, and everything else is the scalar zero.
     fn zero_value_expr(&self, ty: &str) -> Expr {
+        // A defined type's zero value is its base's: `var s mySlice` is a nil
+        // slice that prints `[]`, not the scalar zero. (`type` cycles are
+        // rejected by Go, so following the chain terminates.)
+        if let Some(base) = self.defined.get(ty) {
+            if base != ty {
+                return self.zero_value_expr(&base.clone());
+            }
+        }
         if let (Some(elem), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
             return Expr::SliceLit {
                 elems: (0..n).map(|_| self.zero_value_expr(elem)).collect(),
@@ -2056,6 +2133,23 @@ impl Parser {
                     _ if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&s) => {
                         self.struct_literal(s)
                     }
+                    // `T{ … }` where `T` is a defined type over a slice, array
+                    // or map: the literal is the base's, and the defined name is
+                    // kept as the conversion `T(<base literal>)` — which is what
+                    // the type already means, and needs no new node.
+                    _ if matches!(self.peek(), Tok::LBrace)
+                        && self.defined_composite_base(&s).is_some() =>
+                    {
+                        let line = self.line();
+                        let base = self.defined_composite_base(&s).unwrap_or_default();
+                        let lit = self.elided_literal(&base)?;
+                        Ok(Expr::Call {
+                            func: Box::new(Expr::Ident(s)),
+                            args: vec![lit],
+                            spread: false,
+                            line,
+                        })
+                    }
                     _ => Ok(Expr::Ident(s)),
                 }
             }
@@ -2221,6 +2315,29 @@ impl Parser {
             return self.expr();
         }
         self.elided_literal(ty)
+    }
+
+    /// Whether the `[` at the cursor opens a slice or array *type* rather than a
+    /// generic type-parameter list: `[]T` has nothing between the brackets, and
+    /// `[3]T` / `[...]T` a length. A parameter list always names a parameter
+    /// first (`[T any]`).
+    fn brackets_open_a_type(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(Tok::RBracket) | Some(Tok::Int(_)) | Some(Tok::Ellipsis)
+        )
+    }
+
+    /// The base of a defined type whose base is a composite — a slice, an array
+    /// or a map — so `Name{…}` can be parsed as that base's literal. `None` for
+    /// an undeclared name or one whose base takes no composite literal (`int`,
+    /// `func(…)`, `chan T`, a pointer).
+    fn defined_composite_base(&self, name: &str) -> Option<String> {
+        let base = self.defined.get(name)?;
+        let composite = base.starts_with("[]")
+            || base.starts_with("map[")
+            || (array_elem_ty(base).is_some() && array_len_of(base).is_some());
+        composite.then(|| base.clone())
     }
 
     /// A `{ … }` standing in for a literal of the known element type `ty`.

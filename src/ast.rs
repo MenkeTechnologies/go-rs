@@ -24,6 +24,11 @@ pub struct Program {
     /// Every top-level `func` other than `main` (including methods), lowered to
     /// subroutines.
     pub funcs: Vec<Func>,
+    /// `type Name <base>` over a non-struct, non-interface base, as name → the
+    /// base type as written. A defined type shares its base's representation, so
+    /// it is transparent to every operation; the name is carried only where Go
+    /// makes it observable — `%T`, `%#v` and method dispatch.
+    pub defined: Vec<(String, String)>,
 }
 
 /// A `type T struct { field T; … }` declaration.

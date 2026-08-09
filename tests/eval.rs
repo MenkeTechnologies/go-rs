@@ -2766,3 +2766,95 @@ func main() {
          a 1\n",
     );
 }
+
+/// A verb applies to each element of a composite, and a `[]byte` is the text it
+/// holds under `%s`/`%q`/`%x` — the two rules meet in the `[]byte`/`[]int` pair,
+/// which hold identical values and must print differently.
+#[test]
+fn fmt_verbs_distribute_over_composites() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	ws := []string{\"a\", \"b\"}
+	is := []int{97, 98}
+	bs := []byte(\"ab\")
+	fmt.Printf(\"%q|%q|%q\\n\", ws, is, bs)
+	fmt.Printf(\"%s|%s|%x\\n\", ws, bs, is)
+	fmt.Printf(\"%q|%d\\n\", map[string]string{\"b\": \"y\", \"a\": \"x\"}, map[string]int{\"k\": 3})
+	fmt.Printf(\"%f|%c|%U\\n\", []float64{1.5}, is, is)
+	fmt.Printf(\"%8q|%.2q|%t\\n\", ws, []string{\"alpha\"}, is)
+	fmt.Printf(\"%T|%T\\n\", bs, is)
+}
+";
+    assert_stdout(
+        src,
+        "[\"a\" \"b\"]|['a' 'b']|\"ab\"\n\
+         [a b]|ab|[61 62]\n\
+         map[\"a\":\"x\" \"b\":\"y\"]|map[%!d(string=k):3]\n\
+         [1.500000]|[a b]|[U+0061 U+0062]\n\
+         [     \"a\"      \"b\"]|[\"al\"]|[%!t(int=97) %!t(int=98)]\n\
+         []uint8|[]int\n",
+    );
+}
+
+/// A negative operand under a base verb is a sign and a magnitude, not the
+/// two's-complement bit pattern — the rule `%d` already followed.
+#[test]
+fn base_verbs_sign_a_negative_operand() {
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	n := -9
+	fmt.Printf(\"%x|%X|%o|%b\\n\", n, n, n, n)
+	fmt.Printf(\"%#x|%#o|%#b|%#08x\\n\", n, n, n, n)
+	var u uint64 = 18446744073709551615
+	fmt.Printf(\"%x|%o\\n\", u, u)
+}
+";
+    assert_stdout(
+        src,
+        "-9|-9|-11|-1001\n\
+         -0x9|-011|-0b1001|-0x0000009\n\
+         ffffffffffffffff|1777777777777777777777\n",
+    );
+}
+
+/// A defined type is a distinct type carrying its base's representation: the
+/// base's behaviour, plus a name that `%T` and `%#v` print and a method reaches
+/// through.
+#[test]
+fn defined_types_keep_their_name_and_their_base() {
+    let src = "\
+package main
+import \"fmt\"
+type myInt int
+type myStr string
+type mySlice []int
+type myMap map[string]int
+func (m myInt) triple() myInt { return m * 3 }
+func main() {
+	n := myInt(7)
+	fmt.Printf(\"%T %v %d %T\\n\", n, n, n+1, n.triple())
+	var s myStr = \"hi\"
+	fmt.Printf(\"%T %q %v\\n\", s, s, s+\"!\")
+	sl := mySlice{3, 1}
+	fmt.Printf(\"%T %v %#v %v\\n\", sl, sl, sl, len(sl))
+	m := myMap{\"a\": 1}
+	fmt.Printf(\"%T %v %d\\n\", m, m, m[\"a\"])
+	var zs mySlice
+	fmt.Printf(\"%T %v %v\\n\", zs, zs, int(n))
+	fmt.Printf(\"%T\\n\", map[myStr]myInt{})
+}
+";
+    assert_stdout(
+        src,
+        "main.myInt 7 8 main.myInt\n\
+         main.myStr \"hi\" hi!\n\
+         main.mySlice [3 1] main.mySlice{3, 1} 2\n\
+         main.myMap map[a:1] 1\n\
+         main.mySlice [] 7\n\
+         map[main.myStr]main.myInt\n",
+    );
+}

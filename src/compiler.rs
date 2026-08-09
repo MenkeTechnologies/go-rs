@@ -213,6 +213,10 @@ struct Compiler {
     /// Method result counts keyed by `(receiver type, method name)` — lets a
     /// `v, ok := recv.M()` destructure a multi-value method return.
     method_nresults: HashMap<(String, String), usize>,
+    /// Each method's declared result type, keyed by `(receiver type, method name)`.
+    /// It is the only static-type path to a method call's result, which `%T`
+    /// needs when the method returns a defined type.
+    method_result_ty: HashMap<(String, String), String>,
     /// Each interface type's method set, keyed by its name — both declared
     /// (`type Stringer interface{…}`) and anonymous (`interface{ Unwrap() error }`,
     /// registered by the parser under a canonical name). Only method-bearing
@@ -224,6 +228,10 @@ struct Compiler {
     /// `iface_methods` omits. Naming one in call position — `error(e)`, `any(3)`,
     /// `Stringer(v)` — is Go's identity conversion to an interface type.
     iface_names: HashSet<String>,
+    /// `type Name <base>` over a non-struct, non-interface base, as name → base.
+    /// Naming one in call position is a conversion, and the name is what `%T`
+    /// prints — `main.Weekday`, not `int`.
+    defined_types: HashMap<String, String>,
     /// The stack of enclosing `for` loops (innermost last).
     loops: Vec<LoopScope>,
     /// `return`/jump-outs emitted inside `main`, patched to the end of `main`.
@@ -1102,6 +1110,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     let mut methods: HashMap<(String, String), usize> = HashMap::new();
     let mut method_nresults: HashMap<(String, String), usize> = HashMap::new();
+    let mut method_result_ty: HashMap<(String, String), String> = HashMap::new();
     // Methods declared with a *value* receiver (`func (t T)`, not `func (t *T)`).
     // Go binds such a receiver to a copy, so the method cannot mutate the caller's
     // struct; a pointer receiver binds the struct itself and is meant to.
@@ -1111,6 +1120,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             Some(r) => {
                 methods.insert((base_type(&r.ty), f.name.clone()), f.params.len());
                 method_nresults.insert((base_type(&r.ty), f.name.clone()), f.results.len());
+                if let [result] = f.results.as_slice() {
+                    method_result_ty.insert((base_type(&r.ty), f.name.clone()), result.clone());
+                }
                 if !r.ty.starts_with('*') {
                     value_recv_methods.insert((base_type(&r.ty), f.name.clone()));
                 }
@@ -1236,8 +1248,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         methods,
         value_recv_methods,
         method_nresults,
+        method_result_ty,
         iface_methods,
         iface_names,
+        defined_types: prog.defined.iter().cloned().collect(),
         loops: Vec::new(),
         main_exits: Vec::new(),
         temp_counter: 0,
@@ -3413,6 +3427,15 @@ impl Compiler {
     /// erased [`NumType`] cannot express, since it collapses `[]T`, `map[K]V` and
     /// `any` into one `Unknown`. Everything else falls through to [`Self::emit_default`].
     fn emit_zero(&mut self, ty: &str, line: u32) {
+        // A defined type's zero value is its base's: `var s mySlice` is a nil
+        // slice, which prints `[]` and appends, not the scalar zero. (Go rejects
+        // a `type` cycle, so following the chain terminates.)
+        if let Some(base) = self.defined_types.get(ty).cloned() {
+            if base != ty {
+                self.emit_zero(&base, line);
+                return;
+            }
+        }
         // A fixed-size array's zero is N element zeros, not nil: `var a [3]int`
         // is `[0 0 0]` and `type s struct{ a [2]string }` zeroes to `{[ ]}`.
         if let (Some(elem), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
@@ -3900,7 +3923,11 @@ impl Compiler {
             // closure names it `func()` for the same reason — so an array of
             // them agrees with the element it holds.
             "func" => "func()".to_string(),
-            _ if self.structs.contains(ty) => format!("main.{ty}"),
+            // A declared type — a struct or a defined type over any other base —
+            // is qualified by its package.
+            _ if self.structs.contains(ty) || self.defined_types.contains_key(ty) => {
+                format!("main.{ty}")
+            }
             _ => ty.to_string(),
         }
     }
@@ -4189,6 +4216,10 @@ impl Compiler {
                 // which is what tells `fmt` the result is text rather than a
                 // list of numbers.
                 Expr::Ident(name) if matches!(name.as_str(), "[]byte" | "[]rune") => name.clone(),
+                // A conversion to a defined type has that type, which is the
+                // only place its name enters the value flow: `Weekday(3)` is an
+                // `int` at run time and a `main.Weekday` to `%T`.
+                Expr::Ident(name) if self.defined_types.contains_key(name) => name.clone(),
                 Expr::Ident(name) => self
                     .funcs
                     .get(name)
@@ -4574,6 +4605,54 @@ impl Compiler {
             self.emit_panic_check(line);
         }
         true
+    }
+
+    /// The defined type a `fmt` argument should be tagged with, or `None` when
+    /// its static type is not one. A `*T` is tagged with `T`: go-rs holds a
+    /// pointer and its pointee as the same handle, and `%T` of a `*Weekday`
+    /// naming `main.Weekday` is nearer than naming `int`.
+    fn named_box_spec(&self, e: &Expr) -> Option<String> {
+        // Arithmetic on a defined type keeps it — `Weekday(3) + 1` is a
+        // `Weekday` — so a binary operator reports whichever side names one.
+        if let Expr::Binary { lhs, rhs, .. } = e {
+            return self
+                .named_box_spec(lhs)
+                .or_else(|| self.named_box_spec(rhs));
+        }
+        // `-Weekday(3)` and `^n` keep the operand's type the same way.
+        if let Expr::Unary {
+            op: UnOp::Neg | UnOp::BitNot,
+            rhs,
+        } = e
+        {
+            return self.named_box_spec(rhs);
+        }
+        // A method's declared result type, which no other static-type path
+        // reaches: `Weekday(3).next()` is a `Weekday`.
+        if let Expr::Call { func, .. } = e {
+            if let Expr::Selector { recv, field } = func.as_ref() {
+                let key = (self.type_name(recv), field.clone());
+                if let Some(rt) = self.method_result_ty.get(&key) {
+                    let rt = rt.trim_start_matches('*');
+                    if self.defined_types.contains_key(rt) {
+                        return Some(rt.to_string());
+                    }
+                }
+            }
+        }
+        let ty = self.type_name(e);
+        let ty = ty.trim_start_matches('*');
+        if self.defined_types.contains_key(ty) {
+            return Some(ty.to_string());
+        }
+        // A container whose written type *mentions* a defined type is named by
+        // it too — `map[myStr]myInt` prints as `map[main.myStr]main.myInt`. Only
+        // the map case needs this: a slice already carries its element type
+        // through [`Self::elem_tag_spec`].
+        let mentions_defined = ty
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|w| self.defined_types.contains_key(w));
+        (mentions_defined && ty.starts_with("map[")).then(|| ty.to_string())
     }
 
     /// The written type a `fmt` argument's slices should be tagged with, or
@@ -4966,6 +5045,13 @@ impl Compiler {
                             self.b.emit(Op::LoadConst(t), line);
                             self.b.emit(Op::CallBuiltin(host::GELEM_TAG, 2), line);
                         }
+                        // A defined type is its base at run time, so its name
+                        // exists only in the static type — and `%T` prints it.
+                        if let Some(ty) = self.named_box_spec(a) {
+                            let t = self.b.add_constant(Value::str(ty));
+                            self.b.emit(Op::LoadConst(t), line);
+                            self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+                        }
                     }
                     let argc = Self::call_arity(args.len(), &format!("fmt.{field}"), line)?;
                     self.b.emit(Op::CallBuiltin(id, argc), line);
@@ -5017,6 +5103,24 @@ impl Compiler {
                 self.b.emit(Op::LoadConst(c), line);
                 self.b.emit(Op::CallBuiltin(host::GCONV, 2), line);
                 return Ok(());
+            }
+            // A conversion to a defined type — `Weekday(3)`, `mySlice{…}` (which
+            // the parser writes as `mySlice([]int{…})`). The defined type shares
+            // its base's representation, so the value is the base's conversion:
+            // a predeclared base narrows or reformats through `GCONV`, and any
+            // other base — a slice, map, func, chan or pointer — is the
+            // identity. Only the *name* is new, and it is carried at a `fmt`
+            // argument position by [`Self::named_box_spec`].
+            if args.len() == 1 {
+                if let Some(base) = self.defined_types.get(name).cloned() {
+                    self.expr(&args[0])?;
+                    if is_conversion_type(&base) {
+                        let c = self.b.add_constant(Value::str(base));
+                        self.b.emit(Op::LoadConst(c), line);
+                        self.b.emit(Op::CallBuiltin(host::GCONV, 2), line);
+                    }
+                    return Ok(());
+                }
             }
             // `panic(v)` records the panic then unwinds to the function's defer
             // drain (jump patched to the panic epilogue).
