@@ -315,3 +315,33 @@ including through slice elements, map values and struct fields. The tag is
 applied from the static type at the call site, so a value that has passed
 through an `any`/interface parameter has no width left to read. It wants the
 same `Value` variant the `float32` gap above does.
+
+## Two interfaces holding an `int` and a `float64` compare equal
+
+```go
+var x any = 1
+var y any = 1.0
+fmt.Println(x == y)                 // go: false   go-rs: true
+
+var p any = int64(1e18)
+var q any = float64(1e18)
+fmt.Println(p == q)                 // go: false   go-rs: true
+```
+
+Go decides interface equality by dynamic type before value, so an `int` and a
+`float64` are never equal however the numbers line up. Comparing two interfaces
+is the *only* construct in valid Go that puts the two under one operator:
+arithmetic and ordered comparison on mismatched numeric types are compile
+errors (`invalid operation: i + f (mismatched types int64 and float64)`), and
+interfaces are unordered (`operator < not defined on interface`).
+
+go-rs boxes both as bare `Value::Int` / `Value::Float` with no dynamic type
+beside them, and fusevm 0.17.0 answers a mixed pair natively by promoting the
+integer to `f64` and comparing numerically — so the pair never reaches
+`numeric_hook` and the frontend gets no say. `numeric_hook` already classifies
+the pair correctly (`Eq` false, `Ne` true, arithmetic and ordering reported as
+mismatched types), which closes the `p == q` half as soon as a fusevm release
+delegates a mixed pair past 2^53 rather than rounding it. The `x == y` half
+stays open past that release: the values are small, the promotion is exact, and
+fusevm has no reason to ask. Closing it needs the dynamic type on the value —
+the same representation change the `float32` and `uint64` entries above want.
