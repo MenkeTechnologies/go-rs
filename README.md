@@ -131,7 +131,7 @@ Real Go, executed on fusevm:
 | Structs        | `type T struct{…}`, literals `T{…}` / `T{f: v}`, field read/write `s.f`, **value-copy semantics** — transitive through nested struct fields — on assign, argument bind, return, container store and read, `range` binding, `append`, channel send and value-receiver calls, while pointer/slice/map fields stay shared; **embedded fields** (`struct { Base }`, including `*Base`) whose fields and methods are **promoted** onto the outer type through any depth of embedding — an outer declaration shadows a promoted one, and a promoted method satisfies an interface |
 | Methods        | value/pointer receivers (named or unnamed — `func (T) m()`), `recv.m(args)` dispatch by receiver type |
 | Pointers       | `&T{…}` / `&x` (a no-copy reference — go-rs composite values are heap handles), `*p` deref, `new(T)` (a pointer to a zero value of `T`); a pointer shares the pointed-to struct, and `==` on an allocated pointer compares **identity** (two `errors.New("x")` are distinct) while struct values still compare field by field |
-| Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type; `any`/`interface{}` values, type assertions `x.(T)` (+ comma-ok `v, ok := x.(T)`), and type switches `switch v := x.(type) { case T: … }`. An interface **with a method set** — named or anonymous (`err.(interface{ Unwrap() error })`) — is matched by *method-set containment* on signatures, so `Unwrap() error` and `Unwrap() []error` are told apart, and embedded methods count |
+| Interfaces     | `type I interface{…}`; dynamic method dispatch on a value's runtime type; `any`/`interface{}` values, type assertions `x.(T)` (+ comma-ok `v, ok := x.(T)`), and type switches `switch v := x.(type) { case T: … }`. An interface **with a method set** — named or anonymous (`err.(interface{ Unwrap() error })`) — is matched by *method-set containment* on signatures, so `Unwrap() error` and `Unwrap() []error` are told apart, and embedded methods count. `==` on an interface operand is decided by **dynamic type before value**, so `any(1) == any(1.0)` is false and an interface holding a nil slice is not `nil` |
 | Closures       | function literals `func(…){…}` with **capture-by-reference** (a closure mutating a captured variable propagates, and closures share captured state); `f := func(){…}; f()`, IIFE, `go func(){…}()`; Go 1.22 per-iteration loop-variable capture. A captured variable keeps its **declared type** inside the body, so a `uint8` still wraps at 8 bits, a `float32` still computes and prints at 32, a `uint64` still reads unsigned, and a captured channel is still a channel |
 | First-class fns | `func(int) int` parameters and results — pass/return closures, higher-order fns (`apply`/`compose`/`reduce`); dynamic dispatch via the closure's stored subroutine id (`Op::CallDynamic`) |
 | Functions      | multiple parameters, variadic `func f(x ...int)` + spread `f(xs...)`, `(T, U)` multi-value results, named results (`func f() (n int, err error)` — zero-initialized, bare `return`, deferred/`recover` mutation), `return a, b`, `x, y := f()` destructuring, multi-value spread `f(g())`, calling a function value from an index (`fns[i](x)`, `ops["k"](a, b)`) |
@@ -241,16 +241,21 @@ than the static type: `%T`/`%#v`/`%v` on an array beside the slice spelling that
 must still name a slice, through an assignment, an `any` box, a nested
 `[2][3]int`, an array of structs, an array of slices, a slice and a map *of*
 arrays, and the `float32`/`uint64` widths whose `fmt` boxing rebuilds the value.
-A last one covers **composite literals past fusevm's 255-value call arity**,
+Another covers **composite literals past fusevm's 255-value call arity**,
 which are built in chunks: a slice, an array, a map and a variadic spread all
 sized over the cut, checking an element *past* the cut rather than only the
-length — the old wrap-around silently produced a short literal. The
-fixed-width shape runs its arithmetic both directly and inside a capturing
-closure, which are separate code paths. It diffs both interpreters
-byte-for-byte (stdout + exit status).
+length — the old wrap-around silently produced a short literal. A last one
+covers **interface equality**, which Go decides by dynamic type before value:
+the same number held as an `int`, a `float64` and its own text, a `bool` beside
+the string spelling of one, an untyped `nil`, and a nil slice or map compared
+both directly (true) and through an interface (false). The matched pairs are
+printed alongside the mismatched ones, so neither a blanket `true` nor a blanket
+`false` passes. The fixed-width shape runs its arithmetic both directly and
+inside a capturing closure, which are separate code paths. It diffs both
+interpreters byte-for-byte (stdout + exit status).
 
 `--only N` pins every generated block to statement shape `N`, so one shape's
-divergence rate is measurable instead of diluted across the other 35, and
+divergence rate is measurable instead of diluted across the other 38, and
 `--ours PATH` runs a go-rs binary built from another commit — together they are
 how a newly added shape is shown to actually exercise what it claims to.
 
@@ -314,6 +319,14 @@ superset):
   has nothing to ask. Every other channel operation is correct. This is
   **waiting on a fusevm release** rather than on design work (see
   [`BUGS.md`](BUGS.md)).
+- **Two interfaces holding two integer *widths* compare equal.** Interface `==`
+  is decided by dynamic type before value, so `any(1) == any(1.0)` is false, so
+  is `any(1) == any("1")`, so are two struct types with the same field, and an
+  interface holding a nil slice is not equal to `nil`. Only the integer widths
+  are left: `int`, `int64`, `uint`, `byte` and `rune` are all one 64-bit value
+  and all name `int`, so `any(97) == any(byte(97))` is true where Go says false.
+  It wants the same value-side type tag `float32` and `uint64` do
+  (see [`BUGS.md`](BUGS.md)).
 - **`float32` loses its width through an `any` parameter or a nested struct
   field.** Arithmetic runs at 32-bit width and `fmt` prints the 32-bit shortest
   decimal for a statically-`float32` operand (including `[]float32`,

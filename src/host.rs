@@ -163,6 +163,29 @@ pub const GELEM_TAG: u16 = 968;
 /// operand here, the same way the `float32` and `uint64` width tags ride in.
 /// Every verb but `%T` and `%#v` sees straight through it to the value.
 pub const GNAMED_BOX: u16 = 969;
+/// `[a, b, ne]` → Go's `==` (or `!=` when `ne` is 1) on two **interface**
+/// operands: equal when the dynamic types match *and* the values do.
+///
+/// Go decides interface equality by dynamic type before value, so an `int` and a
+/// `float64` are never equal however the numbers line up, and neither are two
+/// struct types with identical fields. Nothing else in valid Go puts two
+/// different types under one operator — arithmetic and ordered comparison on
+/// mismatched types are compile errors, and an interface is unordered — so this
+/// is the whole of the rule's reach.
+///
+/// It cannot be left to the native op or to [`numeric_hook`]. fusevm answers an
+/// `Int`/`Float` pair natively by promoting the integer, so the pair never
+/// reaches the frontend at all; and the pairs that *do* reach the hook land on
+/// its rendered-string fallback, where `any(1) == any("1")` compares `"1"` with
+/// `"1"` and says yes. So the compiler routes a comparison with an
+/// interface-typed operand here instead of emitting `Op::NumEq`/`Op::StrEq`.
+///
+/// The dynamic type is [`go_type_name`] — the same function `%T` prints, which
+/// already separates a struct type from another with the same fields, and a
+/// typed nil (`HostObj::Nil`) from an untyped one. It does **not** separate two
+/// integer widths: `int`, `int64` and `uint` are all `Value::Int` and all name
+/// `int`, so `any(1) == any(int64(1))` is still wrong (BUGS.md).
+pub const GIFACE_EQ: u16 = 970;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -334,6 +357,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GARRAY_TAG, b_array_tag);
     vm.register_builtin(GELEM_TAG, b_elem_tag);
     vm.register_builtin(GNAMED_BOX, b_named_box);
+    vm.register_builtin(GIFACE_EQ, b_iface_eq);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
     vm.register_builtin(GMIN, b_min);
@@ -2297,6 +2321,49 @@ pub(crate) fn ptr_eq(a: &Value, b: &Value) -> Option<bool> {
         (Value::Obj(x), Value::Obj(y)) => x == y,
         _ => false,
     })
+}
+
+/// Go's `==` on two interface operands: dynamic type first, value second.
+///
+/// The type half is [`go_type_name`], which is what `%T` prints — so a `pt` and
+/// a `qt` with the same field are different types and unequal, and an interface
+/// holding a nil *slice* is a `[]int` rather than a `<nil>` and so is not equal
+/// to the untyped `nil` (Go's non-nil-interface-holding-nil rule falls out of
+/// this rather than needing a case of its own).
+///
+/// The value half runs only once the types agree, so it never has to reconcile
+/// two representations. A pointer compares by handle, the scalars by value, and
+/// anything left — two structs of the same type, two strings — structurally,
+/// which is the comparison the ordinary `==` path already performed. `Float` is
+/// compared as `f64` rather than through the rendered string so that Go's
+/// `NaN != NaN` survives.
+///
+/// Two interfaces holding a *slice*, *map* or *func* panic in Go ("comparing
+/// uncomparable type []int"); go-rs answers structurally instead, which is
+/// unchanged by this and not a case this function adds.
+pub fn iface_eq(a: &Value, b: &Value) -> bool {
+    if go_type_name(a) != go_type_name(b) {
+        return false;
+    }
+    if let Some(same) = ptr_eq(a, b) {
+        return same;
+    }
+    match (a, b) {
+        (Value::Undef, Value::Undef) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        _ => go_str(a) == go_str(b),
+    }
+}
+
+/// [`GIFACE_EQ`] — `[a, b, ne]` → the interface comparison, negated when `ne`.
+fn b_iface_eq(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().cloned().unwrap_or(Value::Undef);
+    let b = args.get(1).cloned().unwrap_or(Value::Undef);
+    let ne = args.get(2).map(|v| v.to_int() != 0).unwrap_or(false);
+    Value::bool(iface_eq(&a, &b) != ne)
 }
 
 /// `s.field` read on a struct.
@@ -4640,6 +4707,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         // numbers are. Go prints `false` there, and would print `false` just
         // the same for `any(int64(1e18)) == any(float64(1e18))`. The rounding
         // fusevm was worried about cannot change the answer.
+        //
+        // That comparison no longer arrives here: the compiler routes an `==`
+        // with an interface operand to [`GIFACE_EQ`], because a *small* mixed
+        // pair is answered inside fusevm by promoting the integer exactly and
+        // so never reaches the frontend at all. This arm stays as the backstop
+        // for a mixed pair that reaches an ordinary comparison some other way,
+        // and it answers the same way [`iface_eq`] does.
         NumOp::Eq | NumOp::Ne if mixed_num_pair(a, b) => Ok(Value::bool(op == NumOp::Ne)),
         // Every other operator on a mixed pair is unreachable from valid Go:
         // arithmetic needs an explicit conversion, and interfaces are

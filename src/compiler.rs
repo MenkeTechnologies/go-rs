@@ -4395,6 +4395,20 @@ impl Compiler {
             _ => {}
         }
 
+        // An `==`/`!=` with an interface operand is decided by dynamic type
+        // before value, which neither native op can do: `Op::NumEq` on an `int`
+        // beside a `float64` is answered inside fusevm by promoting the integer,
+        // so the frontend is never asked. Route it to the builtin that holds
+        // Go's rule. Only `==`/`!=` — an interface is unordered, so `<` on two
+        // of them is a Go compile error and never reaches here.
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (self.is_iface(lhs) || self.is_iface(rhs)) {
+            self.emit_compare_operand(lhs)?;
+            self.emit_compare_operand(rhs)?;
+            self.b.emit(Op::LoadInt(i64::from(op == BinOp::Ne)), 0);
+            self.b.emit(Op::CallBuiltin(host::GIFACE_EQ, 3), 0);
+            return Ok(());
+        }
+
         // Comparisons pick string vs numeric ops from the operand types.
         if let Some(strcmp) = str_compare_op(op) {
             let is_str = self.infer(lhs) == NumType::Str || self.infer(rhs) == NumType::Str;
@@ -4452,6 +4466,17 @@ impl Compiler {
             self.emit_narrow(&ty, 0);
         }
         Ok(())
+    }
+
+    /// Whether `e`'s static Go type is an interface — `any`/`interface{}`,
+    /// `error`, or an interface the program declares.
+    ///
+    /// This is what makes the dynamic-type rule reachable without putting a
+    /// builtin call on every `==`: a comparison of two concrete types is decided
+    /// by the type checker, so the native op is already right for it.
+    fn is_iface(&self, e: &Expr) -> bool {
+        let ty = base_type(&self.type_name(e));
+        matches!(ty.as_str(), "interface{}" | "interface{ }") || self.iface_names.contains(&ty)
     }
 
     /// Whether `e`'s static Go type is `float32`.

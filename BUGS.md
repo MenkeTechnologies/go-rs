@@ -316,32 +316,72 @@ applied from the static type at the call site, so a value that has passed
 through an `any`/interface parameter has no width left to read. It wants the
 same `Value` variant the `float32` gap above does.
 
-## Two interfaces holding an `int` and a `float64` compare equal
+## Two interfaces holding two *integer widths* compare equal
 
 ```go
-var x any = 1
-var y any = 1.0
+var x any = 97
+var y any = int64(97)
 fmt.Println(x == y)                 // go: false   go-rs: true
 
-var p any = int64(1e18)
-var q any = float64(1e18)
-fmt.Println(p == q)                 // go: false   go-rs: true
+var b any = byte(97)
+var r any = rune(97)
+fmt.Println(b == r)                 // go: false   go-rs: true
 ```
 
-Go decides interface equality by dynamic type before value, so an `int` and a
-`float64` are never equal however the numbers line up. Comparing two interfaces
-is the *only* construct in valid Go that puts the two under one operator:
-arithmetic and ordered comparison on mismatched numeric types are compile
-errors (`invalid operation: i + f (mismatched types int64 and float64)`), and
-interfaces are unordered (`operator < not defined on interface`).
+Go decides interface equality by dynamic type before value, so two interfaces
+holding different types are never equal however the numbers line up. That rule
+is implemented — `iface_eq` (`src/host.rs`) compares `go_type_name` before the
+value, and the compiler routes an `==`/`!=` with an interface-typed operand to
+`GIFACE_EQ` rather than emitting the native op. It decides every crossing go-rs
+can see at run time: `any(1) == any(1.0)` is false, so is `any(1) == any("1")`,
+so are two struct types with the same field, and an interface holding a *typed*
+nil (a nil slice or map) is not equal to `nil`. The gates are
+`parity-scripts/iface_equality.go`, `tests/iface_equality.rs`, and shape 38 of
+the fuzzer.
 
-go-rs boxes both as bare `Value::Int` / `Value::Float` with no dynamic type
-beside them, and fusevm 0.17.0 answers a mixed pair natively by promoting the
-integer to `f64` and comparing numerically — so the pair never reaches
-`numeric_hook` and the frontend gets no say. `numeric_hook` already classifies
-the pair correctly (`Eq` false, `Ne` true, arithmetic and ordering reported as
-mismatched types), which closes the `p == q` half as soon as a fusevm release
-delegates a mixed pair past 2^53 rather than rounding it. The `x == y` half
-stays open past that release: the values are small, the promotion is exact, and
-fusevm has no reason to ask. Closing it needs the dynamic type on the value —
-the same representation change the `float32` and `uint64` entries above want.
+What is left is the crossing the values cannot show. `int`, `int8`…`int64`,
+`uint`…`uint64`, `byte` and `rune` are all one `Value::Int`, and
+`go_type_name` names every one of them `int`, so two of different width look
+like the same dynamic type and are compared by value.
+
+Closing it needs the Go type on the value, which is a representation change,
+and it is the *same* one the `float32` and `uint64` entries above want — all
+three are "the static type at the conversion, readable at run time". fusevm
+0.17.0's `Value` has no spare tagged-scalar variant (`Undef`, `Bool`, `Int`,
+`Float`, `Str`, `Array`, `Hash`, `Status`, `Ref`, `NativeFn`, `Obj`), so the
+tag has to ride on `Value::Obj` — a heap handle, exactly the shape
+`HostObj::F32` and `HostObj::U64` already are. Two things make it large rather
+than a patch:
+
+- There is no concrete-to-interface conversion site to hook. `var x any = 1`
+  compiles to `LoadInt(1); SetVar(0)` and nothing else, so the box would have to
+  be emitted at each of them separately: a var declaration, an assignment, an
+  argument bind (including `...any`), a return, a slice or array literal, a map
+  key and a map value, a struct field, a channel send, and `append`.
+- Every reader has to see through it. That is 74 host builtins, plus `go_str`
+  and `go_type_name`, plus map-key equality — `HostObj::Map` is a
+  `Vec<(Value, Value)>` matched on `Value` equality, so a boxed key and a plain
+  one of the same number would be two different keys.
+
+What makes it *feasible* rather than impossible is that valid Go requires a type
+assertion or a type switch before any arithmetic on an interface value, so the
+box can never reach a native fusevm arithmetic op. The one exception was `==`
+and `!=`, which used to be emitted as `Op::NumEq`/`Op::StrEq` — and that is the
+site `GIFACE_EQ` now owns.
+
+## Two interfaces holding a slice, map or func do not panic
+
+```go
+var a any = []int{1}
+var b any = []int{1}
+fmt.Println(a == b)
+// go:    panic: runtime error: comparing uncomparable type []int
+// go-rs: true
+```
+
+Go's `==` on interfaces is defined only when the dynamic type is comparable, and
+panics at run time when it is not. go-rs compares the two structurally and
+answers instead. `iface_eq` gets the dynamic *type* right here — both are
+`[]int` — so what is missing is the comparability table that says a slice, a map
+and a func have no `==`, which is the same static-type knowledge the entry above
+wants on the value.
