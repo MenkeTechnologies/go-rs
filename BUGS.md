@@ -15,6 +15,11 @@ Found by the differential harnesses:
   the program cannot read as agreement. `--only N` pins the generated shape and
   `--ours PATH` runs a binary from another commit, which is how a new shape is
   shown to fail against the code from *before* the fix it claims to cover.
+- `cargo test` — for the cases neither of the above can reach from a `.go` file.
+  A rule's decision function is called directly there, which is the only way to
+  cover an input the compiler rejects (`NaN`, since `math.NaN` is a rejected
+  stdlib call) or one the pinned fusevm answers natively before the frontend is
+  asked.
 
 A gap listed here is deliberately **not** represented by a corpus file, because
 the corpus is a green byte-parity gate. Close the gap and add the corpus file in
