@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 38;
+const SHAPES: u64 = 39;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -793,6 +793,48 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                  \tds2{n} := ds{n}\n\tdi2{n} := di{n}\n\
                  \tfmt.Printf(\"%T %T %v %v\\n\", ds2{n}, di2{n}, ds2{n} == ds{n}, di2{n} == di{n})\n\
                  \tfmt.Printf(\"%T %v\\n\", bump(di{n}), bump(di{n}))\n"
+            )
+        }
+        // Interface equality. Go decides it by *dynamic type first, value
+        // second*, so two interfaces holding different types are never equal
+        // however well the numbers line up — `any(1) == any(1.0)` is false, and
+        // so is `any(97) == any(byte(97))`. Comparing two interfaces is the only
+        // construct in valid Go that puts two different numeric types (or a
+        // number beside a string) under one operator: arithmetic and ordered
+        // comparison on mismatched types are compile errors, and an interface is
+        // unordered. So this shape is the only reachable probe of the rule.
+        //
+        // Both answers are printed. A frontend that compared by value alone
+        // fails the mismatched pairs, and one that answered a blanket `false`
+        // fails the matched ones (`qi == qj`, `qf == qf`, `qz == nil`), so
+        // neither can pass by guessing.
+        //
+        // Every conversion is written from a value inside the narrowest target's
+        // range (`byte` tops out at 255): Go rejects an out-of-range constant
+        // conversion at compile time, which would make the case a skip rather
+        // than a comparison.
+        38 => {
+            let a = rng.int(1, 120);
+            let w = rng.pick(WORDS);
+            format!(
+                "\tvar qi{n} any = {a}\n\
+                 \tvar qf{n} any = float64({a})\n\
+                 \tvar qj{n} any = {a}\n\
+                 \tvar qs{n} any = \"{a}\"\n\
+                 \tvar q64{n} any = int64({a})\n\
+                 \tvar q32{n} any = int32({a})\n\
+                 \tvar qu{n} any = uint({a})\n\
+                 \tvar qb{n} any = byte({a})\n\
+                 \tvar qr{n} any = rune({a})\n\
+                 \tvar qt{n} any = true\n\
+                 \tvar qw{n} any = \"true\"\n\
+                 \tvar qz{n} any\n\
+                 \tfmt.Println(qi{n} == qf{n}, qi{n} == qj{n}, qi{n} != qf{n}, qi{n} != qj{n})\n\
+                 \tfmt.Println(qi{n} == qs{n}, qi{n} == q64{n}, qi{n} == q32{n}, qi{n} == qu{n})\n\
+                 \tfmt.Println(qi{n} == qb{n}, qi{n} == qr{n}, qb{n} == qr{n}, q64{n} == qu{n})\n\
+                 \tfmt.Println(qt{n} == qw{n}, qf{n} == qf{n}, qs{n} == qs{n}, qt{n} == qt{n})\n\
+                 \tfmt.Println(qi{n} == nil, qz{n} == nil, qz{n} != nil, qi{n} == {a})\n\
+                 \tfmt.Println(qf{n} == float64({a}), qs{n} == \"{a}\", qi{n} == \"{w}\")\n"
             )
         }
         // new(T) — a zero-valued struct pointer.
