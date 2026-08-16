@@ -215,7 +215,13 @@ methods, interfaces and interface conversions, multi-name `var` declarations,
 `select`, channel `range`/comma-ok receive, `recover()`'s frame rules, unsigned
 64-bit integers, labelled loop signals, and the declared type a captured
 variable keeps inside a closure (a `uint8` still wraps, a `float32` still
-rounds to 32 bits, a captured channel is still a channel). The fuzzer generates arithmetic /
+rounds to 32 bits, a captured channel is still a channel). It also covers the
+parts of `fmt` a malformed or unusual call reaches — a missing or extra operand,
+a `%` that never reaches a verb, an unknown verb, `*` width and precision — plus
+the space flag, the minimum-digit-count precision an *integer* verb takes (as
+against the truncation a string takes), `%T` of every sized integer width, a
+`f(args...)` spread into a `fmt` call, string/rune iteration against byte
+indexing, and `continue` in every loop form. The fuzzer generates arithmetic /
 float / boolean / string / slice /
 map / control-flow / stdlib blocks plus rune arithmetic, fixed-size arrays
 (sequential + sparse), `[]byte`/`[]rune` conversions, string-range-by-rune,

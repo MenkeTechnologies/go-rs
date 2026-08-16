@@ -56,6 +56,25 @@ fn is_uint64_ty(ty: &str) -> bool {
     matches!(ty, "uint64" | "uint" | "uintptr")
 }
 
+/// Whether `ty` is a sized integer type that `Value::Int` represents but `%T`
+/// must not call `int`.
+///
+/// Every one of these is an `i64` at run time — [`int_width`] already makes the
+/// *arithmetic* wrap at the right bit — so the width survives in the static type
+/// alone. `%T` is the one verb that reads it, which is why the name is attached
+/// only at a `fmt` argument position (see `Compiler::sized_int_box_spec`) and
+/// never enters the value flow.
+///
+/// `int` is excluded because `%T` already prints it, and the unsigned 64-bit
+/// types are excluded because [`is_uint64_ty`] tags them through `GU64_BOX`,
+/// which carries their *signedness* as well as their name.
+fn is_sized_int_ty(ty: &str) -> bool {
+    matches!(
+        ty,
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "byte" | "rune"
+    )
+}
+
 /// The [`host::u64_op`] code for an operator whose result depends on the sign
 /// bit, or `None` for the ones two's complement already makes signedness-blind
 /// (`+ - * << & | ^ &^`) and for the operators that are not arithmetic at all.
@@ -4680,6 +4699,81 @@ impl Compiler {
         (mentions_defined && ty.starts_with("map[")).then(|| ty.to_string())
     }
 
+    /// The sized integer type a `fmt` argument should be tagged with so `%T`
+    /// names its width, or `None` when its static type is not one.
+    ///
+    /// `int8`, `int16`, `int32`/`rune`, `int64`, `uint8`/`byte`, `uint16` and
+    /// `uint32` are all a plain `Value::Int` at run time, so without the tag
+    /// every one of them answers `%T` with `int`. The traversal mirrors
+    /// [`Self::u64_ty`] — the same expression forms carry a width — and the tag
+    /// is applied only where [`Self::named_box_spec`] found no defined type,
+    /// because a `type myByte byte` is `main.myByte` to `%T`, not `uint8`.
+    fn sized_int_box_spec(&self, e: &Expr) -> Option<String> {
+        let named = |t: &str| is_sized_int_ty(t).then(|| t.to_string());
+        let ty = base_type(&self.type_name(e));
+        if let Some(t) = named(&ty) {
+            return Some(t);
+        }
+        // A map object stores no written type — `%T` describes it from the
+        // key/value pairs it holds, which cannot tell a `uint8` value from an
+        // `int` one. So a map whose written type mentions a sized integer
+        // carries that type in whole, exactly as a map mentioning a defined type
+        // does in [`Self::named_box_spec`]. A slice needs none of this: it
+        // already carries its element type through [`Self::elem_tag_spec`].
+        if ty.starts_with("map[")
+            && ty
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(is_sized_int_ty)
+        {
+            return Some(ty);
+        }
+        match e {
+            Expr::Ident(n) => self.decl_types.get(n).and_then(|t| named(&base_type(t))),
+            // A width survives negation and complement.
+            Expr::Unary {
+                op: UnOp::Neg | UnOp::BitNot,
+                rhs,
+            } => self.sized_int_box_spec(rhs),
+            // A shift takes its type from the shifted operand, never the count.
+            Expr::Binary {
+                op: BinOp::Shl | BinOp::Shr,
+                lhs,
+                ..
+            } => self.sized_int_box_spec(lhs),
+            // Any other arithmetic operator requires both operands to already
+            // have the same type, so whichever side names a width names the
+            // result's. Comparisons yield a `bool` and are excluded.
+            Expr::Binary { op, lhs, rhs }
+                if !matches!(
+                    op,
+                    BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Gt
+                        | BinOp::Le
+                        | BinOp::Ge
+                        | BinOp::And
+                        | BinOp::Or
+                ) =>
+            {
+                self.sized_int_box_spec(lhs)
+                    .or_else(|| self.sized_int_box_spec(rhs))
+            }
+            Expr::Call { func, .. } => match func.as_ref() {
+                // A conversion `int8(x)` names its own type.
+                Expr::Ident(n) if is_sized_int_ty(n) => Some(n.clone()),
+                Expr::Ident(n) => self
+                    .funcs
+                    .get(n)
+                    .and_then(|s| named(&base_type(&s.result_ty))),
+                _ => None,
+            },
+            // A slice/map element takes its type from the container's.
+            Expr::Index { recv, .. } => self.elem_ty_of(recv).and_then(|t| named(&base_type(&t))),
+            _ => None,
+        }
+    }
+
     /// The written type a `fmt` argument's slices should be tagged with, or
     /// `None` when the operand is not a container the compiler has a static type
     /// for. Only containers need the tag: it exists so the formatter can tell a
@@ -4970,7 +5064,11 @@ impl Compiler {
                                 field: "Sprintf".to_string(),
                             }),
                             args: args.to_vec(),
-                            spread: false,
+                            // `fmt.Errorf(f, a...)` spreads into the message the
+                            // same way `Printf` does — the synthesized `Sprintf`
+                            // has to carry the flag or the slice formats as one
+                            // operand.
+                            spread,
                             line,
                         };
                         let wrapped: Vec<Expr> = match args.first() {
@@ -5031,7 +5129,21 @@ impl Compiler {
                     // method; `$stringify` (synthesized when such a type exists)
                     // does that at runtime and passes other values through.
                     let has_stringify = self.funcs.contains_key("$stringify");
-                    for a in args {
+                    // `fmt.Printf(f, xs...)` — the last argument is a slice
+                    // standing for the operands it holds, not an operand of its
+                    // own. Its length is a run-time fact and `CallBuiltin`'s
+                    // arity is a compile-time one, so it rides in under
+                    // `GSPREAD` and `pop_args` expands it. The per-argument type
+                    // tags below are skipped for it: they describe one written
+                    // static type, and a spread slice is `[]any` whose elements
+                    // each carry their own.
+                    let last = args.len().saturating_sub(1);
+                    for (n, a) in args.iter().enumerate() {
+                        if spread && n == last {
+                            self.expr(a)?;
+                            self.b.emit(Op::CallBuiltin(host::GSPREAD, 1), line);
+                            continue;
+                        }
                         if has_stringify {
                             self.call(
                                 &Expr::Ident("$stringify".to_string()),
@@ -5072,7 +5184,14 @@ impl Compiler {
                         }
                         // A defined type is its base at run time, so its name
                         // exists only in the static type — and `%T` prints it.
-                        if let Some(ty) = self.named_box_spec(a) {
+                        // A sized integer is the same problem one level down:
+                        // `int8` and `uint16` are also a bare `Value::Int`, so
+                        // when no defined type claims the operand its *width*
+                        // carries the name instead.
+                        if let Some(ty) = self
+                            .named_box_spec(a)
+                            .or_else(|| self.sized_int_box_spec(a))
+                        {
                             let t = self.b.add_constant(Value::str(ty));
                             self.b.emit(Op::LoadConst(t), line);
                             self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);

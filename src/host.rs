@@ -186,6 +186,18 @@ pub const GNAMED_BOX: u16 = 969;
 /// integer widths: `int`, `int64` and `uint` are all `Value::Int` and all name
 /// `int`, so `any(1) == any(int64(1))` is still wrong (BUGS.md).
 pub const GIFACE_EQ: u16 = 970;
+/// `[slice]` → the slice marked for expansion into a variadic builtin's operand
+/// list, for `fmt.Printf(f, args...)` and its siblings.
+///
+/// A `fmt` builtin is compiled as `CallBuiltin(id, argc)` with `argc` fixed at
+/// the call site, so a spread — whose length is only known at run time — cannot
+/// be counted there. The compiler wraps the spread operand in this marker
+/// instead and [`pop_args`] expands it back into the operand list, which is the
+/// one place every `fmt` entry point already funnels through. Without it
+/// `fmt.Sprintf(f, a...)` formats the *slice* as a single operand, so a wrapper
+/// like `func log(f string, a ...any) { fmt.Printf(f, a...) }` silently prints
+/// `[1 2]-%!d(MISSING)` where Go prints `1-2`.
+pub const GSPREAD: u16 = 971;
 /// `[value]` → a heap cell boxing `value`, for a variable captured by reference.
 pub const GCELL_NEW: u16 = 890;
 /// `[cell]` → read a boxed variable's current value.
@@ -357,6 +369,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GARRAY_TAG, b_array_tag);
     vm.register_builtin(GELEM_TAG, b_elem_tag);
     vm.register_builtin(GNAMED_BOX, b_named_box);
+    vm.register_builtin(GSPREAD, b_spread);
     vm.register_builtin(GIFACE_EQ, b_iface_eq);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
     vm.register_builtin(GTYPEOF, b_typeof);
@@ -1181,6 +1194,11 @@ pub(crate) enum HostObj {
     /// [`chan_closed_sentinel`]. It is never stored in a Go variable: every
     /// receive site maps it to the element type's zero immediately.
     ChanClosed,
+    /// The operands of a `f(xs...)` spread into a variadic builtin, waiting to be
+    /// expanded back into the argument list — see [`GSPREAD`]. Like
+    /// [`HostObj::ChanClosed`] it never reaches a Go variable: [`pop_args`]
+    /// unwraps it on the way into the builtin that was handed it.
+    Spread(Vec<Value>),
     /// The zero value of a slice or map type — Go's *typed* nil. It is not
     /// `Value::Undef`, because Go distinguishes a nil slice (`[]`, `len` 0,
     /// appendable) and a nil map (`map[]`, readable, not writable) from a nil
@@ -2707,7 +2725,41 @@ fn pop_args(vm: &mut VM, argc: u8) -> Vec<Value> {
         v.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     v.reverse();
-    v
+    expand_spread(v)
+}
+
+/// Expand a [`HostObj::Spread`] marker back into the operand list it stands for.
+///
+/// Only a `f(xs...)` into a variadic builtin ever produces one, so the common
+/// path is a scan that finds nothing and hands the vector straight back.
+fn expand_spread(args: Vec<Value>) -> Vec<Value> {
+    let spread = |v: &Value| match v {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Spread(xs)) => Some(xs.clone()),
+            _ => None,
+        }),
+        _ => None,
+    };
+    if !args.iter().any(|v| spread(v).is_some()) {
+        return args;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for v in args {
+        match spread(&v) {
+            Some(xs) => out.extend(xs),
+            None => out.push(v),
+        }
+    }
+    out
+}
+
+/// `[slice]` → the slice marked for expansion into a variadic builtin's operands.
+fn b_spread(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.into_iter().next().unwrap_or(Value::Undef);
+    // A nil slice spreads to nothing, which is what Go's `f()` passes.
+    let elems = slice_elems(&v).unwrap_or_default();
+    Value::Obj(heap_alloc(HostObj::Spread(elems)))
 }
 
 /// Render a value the way Go's `fmt` `%v` verb does. Composite values (slices,
@@ -2881,6 +2933,12 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 // Every receive site maps the sentinel away, so it is only
                 // reachable if one was missed; name it after what it stands for.
                 Some(HostObj::ChanClosed) => "<nil>".to_string(),
+                // A spread marker is expanded by `pop_args` before any builtin sees it;
+                // naming it at all means one leaked, so name it after what it holds.
+                Some(HostObj::Spread(xs)) => xs
+                    .first()
+                    .map(go_type_name)
+                    .unwrap_or_else(|| "<nil>".to_string()),
                 None => "<nil>".to_string(),
             }
         }),
@@ -3199,6 +3257,14 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             // Only reachable if a receive site failed to map the sentinel away;
             // it stands for "no value", which is what Go's nil prints as.
             Some(HostObj::ChanClosed) => "<nil>".to_string(),
+            // `pop_args` expands a spread marker before any builtin sees it, so
+            // reaching here means one leaked past a non-builtin path; render the
+            // operands it stands for, space-separated as an argument list.
+            Some(HostObj::Spread(xs)) => xs
+                .iter()
+                .map(|x| go_str_mode(x, mode))
+                .collect::<Vec<_>>()
+                .join(" "),
             // Go prints a nil slice as `[]` and a nil map as `map[]` — the same
             // as an empty one — and `%#v` as the type followed by `(nil)`.
             Some(HostObj::Nil { kind, ty }) => match (mode, kind) {
@@ -3545,8 +3611,26 @@ struct Spec {
     plus: bool,
     /// `#`: the alternate form (`0x` on hex, back-quotes on `%q`, Go syntax on `%v`).
     sharp: bool,
+    /// ` `: leave a space where a non-negative number's sign would go (`% d` of
+    /// `42` is ` 42`), and separate the bytes of a string or byte slice printed
+    /// in hex (`% x` of `"abc"` is `61 62 63`). `+` outranks it.
+    space: bool,
     width: Option<usize>,
     prec: Option<usize>,
+}
+
+/// The sign a numeric verb writes before its magnitude: `-` when the value is
+/// negative, otherwise whichever of `+` and ` ` the flags asked for.
+fn sign_of(neg: bool, spec: &Spec) -> &'static str {
+    if neg {
+        "-"
+    } else if spec.plus {
+        "+"
+    } else if spec.space {
+        " "
+    } else {
+        ""
+    }
 }
 
 /// `fmt.Printf`: the first argument is the format string and each verb consumes
@@ -3558,8 +3642,11 @@ struct Spec {
 /// the whole rendering: `%8q` of a `[]string{"a", "b"}` is `[     "a"      "b"]`.
 fn sprintf(args: &[Value]) -> String {
     let fmt = args.first().map(go_str).unwrap_or_default();
+    let operands: &[Value] = args.get(1..).unwrap_or(&[]);
+    // An index rather than an iterator: the operands left over after the format
+    // is exhausted are Go's `%!(EXTRA …)`, which needs to see the tail.
+    let mut next = 0usize;
     let mut out = String::new();
-    let mut rest = args.iter().skip(1);
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -3569,10 +3656,6 @@ fn sprintf(args: &[Value]) -> String {
             continue;
         }
         i += 1;
-        if i >= chars.len() {
-            out.push('%');
-            break;
-        }
         // flags
         let mut spec = Spec::default();
         while i < chars.len() {
@@ -3581,73 +3664,155 @@ fn sprintf(args: &[Value]) -> String {
                 '0' => spec.zero = true,
                 '+' => spec.plus = true,
                 '#' => spec.sharp = true,
-                ' ' => {}
+                ' ' => spec.space = true,
                 _ => break,
             }
             i += 1;
         }
-        // width
-        let mut width = 0usize;
-        let mut has_width = false;
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            has_width = true;
-            width = width * 10 + (chars[i] as usize - '0' as usize);
+        // Width: literal digits, or `*` taking it from an operand. A `*` that
+        // finds no `int` there is Go's `%!(BADWIDTH)`, after which the verb runs
+        // on with no width at all.
+        if i < chars.len() && chars[i] == '*' {
             i += 1;
-        }
-        spec.width = has_width.then_some(width);
-        // precision
-        if i < chars.len() && chars[i] == '.' {
-            i += 1;
-            let mut p = 0usize;
+            match star_arg(operands, &mut next) {
+                // A negative `*` width means the same as the `-` flag applied to
+                // its magnitude.
+                Some(n) if n < 0 => {
+                    spec.left = true;
+                    spec.width = Some(n.unsigned_abs() as usize);
+                }
+                Some(n) => spec.width = Some(n as usize),
+                None => out.push_str("%!(BADWIDTH)"),
+            }
+        } else {
+            let mut width = 0usize;
+            let mut has_width = false;
             while i < chars.len() && chars[i].is_ascii_digit() {
-                p = p * 10 + (chars[i] as usize - '0' as usize);
+                has_width = true;
+                width = width * 10 + (chars[i] as usize - '0' as usize);
                 i += 1;
             }
-            spec.prec = Some(p);
+            spec.width = has_width.then_some(width);
         }
+        // Precision, with the same `*` form and the same `%!(BADPREC)` recovery.
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            if i < chars.len() && chars[i] == '*' {
+                i += 1;
+                match star_arg(operands, &mut next) {
+                    Some(n) if n >= 0 => spec.prec = Some(n as usize),
+                    _ => out.push_str("%!(BADPREC)"),
+                }
+            } else {
+                let mut p = 0usize;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    p = p * 10 + (chars[i] as usize - '0' as usize);
+                    i += 1;
+                }
+                spec.prec = Some(p);
+            }
+        }
+        // A `%` that never reached a verb character — the format ended inside
+        // the spec, or on the `%` itself.
         if i >= chars.len() {
+            out.push_str("%!(NOVERB)");
             break;
         }
         let verb = chars[i];
         i += 1;
 
+        // `%%` is a literal and is the one form that consumes no operand.
+        if verb == '%' {
+            out.push('%');
+            continue;
+        }
+        let Some(v) = operands.get(next) else {
+            out.push_str("%!");
+            out.push(verb);
+            out.push_str("(MISSING)");
+            continue;
+        };
+        next += 1;
+
         match verb {
-            '%' => out.push('%'),
             // `%T` is the operand's type, not its value.
-            'T' => out.push_str(&pad(
-                &rest.next().map(go_type_name).unwrap_or_default(),
-                'T',
-                &spec,
+            'T' => out.push_str(&pad(&go_type_name(v), 'T', &spec)),
+            // `%w` renders exactly as `%v`. It is only *meaningful* to
+            // `fmt.Errorf`, which is where the wrapping happens — the compiler
+            // lowers `Errorf` to this `Sprintf` and reads `%w` off the format
+            // separately to pick the error type — so here it is the operand's
+            // text. (Go's `Printf` rejects it as `%!w(…)`; go-rs has one format
+            // path, and keeping `Errorf` correct is worth more than rejecting a
+            // verb nobody writes outside it. See BUGS.md.)
+            'v' | 'w' => out.push_str(&render_v(v, &spec)),
+            _ if is_verb(verb) => out.push_str(&render_verb(v, verb, &spec, 0)),
+            // Not a verb at all. Go names the offender and shows the operand
+            // rendered as `%v` under the same flags: `%5.2z` of `3` is
+            // `%!z(int=   03)`.
+            _ => out.push_str(&format!(
+                "%!{verb}({}={})",
+                go_type_name(v),
+                render_v(v, &spec)
             )),
-            // `%v` and anything not a known verb render the whole value, with
-            // `+`/`#` selecting the `%+v` / `%#v` forms and precision truncating
-            // a string.
-            _ if !is_verb(verb) => {
-                let mode = if spec.sharp {
-                    FmtMode::SharpV
-                } else if spec.plus {
-                    FmtMode::PlusV
-                } else {
-                    FmtMode::V
-                };
-                let mut s = rest
-                    .next()
-                    .map(|v| go_str_mode(v, mode))
-                    .unwrap_or_default();
-                if let Some(p) = spec.prec {
-                    if s.chars().count() > p {
-                        s = s.chars().take(p).collect();
-                    }
-                }
-                out.push_str(&pad(&s, verb, &spec));
-            }
-            _ => match rest.next() {
-                Some(v) => out.push_str(&render_verb(v, verb, &spec, 0)),
-                None => out.push_str(&pad(missing_operand(verb), verb, &spec)),
-            },
         }
     }
+    // Operands the format never reached.
+    if next < operands.len() {
+        let extra: Vec<String> = operands[next..]
+            .iter()
+            .map(|v| format!("{}={}", go_type_name(v), go_str(v)))
+            .collect();
+        out.push_str(&format!("%!(EXTRA {})", extra.join(", ")));
+    }
     out
+}
+
+/// Take the `int` operand a `*` width or precision reads, advancing the cursor
+/// past it. `None` — an operand that is not an `int`, or none left — is Go's
+/// `%!(BADWIDTH)` / `%!(BADPREC)`; the operand is still consumed, because Go has
+/// already taken it off the list by the time it finds the wrong type.
+fn star_arg(operands: &[Value], next: &mut usize) -> Option<i64> {
+    let v = operands.get(*next)?;
+    *next += 1;
+    match unname(v) {
+        Value::Int(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Render one operand under `%v`, with `+`/`#` selecting the `%+v` / `%#v`
+/// forms.
+///
+/// An integer is the exception: `%v` of one is exactly `%d`, so a precision is
+/// the digit count [`int_precision`] applies rather than the string truncation
+/// below (`%.2v` of `-3` is `-03`), and the `0` flag zero-fills it. `%+v` and
+/// `%#v` are left on the `%v` path because neither flag reaches a number —
+/// `%+v` of `42` is `42`, not `+42`.
+fn render_v(v: &Value, spec: &Spec) -> String {
+    let numeric = spec.prec.is_some() || spec.zero || spec.space;
+    if numeric && !spec.plus && !spec.sharp && is_int_operand(v) {
+        return pad(&scalar_verb(v, 'd', spec), 'd', spec);
+    }
+    let mode = if spec.sharp {
+        FmtMode::SharpV
+    } else if spec.plus {
+        FmtMode::PlusV
+    } else {
+        FmtMode::V
+    };
+    let mut s = go_str_mode(v, mode);
+    if let Some(p) = spec.prec {
+        if s.chars().count() > p {
+            s = s.chars().take(p).collect();
+        }
+    }
+    pad(&s, 'v', spec)
+}
+
+/// Whether `%v` should render this operand the way `%d` would — a plain integer,
+/// an unsigned-64 box, or a defined type over either.
+fn is_int_operand(v: &Value) -> bool {
+    arg_uint(v).is_some() || matches!(unname(v), Value::Int(_))
 }
 
 /// Whether `c` is a verb [`render_verb`] renders element-wise. `v` and `T` are
@@ -3671,21 +3836,6 @@ fn is_verb(c: char) -> bool {
             | 'U'
             | 's'
     )
-}
-
-/// What a verb renders with no operand left. (Go writes `%!d(MISSING)`; go-rs
-/// keeps the verb's zero value, which is what the rest of the formatter assumes
-/// for an absent argument.)
-fn missing_operand(verb: char) -> &'static str {
-    match verb {
-        'q' => "\"\"",
-        's' | 'c' | 't' => "",
-        'f' | 'F' => "0.000000",
-        'e' => "0.000000e+00",
-        'E' => "0.000000E+00",
-        'U' => "U+0000",
-        _ => "0",
-    }
 }
 
 /// Render one operand under `verb`, distributing over a composite.
@@ -3882,22 +4032,23 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             };
             signed(s, spec)
         }
-        'd' => match arg_uint(v) {
-            Some(u) if spec.plus => format!("+{u}"),
-            Some(u) => u.to_string(),
-            None => {
-                let n = arg_int(v);
-                if spec.plus && n >= 0 {
-                    format!("+{n}")
-                } else {
-                    n.to_string()
+        // A precision is a minimum digit count here, so the sign is split off
+        // the magnitude and [`int_precision`] pads between them: `%+.3d` of `7`
+        // is `+007`, never `007` with the sign lost or `+7` unpadded.
+        'd' => {
+            let (sign, digits) = match arg_uint(v) {
+                Some(u) => (sign_of(false, spec), u.to_string()),
+                None => {
+                    let n = arg_int(v);
+                    (sign_of(n < 0, spec), n.unsigned_abs().to_string())
                 }
-            }
-        },
+            };
+            int_precision(sign, "", &digits, spec.prec)
+        }
         // `%x`/`%X` hex-encode a string bytewise.
         'x' | 'X' if matches!(v, Value::Str(_)) => {
             let upper = verb == 'X';
-            let body: String = go_str(v)
+            let bytes: Vec<String> = go_str(v)
                 .bytes()
                 .map(|b| {
                     if upper {
@@ -3907,6 +4058,9 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
                     }
                 })
                 .collect();
+            // The space flag separates the bytes here rather than standing in
+            // for a sign: `% x` of `"abc"` is `61 62 63`.
+            let body = bytes.join(if spec.space { " " } else { "" });
             if spec.sharp {
                 format!("{}{body}", if upper { "0X" } else { "0x" })
             } else {
@@ -3926,7 +4080,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
                     (n < 0, n.unsigned_abs())
                 }
             };
-            let digits = match verb {
+            let mut digits = match verb {
                 'x' => format!("{mag:x}"),
                 'X' => format!("{mag:X}"),
                 'o' => format!("{mag:o}"),
@@ -3937,17 +4091,18 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
                 (true, 'x') => "0x",
                 (true, 'X') => "0X",
                 (true, 'b') => "0b",
-                (true, _) if digits.starts_with('0') => "",
-                (true, _) => "0",
+                // Octal's alternate form is a leading `0`, which is a digit —
+                // so unlike `0x`/`0b` it counts toward a precision: `%#.4o` of
+                // `8` is `0010`, four characters in all, where `%#.4x` of `255`
+                // is `0x00ff` with four *after* the prefix.
+                (true, _) => {
+                    if !digits.starts_with('0') {
+                        digits.insert(0, '0');
+                    }
+                    ""
+                }
             };
-            let sign = if neg {
-                "-"
-            } else if spec.plus {
-                "+"
-            } else {
-                ""
-            };
-            format!("{sign}{prefix}{digits}")
+            int_precision(sign_of(neg, spec), prefix, &digits, spec.prec)
         }
         // A code point outside Unicode — a negative or too-large integer — is
         // the replacement character, as Go's rune conversion makes it.
@@ -4033,13 +4188,35 @@ fn bad_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> Option<String> 
     ))
 }
 
-/// Apply `+` to an unsigned float rendering.
-fn signed(s: String, spec: &Spec) -> String {
-    if spec.plus && !s.starts_with('-') {
-        format!("+{s}")
-    } else {
-        s
+/// Apply Go's precision rule for an *integer* verb: a minimum digit count, not
+/// the truncation a precision means for a string.
+///
+/// `%.3d` of `-7` is `-007` and `%.4x` of `255` is `00ff` — the zeros go inside
+/// the sign and inside a `#` base prefix (`%#.4x` is `0x00ff`), because both
+/// belong to the number rather than to its digits. A value with more digits than
+/// the precision is never shortened: `%.3d` of `12345` is `12345`.
+///
+/// Precision `0` is the one case that removes digits. Go writes a zero value as
+/// the empty string there (`%.0d` of `0` is ``) and any other value in full
+/// (`%.0d` of `5` is `5`), which is what C's `printf` does too.
+fn int_precision(sign: &str, prefix: &str, digits: &str, prec: Option<usize>) -> String {
+    let Some(p) = prec else {
+        return format!("{sign}{prefix}{digits}");
+    };
+    if p == 0 && digits == "0" {
+        return format!("{sign}{prefix}");
     }
+    let zeros = p.saturating_sub(digits.chars().count());
+    format!("{sign}{prefix}{}{digits}", "0".repeat(zeros))
+}
+
+/// Apply `+` — or the space that stands in for it — to an unsigned float
+/// rendering.
+fn signed(s: String, spec: &Spec) -> String {
+    if s.starts_with('-') {
+        return s;
+    }
+    format!("{}{s}", sign_of(false, spec))
 }
 
 /// Pad one rendered value to the verb's width: right-justified by default, `-`
@@ -4056,8 +4233,17 @@ fn pad(body: &str, verb: char, spec: &Spec) -> String {
     if spec.left {
         return format!("{body}{}", " ".repeat(fill));
     }
-    if spec.zero && matches!(verb, 'd' | 'f' | 'F' | 'x' | 'X' | 'o' | 'b') {
-        let (sign, rest) = match body.strip_prefix(['-', '+']) {
+    // An explicit precision already fixed the digit count on an integer verb, so
+    // Go drops the `0` flag there and pads the rest of the width with spaces:
+    // `%05.2d` of `3` is `   03`, not `00003`. A float keeps both, because its
+    // precision counts fraction digits rather than leading ones.
+    let zero = spec.zero && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'b'));
+    // `%v` joins the numeric verbs here: Go zero-fills whatever it rendered, so
+    // `%05v` of `"ab"` is `000ab` just as `%05v` of `42` is `00042`.
+    if zero && matches!(verb, 'd' | 'f' | 'F' | 'x' | 'X' | 'o' | 'b' | 'v') {
+        // The space the ` ` flag left in place of a sign is part of the sign for
+        // this purpose, so the zeros go after it: `% 05d` of `42` is ` 0042`.
+        let (sign, rest) = match body.strip_prefix(['-', '+', ' ']) {
             Some(d) => (&body[..1], d),
             None => ("", body),
         };

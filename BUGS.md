@@ -231,9 +231,10 @@ source, which it cannot recover: tokens carry a line but no byte offset.
 ## Unsupported stdlib calls
 
 `fmt.Fprintln` / `fmt.Fprintf` / `fmt.Fprint` (writer-directed output),
-`strconv.FormatFloat`, and `strings.Builder`'s methods (`WriteString`, `String`)
-are rejected at compile time. Each is a build failure rather than a wrong
-answer, so a program using one does not run at all.
+`strconv.FormatFloat`, `strings.ContainsRune`, and `strings.Builder`'s methods
+(`WriteString`, `WriteRune`, `String`) are rejected at compile time. Each is a
+build failure rather than a wrong answer, so a program using one does not run at
+all.
 
 ## Constant-overflow is not diagnosed
 
@@ -390,3 +391,82 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 `[]int` — so what is missing is the comparability table that says a slice, a map
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
+
+## A variadic closure binds its parameters wrong
+
+```go
+p := func(f string, a ...any) { fmt.Println(f, len(a)) }
+p("c0")
+p("c1", 1)
+// go:    c0 0 / c1 1
+// go-rs: <func> 2 / c1 0
+```
+
+A call through a *func value* is dispatched by `Op::CallDynamic`, which pushes
+one stack slot per written argument. Only a call to a named function packs the
+trailing arguments into the variadic slice parameter (`Compiler::call`, the
+`self.funcs.get(name)` arm), so a closure receives the wrong number of operands
+and every parameter binds one slot off — the closure handle itself lands in the
+first parameter.
+
+Closing it needs the variadic bit to survive to the call site, and it currently
+does not exist past the parser: `Expr::FuncLit` (src/ast.rs) carries `params`,
+`results` and `body`, but no `variadic` flag, even though `Parser::params`
+computes one. So the work is (a) add `variadic` to `Expr::FuncLit` and to
+`LambdaInfo`, (b) record each func-literal binding's signature the way
+`self.funcs` records a declared function's, and (c) pack at the `CallDynamic`
+site from that signature. Spreading into one (`g(xs...)`) is the same gap seen
+from the other side.
+
+## A string cannot hold invalid UTF-8
+
+```go
+s := "aé中z"
+c := s[1:2] // the first byte of a two-byte code point
+fmt.Println(len(c))
+fmt.Printf("%q %x %d\n", c, c, c[0])
+// go:    1 / "\xc3" c3 195
+// go-rs: 3 / "�" efbfbd 239
+```
+
+A Go string is an arbitrary byte sequence and a slice expression cuts bytes, so
+a cut that lands inside a code point yields a string that is not valid UTF-8.
+go-rs holds a string as fusevm's `Value::Str` — a Rust `String`, which is
+UTF-8 by construction — so the cut is replaced lossily with U+FFFD, and `len`,
+`%q`, `%x` and the byte read all answer about the replacement instead.
+
+This is a representation gap, not a formatting one: closing it means a byte
+string in the shared VM (`Value::Str` is fusevm's, used by every frontend), so
+it is not a change go-rs can make alone.
+
+## A `type` declaration inside a function body is rejected
+
+```go
+func main() {
+	type local int
+	var l local = 3
+	fmt.Printf("%T %v\n", l, l)
+}
+// go:    main.local 3
+// go-rs: go-rs: unexpected token `Type` in expression on line 2
+```
+
+Go allows a type declaration in any block; go-rs only parses one at the top
+level, so the statement parser meets `type` in expression position and stops.
+The compiler's `defined_types` map is already flat and package-wide, so the
+missing piece is the statement form in the parser plus a decision about
+shadowing — a local type may reuse a package-level name.
+
+## `%w` outside `fmt.Errorf` renders instead of reporting
+
+```go
+fmt.Printf("%w\n", errors.New("gone"))
+// go:    %!w(*errors.errorString=&{gone})
+// go-rs: gone
+```
+
+`%w` is `fmt.Errorf`'s wrap verb; `Printf` rejects it. go-rs lowers `Errorf` to
+the same `Sprintf` (reading `%w` off the format separately to pick the wrap
+type), so the one format path has to accept `%w` and render it as `%v`. Keeping
+`Errorf` correct is worth more than rejecting a verb that is only ever written
+inside it. Separating them means giving `Errorf` its own formatter entry point.
