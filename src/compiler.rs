@@ -191,6 +191,16 @@ impl Scope {
     }
 }
 
+/// The two temporaries [`Compiler::comma_ok`] leaves a comma-ok form in, plus
+/// the value's inferred and written types — what a `:=` needs to declare its
+/// name at, and what a `=` reads back to coerce into an existing one.
+struct CommaOk {
+    value: String,
+    ok: String,
+    value_num_ty: NumType,
+    value_decl_ty: String,
+}
+
 /// Back-patch targets for one enclosing breakable construct (`for` loop or
 /// `switch`). `break` targets the innermost; `continue` targets the innermost
 /// non-switch (loop), so a `continue` inside a switch reaches the enclosing loop.
@@ -2275,92 +2285,16 @@ impl Compiler {
                 values,
                 line,
             } => {
-                // `v, ok := x.(T)` — comma-ok type assertion: `ok` is whether the
-                // runtime type matches; `v` is the value (unchecked).
+                // `v, ok := x.(T)` / `<-ch` / `m[k]` — the three comma-ok forms,
+                // lowered to a pair of temporaries and declared from them.
                 if names.len() == 2 && values.len() == 1 {
-                    if let Expr::TypeAssert { expr, ty } = &values[0] {
-                        let n = self.temp_counter;
-                        self.temp_counter += 1;
-                        let tmp = format!("$ta{n}");
-                        let tag = format!("$tatag{n}");
-                        self.expr(expr)?;
-                        self.types.insert(tmp.clone(), NumType::Unknown);
-                        self.emit_set(&tmp, *line);
-                        self.emit_get(&tmp, *line);
-                        self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), *line);
-                        self.types.insert(tag.clone(), NumType::Str);
-                        self.emit_set(&tag, *line);
-                        // ok = whether tmp's dynamic type is T (the empty
-                        // interface, which every value satisfies, is always true).
-                        if !self.emit_type_test(&tmp, &tag, ty, *line) {
-                            self.b.emit(Op::LoadTrue, *line);
-                        }
-                        self.types.insert(names[1].clone(), NumType::Bool);
-                        self.emit_declare(&names[1], *line);
-                        // v = ok ? tmp : zero(T)  (Go zeroes v on a failed assert).
-                        self.emit_get(&names[1], *line);
-                        let to_zero = self.b.emit(Op::JumpIfFalse(0), *line);
-                        self.emit_get(&tmp, *line);
-                        let done = self.b.emit(Op::Jump(0), *line);
-                        let zpos = self.b.current_pos();
-                        self.b.patch_jump(to_zero, zpos);
-                        self.emit_zero(ty, *line);
-                        let end = self.b.current_pos();
-                        self.b.patch_jump(done, end);
-                        self.types.insert(names[0].clone(), numtype_of_ty(ty));
-                        self.decl_types.insert(names[0].clone(), base_type(ty));
+                    if let Some(co) = self.comma_ok(&values[0], *line)? {
+                        self.emit_get(&co.value, *line);
+                        self.types.insert(names[0].clone(), co.value_num_ty);
+                        self.decl_types
+                            .insert(names[0].clone(), co.value_decl_ty.clone());
                         self.emit_declare(&names[0], *line);
-                        return Ok(());
-                    }
-                    // `v, ok := <-ch` — comma-ok channel receive. `ok` is false
-                    // exactly when the channel was closed and drained, which the
-                    // scheduler signals with the sentinel; `v` is then the
-                    // element type's zero.
-                    if let Expr::Recv { chan } = &values[0] {
-                        let n = self.temp_counter;
-                        self.temp_counter += 1;
-                        let raw = format!("$cr{n}");
-                        let elem = self.chan_elem_ty(chan);
-                        self.expr(chan)?;
-                        self.b.emit(Op::ChanRecv, *line);
-                        self.types.insert(raw.clone(), NumType::Unknown);
-                        self.emit_set(&raw, *line);
-                        // ok = the receive did not find the channel drained.
-                        self.emit_get(&raw, *line);
-                        self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), *line);
-                        self.types.insert(names[1].clone(), NumType::Bool);
-                        self.emit_declare(&names[1], *line);
-                        // v = received, or the element zero when not ok.
-                        self.emit_get(&raw, *line);
-                        self.emit_elem_zero(&elem, *line)?;
-                        self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), *line);
-                        self.types.insert(names[0].clone(), numtype_of_ty(&elem));
-                        self.decl_types.insert(names[0].clone(), elem);
-                        self.emit_declare(&names[0], *line);
-                        return Ok(());
-                    }
-                    // `v, ok := m[k]` — comma-ok map lookup: `GMAP_GET2` yields a
-                    // `[value, present]` pair, destructured into the two names.
-                    if let Expr::Index { recv, index } = &values[0] {
-                        let n = self.temp_counter;
-                        self.temp_counter += 1;
-                        let pair = format!("$mg{n}");
-                        self.expr(recv)?;
-                        self.expr(index)?;
-                        self.b.emit(Op::CallBuiltin(host::GMAP_GET2, 2), *line);
-                        self.types.insert(pair.clone(), NumType::Unknown);
-                        self.emit_set(&pair, *line);
-                        // v = pair[0]
-                        self.emit_get(&pair, *line);
-                        self.b.emit(Op::LoadInt(0), *line);
-                        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
-                        self.types.insert(names[0].clone(), NumType::Unknown);
-                        self.decl_types.insert(names[0].clone(), String::new());
-                        self.emit_declare(&names[0], *line);
-                        // ok = pair[1]
-                        self.emit_get(&pair, *line);
-                        self.b.emit(Op::LoadInt(1), *line);
-                        self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
+                        self.emit_get(&co.ok, *line);
                         self.types.insert(names[1].clone(), NumType::Bool);
                         self.emit_declare(&names[1], *line);
                         return Ok(());
@@ -3064,6 +2998,128 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower one of Go's three comma-ok expressions into a pair of temporaries.
+    ///
+    /// `x.(T)`, `<-ch` and `m[k]` each yield a value and a boolean when written
+    /// with two names on the left, and each is legal with `:=` *and* with `=` —
+    /// `v, ok = m[k]` into variables declared earlier is the idiom a loop body
+    /// uses. Producing temporaries rather than binding names is what lets the
+    /// declaring and the assigning statement share one lowering.
+    ///
+    /// `None` means `expr` is none of the three, and the caller falls through to
+    /// its ordinary multi-value handling.
+    fn comma_ok(&mut self, expr: &Expr, line: u32) -> Result<Option<CommaOk>, String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        match expr {
+            // `ok` is whether the dynamic type matches; `v` is the value, or the
+            // asserted type's zero when it does not (Go zeroes it).
+            Expr::TypeAssert { expr, ty } => {
+                let raw = format!("$ta{n}");
+                let tag = format!("$tatag{n}");
+                let ok = format!("$taok{n}");
+                let val = format!("$tav{n}");
+                self.expr(expr)?;
+                self.types.insert(raw.clone(), NumType::Unknown);
+                self.emit_set(&raw, line);
+                self.emit_get(&raw, line);
+                self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), line);
+                self.types.insert(tag.clone(), NumType::Str);
+                self.emit_set(&tag, line);
+                // The empty interface, which every value satisfies, emits no
+                // test at all and is always true.
+                if !self.emit_type_test(&raw, &tag, ty, line) {
+                    self.b.emit(Op::LoadTrue, line);
+                }
+                self.types.insert(ok.clone(), NumType::Bool);
+                self.emit_set(&ok, line);
+
+                self.emit_get(&ok, line);
+                let to_zero = self.b.emit(Op::JumpIfFalse(0), line);
+                self.emit_get(&raw, line);
+                let done = self.b.emit(Op::Jump(0), line);
+                let zpos = self.b.current_pos();
+                self.b.patch_jump(to_zero, zpos);
+                self.emit_zero(ty, line);
+                let end = self.b.current_pos();
+                self.b.patch_jump(done, end);
+                let (num_ty, decl_ty) = (numtype_of_ty(ty), base_type(ty));
+                self.types.insert(val.clone(), num_ty);
+                self.decl_types.insert(val.clone(), decl_ty.clone());
+                self.emit_set(&val, line);
+                Ok(Some(CommaOk {
+                    value: val,
+                    ok,
+                    value_num_ty: num_ty,
+                    value_decl_ty: decl_ty,
+                }))
+            }
+            // `ok` is false exactly when the channel was closed and drained,
+            // which the scheduler signals with a sentinel; `v` is then the
+            // element type's zero.
+            Expr::Recv { chan } => {
+                let raw = format!("$cr{n}");
+                let ok = format!("$crok{n}");
+                let val = format!("$crv{n}");
+                let elem = self.chan_elem_ty(chan);
+                self.expr(chan)?;
+                self.b.emit(Op::ChanRecv, line);
+                self.types.insert(raw.clone(), NumType::Unknown);
+                self.emit_set(&raw, line);
+
+                self.emit_get(&raw, line);
+                self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), line);
+                self.types.insert(ok.clone(), NumType::Bool);
+                self.emit_set(&ok, line);
+
+                self.emit_get(&raw, line);
+                self.emit_elem_zero(&elem, line)?;
+                self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), line);
+                let num_ty = numtype_of_ty(&elem);
+                self.types.insert(val.clone(), num_ty);
+                self.decl_types.insert(val.clone(), elem.clone());
+                self.emit_set(&val, line);
+                Ok(Some(CommaOk {
+                    value: val,
+                    ok,
+                    value_num_ty: num_ty,
+                    value_decl_ty: elem,
+                }))
+            }
+            // `GMAP_GET2` yields a `[value, present]` pair to destructure.
+            Expr::Index { recv, index } => {
+                let pair = format!("$mg{n}");
+                let ok = format!("$mgok{n}");
+                let val = format!("$mgv{n}");
+                self.expr(recv)?;
+                self.expr(index)?;
+                self.b.emit(Op::CallBuiltin(host::GMAP_GET2, 2), line);
+                self.types.insert(pair.clone(), NumType::Unknown);
+                self.emit_set(&pair, line);
+
+                self.emit_get(&pair, line);
+                self.b.emit(Op::LoadInt(0), line);
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+                self.types.insert(val.clone(), NumType::Unknown);
+                self.decl_types.insert(val.clone(), String::new());
+                self.emit_set(&val, line);
+
+                self.emit_get(&pair, line);
+                self.b.emit(Op::LoadInt(1), line);
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+                self.types.insert(ok.clone(), NumType::Bool);
+                self.emit_set(&ok, line);
+                Ok(Some(CommaOk {
+                    value: val,
+                    ok,
+                    value_num_ty: NumType::Unknown,
+                    value_decl_ty: String::new(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Lower a parallel assignment `t… = v…`. Right-hand sides are evaluated into
     /// temporaries *first* (so `a, b = b, a` swaps), then each temp is assigned to
     /// its target. Also handles `a, b = f()` where a call returns exactly as many
@@ -3072,34 +3128,13 @@ impl Compiler {
         let n = self.temp_counter;
         self.temp_counter += 1;
 
-        // `v, ok = <-ch` — the comma-ok receive assigning to *existing*
-        // variables. Same lowering as the `:=` form, only assigning rather than
-        // declaring.
+        // `v, ok = m[k]` / `x.(T)` / `<-ch` — the comma-ok forms assigning to
+        // *existing* variables. Same lowering as the `:=` form, only assigning
+        // rather than declaring.
         if targets.len() == 2 && values.len() == 1 {
-            if let Expr::Recv { chan } = &values[0] {
-                let raw = format!("$cra{n}");
-                let elem = self.chan_elem_ty(chan);
-                self.expr(chan)?;
-                self.b.emit(Op::ChanRecv, line);
-                self.types.insert(raw.clone(), NumType::Unknown);
-                self.emit_set(&raw, line);
-
-                let okt = format!("$crok{n}");
-                self.emit_get(&raw, line);
-                self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), line);
-                self.types.insert(okt.clone(), NumType::Bool);
-                self.emit_set(&okt, line);
-
-                let valt = format!("$crv{n}");
-                self.emit_get(&raw, line);
-                self.emit_elem_zero(&elem, line)?;
-                self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), line);
-                self.types.insert(valt.clone(), numtype_of_ty(&elem));
-                self.decl_types.insert(valt.clone(), elem);
-                self.emit_set(&valt, line);
-
-                self.assign(&targets[0], AssignOp::Set, &Expr::Ident(valt), line)?;
-                self.assign(&targets[1], AssignOp::Set, &Expr::Ident(okt), line)?;
+            if let Some(co) = self.comma_ok(&values[0], line)? {
+                self.assign(&targets[0], AssignOp::Set, &Expr::Ident(co.value), line)?;
+                self.assign(&targets[1], AssignOp::Set, &Expr::Ident(co.ok), line)?;
                 return Ok(());
             }
         }
