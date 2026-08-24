@@ -285,3 +285,99 @@ func main() {
     assert!(ok, "program failed; stdout was: {stdout:?}");
     assert_eq!(stdout, "step: gone\ntrue true\n");
 }
+
+/// An explicit `[n]` operand index reaches the nth operand and re-reads it. Go
+/// tries for one in three places — before the width, before the precision, and
+/// before the verb — so a `*` width can be indexed independently of the value it
+/// sizes. Every expectation is `go run`'s verbatim stdout.
+#[test]
+fn an_explicit_argument_index_selects_the_operand() {
+    assert_prints(
+        r#"	fmt.Printf("[%[1]d][%[2]s][%[1]v]\n", 3, "b")
+	fmt.Printf("[%[2]d %[1]d %[1]s]\n", "x", 7)
+	fmt.Printf("[%[1]*d][%[2]*[1]d]\n", 3, 4)
+	fmt.Printf("[%.[2]d]\n", 5, 3)"#,
+        "[3][b][3]\n[7 %!d(string=x) x]\n[  4][   3]\n[3]\n",
+    );
+}
+
+/// A `[n]` that names no operand, or does not parse, is `%!verb(BADINDEX)` —
+/// and a width or precision written *after* the bracket is the same error,
+/// because the index has to sit immediately before what it selects.
+#[test]
+fn a_malformed_argument_index_is_badindex() {
+    assert_prints(
+        r#"	fmt.Printf("[%[3]d][%[0]d]\n", 1, 2)
+	fmt.Printf("[%[x]d][%[]d]\n", 1)
+	fmt.Printf("[%[1]2d][%[1].2d]\n", 5)"#,
+        "[%!d(BADINDEX)][%!d(BADINDEX)]\n[%!d(BADINDEX)][%!d(BADINDEX)]\n[%!d(BADINDEX)][%!d(BADINDEX)]\n",
+    );
+}
+
+/// Once a format has reordered its operands, Go stops reporting the ones it
+/// never reached: with the cursor moved about, a trailing operand is no evidence
+/// of an unused argument. A format that never indexed still reports them.
+#[test]
+fn an_index_suppresses_the_extra_report() {
+    assert_prints(
+        r#"	fmt.Printf("[%[1]d]\n", 1, 2, 3)
+	fmt.Printf("[%d]\n", 1, 2)"#,
+        "[1]\n[1]\n%!(EXTRA int=2)",
+    );
+}
+
+/// Go's `writePadding` fills with `0` for every verb the flag reaches, not just
+/// the numeric ones — `%010q` of a string is zero-filled and so is `%010T`.
+/// `%U` is the one exception: `fmt.fmtUnicode` clears the flag itself.
+#[test]
+fn the_zero_flag_fills_every_verb_but_unicode() {
+    assert_prints(
+        r#"	fmt.Printf("[%010s][%010q][%010t][%010c]\n", "z", "z", true, 'A')
+	fmt.Printf("[%010U][%010T][%08.3g]\n", 'A', 5, 1.5)
+	fmt.Printf("[%05.2s][%05.2q]\n", "abcdef", "abcdef")"#,
+        "[000000000z][0000000\"z\"][000000true][000000000A]\n[    U+0041][0000000int][000001.5]\n[000ab][0\"ab\"]\n",
+    );
+}
+
+/// A composite under `%v` takes the width at each *element*, the way Go's
+/// `printValue` walks it — padding the list as a whole is the shape a frontend
+/// reaches for first and it is wrong at every depth.
+#[test]
+fn a_width_on_percent_v_applies_to_each_element() {
+    let src = r#"package main
+
+import "fmt"
+
+type S struct {
+	A int
+	B string
+}
+
+func main() {
+	fmt.Printf("[%10v]\n", []int{1, 2})
+	fmt.Printf("[%010v]\n", []int{1, 2})
+	fmt.Printf("[%10v]\n", S{1, "x"})
+	fmt.Printf("[%010v]\n", map[string]int{"a": 1})
+	fmt.Printf("[%010s]\n", []string{"a"})
+	var nilS []int
+	fmt.Printf("[%010v]\n", nilS)
+}
+"#;
+    let (stdout, ok) = run(src);
+    assert!(ok, "program failed; stdout was: {stdout:?}");
+    assert_eq!(
+        stdout,
+        "[[         1          2]]\n[[0000000001 0000000002]]\n[{         1          x}]\n\
+         [map[000000000a:0000000001]]\n[[000000000a]]\n[[]]\n"
+    );
+}
+
+/// A nil operand under an unknown verb has no type to name, so Go writes the
+/// bare `%!y(<nil>)` rather than the `type=value` form a typed operand gets.
+#[test]
+fn an_unknown_verb_on_nil_names_no_type() {
+    assert_prints(
+        r#"	fmt.Printf("[%p][%y][%y]\n", nil, nil, 5)"#,
+        "[%!p(<nil>)][%!y(<nil>)][%!y(int=5)]\n",
+    );
+}
