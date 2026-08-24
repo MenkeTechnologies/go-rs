@@ -912,55 +912,115 @@ case 3:
           <pre><code class="lang-go">strings.LastIndex("go gopher", "go")   // 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strings-12">
-          <h3><a class="doc-anchor" href="#doc-package-strings-12">#</a> <code>strings.Replace</code></h3>
+          <h3><a class="doc-anchor" href="#doc-package-strings-12">#</a> <code>strings.ContainsRune</code></h3>
+          <pre><code class="lang-go">strings.ContainsRune(s string, r rune) bool</code></pre>
+          <p>Whether the code point `r` occurs in `s`.</p>
+          <pre><code class="lang-go">strings.ContainsRune("héllo", 'é')   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-13">
+          <h3><a class="doc-anchor" href="#doc-package-strings-13">#</a> <code>strings.ContainsAny</code></h3>
+          <pre><code class="lang-go">strings.ContainsAny(s, chars string) bool</code></pre>
+          <p>Whether any code point of `chars` occurs in `s`. An empty `chars` is false.</p>
+          <pre><code class="lang-go">strings.ContainsAny("failure", "ui")   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-14">
+          <h3><a class="doc-anchor" href="#doc-package-strings-14">#</a> <code>strings.IndexByte</code></h3>
+          <pre><code class="lang-go">strings.IndexByte(s string, c byte) int</code></pre>
+          <p>The index of the first *byte* equal to `c`, or -1. Searching by byte finds a byte inside a multi-byte rune, which a rune search would step over.</p>
+          <pre><code class="lang-go">strings.IndexByte("golang", 'l')   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-15">
+          <h3><a class="doc-anchor" href="#doc-package-strings-15">#</a> <code>strings.IndexRune</code></h3>
+          <pre><code class="lang-go">strings.IndexRune(s string, r rune) int</code></pre>
+          <p>The *byte* index where the code point `r` starts, or -1.</p>
+          <pre><code class="lang-go">strings.IndexRune("chicken", 'k')   // 4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-16">
+          <h3><a class="doc-anchor" href="#doc-package-strings-16">#</a> <code>strings.IndexAny</code></h3>
+          <pre><code class="lang-go">strings.IndexAny(s, chars string) int</code></pre>
+          <p>The byte index of the first code point of `s` that appears in `chars`, or -1.</p>
+          <pre><code class="lang-go">strings.IndexAny("chicken", "aeiouy")   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-17">
+          <h3><a class="doc-anchor" href="#doc-package-strings-17">#</a> <code>strings.LastIndexByte</code></h3>
+          <pre><code class="lang-go">strings.LastIndexByte(s string, c byte) int</code></pre>
+          <p>The index of the last *byte* equal to `c`, or -1.</p>
+          <pre><code class="lang-go">strings.LastIndexByte("golang", 'g')   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-18">
+          <h3><a class="doc-anchor" href="#doc-package-strings-18">#</a> <code>strings.SplitN</code></h3>
+          <pre><code class="lang-go">strings.SplitN(s, sep string, n int) []string</code></pre>
+          <p>Like `Split`, but at most `n` parts — the last holds the unsplit remainder. `n == 0` is a nil slice and `n &lt; 0` means no limit. An empty `sep` splits into runes, `n-1` of them followed by the rest of the string whole.</p>
+          <pre><code class="lang-go">strings.SplitN("a,b,c", ",", 2)   // [a b,c]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-19">
+          <h3><a class="doc-anchor" href="#doc-package-strings-19">#</a> <code>strings.TrimLeft</code></h3>
+          <pre><code class="lang-go">strings.TrimLeft(s, cutset string) string</code></pre>
+          <p>`s` with every leading code point that appears in `cutset` removed. `cutset` is a *set* of characters, not a prefix — use `TrimPrefix` for that.</p>
+          <pre><code class="lang-go">strings.TrimLeft("xxhixx", "x")   // hixx</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-20">
+          <h3><a class="doc-anchor" href="#doc-package-strings-20">#</a> <code>strings.TrimRight</code></h3>
+          <pre><code class="lang-go">strings.TrimRight(s, cutset string) string</code></pre>
+          <p>`s` with every trailing code point that appears in `cutset` removed.</p>
+          <pre><code class="lang-go">strings.TrimRight("xxhixx", "x")   // xxhi</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-21">
+          <h3><a class="doc-anchor" href="#doc-package-strings-21">#</a> <code>strings.Compare</code></h3>
+          <pre><code class="lang-go">strings.Compare(a, b string) int</code></pre>
+          <p>-1, 0 or 1 as `a` sorts before, with, or after `b`. `&lt;` and `==` say the same thing and read better; this exists for a sort comparator.</p>
+          <pre><code class="lang-go">strings.Compare("a", "b")   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-22">
+          <h3><a class="doc-anchor" href="#doc-package-strings-22">#</a> <code>strings.Replace</code></h3>
           <pre><code class="lang-go">strings.Replace(s, old, new string, n int) string</code></pre>
           <p>`s` with the first `n` occurrences of `old` replaced by `new`; a negative `n` replaces every occurrence. An empty `old` returns `s` unchanged, where Go would insert `new` between every rune.</p>
           <pre><code class="lang-go">strings.Replace("aaa", "a", "b", 2)   // bba</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-13">
-          <h3><a class="doc-anchor" href="#doc-package-strings-13">#</a> <code>strings.ReplaceAll</code></h3>
+        <article class="doc-entry" id="doc-package-strings-23">
+          <h3><a class="doc-anchor" href="#doc-package-strings-23">#</a> <code>strings.ReplaceAll</code></h3>
           <pre><code class="lang-go">strings.ReplaceAll(s, old, new string) string</code></pre>
           <p>`s` with every occurrence of `old` replaced by `new`. An empty `old` returns `s` unchanged.</p>
           <pre><code class="lang-go">strings.ReplaceAll("a,b", ",", "-")   // a-b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-14">
-          <h3><a class="doc-anchor" href="#doc-package-strings-14">#</a> <code>strings.Fields</code></h3>
+        <article class="doc-entry" id="doc-package-strings-24">
+          <h3><a class="doc-anchor" href="#doc-package-strings-24">#</a> <code>strings.Fields</code></h3>
           <pre><code class="lang-go">strings.Fields(s string) []string</code></pre>
           <p>The substrings of `s` separated by runs of Unicode whitespace, with empty fields dropped.</p>
           <pre><code class="lang-go">len(strings.Fields("  a  b "))   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-15">
-          <h3><a class="doc-anchor" href="#doc-package-strings-15">#</a> <code>strings.Count</code></h3>
+        <article class="doc-entry" id="doc-package-strings-25">
+          <h3><a class="doc-anchor" href="#doc-package-strings-25">#</a> <code>strings.Count</code></h3>
           <pre><code class="lang-go">strings.Count(s, substr string) int</code></pre>
           <p>The number of non-overlapping occurrences of `substr` in `s`. An empty substring returns the number of code points plus one, matching Go.</p>
           <pre><code class="lang-go">strings.Count("cheese", "e")   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-16">
-          <h3><a class="doc-anchor" href="#doc-package-strings-16">#</a> <code>strings.TrimPrefix</code></h3>
+        <article class="doc-entry" id="doc-package-strings-26">
+          <h3><a class="doc-anchor" href="#doc-package-strings-26">#</a> <code>strings.TrimPrefix</code></h3>
           <pre><code class="lang-go">strings.TrimPrefix(s, prefix string) string</code></pre>
           <p>`s` without a leading `prefix`, or `s` unchanged when the prefix is absent. Removes at most one occurrence.</p>
           <pre><code class="lang-go">strings.TrimPrefix("go-rs", "go-")   // rs</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-17">
-          <h3><a class="doc-anchor" href="#doc-package-strings-17">#</a> <code>strings.TrimSuffix</code></h3>
+        <article class="doc-entry" id="doc-package-strings-27">
+          <h3><a class="doc-anchor" href="#doc-package-strings-27">#</a> <code>strings.TrimSuffix</code></h3>
           <pre><code class="lang-go">strings.TrimSuffix(s, suffix string) string</code></pre>
           <p>`s` without a trailing `suffix`, or `s` unchanged when the suffix is absent.</p>
           <pre><code class="lang-go">strings.TrimSuffix("a.go", ".go")   // a</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-18">
-          <h3><a class="doc-anchor" href="#doc-package-strings-18">#</a> <code>strings.Trim</code></h3>
+        <article class="doc-entry" id="doc-package-strings-28">
+          <h3><a class="doc-anchor" href="#doc-package-strings-28">#</a> <code>strings.Trim</code></h3>
           <pre><code class="lang-go">strings.Trim(s, cutset string) string</code></pre>
           <p>`s` with every leading and trailing character that appears in `cutset` removed.</p>
           <pre><code class="lang-go">strings.Trim("xxhixx", "x")   // hi</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-19">
-          <h3><a class="doc-anchor" href="#doc-package-strings-19">#</a> <code>strings.Title</code></h3>
+        <article class="doc-entry" id="doc-package-strings-29">
+          <h3><a class="doc-anchor" href="#doc-package-strings-29">#</a> <code>strings.Title</code></h3>
           <pre><code class="lang-go">strings.Title(s string) string</code></pre>
           <p>Each space-separated word with its first character upper-cased. It splits on the ASCII space only, where Go's deprecated Title splits on every non-letter.</p>
           <pre><code class="lang-go">strings.Title("hello wide world")   // Hello Wide World</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-20">
-          <h3><a class="doc-anchor" href="#doc-package-strings-20">#</a> <code>strings.EqualFold</code></h3>
+        <article class="doc-entry" id="doc-package-strings-30">
+          <h3><a class="doc-anchor" href="#doc-package-strings-30">#</a> <code>strings.EqualFold</code></h3>
           <pre><code class="lang-go">strings.EqualFold(s, t string) bool</code></pre>
           <p>Case-insensitive equality — but ASCII-only. Go performs full Unicode case folding, so `EqualFold("HÉ", "hé")` is true in Go and false here.</p>
           <pre><code class="lang-go">strings.EqualFold("Go", "GO")   // true</code></pre>
@@ -1002,8 +1062,32 @@ case 3:
         <article class="doc-entry" id="doc-package-strconv-6">
           <h3><a class="doc-anchor" href="#doc-package-strconv-6">#</a> <code>strconv.Quote</code></h3>
           <pre><code class="lang-go">strconv.Quote(s string) string</code></pre>
-          <p>The string wrapped in double quotes. The content is not escaped, so unlike Go a control character or embedded quote passes through verbatim.</p>
-          <pre><code class="lang-go">strconv.Quote("hi")   // "\"hi\""</code></pre>
+          <p>The string as a double-quoted Go literal, with the same escaping `%q` applies: a control character becomes `\n`/`\t`/`\xHH`, an embedded quote is backslashed, and a non-printable rune becomes `\uHHHH`.</p>
+          <pre><code class="lang-go">strconv.Quote("a\"b\n")   // "a\"b\n"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-7">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-7">#</a> <code>strconv.QuoteRune</code></h3>
+          <pre><code class="lang-go">strconv.QuoteRune(r rune) string</code></pre>
+          <p>The rune as a single-quoted Go literal, escaped the same way `%q` escapes one.</p>
+          <pre><code class="lang-go">strconv.QuoteRune('\t')   // '\t'</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-8">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-8">#</a> <code>strconv.ParseBool</code></h3>
+          <pre><code class="lang-go">strconv.ParseBool(s string) (bool, error)</code></pre>
+          <p>The boolean `s` spells. Exactly ten spellings are accepted — `1 t T TRUE true True 0 f F FALSE false False` — and anything else is a `*strconv.NumError` wrapping `ErrSyntax`, with `false` as the value.</p>
+          <pre><code class="lang-go">strconv.ParseBool("T")   // true, &lt;nil&gt;</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-9">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-9">#</a> <code>strconv.FormatBool</code></h3>
+          <pre><code class="lang-go">strconv.FormatBool(b bool) string</code></pre>
+          <p>`"true"` or `"false"`.</p>
+          <pre><code class="lang-go">strconv.FormatBool(1 == 1)   // "true"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-10">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-10">#</a> <code>strconv.FormatFloat</code></h3>
+          <pre><code class="lang-go">strconv.FormatFloat(f float64, fmt byte, prec, bitSize int) string</code></pre>
+          <p>The float as text. `fmt` is one of `f` (no exponent), `e`/`E` (an exponent always), `g`/`G` (an exponent for large exponents, plain otherwise). `prec` is the digit count, or `-1` for the fewest digits that parse back to `f` exactly — at the width `bitSize` names, so `32` gives `float32`'s shorter answer. The `b`, `x` and `X` verbs (binary and hexadecimal exponents) are not implemented and fault rather than answering.</p>
+          <pre><code class="lang-go">strconv.FormatFloat(0.1, 'f', -1, 32)   // "0.1"</code></pre>
         </article>
       </section>
 

@@ -238,11 +238,17 @@ the pointer entry above.
 
 ## Unsupported stdlib calls
 
-`fmt.Fprintln` / `fmt.Fprintf` / `fmt.Fprint` (writer-directed output),
-`strconv.FormatFloat`, `strings.ContainsRune`, and `strings.Builder`'s methods
-(`WriteString`, `WriteRune`, `String`) are rejected at compile time. Each is a
-build failure rather than a wrong answer, so a program using one does not run at
-all.
+`fmt.Fprintln` / `fmt.Fprintf` / `fmt.Fprint` (writer-directed output) and
+`strings.Builder`'s methods (`WriteString`, `WriteRune`, `String`) are rejected
+at compile time. Each is a build failure rather than a wrong answer, so a
+program using one does not run at all. Both want the same thing: an `io.Writer`
+that is a value the program holds, which go-rs has no representation for.
+
+`strconv.FormatFloat` is implemented for the `f`, `F`, `e`, `E`, `g` and `G`
+verbs at both `bitSize`s, including `prec == -1`. The two remaining verbs —
+`b` (binary exponent) and `x`/`X` (hexadecimal float) — fault at run time
+rather than answering, because the alternative is a decimal string presented as
+a hex-float one.
 
 ## Constant-overflow is not diagnosed
 

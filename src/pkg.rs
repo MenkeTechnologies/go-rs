@@ -239,7 +239,7 @@ fn uses_errorf(prog: &Program) -> bool {
 /// conversion that builds one, or names one of the sentinels such a value wraps.
 fn uses_strconv_error(prog: &Program) -> bool {
     /// The `strconv` conversions whose second result is a `*NumError`.
-    const PARSERS: &[&str] = &["Atoi", "ParseInt", "ParseFloat"];
+    const PARSERS: &[&str] = &["Atoi", "ParseInt", "ParseFloat", "ParseBool"];
     program_has_expr(prog, &|e| match e {
         Expr::Call { func, .. } => PARSERS.iter().any(|f| is_selector(func, "strconv", f)),
         e => is_selector(e, "strconv", "ErrSyntax") || is_selector(e, "strconv", "ErrRange"),

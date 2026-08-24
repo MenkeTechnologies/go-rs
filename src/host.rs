@@ -1259,10 +1259,10 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
-/// `[typeName]` → the typed nil for that slice or map type.
-fn b_nil_of(vm: &mut VM, argc: u8) -> Value {
-    let args = pop_args(vm, argc);
-    let ty = args.first().map(go_str).unwrap_or_default();
+/// The typed nil for a slice or map type, shared per type name so `== nil` and
+/// `%#v` see one object.
+fn typed_nil(ty: &str) -> Value {
+    let ty = ty.to_string();
     NILS.with(|n| {
         n.borrow_mut()
             .entry(ty.clone())
@@ -1276,6 +1276,12 @@ fn b_nil_of(vm: &mut VM, argc: u8) -> Value {
             })
             .clone()
     })
+}
+
+/// `[typeName]` → the typed nil for that slice or map type.
+fn b_nil_of(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    typed_nil(&args.first().map(go_str).unwrap_or_default())
 }
 
 /// [`GF32_BOX`] — tag the `float32`s in a `fmt` argument. Stack `[value, spec]`:
@@ -4734,6 +4740,21 @@ pub mod stdlib {
     pub const LOG2: u16 = 919;
     pub const LOG10: u16 = 920;
     pub const CBRT: u16 = 921;
+    // strings.* / strconv.* (added wave).
+    pub const CONTAINS_RUNE: u16 = 972;
+    pub const CONTAINS_ANY: u16 = 973;
+    pub const INDEX_BYTE: u16 = 974;
+    pub const INDEX_RUNE: u16 = 975;
+    pub const INDEX_ANY: u16 = 976;
+    pub const LAST_INDEX_BYTE: u16 = 977;
+    pub const SPLIT_N: u16 = 978;
+    pub const TRIM_LEFT: u16 = 979;
+    pub const TRIM_RIGHT: u16 = 980;
+    pub const COMPARE: u16 = 981;
+    pub const PARSE_BOOL: u16 = 982;
+    pub const FORMAT_BOOL: u16 = 983;
+    pub const FORMAT_FLOAT: u16 = 984;
+    pub const QUOTE_RUNE: u16 = 985;
     // sort.*
     pub const SORT_INTS: u16 = 875;
     pub const SORT_STRINGS: u16 = 876;
@@ -4764,6 +4785,20 @@ pub mod stdlib {
             ("strings", "Title") => TITLE,
             ("strings", "EqualFold") => EQUAL_FOLD,
             ("strings", "LastIndex") => LAST_INDEX,
+            ("strings", "ContainsRune") => CONTAINS_RUNE,
+            ("strings", "ContainsAny") => CONTAINS_ANY,
+            ("strings", "IndexByte") => INDEX_BYTE,
+            ("strings", "IndexRune") => INDEX_RUNE,
+            ("strings", "IndexAny") => INDEX_ANY,
+            ("strings", "LastIndexByte") => LAST_INDEX_BYTE,
+            ("strings", "SplitN") => SPLIT_N,
+            ("strings", "TrimLeft") => TRIM_LEFT,
+            ("strings", "TrimRight") => TRIM_RIGHT,
+            ("strings", "Compare") => COMPARE,
+            ("strconv", "ParseBool") => PARSE_BOOL,
+            ("strconv", "FormatBool") => FORMAT_BOOL,
+            ("strconv", "FormatFloat") => FORMAT_FLOAT,
+            ("strconv", "QuoteRune") => QUOTE_RUNE,
             ("strconv", "Itoa") => ITOA,
             ("strconv", "Atoi") => ATOI,
             ("strconv", "ParseInt") => PARSE_INT,
@@ -4810,7 +4845,10 @@ pub mod stdlib {
     pub fn returns_error(pkg: &str, func: &str) -> bool {
         matches!(
             (pkg, func),
-            ("strconv", "Atoi") | ("strconv", "ParseInt") | ("strconv", "ParseFloat")
+            ("strconv", "Atoi")
+                | ("strconv", "ParseInt")
+                | ("strconv", "ParseFloat")
+                | ("strconv", "ParseBool")
         )
     }
 
@@ -4863,6 +4901,84 @@ pub mod stdlib {
             b2(vm, a, |s, t| s.eq_ignore_ascii_case(t))
         });
         vm.register_builtin(LAST_INDEX, b_last_index);
+        // `strings.ContainsRune` / `IndexRune` take a `rune`, which reaches here
+        // as the code point rather than a string.
+        vm.register_builtin(CONTAINS_RUNE, |vm, a| {
+            let args = pop_args(vm, a);
+            let s = args.first().map(go_str).unwrap_or_default();
+            Value::bool(rune_of(args.get(1)).is_some_and(|r| s.contains(r)))
+        });
+        vm.register_builtin(INDEX_RUNE, |vm, a| {
+            let args = pop_args(vm, a);
+            let s = args.first().map(go_str).unwrap_or_default();
+            let at = rune_of(args.get(1)).and_then(|r| s.find(r));
+            Value::Int(at.map(|b| b as i64).unwrap_or(-1))
+        });
+        vm.register_builtin(CONTAINS_ANY, |vm, a| {
+            b2(vm, a, |s, chars| s.contains(|c| chars.contains(c)))
+        });
+        // `IndexByte` / `LastIndexByte` answer in *bytes*, over bytes: a byte of
+        // a multi-byte rune is a legitimate match, which searching by `char`
+        // would miss.
+        vm.register_builtin(INDEX_BYTE, |vm, a| {
+            let args = pop_args(vm, a);
+            let s = args.first().map(go_str).unwrap_or_default();
+            let b = args.get(1).map(|v| v.to_int()).unwrap_or(-1);
+            let at = u8::try_from(b)
+                .ok()
+                .and_then(|b| s.bytes().position(|x| x == b));
+            Value::Int(at.map(|i| i as i64).unwrap_or(-1))
+        });
+        vm.register_builtin(LAST_INDEX_BYTE, |vm, a| {
+            let args = pop_args(vm, a);
+            let s = args.first().map(go_str).unwrap_or_default();
+            let b = args.get(1).map(|v| v.to_int()).unwrap_or(-1);
+            let at = u8::try_from(b)
+                .ok()
+                .and_then(|b| s.bytes().rposition(|x| x == b));
+            Value::Int(at.map(|i| i as i64).unwrap_or(-1))
+        });
+        vm.register_builtin(INDEX_ANY, |vm, a| {
+            let args = pop_args(vm, a);
+            let s = args.first().map(go_str).unwrap_or_default();
+            let chars = args.get(1).map(go_str).unwrap_or_default();
+            let at = s.find(|c| chars.contains(c));
+            Value::Int(at.map(|b| b as i64).unwrap_or(-1))
+        });
+        vm.register_builtin(SPLIT_N, b_split_n);
+        vm.register_builtin(TRIM_LEFT, |vm, a| {
+            two_str(vm, a, |s, cut| {
+                s.trim_start_matches(|c| cut.contains(c)).to_string()
+            })
+        });
+        vm.register_builtin(TRIM_RIGHT, |vm, a| {
+            two_str(vm, a, |s, cut| {
+                s.trim_end_matches(|c| cut.contains(c)).to_string()
+            })
+        });
+        vm.register_builtin(COMPARE, |vm, a| {
+            let args = pop_args(vm, a);
+            let s = args.first().map(go_str).unwrap_or_default();
+            let t = args.get(1).map(go_str).unwrap_or_default();
+            Value::Int(match s.cmp(&t) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })
+        });
+        vm.register_builtin(PARSE_BOOL, b_parse_bool);
+        vm.register_builtin(FORMAT_BOOL, |vm, a| {
+            let args = pop_args(vm, a);
+            let b = matches!(args.first(), Some(Value::Bool(true)));
+            Value::str(if b { "true" } else { "false" })
+        });
+        vm.register_builtin(FORMAT_FLOAT, b_format_float);
+        vm.register_builtin(QUOTE_RUNE, |vm, a| {
+            let args = pop_args(vm, a);
+            Value::str(super::go_quote_rune(
+                args.first().map(|v| v.to_int()).unwrap_or(0),
+            ))
+        });
         // extra strconv.*
         vm.register_builtin(PARSE_INT, b_parse_int);
         vm.register_builtin(PARSE_FLOAT, b_parse_float);
@@ -5099,6 +5215,126 @@ pub mod stdlib {
             s.split(&sep).map(Value::str).collect()
         };
         Value::Obj(heap_alloc(HostObj::slice(parts)))
+    }
+
+    /// `strings.SplitN(s, sep, n)` — at most `n` parts, the last holding the
+    /// unsplit remainder. `n == 0` is a nil slice and `n < 0` is `Split`.
+    fn b_split_n(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let sep = args.get(1).map(go_str).unwrap_or_default();
+        let n = args.get(2).map(|v| v.to_int()).unwrap_or(-1);
+        if n == 0 {
+            return super::typed_nil("[]string");
+        }
+        let parts: Vec<Value> = match (sep.is_empty(), usize::try_from(n).ok()) {
+            // An empty separator splits into runes. `n` caps how many, and the
+            // last one holds the rest of the string whole — Go's `explode`
+            // writes `n-1` single runes and then the remainder.
+            (true, Some(k)) => {
+                let mut rest = s.as_str();
+                let mut out = Vec::new();
+                while out.len() + 1 < k && !rest.is_empty() {
+                    let c = rest.chars().next().expect("non-empty");
+                    out.push(Value::str(c.to_string()));
+                    rest = &rest[c.len_utf8()..];
+                }
+                if k > 0 && !rest.is_empty() {
+                    out.push(Value::str(rest.to_string()));
+                }
+                out
+            }
+            (true, None) => s.chars().map(|c| Value::str(c.to_string())).collect(),
+            (false, Some(k)) => s.splitn(k, &sep).map(Value::str).collect(),
+            (false, None) => s.split(&sep).map(Value::str).collect(),
+        };
+        Value::Obj(heap_alloc(HostObj::slice(parts)))
+    }
+
+    /// `strconv.ParseBool(s) (bool, error)` — Go accepts exactly these ten
+    /// spellings and nothing else, not even `TRUE`/`False` outside the list.
+    fn b_parse_bool(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        match s.as_str() {
+            "1" | "t" | "T" | "TRUE" | "true" | "True" => parsed(Value::bool(true), None),
+            "0" | "f" | "F" | "FALSE" | "false" | "False" => parsed(Value::bool(false), None),
+            _ => parsed(Value::bool(false), Some(num_error("ParseBool", &s, SYNTAX))),
+        }
+    }
+
+    /// A `rune` argument as a `char`. It reaches a builtin as the code point,
+    /// which is how every other integer arrives.
+    fn rune_of(v: Option<&Value>) -> Option<char> {
+        char::from_u32(u32::try_from(v?.to_int()).ok()?)
+    }
+
+    /// `strconv.FormatFloat(f, 'f', -1, bits)`: the shortest decimal that parses
+    /// back to `f` at that width, always in fixed notation. Rust's `Display` for
+    /// a float is exactly that — shortest round-trip, and never an exponent, so
+    /// `1e21` writes its 22 digits out as Go's `'f'` does.
+    fn shortest_fixed(f: f64, narrowed: bool) -> String {
+        if f.is_nan() {
+            return "NaN".to_string();
+        }
+        if f.is_infinite() {
+            return if f < 0.0 { "-Inf" } else { "+Inf" }.to_string();
+        }
+        if narrowed {
+            format!("{}", f as f32)
+        } else {
+            format!("{f}")
+        }
+    }
+
+    /// `strconv.FormatFloat(f, fmt, prec, bitSize)`.
+    ///
+    /// `prec == -1` is "the fewest digits that parse back to `f` exactly", which
+    /// is what `%v` already computes — at the *width* `bitSize` names, so a
+    /// `float32` gets the shorter `float32` answer.
+    fn b_format_float(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let f = args.first().map(|v| v.to_float()).unwrap_or(0.0);
+        let verb =
+            char::from_u32(args.get(1).map(|v| v.to_int()).unwrap_or(0) as u32).unwrap_or('\0');
+        let prec = args.get(2).map(|v| v.to_int()).unwrap_or(-1);
+        let bits = args.get(3).map(|v| v.to_int()).unwrap_or(64);
+        let prec = usize::try_from(prec).ok();
+        let narrowed = bits == 32;
+        let out = match verb {
+            'f' | 'F' => match prec {
+                Some(p) => format!("{:.*}", p, f),
+                None => shortest_fixed(f, narrowed),
+            },
+            'e' | 'E' => {
+                let f = if narrowed { f as f32 as f64 } else { f };
+                super::format_float_e(f, prec, verb == 'E')
+            }
+            'g' | 'G' => match (prec, narrowed) {
+                (None, true) => {
+                    let g = super::format_float32(f as f32);
+                    if verb == 'G' {
+                        g.to_uppercase()
+                    } else {
+                        g
+                    }
+                }
+                _ => super::format_float_g(f, prec, verb == 'G'),
+            },
+            // Go also defines `b`, `x` and `X` (binary and hexadecimal
+            // exponents). Faulting is the honest answer: the alternative is a
+            // decimal string presented as a hex-float one.
+            'b' | 'x' | 'X' => {
+                super::ffi_fault(
+                    vm,
+                    format!("go-rs: strconv.FormatFloat: fmt '{verb}' is not implemented"),
+                );
+                return Value::Undef;
+            }
+            // Go's `ftoa` writes `%` and the byte for anything else.
+            other => format!("%{other}"),
+        };
+        Value::str(out)
     }
 
     fn b_fields(vm: &mut VM, argc: u8) -> Value {
