@@ -454,23 +454,23 @@ This is a representation gap, not a formatting one: closing it means a byte
 string in the shared VM (`Value::Str` is fusevm's, used by every frontend), so
 it is not a change go-rs can make alone.
 
-## A `type` declaration inside a function body is rejected
+## A `type` declaration inside a function body is not scoped to its block
 
 ```go
-func main() {
-	type local int
-	var l local = 3
-	fmt.Printf("%T %v\n", l, l)
-}
-// go:    main.local 3
-// go-rs: go-rs: unexpected token `Type` in expression on line 2
+func a() { type T struct{ X int } }
+func b() { type T struct{ Y string } }   // go: two types   go-rs: one, from `a`
 ```
 
-Go allows a type declaration in any block; go-rs only parses one at the top
-level, so the statement parser meets `type` in expression position and stops.
-The compiler's `defined_types` map is already flat and package-wide, so the
-missing piece is the statement form in the parser plus a decision about
-shadowing — a local type may reuse a package-level name.
+A body-local `type` is parsed and hoisted to the program's declarations, which
+is where the compiler reads every type from. That is right for everything the
+name is observable through — `%T` prints `main.T` whether the declaration was
+local or package-level — and wrong only when two blocks declare *different*
+types under one name, where the first one parsed wins. A local declaration that
+shadows a package-level name has the same collision.
+
+Closing it needs a scope chain in the parser and mangled names in the program,
+so that `T` in `a` and `T` in `b` are two entries. The gate for what does work
+is `parity-scripts/local_type_decl.go`.
 
 ## `%w` outside `fmt.Errorf` renders instead of reporting
 

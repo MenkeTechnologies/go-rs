@@ -119,7 +119,7 @@ Real Go, executed on fusevm:
 
 | Area           | Supported                                                              |
 | -------------- | --------------------------------------------------------------------- |
-| Declarations   | `package`, `import` (single + grouped), `type T struct`, top-level `func` and methods (`func (r T) m()`) |
+| Declarations   | `package`, `import` (single + grouped), `type T struct` / `interface` / defined (`type Weekday int`) — single or grouped `type ( … )`, at package level **or inside a function body** — top-level `func` and methods (`func (r T) m()`) |
 | Variables      | `:=`, `var x [T] [= e]` and the multi-name forms (`var a, b int = 1, 2`, `var a, b = f()`, `var a, b int`), assignment to lvalues (ident / `x[i]` / `x.f`), parallel assignment `a, b = x, y` (swap/rotate; RHS evaluated first), `a, b = f()`, `+= -= *= /= %=`, `x++` / `x--`. All three comma-ok forms — `m[k]`, `x.(T)`, `<-ch` — take `=` into existing variables as well as `:=`, and into any assignment target (`b.OK, s[i], out["x"], _`) |
 | Control flow   | `if` / `else if` / `else` (with init clause), three-clause / condition / infinite `for`, `for … range`, `switch` (tagged / expression / multi-value cases / init clause / `fallthrough`) and type switch, `break`, `continue`, `return`, and **labeled** `break L` / `continue L` naming an enclosing `for` or `switch` |
 | Expressions    | int / float / string / bool literals (incl. `0x` / `0o` / `0b` bases, `_` separators, and uint64 masks above `i64::MAX` stored by bit pattern), rune literals as int32 code points (`'A'` == 65, `'z' - '0'`) with the full escape set (`\n \t \xHH \uHHHH \UHHHHHHHH` + octal, in rune **and** string literals), arithmetic, bitwise `& \| ^ << >> &^` (+ `^x` complement, compound `&= \|= ^= <<= >>= &^=`), comparisons, `&&` `\|\|` `!` (short-circuit), unary, parentheses, calls, recursion |
@@ -167,8 +167,9 @@ an unrecovered panic prints its message but not Go's goroutine stack trace.
 its value's type name as embedded — which is exactly how the parser records
 `struct { Base }`, but also matches a hand-written `Base Base` field, so that
 field would promote here where Go would reject the reference as undefined.
-A `type` declaration inside a function body is not parsed; declare the type at
-package level.
+A `type` declaration inside a function body is parsed but **hoisted** to the
+package rather than scoped to its block, so two blocks declaring different types
+under one name collide (the first parsed wins).
 
 ## Toolchain
 

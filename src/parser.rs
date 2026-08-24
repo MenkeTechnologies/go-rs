@@ -40,6 +40,8 @@ pub fn parse(src: &str) -> Result<Program, String> {
         no_composite: false,
         anon_structs: HashMap::new(),
         anon_interfaces: HashMap::new(),
+        local_types: Vec::new(),
+        local_interfaces: Vec::new(),
         defined: HashMap::new(),
     };
     // Pre-scan `type Name <base>` over a non-struct base, with the real type
@@ -73,6 +75,11 @@ struct Parser {
     /// [`iface_name`] builds, so an identical method set shares one type. Merged
     /// into the program's interface declarations.
     anon_interfaces: HashMap<String, Vec<String>>,
+    /// `type T struct{…}` / `type I interface{…}` written inside a function
+    /// body, hoisted to the program's declarations — which is where the compiler
+    /// reads every type from — as they are parsed.
+    local_types: Vec<StructDecl>,
+    local_interfaces: Vec<InterfaceDecl>,
     /// Defined types over a non-struct, non-interface base — `type Weekday int`,
     /// `type mySlice []int` — as name → the base type as written. A defined type
     /// is a *distinct* type in Go with the same representation as its base, so
@@ -94,40 +101,92 @@ fn iface_name(methods: &mut Vec<String>) -> String {
     format!("interface{{{}}}", methods.join(";"))
 }
 
+/// The token index of the *name* in every type spec, whether written singly
+/// (`type T …`) or inside a group (`type ( T … ; U … )`).
+///
+/// The pre-scans need both forms, and a group's later specs are not preceded by
+/// the `type` keyword, so they cannot be found by looking for one.
+fn type_spec_positions(tokens: &[Token]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if !matches!(tokens[i].kind, Tok::Type) {
+            i += 1;
+            continue;
+        }
+        if !matches!(tokens.get(i + 1).map(|t| &t.kind), Some(Tok::LParen)) {
+            if matches!(tokens.get(i + 1).map(|t| &t.kind), Some(Tok::Ident(_))) {
+                out.push(i + 1);
+            }
+            i += 1;
+            continue;
+        }
+        // A group: a spec starts at the first token after the `(` or after the
+        // `;` that ended the previous one.
+        let mut j = i + 2;
+        let mut depth = 1usize;
+        let mut at_spec_start = true;
+        while j < tokens.len() && depth > 0 {
+            match &tokens[j].kind {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                    depth += 1;
+                    at_spec_start = false;
+                }
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    depth -= 1;
+                    at_spec_start = false;
+                }
+                Tok::Semi if depth == 1 => at_spec_start = true,
+                Tok::Ident(_) if at_spec_start => {
+                    out.push(j);
+                    at_spec_start = false;
+                }
+                _ => at_spec_start = false,
+            }
+            j += 1;
+        }
+        i = j;
+    }
+    out
+}
+
+/// The token index just past an optional `[ … ]` generic type-parameter list at
+/// `j`, or `j` itself when there is none.
+fn skip_type_param_tokens(tokens: &[Token], j: usize) -> usize {
+    if !matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::LBracket)) {
+        return j;
+    }
+    let mut j = j;
+    let mut depth = 0usize;
+    while j < tokens.len() {
+        match &tokens[j].kind {
+            Tok::LBracket => depth += 1,
+            Tok::RBracket => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    j
+}
+
 /// Collect names declared as `type Name struct` — including generic structs
 /// `type Name[T any] struct`, where an optional `[ … ]` type-parameter list sits
 /// between the name and `struct`. Enables `Name{…}` composite-literal parsing.
 fn scan_struct_names(tokens: &[Token]) -> HashSet<String> {
     let mut names = HashSet::new();
-    let mut i = 0;
-    while i + 2 < tokens.len() {
-        if matches!(tokens[i].kind, Tok::Type) {
-            if let Tok::Ident(n) = &tokens[i + 1].kind {
-                // Step past an optional `[ … ]` generic type-parameter list.
-                let mut j = i + 2;
-                if matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::LBracket)) {
-                    let mut depth = 0;
-                    while j < tokens.len() {
-                        match &tokens[j].kind {
-                            Tok::LBracket => depth += 1,
-                            Tok::RBracket => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    j += 1;
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                }
-                if matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::Struct)) {
-                    names.insert(n.clone());
-                }
-            }
+    for p in type_spec_positions(tokens) {
+        let Tok::Ident(n) = &tokens[p].kind else {
+            continue;
+        };
+        let j = skip_type_param_tokens(tokens, p + 1);
+        if matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::Struct)) {
+            names.insert(n.clone());
         }
-        i += 1;
     }
     names
 }
@@ -312,7 +371,7 @@ impl Parser {
                     }
                 }
                 Tok::Type => {
-                    if let Some(td) = self.type_decl()? {
+                    for td in self.type_decl()? {
                         match td {
                             TypeDecl::Struct(s) => types.push(s),
                             TypeDecl::Interface(i) => interfaces.push(i),
@@ -334,6 +393,12 @@ impl Parser {
         globals.extend(main);
         let main = globals;
 
+        // Types declared inside a function body. Go scopes them to their block;
+        // go-rs hoists them, which is right for everything the name is
+        // observable through (`%T` prints `main.T` either way) and wrong only if
+        // two functions declare *different* types under one name.
+        types.append(&mut self.local_types);
+        interfaces.append(&mut self.local_interfaces);
         // Register anonymous struct types (`struct{…}` used as a type or literal)
         // so the compiler can zero-fill and field-access them.
         for (name, fields) in std::mem::take(&mut self.anon_structs) {
@@ -367,48 +432,46 @@ impl Parser {
     /// and struct/interface declarations are skipped rather than parsed twice.
     fn scan_defined_types(&mut self) {
         let saved = self.pos;
-        for i in 0..self.tokens.len() {
-            if !matches!(self.tokens[i].kind, Tok::Type) {
-                continue;
-            }
-            self.pos = i;
-            // `type Name` then anything but `struct` / `interface`, looking past
-            // a generic type-parameter list.
-            let mut j = i + 2;
-            if matches!(self.tokens.get(j).map(|t| &t.kind), Some(Tok::LBracket)) {
-                let mut depth = 0usize;
-                while let Some(t) = self.tokens.get(j) {
-                    match t.kind {
-                        Tok::LBracket => depth += 1,
-                        Tok::RBracket => {
-                            depth -= 1;
-                            if depth == 0 {
-                                j += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
-            }
+        for p in type_spec_positions(&self.tokens) {
+            // `Name` then anything but `struct` / `interface`, looking past a
+            // generic type-parameter list.
+            let j = skip_type_param_tokens(&self.tokens, p + 1);
             if matches!(
                 self.tokens.get(j).map(|t| &t.kind),
                 Some(Tok::Struct) | Some(Tok::Interface) | None
             ) {
                 continue;
             }
-            let _ = self.type_decl();
+            self.pos = p;
+            let _ = self.type_spec();
         }
         self.pos = saved;
     }
 
-    /// Parse `type T struct { … }`, `type I interface { … }`, or a defined type
-    /// `type T <base>` (an alias in go-rs's dynamic model — parsed and discarded,
-    /// so `Weekday` in `type Weekday int` is transparent). Returns `None` for a
-    /// discarded defined type.
-    fn type_decl(&mut self) -> Result<Option<TypeDecl>, String> {
+    /// Parse a `type` declaration: one spec, or a parenthesized group of them
+    /// (`type ( A int; B struct{…} )`).
+    fn type_decl(&mut self) -> Result<Vec<TypeDecl>, String> {
         self.expect(&Tok::Type)?;
+        if !self.eat(&Tok::LParen) {
+            return Ok(self.type_spec()?.into_iter().collect());
+        }
+        let mut out = Vec::new();
+        self.skip_semis();
+        while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
+            out.extend(self.type_spec()?);
+            self.skip_semis();
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(out)
+    }
+
+    /// Parse one type spec — everything after the `type` keyword, or one entry
+    /// of a group: `T struct { … }`, `I interface { … }`, or a defined type
+    /// `T <base>`. Returns `None` for the defined type, which is recorded in
+    /// [`Parser::defined`] rather than declared: it has the same representation
+    /// as its base, and the name is carried only where it is observable (`%T`,
+    /// `%#v`, method dispatch).
+    fn type_spec(&mut self) -> Result<Option<TypeDecl>, String> {
         let name = self.ident()?;
         // Erase a generic type-parameter list: `type Stack[T any] struct{…}`.
         //
@@ -1012,6 +1075,18 @@ impl Parser {
         match self.peek() {
             Tok::Var => self.var_stmt(),
             Tok::Const => self.const_stmt(),
+            // `type T …` in a function body. It declares no run-time work, so it
+            // lowers to nothing; the declaration itself is hoisted to the
+            // program (a defined type goes into `defined` inside `type_decl`).
+            Tok::Type => {
+                for td in self.type_decl()? {
+                    match td {
+                        TypeDecl::Struct(s) => self.local_types.push(s),
+                        TypeDecl::Interface(i) => self.local_interfaces.push(i),
+                    }
+                }
+                Ok(Stmt::Block(Vec::new()))
+            }
             Tok::Return => {
                 let line = self.line();
                 self.advance();
