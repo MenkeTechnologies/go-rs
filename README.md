@@ -225,7 +225,15 @@ one exception (`%U`), a width on `%v` landing on each *element* of a composite,
 the minimum-digit-count precision an *integer* verb takes (as
 against the truncation a string takes), `%T` of every sized integer width, a
 `f(args...)` spread into a `fmt` call, string/rune iteration against byte
-indexing, and `continue` in every loop form. The fuzzer generates arithmetic /
+indexing, and `continue` in every loop form. Further files cover map key
+equality and the order a map keeps through inserts and deletes, `error` as a
+method set (a type switch and an assertion against it, and the conversion panic
+each raises), the comma-ok forms assigning into existing variables, `type`
+declared inside a function body and the grouped `type ( … )` form, which slice
+operations share a backing array and which reallocate, a non-ASCII rune literal
+next to punctuation, the added `strings`/`strconv` functions with their
+edge cases, and `strconv.FormatFloat` over every verb x precision x bit-size
+combination. The fuzzer generates arithmetic /
 float / boolean / string / slice /
 map / control-flow / stdlib blocks plus rune arithmetic, fixed-size arrays
 (sequential + sparse), `[]byte`/`[]rune` conversions, string-range-by-rune,
