@@ -123,35 +123,37 @@ are `parity-scripts/array_value_semantics.go` and
 on the object, so `%T` and `%#v` name the array at every depth
 (`parity-scripts/array_type_name.go`).
 
-## `map` operations are O(n) each, so building one is O(n²)
+## A struct or array key still scans (the rest of a `map` is hashed)
 
-```go
-m := make(map[int]int)
-for i := 0; i < n; i++ { m[i] = i }
-```
+`HostObj::Map` is a `GoMap` (`src/host.rs`): insertion-ordered pairs plus a hash
+index over the keys, built the first time the map grows past eight of them. A
+key with no hash projection — a struct or array key, compared field by field
+through the heap, or a `NaN` — drops the index for that map, and every lookup,
+insert and `delete` in it goes back to the linear scan that used to be the only
+path. Building such a map is still O(n²).
 
-| n      | go-rs insert-only | go-rs insert + `range` |
-|--------|-------------------|------------------------|
-| 4,000  | 0.17s             | 0.44s                  |
-| 8,000  | 0.66s             | 1.80s                  |
-| 16,000 | 2.62s             | 6.98s                  |
-| 32,000 | —                 | 28.32s                 |
-
-Time quadruples when `n` doubles. Every value is correct — this is a cost, not a
-divergence — but a map big enough makes a program that finishes instantly under
-`go` look hung.
-
-The cause is local to go-rs: `HostObj::Map` is a `Vec<(Value, Value)>` kept in
-insertion order (`src/host.rs`), so every lookup, insert and `delete` is a
-linear scan comparing keys by value. Insertion order is not incidental — it is
-what makes iteration stable, and `fmt` sorts keys when printing regardless — so
-closing this means a hash index *beside* the ordered vector rather than
-replacing it.
+Every value is correct either way; this is a cost, not a divergence. It has not
+been closed because a structural hash has to agree with `key_eq` at every depth
+(a struct holding a struct holding an array) and a struct key is rare next to
+the string and integer keys the index already covers.
 
 For comparison, ranging a **slice** is linear (32k/64k/128k/256k elements →
 0.10s/0.19s/0.39s/0.77s), because a go-rs slice is a `Value::Obj` handle into
 the frontend's own heap rather than a `fusevm::Value::Array`, so loading one
 copies a `u32` instead of deep-cloning the backing `Vec`.
+
+## A missing key yields `0`, not the value type's zero
+
+```go
+m := map[string]string{}
+fmt.Printf("%q\n", m["absent"])   // go: ""   go-rs: "0"
+```
+
+`GINDEX_GET` has no static type for the map, so a miss answers `Value::Int(0)` —
+right for the common `map[K]int`, wrong for every other value type. The comma-ok
+form `v, ok := m[k]` has the same gap in `v`. Closing it means threading the
+map's written value type to the twelve `GINDEX_GET` call sites, which also serve
+slice and string indexing.
 
 ## A pointer to a struct prints without `&`
 
@@ -356,6 +358,13 @@ What is left is the crossing the values cannot show. `int`, `int8`…`int64`,
 `go_type_name` names every one of them `int`, so two of different width look
 like the same dynamic type and are compared by value.
 
+The same crossing shows as a **map key**: `key_eq` (`src/host.rs`) partitions
+keys into nil, string, bool and number, so `map[any]int` keeps a `"1"`, a `true`
+and a `nil` apart — but an `int` `1` and a `float64` `1.0` are one key there,
+where Go has two. `key_eq` cannot use `iface_eq`'s stricter rule, because an
+untyped integer literal in a float-keyed map (`map[float64]int{1: 5}`) reaches it
+as a `Value::Int` and has to find the `float64` entry.
+
 Closing it needs the Go type on the value, which is a representation change,
 and it is the *same* one the `float32` and `uint64` entries above want — all
 three are "the static type at the conversion, readable at run time". fusevm
@@ -371,9 +380,9 @@ than a patch:
   argument bind (including `...any`), a return, a slice or array literal, a map
   key and a map value, a struct field, a channel send, and `append`.
 - Every reader has to see through it. That is 74 host builtins, plus `go_str`
-  and `go_type_name`, plus map-key equality — `HostObj::Map` is a
-  `Vec<(Value, Value)>` matched on `Value` equality, so a boxed key and a plain
-  one of the same number would be two different keys.
+  and `go_type_name`, plus map-key equality — a `GoMap` is ordered pairs plus a
+  hash index, both keyed on `Value` equality, so a boxed key and a plain one of
+  the same number would be two different keys.
 
 What makes it *feasible* rather than impossible is that valid Go requires a type
 assertion or a type switch before any arithmetic on an interface value, so the

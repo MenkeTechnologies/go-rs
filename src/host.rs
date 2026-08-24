@@ -1168,7 +1168,7 @@ pub(crate) enum HostObj {
         cap: usize,
     },
     /// A map, insertion-ordered for stable iteration; keys compared by value.
-    Map(Vec<(Value, Value)>),
+    Map(GoMap),
     /// A struct: its type name and ordered `(field, value)` pairs.
     ///
     /// `by_ref` marks a handle produced by `&T{…}` / `new(T)` — a Go *pointer*
@@ -1399,7 +1399,7 @@ fn box_for_fmt(v: &Value, spec: &str, tag: BoxTag) -> Value {
             .into_iter()
             .map(|(k, val)| (k, box_for_fmt(&val, spec, tag)))
             .collect();
-        return Value::Obj(heap_alloc(HostObj::Map(boxed)));
+        return Value::Obj(heap_alloc(HostObj::Map(GoMap::from_pairs(boxed))));
     }
     if spec.is_empty() {
         return box_leaf(v, tag);
@@ -1437,7 +1437,7 @@ fn box_for_fmt(v: &Value, spec: &str, tag: BoxTag) -> Value {
 fn map_pairs(v: &Value) -> Option<Vec<(Value, Value)>> {
     let Value::Obj(id) = v else { return None };
     HEAP.with(|h| match h.borrow().get(*id as usize) {
-        Some(HostObj::Map(m)) => Some(m.clone()),
+        Some(HostObj::Map(m)) => Some(m.to_vec()),
         _ => None,
     })
 }
@@ -1735,19 +1735,207 @@ fn key_eq(a: &Value, b: &Value) -> bool {
                 }
             })
         }
+        // `nil` is a key of its own: Go's `map[any]V` compares the dynamic type
+        // before the value, so a nil key equals another nil and nothing else.
+        (Value::Undef, Value::Undef) => true,
+        // A string, a bool and a number are three different Go types, so a key
+        // of one kind is never equal to a key of another. Comparing them by
+        // `to_float` — which reads a `"1"` as `1` and a `true` as `1` — merged
+        // three distinct keys of a `map[any]V` into one.
+        (Value::Str(_) | Value::Bool(_) | Value::Obj(_) | Value::Undef, _)
+        | (_, Value::Str(_) | Value::Bool(_) | Value::Obj(_) | Value::Undef) => false,
         _ => a.to_float() == b.to_float(),
     }
 }
 
-/// The index of `key` in the map at heap `id`, comparing by value. Keys are
-/// snapshotted first so a struct-key `key_eq` (which itself reads the heap) never
-/// re-enters an active borrow held by the caller.
+/// A Go map key projected to something hashable, for the index a [`GoMap`]
+/// keeps beside its ordered pairs.
+///
+/// The projection has to agree with [`key_eq`] exactly, so numbers go through
+/// `to_float` — that is what `key_eq` compares them by — with `-0.0` normalised
+/// to `0.0` so the two hash alike. A `NaN` has no projection, which is also
+/// Go's answer: a `NaN` key equals nothing, not even itself, so every insert of
+/// one adds another entry no lookup can ever reach.
+#[derive(PartialEq, Eq, Hash, Clone)]
+enum MapKey {
+    Nil,
+    Str(std::sync::Arc<String>),
+    Bool(bool),
+    Num(u64),
+}
+
+/// A key's hash projection, or `None` when it has none: a struct or array key
+/// (compared structurally, through the heap) or a `NaN`.
+///
+/// The variants partition keys exactly the way [`key_eq`] does, so two keys
+/// with projections are equal if and only if their projections are.
+fn map_key(v: &Value) -> Option<MapKey> {
+    match v {
+        Value::Undef => Some(MapKey::Nil),
+        Value::Str(s) => Some(MapKey::Str(s.clone())),
+        Value::Bool(b) => Some(MapKey::Bool(*b)),
+        Value::Obj(_) => None,
+        other => {
+            let f = other.to_float();
+            (!f.is_nan()).then(|| MapKey::Num(if f == 0.0 { 0.0 } else { f }.to_bits()))
+        }
+    }
+}
+
+/// What the hash index can say about a key.
+enum Probe {
+    /// The index is authoritative: this is where the key sits, or it is absent.
+    Answered(Option<usize>),
+    /// The index cannot speak for this map or this key — scan in order.
+    Scan,
+}
+
+/// A Go map: insertion-ordered `(key, value)` pairs plus a hash index over the
+/// keys.
+///
+/// The order is load-bearing — it is what makes iteration stable, and `fmt`
+/// sorts on top of it — so the index sits *beside* the pairs rather than
+/// replacing them. Without one, every lookup, insert and `delete` was a linear
+/// scan and building a map was O(n²).
+///
+/// The index is dropped, and every operation falls back to that scan, the
+/// moment a key appears that a hash lookup could not answer: one with no
+/// [`map_key`] projection, which is a struct or array key (compared
+/// structurally, through the heap) or a `NaN`.
+/// Pairs below which the ordered scan beats hashing, so no index is built. A
+/// program that creates many small maps — a literal per loop iteration — would
+/// otherwise pay a `HashMap` allocation for each one it never grows into.
+const INDEX_THRESHOLD: usize = 8;
+
+#[derive(Clone, Default)]
+pub(crate) struct GoMap {
+    pairs: Vec<(Value, Value)>,
+    /// `None` until the map outgrows [`INDEX_THRESHOLD`], and `None` for good
+    /// once `unindexable` is set.
+    index: Option<HashMap<MapKey, usize>>,
+    /// Set by a key with no [`map_key`] projection. The scan is then the only
+    /// thing that can find that key again, so the index is never built.
+    unindexable: bool,
+}
+
+/// Read access to the ordered pairs. There is deliberately no `DerefMut`: every
+/// write goes through a method that keeps the index in step.
+impl std::ops::Deref for GoMap {
+    type Target = [(Value, Value)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.pairs
+    }
+}
+
+impl GoMap {
+    /// A map rebuilt from pairs already known to have distinct keys — a display
+    /// copy of an existing one, not a fresh sequence of inserts.
+    fn from_pairs(pairs: Vec<(Value, Value)>) -> Self {
+        let mut m = GoMap::default();
+        for (k, v) in pairs {
+            m.put(None, k, v);
+        }
+        m
+    }
+
+    /// Where `key` sits, when the index can answer without the ordered scan.
+    fn probe(&self, key: &Value) -> Probe {
+        let (Some(index), Some(k)) = (self.index.as_ref(), map_key(key)) else {
+            return Probe::Scan;
+        };
+        Probe::Answered(index.get(&k).copied())
+    }
+
+    /// Where `key` sits, falling back to the ordered scan. Callable only with no
+    /// heap borrow held: [`key_eq`] on a struct key reads the heap itself.
+    fn find(&self, key: &Value) -> Option<usize> {
+        match self.probe(key) {
+            Probe::Answered(hit) => hit,
+            Probe::Scan => self.pairs.iter().position(|(k, _)| key_eq(k, key)),
+        }
+    }
+
+    /// Insert `key`, or overwrite the value at `at` when the caller has already
+    /// located it. Splitting the search out is what lets the heap borrow be
+    /// taken *after* a struct-key comparison has read the heap.
+    fn put(&mut self, at: Option<usize>, key: Value, val: Value) {
+        if let Some(i) = at {
+            self.pairs[i].1 = val;
+            return;
+        }
+        let pos = self.pairs.len();
+        match map_key(&key) {
+            Some(k) => {
+                if let Some(index) = self.index.as_mut() {
+                    index.insert(k, pos);
+                }
+            }
+            // A key the index cannot hold makes it unsound for the whole map:
+            // the scan is the only thing that can find that key again.
+            None => {
+                self.unindexable = true;
+                self.index = None;
+            }
+        }
+        self.pairs.push((key, val));
+        if self.index.is_none() && !self.unindexable && self.pairs.len() > INDEX_THRESHOLD {
+            self.build_index();
+        }
+    }
+
+    /// Index every pair. Runs once, when the map outgrows the scan.
+    fn build_index(&mut self) {
+        let mut index = HashMap::with_capacity(self.pairs.len() * 2);
+        for (i, (k, _)) in self.pairs.iter().enumerate() {
+            let Some(mk) = map_key(k) else {
+                self.unindexable = true;
+                return;
+            };
+            index.insert(mk, i);
+        }
+        self.index = Some(index);
+    }
+
+    /// Drop the pair at `i`, keeping the order of the rest.
+    fn remove(&mut self, i: usize) {
+        let (key, _) = self.pairs.remove(i);
+        let Some(index) = self.index.as_mut() else {
+            return;
+        };
+        if let Some(k) = map_key(&key) {
+            index.remove(&k);
+        }
+        // Everything after it moved down a slot.
+        for pos in index.values_mut() {
+            if *pos > i {
+                *pos -= 1;
+            }
+        }
+    }
+}
+
+/// The index of `key` in the map at heap `id`, comparing by value.
+///
+/// The hash index answers under the borrow, since projecting a key never reads
+/// the heap. The scan it falls back to does — a struct key's [`key_eq`] reads
+/// the heap itself — so the keys are snapshotted first and the borrow released.
 fn map_find_index(id: u32, key: &Value) -> Option<usize> {
-    let keys: Vec<Value> = HEAP.with(|h| match h.borrow().get(id as usize) {
-        Some(HostObj::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
-        _ => Vec::new(),
+    let probe = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map(m)) => m.probe(key),
+        // Not a map at all; a nil map reads as an empty one.
+        _ => Probe::Answered(None),
     });
-    keys.iter().position(|k| key_eq(k, key))
+    match probe {
+        Probe::Answered(hit) => hit,
+        Probe::Scan => {
+            let keys: Vec<Value> = HEAP.with(|h| match h.borrow().get(id as usize) {
+                Some(HostObj::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
+                _ => Vec::new(),
+            });
+            keys.iter().position(|k| key_eq(k, key))
+        }
+    }
 }
 
 /// `make([]T, n)` (2 args: kind-tag, n) or `make(map[K]V)` (1 arg: kind-tag).
@@ -1757,7 +1945,7 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let kind = args.first().map(go_str).unwrap_or_default();
     match kind.as_str() {
-        "map" => Value::Obj(heap_alloc(HostObj::Map(Vec::new()))),
+        "map" => Value::Obj(heap_alloc(HostObj::Map(GoMap::default()))),
         _ => {
             let n = args.get(1).map(|v| v.to_int()).unwrap_or(0);
             let zero = args.get(2).cloned().unwrap_or(Value::Int(0));
@@ -1806,23 +1994,20 @@ fn b_slice_lit(vm: &mut VM, argc: u8) -> Value {
 /// Insert a flat `k0,v0,k1,v1,…` run into `pairs`, a duplicate key overwriting
 /// in place so the map keeps its first-mention order — Go's literal rule, and
 /// the same one whether the run is the whole literal or a later chunk of it.
-fn map_insert_all(pairs: &mut Vec<(Value, Value)>, flat: Vec<Value>) {
+fn map_insert_all(map: &mut GoMap, flat: Vec<Value>) {
     let mut it = flat.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        if let Some(slot) = pairs.iter_mut().find(|(ek, _)| key_eq(ek, &k)) {
-            slot.1 = v;
-        } else {
-            pairs.push((k, v));
-        }
+        let at = map.find(&k);
+        map.put(at, k, v);
     }
 }
 
 /// `map[K]V{k0: v0, …}` — build a map from popped `k0,v0,k1,v1,…` pairs.
 fn b_map_lit(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_args(vm, argc);
-    let mut pairs = Vec::with_capacity(flat.len() / 2);
-    map_insert_all(&mut pairs, flat);
-    Value::Obj(heap_alloc(HostObj::Map(pairs)))
+    let mut m = GoMap::default();
+    map_insert_all(&mut m, flat);
+    Value::Obj(heap_alloc(HostObj::Map(m)))
 }
 
 /// [`GLIT_EXTEND`] — append a further chunk of a composite literal to the
@@ -1865,7 +2050,7 @@ fn b_lit_extend(vm: &mut VM, argc: u8) -> Value {
         Kind::Map => {
             let mut pairs = HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
                 Some(HostObj::Map(p)) => std::mem::take(p),
-                _ => Vec::new(),
+                _ => GoMap::default(),
             });
             map_insert_all(&mut pairs, args);
             HEAP.with(|h| {
@@ -2071,10 +2256,7 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
             Some(HostObj::Map(m)) => {
-                match existing {
-                    Some(i) => m[i].1 = val.clone(),
-                    None => m.push((key.clone(), val.clone())),
-                }
+                m.put(existing, key.clone(), val.clone());
                 None
             }
             _ => Some("go-rs: invalid assignment target".to_string()),
@@ -3125,7 +3307,7 @@ fn tag_elem_ty(v: &Value, ty: &str) -> Value {
             .into_iter()
             .map(|(k, val)| (tag_elem_ty(&k, &key), tag_elem_ty(&val, &elem)))
             .collect();
-        return Value::Obj(heap_alloc(HostObj::Map(tagged)));
+        return Value::Obj(heap_alloc(HostObj::Map(GoMap::from_pairs(tagged))));
     }
     let Some(es) = slice_elems(v) else {
         return v.clone();
