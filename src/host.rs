@@ -5274,16 +5274,23 @@ pub mod stdlib {
     /// a float is exactly that — shortest round-trip, and never an exponent, so
     /// `1e21` writes its 22 digits out as Go's `'f'` does.
     fn shortest_fixed(f: f64, narrowed: bool) -> String {
-        if f.is_nan() {
-            return "NaN".to_string();
-        }
-        if f.is_infinite() {
-            return if f < 0.0 { "-Inf" } else { "+Inf" }.to_string();
-        }
         if narrowed {
             format!("{}", f as f32)
         } else {
             format!("{f}")
+        }
+    }
+
+    /// `strconv.FormatFloat(f, 'e', -1, 32)`: the `%e` form of a `float32`'s
+    /// shortest round-trip decimal. Rust's `{:e}` for an `f32` produces exactly
+    /// those digits — only the exponent spelling differs from Go's signed
+    /// two-digit form, which [`super::format_e`] writes.
+    fn shortest_sci32(f: f32, upper: bool) -> String {
+        let s = format!("{f:e}");
+        let e = if upper { 'E' } else { 'e' };
+        match s.split_once('e') {
+            Some((mant, exp)) => super::format_e(mant, exp.parse().unwrap_or(0), e),
+            None => s,
         }
     }
 
@@ -5301,15 +5308,30 @@ pub mod stdlib {
         let bits = args.get(3).map(|v| v.to_int()).unwrap_or(64);
         let prec = usize::try_from(prec).ok();
         let narrowed = bits == 32;
+        // Go reads the value *at* `bitSize` before it formats anything
+        // (`genericFtoa` takes the `float32` bits), so a 32-bit request rounds
+        // first and writes second — which shows in an explicit precision
+        // (`%.10f` of `1.0/3` at 32 is `0.3333333433`) and in an overflow to
+        // infinity (`1e300` at 32 is `+Inf`).
+        let f = if narrowed { f as f32 as f64 } else { f };
+        // An infinity or a NaN is the whole answer, before any verb: Go's
+        // `ftoa` returns it from the exponent check with no formatting at all,
+        // so even `G` writes `+Inf` rather than an upper-cased one.
+        if f.is_nan() {
+            return Value::str("NaN");
+        }
+        if f.is_infinite() {
+            return Value::str(if f < 0.0 { "-Inf" } else { "+Inf" });
+        }
         let out = match verb {
             'f' | 'F' => match prec {
                 Some(p) => format!("{:.*}", p, f),
                 None => shortest_fixed(f, narrowed),
             },
-            'e' | 'E' => {
-                let f = if narrowed { f as f32 as f64 } else { f };
-                super::format_float_e(f, prec, verb == 'E')
-            }
+            'e' | 'E' => match (prec, narrowed) {
+                (None, true) => shortest_sci32(f as f32, verb == 'E'),
+                _ => super::format_float_e(f, prec, verb == 'E'),
+            },
             'g' | 'G' => match (prec, narrowed) {
                 (None, true) => {
                     let g = super::format_float32(f as f32);
