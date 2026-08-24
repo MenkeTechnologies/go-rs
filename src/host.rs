@@ -132,7 +132,7 @@ pub const GLIT_EXTEND: u16 = 966;
 /// `[array, type]` → the same object, tagged as the fixed-size array type it
 /// was written as, so `%T` and `%#v` can name it.
 ///
-/// A `[N]T` and a `[]T` are the same [`HostObj::Slice`], and the length is not
+/// A `[N]T` and a `[]T` are the same `HostObj::Slice`, and the length is not
 /// recoverable from the elements (`[3]int` and a 3-element `[]int` hold the
 /// same thing), so the *written* type is stamped on the object where an array
 /// value is born — a composite literal and a zero value. Every other array is a
@@ -180,7 +180,7 @@ pub const GNAMED_BOX: u16 = 969;
 /// `"1"` and says yes. So the compiler routes a comparison with an
 /// interface-typed operand here instead of emitting `Op::NumEq`/`Op::StrEq`.
 ///
-/// The dynamic type is [`go_type_name`] — the same function `%T` prints, which
+/// The dynamic type is `go_type_name` — the same function `%T` prints, which
 /// already separates a struct type from another with the same fields, and a
 /// typed nil (`HostObj::Nil`) from an untyped one. It does **not** separate two
 /// integer widths: `int`, `int64` and `uint` are all `Value::Int` and all name
@@ -192,7 +192,7 @@ pub const GIFACE_EQ: u16 = 970;
 /// A `fmt` builtin is compiled as `CallBuiltin(id, argc)` with `argc` fixed at
 /// the call site, so a spread — whose length is only known at run time — cannot
 /// be counted there. The compiler wraps the spread operand in this marker
-/// instead and [`pop_args`] expands it back into the operand list, which is the
+/// instead and `pop_args` expands it back into the operand list, which is the
 /// one place every `fmt` entry point already funnels through. Without it
 /// `fmt.Sprintf(f, a...)` formats the *slice* as a single operand, so a wrapper
 /// like `func log(f string, a ...any) { fmt.Printf(f, a...) }` silently prints
@@ -249,7 +249,7 @@ pub const GAPPEND_SPREAD: u16 = 906;
 /// division otherwise, and the choice is made statically by the type checker.
 /// go-rs's compiler infers a numeric category for most expressions, but some
 /// forms (indexing a slice/map, a method result, an `interface{}` value) come
-/// back [`NumType::Unknown`]; emitting the float `Op::Div` for those made
+/// back `NumType::Unknown`; emitting the float `Op::Div` for those made
 /// `xs[0] / 2` yield `3.5` where Go yields `3`. This builtin resolves the same
 /// rule against the actual values, so an untyped-at-compile-time integer pair
 /// still truncates toward zero (and panics on a zero divisor) like Go.
@@ -2343,7 +2343,7 @@ pub(crate) fn ptr_eq(a: &Value, b: &Value) -> Option<bool> {
 
 /// Go's `==` on two interface operands: dynamic type first, value second.
 ///
-/// The type half is [`go_type_name`], which is what `%T` prints — so a `pt` and
+/// The type half is `go_type_name`, which is what `%T` prints — so a `pt` and
 /// a `qt` with the same field are different types and unequal, and an interface
 /// holding a nil *slice* is a `[]int` rather than a `<nil>` and so is not equal
 /// to the untyped `nil` (Go's non-nil-interface-holding-nil rule falls out of
