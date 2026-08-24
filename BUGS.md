@@ -123,6 +123,49 @@ are `parity-scripts/array_value_semantics.go` and
 on the object, so `%T` and `%#v` name the array at every depth
 (`parity-scripts/array_type_name.go`).
 
+## Spawning a goroutine copies the whole program — waiting on a fusevm release
+
+```go
+for i := 0; i < n; i++ { wg.Add(1); go func() { defer wg.Done(); … }() }
+```
+
+| goroutines | program (lines) | go-rs  |
+|------------|-----------------|--------|
+| 500        | 19              | 0.03s  |
+| 500        | 419             | 0.11s  |
+| 500        | 1,619           | 0.58s  |
+| 1,000      | 19              | 0.06s  |
+| 1,000      | 1,619           | 1.18s  |
+
+Spawn cost is linear in *program size*, so a big program's goroutines are
+expensive for no reason of their own. Every value is correct — this is a cost,
+not a divergence.
+
+`sample` on 12,000 goroutines in the 1,619-line program says where it goes:
+
+```
+  1404  alloc::slice::…to_vec_in::<fusevm::op::Op>
+   919  core::slice::iter::Iter<fusevm::op::Op>::…
+   704  <fusevm::op::Op as core::clone::Clone>::clone
+   630  core::iter::adapters::Enumerate<slice::Iter<…>>::…
+   585  _platform_memmove
+   222  core::slice::iter::Iter<(u16, usize)>::find
+   210  fusevm::chunk::Chunk::find_sub::{closure}
+```
+
+That is a deep copy of `Chunk` per goroutine — `ops`, `lines`, `names` and the
+constant pool — and it is about three quarters of the run. (Registering the
+builtins per goroutine does *not* show up; the copy is the whole story.)
+
+It cannot be closed from the frontend. `fusevm::Scheduler::new` takes an
+`FnMut() -> VM` factory and keeps every goroutine's `VM` in `vms: Vec<VM>`
+across suspension, while `VM::new` and `VM::reset` both take `Chunk` **by
+value** — so there is no way to hand the scheduler a VM that shares the program
+rather than owning a copy of it, and no way to pool and reset one either (a
+suspended goroutine still holds its VM). Closing it needs a fusevm release
+where the VM borrows or `Arc`-shares its chunk; the published pin is the
+contract.
+
 ## A struct or array key still scans (the rest of a `map` is hashed)
 
 `HostObj::Map` is a `GoMap` (`src/host.rs`): insertion-ordered pairs plus a hash
