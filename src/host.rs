@@ -478,11 +478,22 @@ fn b_assert_iface(vm: &mut VM, argc: u8) -> Value {
     match missing_method(&v, &want) {
         None => v,
         Some(m) => {
-            let got = go_type_name(&v);
-            runtime_panic(
-                vm,
-                format!("interface conversion: {got} is not {display}: missing method {m}"),
-            );
+            // Go's `TypeAssertionError` is not one of the `runtime error: `
+            // messages — its text starts at `interface conversion`.
+            let msg = if matches!(v, Value::Undef) {
+                // A nil interface holds no dynamic type, so Go words it as the
+                // absence of one rather than naming a missing method.
+                format!("interface conversion: interface is nil, not {display}")
+            } else {
+                // `missing_method` answers with the `name/arity:results` key the
+                // method table uses; Go's panic names only the method.
+                let name = m.split('/').next().unwrap_or(&m);
+                format!(
+                    "interface conversion: {} is not {display}: missing method {name}",
+                    go_type_name(&v)
+                )
+            };
+            plain_panic(vm, msg);
             Value::Undef
         }
     }
@@ -499,7 +510,9 @@ fn b_assert(vm: &mut VM, argc: u8) -> Value {
     if want.is_empty() || want == got {
         v
     } else {
-        runtime_panic(
+        // Not a `runtime error: ` message: Go's `TypeAssertionError` text starts
+        // at `interface conversion`.
+        plain_panic(
             vm,
             format!("interface conversion: interface {{}} is {got}, not {want}"),
         );

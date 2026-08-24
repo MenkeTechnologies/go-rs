@@ -218,7 +218,7 @@ var err error = errors.New("x")
 _ = err.(interface{ Unwrap() error })
 // go:    panic: interface conversion: *errors.errorString is not
 //        interface { Unwrap() error }: missing method Unwrap
-// go-rs: panic: interface conversion: main.$errorString is not
+// go-rs: panic: interface conversion: main.errors.errorString is not
 //        interface{Unwrap/0:error}: missing method Unwrap
 ```
 
@@ -227,6 +227,12 @@ signatures, and it is what `errors.Is`/`As` rely on. Only the panic *text*
 differs, because the parser canonicalizes an inline interface to
 [`method_sig`]-encoded names (`src/ast.rs`) rather than keeping the written
 source, which it cannot recover: tokens carry a line but no byte offset.
+
+A *named* interface is not affected — `x.(Stringer)` panics with Go's exact
+`interface conversion: int is not main.Stringer: missing method String`, and so
+does `x.(error)`. The synthesized `errors`/`fmt` error types keep the `main.`
+qualifier of the one package go-rs compiles, and lose the `*` for the reason in
+the pointer entry above.
 
 ## Unsupported stdlib calls
 

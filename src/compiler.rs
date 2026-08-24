@@ -1207,7 +1207,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         ms.sort();
         ms.dedup();
     }
-    let iface_methods: HashMap<String, Vec<String>> = prog
+    let mut iface_methods: HashMap<String, Vec<String>> = prog
         .interfaces
         .iter()
         .filter(|i| !i.methods.is_empty())
@@ -1218,6 +1218,13 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             (i.name.clone(), ms)
         })
         .collect();
+    // `error` is predeclared, so it never appears in `prog.interfaces` — but it
+    // is `interface{ Error() string }`, not the empty interface. Leaving it out
+    // made `type_to_tag` answer the empty tag, which `emit_type_test` reads as
+    // "matches everything": `case error:` then took a `float64`.
+    iface_methods
+        .entry("error".to_string())
+        .or_insert_with(|| vec![method_sig("Error", 0, &["string".to_string()])]);
 
     // Every interface name usable as an identity conversion, plus the two
     // predeclared ones (`error` and `any`/`interface{}`) a program never declares.
@@ -1296,9 +1303,13 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         c.b.emit(Op::CallBuiltin(host::GSET_PANIC_MODE, 0), 0);
         c.b.emit(Op::Pop, 0);
     }
-    // Publish every concrete type's method set when the program tests a value
-    // against a method-bearing interface; a program that never does pays nothing.
-    if !c.iface_methods.is_empty() {
+    // Publish every concrete type's method set, which is the half of Go's
+    // interface satisfaction rule the run time has to look up. A program with no
+    // methods at all registers nothing; one with methods pays a constant load
+    // and a call per type, once, in the prologue. (It cannot be gated on the
+    // program naming an interface: `error` is predeclared, so every program can
+    // test against one without declaring anything.)
+    if !type_methods.is_empty() {
         for (ty, ms) in &type_methods {
             let t = c.b.add_constant(Value::str(ty.clone()));
             c.b.emit(Op::LoadConst(t), 0);
@@ -2872,11 +2883,19 @@ impl Compiler {
             for j in &match_jumps {
                 self.b.patch_jump(*j, body_start);
             }
-            // Bind the value to `v` inside the body.
+            // Bind the value to `v` inside the body. Go gives the binding the
+            // case's own type when the case names exactly one — which is what
+            // makes `v.Error()` legal under `case error:` in a program that
+            // declares no error type of its own — and the switch expression's
+            // type when it names several.
             if let Some(name) = bind {
                 self.emit_get(&val, line);
                 self.types.insert(name.clone(), NumType::Unknown);
-                self.decl_types.insert(name.clone(), String::new());
+                let bound_ty = match case.types.as_slice() {
+                    [only] => only.clone(),
+                    _ => String::new(),
+                };
+                self.decl_types.insert(name.clone(), bound_ty);
                 self.emit_declare(name, line);
             }
             for s in &case.body {
@@ -3583,7 +3602,7 @@ impl Compiler {
                     Some(ms) => {
                         let want = self.b.add_constant(Value::str(ms.join(",")));
                         self.b.emit(Op::LoadConst(want), 0);
-                        let disp = self.b.add_constant(Value::str(base_type(ty)));
+                        let disp = self.b.add_constant(Value::str(iface_display(ty)));
                         self.b.emit(Op::LoadConst(disp), 0);
                         self.b.emit(Op::CallBuiltin(host::GASSERT_IFACE, 3), 0);
                     }
@@ -5612,6 +5631,18 @@ fn sub_name(f: &Func) -> String {
 /// value receiver `T` and pointer receiver `*T` mangle to the same method set.
 fn base_type(ty: &str) -> String {
     ty.trim_start_matches('*').to_string()
+}
+
+/// How Go names an interface type in an `interface conversion` panic: a
+/// program-declared one is package-qualified (`main.St`), the predeclared
+/// `error` is not, and an anonymous one is spelled out by its method set.
+fn iface_display(ty: &str) -> String {
+    let name = base_type(ty);
+    if name == "error" || name.starts_with("interface{") {
+        name
+    } else {
+        format!("main.{name}")
+    }
 }
 
 /// Fold a compile-time-constant float expression to a single `f64`, evaluated
