@@ -403,17 +403,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // operators & punctuation (longest match first)
-        let three = if i + 2 < bytes.len() {
-            &src[i..i + 3]
-        } else {
-            ""
+        // Operators & punctuation, longest match first.
+        //
+        // The lookahead slices by byte, so it has to stop on a character
+        // boundary: `f('世')` puts a three-byte rune two bytes past the `(`, and
+        // slicing three bytes from there lands inside it and panics. No operator
+        // is non-ASCII, so a slice that would split a character is no match.
+        let ahead = |n: usize| {
+            let end = i + n;
+            if end <= bytes.len() && src.is_char_boundary(end) {
+                &src[i..end]
+            } else {
+                ""
+            }
         };
-        let two = if i + 1 < bytes.len() {
-            &src[i..i + 2]
-        } else {
-            ""
-        };
+        let three = ahead(3);
+        let two = ahead(2);
         let (kind, adv) = match three {
             "<<=" => (Tok::ShlAssign, 3),
             ">>=" => (Tok::ShrAssign, 3),
@@ -558,23 +563,20 @@ fn unescape(c: char) -> char {
 /// Handles `\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\ooo` (octal), and the simple
 /// single-char escapes (`\n \t \r \0 \\ \' \"` …).
 fn scan_escape(src: &str, bytes: &[u8], i: usize) -> (u32, usize) {
+    /// The `n` digits at `at` read in `radix`, or U+FFFD when they are not
+    /// there: a truncated escape at end of input, or one whose digits are a
+    /// multi-byte character. Go rejects both, and `str::get` answers `None` for
+    /// either rather than panicking the way a bare slice does.
+    fn digits(src: &str, at: usize, n: usize, radix: u32) -> u32 {
+        src.get(at..at + n)
+            .and_then(|s| u32::from_str_radix(s, radix).ok())
+            .unwrap_or(0xFFFD)
+    }
     match bytes[i] {
-        b'x' => {
-            let hex = &src[i + 1..i + 3];
-            (u32::from_str_radix(hex, 16).unwrap_or(0xFFFD), i + 3)
-        }
-        b'u' => {
-            let hex = &src[i + 1..i + 5];
-            (u32::from_str_radix(hex, 16).unwrap_or(0xFFFD), i + 5)
-        }
-        b'U' => {
-            let hex = &src[i + 1..i + 9];
-            (u32::from_str_radix(hex, 16).unwrap_or(0xFFFD), i + 9)
-        }
-        b'0'..=b'7' => {
-            let oct = &src[i..i + 3];
-            (u32::from_str_radix(oct, 8).unwrap_or(0xFFFD), i + 3)
-        }
+        b'x' => (digits(src, i + 1, 2, 16), i + 3),
+        b'u' => (digits(src, i + 1, 4, 16), i + 5),
+        b'U' => (digits(src, i + 1, 8, 16), i + 9),
+        b'0'..=b'7' => (digits(src, i, 3, 8), i + 3),
         other => (unescape(other as char) as u32, i + 1),
     }
 }
@@ -606,5 +608,39 @@ mod tests {
     fn line_comment_still_terminates() {
         let k = kinds("x := 1 // comment\n");
         assert!(k.contains(&Tok::Semi));
+    }
+
+    /// The operator lookahead slices three bytes from the cursor, so a
+    /// multi-byte rune within two bytes of punctuation lands inside a character
+    /// — which panicked the slice rather than lexing. Every position here put a
+    /// different byte of the rune at the slice boundary.
+    #[test]
+    fn a_multibyte_rune_next_to_punctuation_lexes() {
+        for src in [
+            "f('世')\n",
+            "f('é')\n",
+            "x:='世'\n",
+            "a['界']=1\n",
+            "(('世'))\n",
+            "x:=\"世\"+\"界\"\n",
+            "// 世界\nx := 1\n",
+            "/* 世 */ x := 1\n",
+        ] {
+            let toks = lex(src);
+            assert!(toks.is_ok(), "failed to lex {src:?}: {:?}", toks.err());
+        }
+        assert_eq!(kinds("'世'\n")[0], Tok::Int('世' as i64));
+        assert_eq!(kinds("'a'\n")[0], Tok::Int('a' as i64));
+    }
+
+    /// A truncated or malformed escape is a Go compile error; here it must at
+    /// worst lex to U+FFFD, never panic the byte slice that reads its digits.
+    #[test]
+    fn a_truncated_escape_does_not_panic() {
+        for src in ["'\\x", "\"\\x\"", "'\\u12", "\"\\u12\"", "'\\U1234", "'\\7"] {
+            let _ = lex(src);
+        }
+        assert_eq!(kinds("'\\x41'\n")[0], Tok::Int(0x41));
+        assert_eq!(kinds("'\\u4e16'\n")[0], Tok::Int('世' as i64));
     }
 }
