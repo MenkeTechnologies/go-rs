@@ -320,19 +320,20 @@ the pointer entry above.
 ## Unsupported stdlib calls
 
 Writer-directed output is implemented. `fmt.Fprint` / `Fprintf` / `Fprintln`
-rewrite to `w.Write([]byte(fmt.Sprint*(…)))`, `io` is vendored
-(`goroot/io.go`: `Writer`, `StringWriter`, `WriteString`), and
-`strings.Builder` and `os.Stdout` / `os.Stderr` are synthesized and qualified
-under their native packages (`goroot/strings_builder.go`, `goroot/os_file.go`).
+rewrite to `w.Write([]byte(fmt.Sprint*(…)))`; `io` and `bytes` are vendored
+(`goroot/io.go`, `goroot/bytes.go`); and `strings.Builder` and `os.Stdout` /
+`os.Stderr` are synthesized and qualified under their native packages
+(`goroot/strings_builder.go`, `goroot/os_file.go`).
 
 What is still missing from that corner:
 
-- **`bytes.Buffer`** — the same shape as `strings.Builder`, and `bytes` is not
-  native, so it is the ordinary vendored-source path rather than a synthesis.
-- **`strings.Builder.Cap`** is deliberately absent: go-rs cannot reserve
-  capacity, so answering it would mean answering wrongly. `Grow` is a no-op,
-  which nothing can observe once `Cap` is gone. A program calling `Cap` gets a
-  compile error.
+- **`Cap` / `Grow`** on `strings.Builder` and `bytes.Buffer` are deliberately
+  absent: go-rs cannot reserve capacity, so answering would mean answering
+  wrongly. (`Builder.Grow` is a no-op, which nothing can observe once `Cap` is
+  gone.) A program calling `Cap` gets a compile error.
+- **`bytes.Buffer`'s read half** — `Read`, `ReadString`, `Next`, `UnreadByte`
+  and the read offset they share. The write half is what a program reaches for
+  when it wants somewhere to write, and is what is vendored.
 - **`os.File` is only the two standard streams.** There is no `Open`, `Create`
   or `Read` — `writeFd` is the package's one intrinsic and only ever sees
   descriptors 1 and 2.

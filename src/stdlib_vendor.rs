@@ -15,6 +15,7 @@ pub fn source(path: &str) -> Option<String> {
         "unicode/utf16" => include_str!("../goroot/utf16.go"),
         "cmp" => include_str!("../goroot/cmp.go"),
         "io" => include_str!("../goroot/io.go"),
+        "bytes" => include_str!("../goroot/bytes.go"),
         _ => return None,
     };
     Some(text.to_string())
