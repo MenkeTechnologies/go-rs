@@ -216,12 +216,25 @@ fmt.Println(&p1 == &p2)   // go: false   go-rs: true
 go-rs models `&x` on a non-struct as the value itself, so a `*int` carries no
 identity to compare: `==` falls through to the value, and two distinct pointers
 to equal values are one key of a `map[*int]V` rather than two. A pointer *field*
-inside a struct key inherits the same merge. A `&T{…}` handle is unaffected —
-it is a real heap handle, and `HostObj::Struct::by_ref` is what keeps two of
-them distinct.
+inside a struct key inherits the same merge.
 
-Closing it means giving a scalar pointer a heap cell of its own, which changes
-what every `&x` and `*p` on a scalar costs.
+`&x` on a **composite** is no longer affected: it allocates a `HostObj::Ptr`
+addressing the variable's handle, so it binds, stores and compares as a pointer.
+That machinery cannot reach a scalar for the reason the gap exists — an `int` is
+not a heap object, so `GPTR_TO` has nothing to point at and passes the value
+through. `*p = v` through such a pointer is refused rather than answered:
+
+```go
+a := 5
+pa := &a
+*pa = 9   // go-rs: cannot assign through a pointer to a non-composite value
+```
+
+Closing it means boxing any scalar whose address is taken — a heap cell of its
+own, which the closure-capture path already builds for a different reason — and
+teaching `*p` to read through one. That changes what every `&x` and `*p` on a
+scalar costs, and every loop holding such a variable would leave the tracing
+tier, so it is a deliberate trade rather than an oversight.
 
 ## A pointer to a struct prints without `&`
 
@@ -243,33 +256,6 @@ half:
 - A pointer *nested* inside a printed value is a hex address in Go, which is
   nondeterministic and not reproducible at all; the depth-0 `&{…}` form is the
   only part worth matching.
-
-## `&x` on an existing variable produces a pointer that copies when bound
-
-```go
-type pt struct{ X int }
-x := pt{1}
-p := &x
-q := p
-q.X = 7
-fmt.Println(x.X)              // go: 7   go-rs: 1
-```
-
-A bind copies a struct value and shares a pointer, which the run time decides
-from the `by_ref` mark `&T{…}` and `new(T)` leave on their handle
-(`host::struct_bind`). `&x` on an *existing* variable is a different thing: it
-is a no-op on the shared handle, so there is no separate object to mark, and
-marking the one there is would mark `x` too — which would make `x == y` compare
-by identity where Go compares field by field.
-
-So a pointer taken that way carries no mark and copies when it is bound again.
-Passing it straight down works — `f(&x)` is exempt because the `&` is written at
-the call site — and so does a pointer-receiver method on it; it is only the
-second bind (`p := &x; q := p`, or `f(p)`) that loses the aliasing.
-
-Closing it needs a real pointer object with its own identity, which is the same
-representation change the printing half of **A pointer to a struct prints
-without `&`** wants.
 
 ## `append` capacity misses Go's malloc size-class rounding
 

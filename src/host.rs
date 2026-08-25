@@ -2912,10 +2912,10 @@ fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
     let target = args.first().cloned().unwrap_or(Value::Undef);
     let val = args.get(1).cloned().unwrap_or(Value::Undef);
     let Value::Obj(id) = target else {
-        ffi_fault(
-            vm,
-            "go-rs: invalid memory address or nil pointer dereference".to_string(),
-        );
+        // `&x` on a scalar yields the value, not an address, so there is nothing
+        // to write back through. Naming that beats faulting as if the pointer
+        // were nil, which is what the address it never took would look like.
+        ffi_fault(vm, "go-rs: cannot assign through a pointer to a non-composite value (`&x` on a scalar has no address)".to_string(),);
         return Value::Undef;
     };
     // The *pointee* is overwritten rather than rebound, which is what makes the
@@ -2936,7 +2936,7 @@ fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
             }
         }),
         None => {
-            ffi_fault(vm, "go-rs: cannot assign through this pointer".to_string());
+            ffi_fault(vm, "go-rs: cannot assign through a pointer to a non-composite value (`&x` on a scalar has no address)".to_string(),);
         }
     }
     val
