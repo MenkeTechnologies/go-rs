@@ -23,7 +23,7 @@ pub const NATIVE: &[&str] = &["fmt", "strings", "strconv", "math", "sort", "os"]
 /// switch dispatches on, which no Go source can name). Listed here so they are
 /// qualified like the package's own names — a user program's `runtimeTypeTag`
 /// then cannot capture the reference.
-const INTRINSICS: &[(&str, &str)] = &[("errors", "runtimeTypeTag")];
+const INTRINSICS: &[(&str, &str)] = &[("errors", "runtimeTypeTag"), ("os", "writeFd")];
 
 /// Whether a type name is the parser's canonical name for an anonymous interface
 /// (`interface{Unwrap}`), which names a method set rather than a package's type.
@@ -78,6 +78,12 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     // that never names `strings` cannot name the type either.
     if main.imports.iter().any(|p| p == "strings") {
         add_strings_builder(&mut main)?;
+    }
+    // `os.Stdout` / `os.Stderr` the same way. Their initializers are
+    // package-level vars, so they are spliced ahead of the program's own
+    // globals — a `var out = os.Stdout` must see them already built.
+    if main.imports.iter().any(|p| p == "os") {
+        add_os_file(&mut main)?;
     }
     add_sort_slice(&mut main);
     add_stringify(&mut main);
@@ -251,6 +257,19 @@ fn uses_strconv_error(prog: &Program) -> bool {
         Expr::Call { func, .. } => PARSERS.iter().any(|f| is_selector(func, "strconv", f)),
         e => is_selector(e, "strconv", "ErrSyntax") || is_selector(e, "strconv", "ErrRange"),
     })
+}
+
+/// Synthesize `os.Stdout` / `os.Stderr` and the `*os.File` behind them. Their
+/// package-level initializers are spliced to the *front* of the program's
+/// globals, because a user global may read one.
+fn add_os_file(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/os_file.go"))?;
+    qualify(&mut pkg, "os", true);
+    prog.types.append(&mut pkg.types);
+    prog.funcs.append(&mut pkg.funcs);
+    let inits = std::mem::take(&mut pkg.main);
+    prog.main.splice(0..0, inits);
+    Ok(())
 }
 
 /// Synthesize `strings.Builder` and its method set from real Go source, then

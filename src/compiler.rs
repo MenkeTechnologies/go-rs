@@ -4005,6 +4005,17 @@ impl Compiler {
                     // not constants: `errors.Is` compares them by pointer, so each
                     // mention must yield the one handle the host memoizes rather
                     // than a fresh chunk constant.
+                    // `os.Stdout` / `os.Stderr` are package-level *vars* the
+                    // linker synthesizes (`goroot/os_file.go`). `os` is native,
+                    // so nothing rewrote the selector into the qualified name
+                    // the way it would for a source package — this does.
+                    if pkg == "os" && matches!(field.as_str(), "Stdout" | "Stderr") {
+                        let name = format!("os.{field}");
+                        if self.scope_has(&name) || self.globals.contains(&name) {
+                            self.emit_get(&name, 0);
+                            return Ok(());
+                        }
+                    }
                     if pkg == "strconv" && matches!(field.as_str(), "ErrSyntax" | "ErrRange") {
                         let c = self.b.add_constant(Value::str(field.clone()));
                         self.b.emit(Op::LoadConst(c), 0);
@@ -4696,6 +4707,19 @@ impl Compiler {
                 rhs,
             } => self.type_name(rhs),
             Expr::Selector { recv, field } => {
+                // A package-level name of a package the linker merged in
+                // (`os.Stdout`) is a global under its qualified name, and the
+                // receiver names no type of its own — so the qualified name is
+                // where its declared type lives.
+                if let Expr::Ident(pkg) = recv.as_ref() {
+                    let qualified = format!("{pkg}.{field}");
+                    if self.decl_types.contains_key(pkg) {
+                        // The receiver is a *variable* named like a package;
+                        // fall through to the struct-field lookup below.
+                    } else if let Some(t) = self.decl_types.get(&qualified) {
+                        return t.clone();
+                    }
+                }
                 // A field's declared type, looked up on the receiver's struct.
                 let rt = self.type_name(recv);
                 self.struct_fields
@@ -5834,6 +5858,14 @@ impl Compiler {
             }
             // The vendored `errors` package's one host intrinsic: the runtime type
             // tag a type switch dispatches on, which `asTag` compares against.
+            // The `os` package's one host intrinsic: the write behind
+            // `os.Stdout` / `os.Stderr`, which no Go source can express.
+            if name == "os.writeFd" && args.len() == 2 {
+                self.expr(&args[0])?;
+                self.expr(&args[1])?;
+                self.b.emit(Op::CallBuiltin(host::GWRITE_FD, 2), line);
+                return Ok(());
+            }
             if name == "errors.runtimeTypeTag" && args.len() == 1 {
                 self.expr(&args[0])?;
                 self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), line);

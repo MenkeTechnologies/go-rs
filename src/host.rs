@@ -61,6 +61,12 @@ pub const GSTRUCT_COPY: u16 = 823;
 /// struct value at every one of those sites and copies nothing at all through a
 /// pointer, so `q := p` on a `*T` has to share what `p` points at.
 pub const GSTRUCT_BIND: u16 = 857;
+
+/// `os.writeFd(fd, s)` — the write behind `os.Stdout` / `os.Stderr`, which no
+/// Go source in `goroot/` can name. Descriptor 2 is stderr; anything else is
+/// stdout, because those are the only two files a synthesized `*os.File` is
+/// ever built for.
+pub const GWRITE_FD: u16 = 858;
 /// The range keys of a value as a slice: `0..len` for a slice/string, the keys
 /// for a map. Lets `for … range` iterate slices and maps uniformly.
 pub const GRANGE_KEYS: u16 = 824;
@@ -372,6 +378,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GFIELD_SET, b_field_set);
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
     vm.register_builtin(GSTRUCT_BIND, b_struct_bind);
+    vm.register_builtin(GWRITE_FD, b_write_fd);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
     vm.register_builtin(GARRAY_TAG, b_array_tag);
@@ -2803,6 +2810,27 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
 fn b_struct_copy(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     struct_copy(args.first().cloned().unwrap_or(Value::Undef))
+}
+
+fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
+    use std::io::Write as _;
+    let args = pop_args(vm, argc);
+    let text = args.get(1).map(go_str).unwrap_or_default();
+    // Unbuffered, and flushed at once, so a write to `os.Stdout` interleaves
+    // with `fmt.Println` in the order the program made them.
+    match args.first().map(|v| v.to_int()) {
+        Some(2) => {
+            let mut e = std::io::stderr();
+            let _ = e.write_all(text.as_bytes());
+            let _ = e.flush();
+        }
+        _ => {
+            let mut o = std::io::stdout();
+            let _ = o.write_all(text.as_bytes());
+            let _ = o.flush();
+        }
+    }
+    Value::Undef
 }
 
 fn b_struct_bind(vm: &mut VM, argc: u8) -> Value {
