@@ -2474,9 +2474,34 @@ impl Compiler {
                     if !vals.is_empty() {
                         let names = self.named_results.clone();
                         let tys = self.fn_results.clone();
-                        for (i, (name, e)) in names.iter().zip(vals).enumerate() {
-                            self.emit_result(e, i, &tys)?;
-                            self.emit_set(name, *line);
+                        // `return f()` forwarding a call that yields exactly as
+                        // many values as there are results — Go assigns them
+                        // position by position. Zipping the names against the
+                        // one written value instead puts the callee's whole
+                        // tuple in the first name and leaves the rest at their
+                        // zero, which is what made `io.WriteString` answer
+                        // `[2 <nil>] <nil>`.
+                        if vals.len() == 1
+                            && names.len() >= 2
+                            && self.call_result_count(&vals[0]) == Some(names.len())
+                        {
+                            let n = self.temp_counter;
+                            self.temp_counter += 1;
+                            let tup = format!("$rt{n}");
+                            self.expr(&vals[0])?;
+                            self.types.insert(tup.clone(), NumType::Unknown);
+                            self.emit_set(&tup, *line);
+                            for (i, name) in names.iter().enumerate() {
+                                self.emit_get(&tup, *line);
+                                self.b.emit(Op::LoadInt(i as i64), *line);
+                                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
+                                self.emit_set(name, *line);
+                            }
+                        } else {
+                            for (i, (name, e)) in names.iter().zip(vals).enumerate() {
+                                self.emit_result(e, i, &tys)?;
+                                self.emit_set(name, *line);
+                            }
                         }
                     }
                     self.emit_named_return(*line);
@@ -4571,13 +4596,53 @@ impl Compiler {
                         if host::stdlib::returns_error(pkg, field) {
                             return Some(2);
                         }
+                        // `fmt.Fprint*` is rewritten to the writer's own
+                        // `Write`, so it returns what `Write` does — but the
+                        // count is asked for before the rewrite, off the name
+                        // the program wrote.
+                        if pkg == "fmt"
+                            && matches!(field.as_str(), "Fprintf" | "Fprint" | "Fprintln")
+                        {
+                            return Some(2);
+                        }
                     }
                     // A method call `recv.M()` — look up M's result count on the
                     // receiver's static type. (A package call like `strings.Split`
                     // has an untyped receiver, so this yields `None`.)
                     let rt = self.type_name(recv);
                     if !rt.is_empty() {
-                        return self.method_nresults.get(&(rt, field.clone())).copied();
+                        if let Some(n) = self.method_nresults.get(&(rt.clone(), field.clone())) {
+                            return Some(*n);
+                        }
+                        // An *interface*-typed receiver declares no method of
+                        // its own, so the count comes off the method set, whose
+                        // entries carry the result types (`Write/1:int,error`).
+                        // Without this a call through an interface looked like
+                        // it yielded one value, and `n, err := w.Write(p)` put
+                        // the whole tuple in `n`.
+                        let prefix = format!("{field}/");
+                        if let Some(sig) = self
+                            .iface_of(&rt)
+                            .and_then(|ms| ms.iter().find(|m| m.starts_with(&prefix)))
+                        {
+                            let results = sig.split_once(':').map(|(_, r)| r).unwrap_or("");
+                            return Some(match results.is_empty() {
+                                true => 0,
+                                false => results.split(',').count(),
+                            });
+                        }
+                        return None;
+                    }
+                    // A *source*-linked package's function is merged into the
+                    // program under its qualified name, so `io.WriteString`'s
+                    // two results are known the same way a local `func`'s are.
+                    // Reached only when the receiver named no type, which is
+                    // what tells a package selector from a method call.
+                    if let Expr::Ident(pkg) = recv.as_ref() {
+                        return self
+                            .funcs
+                            .get(&format!("{pkg}.{field}"))
+                            .map(|sig| sig.nresults);
                     }
                 }
                 _ => {}
@@ -5505,6 +5570,49 @@ impl Compiler {
                             }),
                         };
                         return self.expr(&addr);
+                    }
+                    // `fmt.Fprint*(w, …)` is `w.Write([]byte(fmt.Sprint*(…)))`
+                    // and nothing else. Both halves already exist — the
+                    // formatting one as `Sprint*`, the writing one as an
+                    // ordinary method call on whatever the program handed in —
+                    // so writer-directed output needs no host support at all,
+                    // only the rewrite. The result is `Write`'s own
+                    // `(n int, err error)`, which is what Go's returns.
+                    if let Some(sprint) = match field.as_str() {
+                        "Fprintf" => Some("Sprintf"),
+                        "Fprint" => Some("Sprint"),
+                        "Fprintln" => Some("Sprintln"),
+                        _ => None,
+                    } {
+                        let Some((w, rest)) = args.split_first() else {
+                            return Err(format!(
+                                "go-rs: `fmt.{field}` needs a writer (line {line})"
+                            ));
+                        };
+                        let text = Expr::Call {
+                            func: Box::new(Expr::Selector {
+                                recv: Box::new(Expr::Ident("fmt".to_string())),
+                                field: sprint.to_string(),
+                            }),
+                            args: rest.to_vec(),
+                            spread,
+                            line,
+                        };
+                        let bytes = Expr::Call {
+                            func: Box::new(Expr::Ident("[]byte".to_string())),
+                            args: vec![text],
+                            spread: false,
+                            line,
+                        };
+                        return self.call(
+                            &Expr::Selector {
+                                recv: Box::new(w.clone()),
+                                field: "Write".to_string(),
+                            },
+                            &[bytes],
+                            false,
+                            line,
+                        );
                     }
                     let id = match field.as_str() {
                         "Println" => host::GPRINTLN,

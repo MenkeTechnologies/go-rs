@@ -569,21 +569,15 @@ impl Parser {
     /// Parse an interface method's result list: nothing, one type, or a
     /// parenthesized `(T, U)` list.
     fn result_types(&mut self) -> Result<Vec<String>, String> {
-        if self.eat(&Tok::LParen) {
-            let mut out = Vec::new();
-            while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
-                out.push(self.type_name()?);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            self.expect(&Tok::RParen)?;
-            return Ok(out);
-        }
         if matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::Eof) {
             return Ok(Vec::new());
         }
-        Ok(vec![self.type_name()?])
+        // An interface method's results are a function's results — including the
+        // *named* form Go's own stdlib writes them in (`Write(p []byte) (n int,
+        // err error)`). Reading them as bare types made the name a type and the
+        // type a syntax error, which is what stopped `io` from being vendored.
+        // The names carry no meaning in a method set, so they are dropped here.
+        Ok(self.results()?.into_iter().map(|(_, ty)| ty).collect())
     }
 
     /// Parse a `{ field-decls }` struct body into its fields. The `struct`

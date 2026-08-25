@@ -14,6 +14,7 @@ pub fn source(path: &str) -> Option<String> {
         "sync" => include_str!("../goroot/sync.go"),
         "unicode/utf16" => include_str!("../goroot/utf16.go"),
         "cmp" => include_str!("../goroot/cmp.go"),
+        "io" => include_str!("../goroot/io.go"),
         _ => return None,
     };
     Some(text.to_string())
