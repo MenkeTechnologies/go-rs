@@ -54,6 +54,13 @@ pub const GFIELD_GET: u16 = 821;
 pub const GFIELD_SET: u16 = 822;
 /// Deep-copy a struct value (Go struct value semantics on assign/pass/return).
 pub const GSTRUCT_COPY: u16 = 823;
+
+/// Copy a struct value at a *bind* site — an assignment, an argument, a return,
+/// a container store, a `range` binding. Unlike [`GSTRUCT_COPY`] it is the
+/// identity on a handle marked `by_ref`, which is a Go **pointer**: Go copies a
+/// struct value at every one of those sites and copies nothing at all through a
+/// pointer, so `q := p` on a `*T` has to share what `p` points at.
+pub const GSTRUCT_BIND: u16 = 857;
 /// The range keys of a value as a slice: `0..len` for a slice/string, the keys
 /// for a map. Lets `for … range` iterate slices and maps uniformly.
 pub const GRANGE_KEYS: u16 = 824;
@@ -364,6 +371,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GFIELD_GET, b_field_get);
     vm.register_builtin(GFIELD_SET, b_field_set);
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
+    vm.register_builtin(GSTRUCT_BIND, b_struct_bind);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
     vm.register_builtin(GARRAY_TAG, b_array_tag);
@@ -2797,6 +2805,36 @@ fn b_struct_copy(vm: &mut VM, argc: u8) -> Value {
     struct_copy(args.first().cloned().unwrap_or(Value::Undef))
 }
 
+fn b_struct_bind(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    struct_bind(args.first().cloned().unwrap_or(Value::Undef))
+}
+
+/// One value copy at a bind site: the identity on a pointer, a struct copy on
+/// anything else.
+///
+/// `&T{…}` and `new(T)` mark their handle `by_ref` ([`HostObj::Struct`]) — it is
+/// a Go pointer, and Go copies nothing through one. Copying it anyway is what
+/// made `q := p`, `f(p)` and `[]*T{p}` each hand out a private struct whose
+/// writes the original never saw.
+///
+/// The inverse — `*p`, which asks for the pointed-to *value* — keeps
+/// [`struct_copy`], and so does a value-receiver method call. Those are the two
+/// places a pointer is deliberately turned back into a value.
+fn struct_bind(v: Value) -> Value {
+    let Value::Obj(id) = v else { return v };
+    let is_ptr = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(id as usize),
+            Some(HostObj::Struct { by_ref: true, .. })
+        )
+    });
+    if is_ptr {
+        return v;
+    }
+    struct_copy(v)
+}
+
 /// Copy a fixed-size array value (Go array value semantics), given its written
 /// element type. Non-array values pass through unchanged.
 fn b_array_copy(vm: &mut VM, argc: u8) -> Value {
@@ -2811,7 +2849,9 @@ fn b_array_copy(vm: &mut VM, argc: u8) -> Value {
 fn value_copy(v: Value, ty: &str) -> Value {
     match crate::ast::array_elem_ty(ty) {
         Some(elem) => array_copy(v, elem),
-        None => struct_copy(v),
+        // A bind, not a copy: a `[2]*T` array's elements are pointers, and Go
+        // copies the array while sharing what each element points at.
+        None => struct_bind(v),
     }
 }
 

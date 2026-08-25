@@ -4255,13 +4255,28 @@ impl Compiler {
     /// are reference types and pass through the copy unchanged).
     fn emit_value(&mut self, e: &Expr) -> Result<(), String> {
         self.expr(e)?;
-        // Struct and array values are copied on assign/pass/return (Go value
-        // semantics) — but `&x` is a pointer (a reference), so it is never
-        // copied.
-        let is_pointer = matches!(e, Expr::Unary { op: UnOp::Addr, .. });
-        if !is_pointer {
-            self.emit_copy_for(&self.type_name(e));
+        // `&x` is a pointer (a reference), so it is never copied.
+        if matches!(e, Expr::Unary { op: UnOp::Addr, .. }) {
+            return Ok(());
         }
+        // `*p` asks for the pointed-to *value*, so it copies even though the
+        // handle it evaluates to is a pointer. This is the one site where the
+        // bind-time rule is inverted, and it is why the two cannot share an op:
+        // `q := p` and `v := *p` reach the run time as the same handle, and only
+        // the AST still knows which is which.
+        let ty = self.type_name(e);
+        if matches!(
+            e,
+            Expr::Unary {
+                op: UnOp::Deref,
+                ..
+            }
+        ) && self.structs.contains(&ty)
+        {
+            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+            return Ok(());
+        }
+        self.emit_copy_for(&ty);
         Ok(())
     }
 
@@ -4417,7 +4432,9 @@ impl Compiler {
             self.b.emit(Op::LoadConst(c), 0);
             self.b.emit(Op::CallBuiltin(host::GARRAY_COPY, 2), 0);
         } else if self.structs.contains(ty) {
-            self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
+            // A *bind*: copies a struct value, shares a pointer. See
+            // `host::struct_bind` for why the two cannot be one op.
+            self.b.emit(Op::CallBuiltin(host::GSTRUCT_BIND, 1), 0);
         }
     }
 
