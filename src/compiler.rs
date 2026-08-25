@@ -49,6 +49,26 @@ fn int_width(ty: &str) -> Option<(u32, bool)> {
     })
 }
 
+/// Whether `for … range x` over a value of static type `ty` walks the index
+/// sequence `0 … n-1`.
+///
+/// A slice, a fixed-size array and — since Go 1.22 — an integer all do. A map
+/// does not: its keys are its own values. Neither does a string: `range` walks
+/// it by rune, so the keys are the byte offsets each rune *starts* at, which
+/// skip the continuation bytes of every multi-byte one.
+///
+/// An empty `ty` is an unknown static type rather than a claim about the
+/// value, so it answers `false` and takes the general path.
+fn integer_keyed_range(ty: &str) -> bool {
+    ty.starts_with("[]") || array_elem_ty(ty).is_some() || int_range_ty(ty)
+}
+
+/// Whether `ty` is one of the integer types Go 1.22's `for i := range n`
+/// accepts, whose iteration count is the value itself rather than a length.
+fn int_range_ty(ty: &str) -> bool {
+    matches!(ty, "int" | "int64" | "uint" | "uint64" | "uintptr") || int_width(ty).is_some()
+}
+
 /// Whether `ty` is one of Go's unsigned 64-bit integer types. They are the
 /// widths `Value::Int` (an `i64`) holds bit-identically but *reads* differently:
 /// every operation that consults the sign bit needs an unsigned form.
@@ -1397,10 +1417,21 @@ impl Compiler {
             self.decl_types.insert(r.name.clone(), base_type(&r.ty));
             slot += 1;
         }
-        for p in &f.params {
+        for (n, p) in f.params.iter().enumerate() {
             scope.slots.insert(p.name.clone(), slot);
-            self.types.insert(p.name.clone(), numtype_of_ty(&p.ty));
-            self.decl_types.insert(p.name.clone(), base_type(&p.ty));
+            // `Param::ty` of a variadic parameter is its *element* type — the
+            // call site needs that to build the trailing slice — but inside the
+            // body the name is bound to the slice, so that is the type recorded
+            // here. Without the distinction `xs ...int` reads as a plain `int`,
+            // and anything deciding by static type treats the slice handle as
+            // the number it is stored as.
+            let ty = if f.variadic && n + 1 == f.params.len() {
+                format!("[]{}", base_type(&p.ty))
+            } else {
+                base_type(&p.ty)
+            };
+            self.types.insert(p.name.clone(), numtype_of_ty(&ty));
+            self.decl_types.insert(p.name.clone(), ty);
             slot += 1;
         }
         scope.next_slot = slot;
@@ -3386,17 +3417,34 @@ impl Compiler {
             self.emit_copy_for(&iter_ty);
         }
         self.emit_set(&it, 0);
-        self.emit_get(&it, 0);
-        self.b.emit(Op::CallBuiltin(host::GRANGE_KEYS, 1), 0);
-        self.emit_set(&keys, 0);
+
+        // A slice, a fixed-size array and an integer all iterate `0 … n-1`, so
+        // the key is `$i` itself and the materialized key list is pure waste —
+        // an n-element allocation built only to be read back one index at a
+        // time. Skipping it is also what lets the body reach native code: the
+        // tracing JIT refuses a trace containing any `CallBuiltin`, and
+        // `$keys[$i]` was one per iteration.
+        let indexed = integer_keyed_range(&iter_ty);
+        if !indexed {
+            self.emit_get(&it, 0);
+            self.b.emit(Op::CallBuiltin(host::GRANGE_KEYS, 1), 0);
+            self.emit_set(&keys, 0);
+        }
         self.b.emit(Op::LoadInt(0), 0);
         self.emit_set(&i, 0);
 
-        // `$keys` is a freshly built list that nothing in the body can reach,
-        // so its length is a loop constant: read it once rather than calling
-        // `GLEN` on every iteration.
-        self.emit_get(&keys, 0);
-        self.b.emit(Op::CallBuiltin(host::GLEN, 1), 0);
+        // The iteration count, read once: Go fixes it when the loop starts, so
+        // an `append` in the body does not lengthen the walk and a `delete`
+        // does not shorten it. For a slice or array that is `len`; for an
+        // integer it is the value itself (a negative one runs zero times,
+        // which the `$i < $n` test already says); for a map or string it is the
+        // length of the key snapshot, which nothing in the body can reach.
+        if int_range_ty(&iter_ty) {
+            self.emit_get(&it, 0);
+        } else {
+            self.emit_get(if indexed { &it } else { &keys }, 0);
+            self.b.emit(Op::CallBuiltin(host::GLEN, 1), 0);
+        }
         self.types.insert(n_keys.clone(), NumType::Int);
         self.emit_set(&n_keys, 0);
 
@@ -3413,11 +3461,15 @@ impl Compiler {
         let guard = self.b.emit(Op::JumpIfFalse(0), 0);
         let top = self.b.current_pos();
 
-        // key := $keys[$i]
+        // key := $keys[$i] — or `$i` itself where the two are the same number.
         if let Some(k) = key {
-            self.emit_get(&keys, 0);
-            self.emit_get(&i, 0);
-            self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            if indexed {
+                self.emit_get(&i, 0);
+            } else {
+                self.emit_get(&keys, 0);
+                self.emit_get(&i, 0);
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            }
             self.emit_set(k, 0);
             self.types.insert(k.clone(), NumType::Unknown);
         }
@@ -3426,9 +3478,13 @@ impl Compiler {
         // strings by rune, so the value is a code point, not a byte).
         if let Some(v) = val {
             self.emit_get(&it, 0);
-            self.emit_get(&keys, 0);
-            self.emit_get(&i, 0);
-            self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            if indexed {
+                self.emit_get(&i, 0);
+            } else {
+                self.emit_get(&keys, 0);
+                self.emit_get(&i, 0);
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+            }
             self.b.emit(Op::CallBuiltin(host::GRANGE_VAL, 2), 0);
             // The range variable is a *copy* of the element, so `for _, v := range
             // xs { v.N = 1 }` leaves `xs` untouched — the single most damaging
