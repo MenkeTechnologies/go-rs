@@ -206,6 +206,67 @@ outright. That one is representational — a Go slice is a handle into go-rs's o
 heap, not a `fusevm::Value::Array`, so there is no native op that can read an
 element.
 
+## A `select` whose send case must block deadlocks — waiting on a fusevm release
+
+```go
+out := make(chan int)
+go func() {
+    for i := 0; i < 3; i++ {
+        select {
+        case out <- i:          // parks, and is never revisited
+        }
+    }
+}()
+for i := 0; i < 3; i++ { <-out }   // go: 3   go-rs: deadlock
+```
+
+The order is what decides it. A `select` that runs *after* a peer parked works —
+`try_select` reads live channel state and finds the parked sender — which is why
+a receive case fed by a blocked sender is fine, and why the corpus file covers
+that shape. It is a `select` that parks *first* that is lost.
+
+Two things in `fusevm-0.23.0/src/sched.rs` combine:
+
+- A select's send case does not register in the channel's `send_q`
+  (`SchedReq::Select` pushes the goroutine onto `select_waiters` instead,
+  `:283`), so a later receiver looking for a partner cannot see it.
+- The parking paths do not re-check waiting selects. `SchedReq::Recv`,
+  `RecvOk` and `Send` each call `recheck_selects()` only on the branch where
+  they *succeeded* (`:245`, `:255`, `:266`); the `else` branch that parks the
+  goroutine does not (`:250`, `:260`, `:271`).
+
+So the receiver parks without waking the select, and the select waits for a
+receiver it was never told about. Closing it upstream is either half: register
+select cases in the channel queues, or re-check waiters when a goroutine parks.
+The frontend cannot reach it — `Op::Select` is the only primitive that can wait
+on several channels at once, and a two-case cancellation `select` is exactly
+what it exists for.
+
+## A nil channel in a `select` aliases the first channel made — waiting on a fusevm release
+
+```go
+real0 := make(chan int, 1)
+real0 <- 111
+var nilch chan int
+select {
+case v := <-nilch:  fmt.Println("nil-fired", v)   // go-rs takes this case
+default:            fmt.Println("default")        // go takes this one
+}
+```
+
+Go blocks forever on a nil channel, so a `select` over one takes its `default`.
+go-rs evaluates the nil to `Value::Undef`, `SchedReq::Select` reads the case's
+channel with `to_int()`, and the result is `0` — the id of the *first* channel
+the program made. The case is therefore ready whenever that unrelated channel
+is, and takes its value: above, `real0` loses the `111` it was holding and the
+program then deadlocks waiting for it.
+
+This is the worse of the two, because it is a silent wrong answer rather than a
+hang. It needs an id that cannot collide with a real channel — the ids are
+indices into the scheduler's `chans` vector, so `0` is a valid one and the
+frontend has no sentinel it can emit instead: `try_recv` on an out-of-range id
+raises a panic rather than blocking, which is not what a nil channel does.
+
 ## `&x` on a scalar has no address, so two pointers to equal values compare equal
 
 ```go
