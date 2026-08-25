@@ -131,12 +131,23 @@ fn numtype_of_ty(ty: &str) -> NumType {
 /// (`map[string][]T`), so the key ends at the `]` that closes the one `map[`
 /// opened — found by depth, not by the first or last `]`.
 fn map_value_ty(ty: &str) -> Option<&str> {
+    map_split(ty).map(|(_, v)| v)
+}
+
+/// The key type written in a `map[K]V`, exactly as written. `None` for anything
+/// that is not a map type.
+fn map_key_ty(ty: &str) -> Option<&str> {
+    map_split(ty).map(|(k, _)| k)
+}
+
+/// Split `map[K]V` into `(K, V)` at the `]` that closes the one `map[` opened.
+fn map_split(ty: &str) -> Option<(&str, &str)> {
     let rest = ty.strip_prefix("map[")?;
     let mut depth = 0usize;
     for (i, ch) in rest.char_indices() {
         match ch {
             '[' => depth += 1,
-            ']' if depth == 0 => return Some(&rest[i + 1..]),
+            ']' if depth == 0 => return Some((&rest[..i], &rest[i + 1..])),
             ']' => depth -= 1,
             _ => {}
         }
@@ -2287,6 +2298,9 @@ impl Compiler {
                     (None, Some(e)) => self.type_name(e),
                     (None, None) => String::new(),
                 };
+                if let Some(k) = map_key_ty(&decl_ty) {
+                    self.check_map_key(k, *line)?;
+                }
                 // `var s T` where T is a *value* struct type → its zero value is a
                 // struct with every field zeroed (so `s.f` and methods work). A
                 // pointer `var p *T` is nil, not a zero struct.
@@ -3693,6 +3707,53 @@ impl Compiler {
     /// The argument is evaluated before the call, so a struct value type costs
     /// one zero-struct construction per lookup whether the key is there or not.
     /// Every other value type's zero is a single constant-load op.
+    /// Whether `ty` names a Go **comparable** type, which is the only kind a
+    /// map key may have.
+    ///
+    /// A slice, a map and a function are not comparable, and neither is a
+    /// struct or an array built out of one. A pointer is (Go compares the
+    /// address), a channel is, and an interface is *statically* — the check Go
+    /// makes on the dynamic type of an interface key happens at run time.
+    fn comparable(&self, ty: &str) -> bool {
+        let ty = ty.trim();
+        if ty.starts_with('*') {
+            return true;
+        }
+        if ty.starts_with("[]") || ty.starts_with("map[") || ty.starts_with("func(") || ty == "func"
+        {
+            return false;
+        }
+        if let Some(elem) = array_elem_ty(ty) {
+            return self.comparable(elem);
+        }
+        // A defined type is comparable exactly when its underlying type is.
+        if let Some(base) = self.defined_types.get(ty) {
+            if base != ty {
+                return self.comparable(base);
+            }
+        }
+        match self.struct_fields.get(ty) {
+            Some(fields) => fields.iter().all(|(_, t)| self.comparable(t)),
+            None => true,
+        }
+    }
+
+    /// Reject a map key type Go rejects. `go` refuses to build the program at
+    /// all — `invalid map key type []int` — so go-rs does too rather than
+    /// silently building a map whose keys nothing can look up.
+    fn check_map_key(&self, key_ty: &str, line: u32) -> Result<(), String> {
+        if self.comparable(key_ty) {
+            return Ok(());
+        }
+        // A composite-literal type carries no line, so `0` means "unknown" and
+        // the suffix is left off rather than pointing at the top of the file.
+        let where_ = match line {
+            0 => String::new(),
+            n => format!(" (line {n})"),
+        };
+        Err(format!("go-rs: invalid map key type {key_ty}{where_}"))
+    }
+
     fn emit_map_miss_zero(&mut self, recv: &Expr, line: u32) -> Result<u8, String> {
         let Some(v_ty) = map_value_ty(&self.type_name(recv)).map(str::to_string) else {
             return Ok(2);
@@ -3888,6 +3949,7 @@ impl Compiler {
                 pairs,
             } => {
                 let (key_ty, val_ty, pairs) = (key_ty.clone(), val_ty.clone(), pairs.clone());
+                self.check_map_key(&key_ty, 0)?;
                 self.emit_lit_chunked(host::GMAP_LIT, 0, 2, pairs.len(), 0, |c, i| {
                     let (k, v) = &pairs[i];
                     c.emit_typed(k, &key_ty)?;
@@ -3903,6 +3965,10 @@ impl Compiler {
                 elem_ty,
             } => {
                 if *is_map {
+                    // `elem_ty` of a `make(map[K]V)` is the whole written type.
+                    if let Some(k) = map_key_ty(elem_ty) {
+                        self.check_map_key(k, 0)?;
+                    }
                     let c = self.b.add_constant(Value::str("map"));
                     self.b.emit(Op::LoadConst(c), 0);
                     self.b.emit(Op::CallBuiltin(host::GMAKE, 1), 0);

@@ -240,7 +240,7 @@ const CORPUS: &[Entry] = &[
         "map",
         "Predeclared Identifier",
         "map[K]V",
-        "The map type constructor — a predeclared identifier, not a keyword. A go-rs map is an association list: lookup, insert and delete are a linear scan, keys compare by value (structs field by field), and iteration order is insertion order.",
+        "The map type constructor — a predeclared identifier, not a keyword. A go-rs map keeps its key/value pairs in insertion order, which is the order `range` walks, beside a hash index over the keys that answers lookup, insert and delete in constant time. Keys compare by value, structs and arrays field by field and element by element, and hash the same way.",
         "m := make(map[string]int)",
     ),
     e(
@@ -430,7 +430,7 @@ const CORPUS: &[Entry] = &[
         "map[K]V",
         "Type",
         "map[K]V",
-        "Map type, represented as an association list of key/value pairs. Lookup is linear in the map's size and keys compare by value, which is what lets a struct or array key work.",
+        "Map type, represented as insertion-ordered key/value pairs beside a hash index over the keys. Keys compare by value — a struct field by field, an array element by element — and project into the index the same way, so a map of struct keys is linear to build rather than quadratic.",
         "m := map[string]int{\"a\": 1}",
     ),
     e(
@@ -2342,7 +2342,7 @@ const CORPUS: &[Entry] = &[
         "map iteration order",
         "Divergence from Go",
         "for k := range m",
-        "Go deliberately randomizes map iteration order. go-rs stores a map as an association list and ranges it in insertion order, so iteration is deterministic. Do not rely on that determinism in code meant to also build with the Go toolchain.",
+        "Go deliberately randomizes map iteration order. go-rs keeps a map's pairs in insertion order and ranges them in that order, so iteration is deterministic. Do not rely on that determinism in code meant to also build with the Go toolchain.",
         "for k, v := range m { … }   // insertion order",
     ),
 ];

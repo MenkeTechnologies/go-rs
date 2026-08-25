@@ -1768,19 +1768,58 @@ enum MapKey {
     Str(std::sync::Arc<String>),
     Bool(bool),
     Num(u64),
+    /// A struct key: its type name and its *field values'* projections in
+    /// declaration order — the field names are not part of it, because
+    /// [`key_eq`] does not compare them either.
+    Struct(String, Vec<MapKey>),
+    /// An array key: its elements' projections, in order. A distinct variant
+    /// from [`MapKey::Struct`] because `key_eq` never equates the two.
+    Array(Vec<MapKey>),
 }
 
-/// A key's hash projection, or `None` when it has none: a struct or array key
-/// (compared structurally, through the heap) or a `NaN`.
+/// A key's hash projection, or `None` when it has none: a `NaN`, a struct or
+/// array holding one, or a heap object that is neither a struct nor an array
+/// (a nil, a closure — things `key_eq` answers `false` for against anything but
+/// themselves).
 ///
 /// The variants partition keys exactly the way [`key_eq`] does, so two keys
-/// with projections are equal if and only if their projections are.
+/// with projections are equal if and only if their projections are. That is the
+/// whole contract: the index is authoritative for any key this answers `Some`
+/// for, so a projection that separated two keys `key_eq` calls equal would lose
+/// entries.
+///
+/// **Reads the heap** for a struct or array key, so it must be called with no
+/// *mutable* heap borrow held — which is why every [`GoMap`] method takes the
+/// projection rather than computing it.
 fn map_key(v: &Value) -> Option<MapKey> {
     match v {
         Value::Undef => Some(MapKey::Nil),
         Value::Str(s) => Some(MapKey::Str(s.clone())),
         Value::Bool(b) => Some(MapKey::Bool(*b)),
-        Value::Obj(_) => None,
+        // A struct or array key is compared field by field / element by
+        // element, so it projects the same way: recursively, into a shape that
+        // hashes. Without this every such key fell back to the ordered scan and
+        // made a map of them O(n²) to build and to read.
+        // The recursion re-enters `HEAP` for a nested struct or array field.
+        // Both borrows are shared, which `RefCell` allows any number of.
+        Value::Obj(id) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Struct {
+                    type_name, fields, ..
+                }) => Some(MapKey::Struct(
+                    type_name.clone(),
+                    fields
+                        .iter()
+                        .map(|(_, v)| map_key(v))
+                        .collect::<Option<Vec<_>>>()?,
+                )),
+                Some(HostObj::Slice { elems, .. }) => Some(MapKey::Array(
+                    elems.iter().map(map_key).collect::<Option<Vec<_>>>()?,
+                )),
+                _ => None,
+            }
+        }),
         other => {
             let f = other.to_float();
             (!f.is_nan()).then(|| MapKey::Num(if f == 0.0 { 0.0 } else { f }.to_bits()))
@@ -1816,6 +1855,14 @@ const INDEX_THRESHOLD: usize = 8;
 #[derive(Clone, Default)]
 pub(crate) struct GoMap {
     pairs: Vec<(Value, Value)>,
+    /// Each pair's key projected for the index, aligned with `pairs`.
+    ///
+    /// Kept rather than recomputed because projecting a struct or array key
+    /// reads the heap, and [`GoMap::build_index`] runs from inside
+    /// [`GoMap::put`], which its callers reach while holding a *mutable* heap
+    /// borrow. Every projection the map ever needs is therefore taken once, by
+    /// the caller, before that borrow.
+    keys: Vec<Option<MapKey>>,
     /// `None` until the map outgrows [`INDEX_THRESHOLD`], and `None` for good
     /// once `unindexable` is set.
     index: Option<HashMap<MapKey, usize>>,
@@ -1840,41 +1887,44 @@ impl GoMap {
     fn from_pairs(pairs: Vec<(Value, Value)>) -> Self {
         let mut m = GoMap::default();
         for (k, v) in pairs {
-            m.put(None, k, v);
+            let mk = map_key(&k);
+            m.put(None, mk, k, v);
         }
         m
     }
 
-    /// Where `key` sits, when the index can answer without the ordered scan.
-    fn probe(&self, key: &Value) -> Probe {
-        let (Some(index), Some(k)) = (self.index.as_ref(), map_key(key)) else {
+    /// Where the key projecting to `mk` sits, when the index can answer without
+    /// the ordered scan.
+    fn probe(&self, mk: Option<&MapKey>) -> Probe {
+        let (Some(index), Some(k)) = (self.index.as_ref(), mk) else {
             return Probe::Scan;
         };
-        Probe::Answered(index.get(&k).copied())
+        Probe::Answered(index.get(k).copied())
     }
 
     /// Where `key` sits, falling back to the ordered scan. Callable only with no
     /// heap borrow held: [`key_eq`] on a struct key reads the heap itself.
-    fn find(&self, key: &Value) -> Option<usize> {
-        match self.probe(key) {
+    fn find(&self, mk: Option<&MapKey>, key: &Value) -> Option<usize> {
+        match self.probe(mk) {
             Probe::Answered(hit) => hit,
             Probe::Scan => self.pairs.iter().position(|(k, _)| key_eq(k, key)),
         }
     }
 
-    /// Insert `key`, or overwrite the value at `at` when the caller has already
-    /// located it. Splitting the search out is what lets the heap borrow be
-    /// taken *after* a struct-key comparison has read the heap.
-    fn put(&mut self, at: Option<usize>, key: Value, val: Value) {
+    /// Insert `key` — projected to `mk` by the caller — or overwrite the value
+    /// at `at` when the caller has already located it. Splitting both the
+    /// search and the projection out is what lets the heap borrow be taken
+    /// *after* the two things that read the heap themselves.
+    fn put(&mut self, at: Option<usize>, mk: Option<MapKey>, key: Value, val: Value) {
         if let Some(i) = at {
             self.pairs[i].1 = val;
             return;
         }
         let pos = self.pairs.len();
-        match map_key(&key) {
+        match &mk {
             Some(k) => {
                 if let Some(index) = self.index.as_mut() {
-                    index.insert(k, pos);
+                    index.insert(k.clone(), pos);
                 }
             }
             // A key the index cannot hold makes it unsound for the whole map:
@@ -1884,32 +1934,35 @@ impl GoMap {
                 self.index = None;
             }
         }
+        self.keys.push(mk);
         self.pairs.push((key, val));
         if self.index.is_none() && !self.unindexable && self.pairs.len() > INDEX_THRESHOLD {
             self.build_index();
         }
     }
 
-    /// Index every pair. Runs once, when the map outgrows the scan.
+    /// Index every pair from the projections already taken. Runs once, when the
+    /// map outgrows the scan.
     fn build_index(&mut self) {
         let mut index = HashMap::with_capacity(self.pairs.len() * 2);
-        for (i, (k, _)) in self.pairs.iter().enumerate() {
-            let Some(mk) = map_key(k) else {
+        for (i, mk) in self.keys.iter().enumerate() {
+            let Some(mk) = mk else {
                 self.unindexable = true;
                 return;
             };
-            index.insert(mk, i);
+            index.insert(mk.clone(), i);
         }
         self.index = Some(index);
     }
 
     /// Drop the pair at `i`, keeping the order of the rest.
     fn remove(&mut self, i: usize) {
-        let (key, _) = self.pairs.remove(i);
+        self.pairs.remove(i);
+        let removed = self.keys.remove(i);
         let Some(index) = self.index.as_mut() else {
             return;
         };
-        if let Some(k) = map_key(&key) {
+        if let Some(k) = removed {
             index.remove(&k);
         }
         // Everything after it moved down a slot.
@@ -1927,8 +1980,11 @@ impl GoMap {
 /// the heap. The scan it falls back to does — a struct key's [`key_eq`] reads
 /// the heap itself — so the keys are snapshotted first and the borrow released.
 fn map_find_index(id: u32, key: &Value) -> Option<usize> {
+    // Projected first: a struct or array key reads the heap to project, and the
+    // probe below holds a borrow of it.
+    let mk = map_key(key);
     let probe = HEAP.with(|h| match h.borrow().get(id as usize) {
-        Some(HostObj::Map(m)) => m.probe(key),
+        Some(HostObj::Map(m)) => m.probe(mk.as_ref()),
         // Not a map at all; a nil map reads as an empty one.
         _ => Probe::Answered(None),
     });
@@ -2003,8 +2059,9 @@ fn b_slice_lit(vm: &mut VM, argc: u8) -> Value {
 fn map_insert_all(map: &mut GoMap, flat: Vec<Value>) {
     let mut it = flat.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        let at = map.find(&k);
-        map.put(at, k, v);
+        let mk = map_key(&k);
+        let at = map.find(mk.as_ref(), &k);
+        map.put(at, mk, k, v);
     }
 }
 
@@ -2263,11 +2320,12 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
     // Find an existing key (by value) without holding the borrow across key_eq,
     // then insert/overwrite under a fresh mutable borrow.
     let existing = map_find_index(id, &key);
+    let mk = map_key(&key);
     let err = HEAP.with(|h| {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
             Some(HostObj::Map(m)) => {
-                m.put(existing, key.clone(), val.clone());
+                m.put(existing, mk, key.clone(), val.clone());
                 None
             }
             _ => Some("go-rs: invalid assignment target".to_string()),

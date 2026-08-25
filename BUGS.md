@@ -166,37 +166,37 @@ suspended goroutine still holds its VM). Closing it needs a fusevm release
 where the VM borrows or `Arc`-shares its chunk; the published pin is the
 contract.
 
-## A struct or array key still scans (the rest of a `map` is hashed)
-
-`HostObj::Map` is a `GoMap` (`src/host.rs`): insertion-ordered pairs plus a hash
-index over the keys, built the first time the map grows past eight of them. A
-key with no hash projection — a struct or array key, compared field by field
-through the heap, or a `NaN` — drops the index for that map, and every lookup,
-insert and `delete` in it goes back to the linear scan that used to be the only
-path. Building such a map is still O(n²).
-
-Every value is correct either way; this is a cost, not a divergence. It has not
-been closed because a structural hash has to agree with `key_eq` at every depth
-(a struct holding a struct holding an array) and a struct key is rare next to
-the string and integer keys the index already covers.
-
-For comparison, ranging a **slice** is linear (32k/64k/128k/256k elements →
-0.10s/0.19s/0.39s/0.77s), because a go-rs slice is a `Value::Obj` handle into
-the frontend's own heap rather than a `fusevm::Value::Array`, so loading one
-copies a `u32` instead of deep-cloning the backing `Vec`.
-
-## A missing key yields `0`, not the value type's zero
+## `&x` on a scalar has no address, so two pointers to equal values compare equal
 
 ```go
-m := map[string]string{}
-fmt.Printf("%q\n", m["absent"])   // go: ""   go-rs: "0"
+p1, p2 := 1, 1
+fmt.Println(&p1 == &p2)   // go: false   go-rs: true
 ```
 
-`GINDEX_GET` has no static type for the map, so a miss answers `Value::Int(0)` —
-right for the common `map[K]int`, wrong for every other value type. The comma-ok
-form `v, ok := m[k]` has the same gap in `v`. Closing it means threading the
-map's written value type to the twelve `GINDEX_GET` call sites, which also serve
-slice and string indexing.
+go-rs models `&x` on a non-struct as the value itself, so a `*int` carries no
+identity to compare: `==` falls through to the value, and two distinct pointers
+to equal values are one key of a `map[*int]V` rather than two. A pointer *field*
+inside a struct key inherits the same merge. A `&T{…}` handle is unaffected —
+it is a real heap handle, and `HostObj::Struct::by_ref` is what keeps two of
+them distinct.
+
+Closing it means giving a scalar pointer a heap cell of its own, which changes
+what every `&x` and `*p` on a scalar costs.
+
+## A composite literal cannot elide a defined or pointer element type
+
+```go
+type ints []int
+m := map[string]ints{"a": {1}}      // go: builds     go-rs: undefined struct type `ints`
+p := map[string]*point{"a": {1, 2}} // go: builds     go-rs: undefined struct type `*point`
+```
+
+Go lets a composite literal inside another one drop the element type, including
+when that type is a defined slice/map type or a pointer to a struct (`{1, 2}`
+meaning `&point{1, 2}`). go-rs resolves an elided literal as a *struct* literal
+of the element type name, so a defined non-struct type and a `*T` both reach
+`struct_lit` and are rejected. Writing the type out (`ints{1}`, `&point{1, 2}`)
+works.
 
 ## A pointer to a struct prints without `&`
 

@@ -2858,3 +2858,63 @@ func main() {
          map[main.myStr]main.myInt\n",
     );
 }
+
+/// Go refuses to build a program whose map key type is not comparable, and
+/// names the type it refused. go-rs rejects the same four shapes at compile
+/// time rather than building a map whose keys nothing can look up: the key is
+/// hashed structurally, and a slice, map or func has no value to hash.
+///
+/// One of these — the slice key — is also a corpus file, which is what pins the
+/// *exit status* against the reference. The rest are here because a corpus file
+/// carries one program.
+#[test]
+fn a_map_key_type_go_rejects_is_a_compile_error() {
+    // The third column is the type as the *parser* recorded it, which is what
+    // the diagnostic names: a func type keeps only its `func` head there, so
+    // `map[func()]int` is reported as `func`.
+    for (key_ty, decl, named) in [
+        ("[]int", "", "[]int"),
+        ("map[string]int", "", "map[string]int"),
+        ("func()", "", "func"),
+        // A struct is comparable only when every field is.
+        ("bad", "type bad struct { A int; B []int }\n", "bad"),
+        // So is a defined type over one that is not.
+        ("named", "type named []int\n", "named"),
+    ] {
+        let src = format!(
+            "package main\nimport \"fmt\"\n{decl}func main() {{\n\tm := make(map[{key_ty}]int)\n\tfmt.Println(len(m))\n}}\n"
+        );
+        let (out, ok) = run_capturing_stderr(&src);
+        assert!(!ok, "map[{key_ty}]int was accepted; output: {out:?}");
+        assert!(
+            out.contains(&format!("invalid map key type {named}")),
+            "map[{key_ty}]int: {out:?}"
+        );
+    }
+}
+
+/// The types Go *does* accept as keys keep working — a pointer and a channel
+/// are comparable by identity, an interface is comparable statically, and an
+/// array or struct of comparable fields is comparable structurally. Without
+/// this the check above is one over-eager predicate away from rejecting valid
+/// programs.
+#[test]
+fn a_comparable_map_key_type_still_builds() {
+    for (key_ty, decl) in [
+        ("*int", ""),
+        ("chan int", ""),
+        ("interface{}", ""),
+        ("[2]int", ""),
+        ("string", ""),
+        ("ok", "type ok struct { A int; B string }\n"),
+        ("alias", "type alias int\n"),
+        ("arr", "type arr [2]string\n"),
+    ] {
+        let src = format!(
+            "package main\nimport \"fmt\"\n{decl}func main() {{\n\tm := make(map[{key_ty}]int)\n\tfmt.Println(len(m))\n}}\n"
+        );
+        let (out, ok) = run_capturing_stderr(&src);
+        assert!(ok, "map[{key_ty}]int was rejected; output: {out:?}");
+        assert_eq!(out, "0\n", "map[{key_ty}]int");
+    }
+}
