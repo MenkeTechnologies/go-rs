@@ -2599,6 +2599,25 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower `for init; cond; post { … }` — which is also Go's `while` (`for
+    /// cond {}`) and its infinite loop (`for {}`) — **rotated**: the condition
+    /// is emitted once above the body as an entry guard and once below it as a
+    /// *conditional backward branch*, instead of once at the top closed by an
+    /// unconditional `Jump` back to it.
+    ///
+    /// The shape is what fusevm's tracing JIT requires: it only closes a
+    /// recorded trace on a conditional backward branch. Emitted the other way
+    /// `go --tiers` reported `trace-eligible=true traced=false` and `reaches
+    /// native code false` for every counted loop go-rs produced, so the hottest
+    /// shape a Go program has stayed in the interpreter however hot it got.
+    ///
+    /// Evaluation order and count are unchanged: a top-test loop evaluates the
+    /// condition `n + 1` times for `n` iterations, and so does this — once on
+    /// entry, then once after each body-and-post run. Rotation costs one copy
+    /// of the condition's code and saves one jump per iteration.
+    ///
+    /// `for {}` has no condition to branch on, so its back edge stays
+    /// unconditional — and with it, its ineligibility for a trace.
     fn compile_for(
         &mut self,
         init: &Option<Box<Stmt>>,
@@ -2614,14 +2633,16 @@ impl Compiler {
             label: label.clone(),
             ..Default::default()
         });
+        // The entry guard. It leaves the loop when the condition is false on
+        // arrival, which is the only thing the top copy still does.
+        let guard = match cond {
+            Some(c) => {
+                self.expr(c)?;
+                Some(self.b.emit(Op::JumpIfFalse(0), 0))
+            }
+            None => None,
+        };
         let top = self.b.current_pos();
-        // A condition, if present, exits the loop when false (patched to `end`
-        // alongside every `break`).
-        if let Some(c) = cond {
-            self.expr(c)?;
-            let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-            self.loops.last_mut().unwrap().breaks.push(jf);
-        }
         for s in body {
             self.stmt(s)?;
         }
@@ -2630,10 +2651,21 @@ impl Compiler {
         if let Some(p) = post {
             self.stmt(p)?;
         }
-        self.b.emit(Op::Jump(top), 0);
+        match cond {
+            Some(c) => {
+                self.expr(c)?;
+                self.b.emit(Op::JumpIfTrue(top), 0);
+            }
+            None => {
+                self.b.emit(Op::Jump(top), 0);
+            }
+        }
         let end = self.b.current_pos();
 
         let scope = self.loops.pop().unwrap();
+        if let Some(jf) = guard {
+            self.b.patch_jump(jf, end);
+        }
         for j in scope.continues {
             self.b.patch_jump(j, post_pos);
         }
@@ -3336,6 +3368,7 @@ impl Compiler {
         self.temp_counter += 1;
         let it = format!("$it{n}");
         let keys = format!("$keys{n}");
+        let n_keys = format!("$n{n}");
         let i = format!("$i{n}");
 
         // $it = iter; $keys = GRANGE_KEYS($it); $i = 0
@@ -3359,18 +3392,26 @@ impl Compiler {
         self.b.emit(Op::LoadInt(0), 0);
         self.emit_set(&i, 0);
 
+        // `$keys` is a freshly built list that nothing in the body can reach,
+        // so its length is a loop constant: read it once rather than calling
+        // `GLEN` on every iteration.
+        self.emit_get(&keys, 0);
+        self.b.emit(Op::CallBuiltin(host::GLEN, 1), 0);
+        self.types.insert(n_keys.clone(), NumType::Int);
+        self.emit_set(&n_keys, 0);
+
         self.loops.push(LoopScope {
             label: label.clone(),
             ..Default::default()
         });
-        let top = self.b.current_pos();
-        // if $i >= len($keys) break
+        // The entry guard: `$i < $n` decides whether the loop runs at all. The
+        // same test is repeated below the body as a conditional backward branch
+        // — the rotated shape [`Compiler::compile_for`] explains.
         self.emit_get(&i, 0);
-        self.emit_get(&keys, 0);
-        self.b.emit(Op::CallBuiltin(host::GLEN, 1), 0);
+        self.emit_get(&n_keys, 0);
         self.b.emit(Op::NumLt, 0);
-        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-        self.loops.last_mut().unwrap().breaks.push(jf);
+        let guard = self.b.emit(Op::JumpIfFalse(0), 0);
+        let top = self.b.current_pos();
 
         // key := $keys[$i]
         if let Some(k) = key {
@@ -3415,10 +3456,14 @@ impl Compiler {
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(Op::Add, 0);
         self.emit_set(&i, 0);
-        self.b.emit(Op::Jump(top), 0);
+        self.emit_get(&i, 0);
+        self.emit_get(&n_keys, 0);
+        self.b.emit(Op::NumLt, 0);
+        self.b.emit(Op::JumpIfTrue(top), 0);
         let end = self.b.current_pos();
 
         let scope = self.loops.pop().unwrap();
+        self.b.patch_jump(guard, end);
         for j in scope.continues {
             self.b.patch_jump(j, post_pos);
         }
