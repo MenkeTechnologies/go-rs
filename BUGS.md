@@ -477,22 +477,31 @@ reason two of them compare equal above: the width is in the static type.
 
 Closing it needs the Go type on the value, which is a representation change,
 and it is the *same* one the `float32` and `uint64` entries above want — all
-three are "the static type at the conversion, readable at run time". fusevm
-0.17.0's `Value` has no spare tagged-scalar variant (`Undef`, `Bool`, `Int`,
-`Float`, `Str`, `Array`, `Hash`, `Status`, `Ref`, `NativeFn`, `Obj`), so the
-tag has to ride on `Value::Obj` — a heap handle, exactly the shape
-`HostObj::F32` and `HostObj::U64` already are. Two things make it large rather
-than a patch:
+three are "the static type at the conversion, readable at run time".
 
-- There is no concrete-to-interface conversion site to hook. `var x any = 1`
-  compiles to `LoadInt(1); SetVar(0)` and nothing else, so the box would have to
-  be emitted at each of them separately: a var declaration, an assignment, an
-  argument bind (including `...any`), a return, a slice or array literal, a map
-  key and a map value, a struct field, a channel send, and `append`.
-- Every reader has to see through it. That is 74 host builtins, plus `go_str`
-  and `go_type_name`, plus map-key equality — a `GoMap` is ordered pairs plus a
-  hash index, both keyed on `Value` equality, so a boxed key and a plain one of
-  the same number would be two different keys.
+**Re-assessed after the pointer object landed, and it is materially more
+tractable than this entry used to claim.** Two of the three obstacles are gone:
+
+- The box already exists. `HostObj::Named { ty, inner }` carries a type name
+  beside a value, with `unname` to read through it, and `GNAMED_BOX` emits it —
+  today only at a `fmt` argument position.
+- The conversion site now exists. The entry said `var x any = 1` compiles to
+  `LoadInt(1); SetVar(0)` with nowhere to hook. It no longer does: every binding
+  site was routed through `Compiler::emit_typed` when untyped constants were
+  taught to convert to a float destination — a var, an argument, a struct field,
+  a container element, a channel send, a map key. `is_iface_ty` is already there
+  to test the destination.
+- The pointer object is the worked example that the readers are few, not 74. A
+  `Ptr` needed resolving at eight sites, because it can only appear where a
+  pointer can. A `Named` int is the same: valid Go requires a type assertion
+  before any arithmetic on an interface value, so the box reaches only the
+  interface operations — `go_type_name`, `iface_eq`, `key_eq` / `map_key`, the
+  assertion and type switch, and printing.
+
+What is left is real work rather than a blocker: `key_eq` and `map_key` must
+carry the name (a boxed key and a plain one of the same number are otherwise two
+keys), and the unbox has to happen at every assertion. It wants its own change
+with the full fuzz behind it, not a corner of another one.
 
 What makes it *feasible* rather than impossible is that valid Go requires a type
 assertion or a type switch before any arithmetic on an interface value, so the
@@ -581,6 +590,16 @@ shadows a package-level name has the same collision.
 Closing it needs a scope chain in the parser and mangled names in the program,
 so that `T` in `a` and `T` in `b` are two entries. The gate for what does work
 is `parity-scripts/local_type_decl.go`.
+
+Re-assessed: the `%T` hazard that made this look worse than it is can be
+designed out. Mangle only on an actual collision — a local type name declared
+once in the whole program, which is every existing program, keeps its name and
+its `%T` output untouched, and only the second declaration of a shared name
+needs a display name beside its mangled one. What remains is the part that was
+always the work: a rename walker over one function body's *type positions*,
+where a reference may precede the declaration. It is tractable and it is the
+lowest-value item on the list — the collision needs two same-named local types
+in one program to be observable at all.
 
 ## `%w` outside `fmt.Errorf` renders instead of reporting
 
