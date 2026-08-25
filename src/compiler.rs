@@ -2647,8 +2647,9 @@ impl Compiler {
     /// entry, then once after each body-and-post run. Rotation costs one copy
     /// of the condition's code and saves one jump per iteration.
     ///
-    /// `for {}` has no condition to branch on, so its back edge stays
-    /// unconditional — and with it, its ineligibility for a trace.
+    /// `for {}` has no condition, so it needs no entry guard and branches back
+    /// on a constant `true`: one push and pop per iteration buys the same
+    /// compilable shape, which an `Op::Jump` back edge does not get.
     fn compile_for(
         &mut self,
         init: &Option<Box<Stmt>>,
@@ -2682,15 +2683,19 @@ impl Compiler {
         if let Some(p) = post {
             self.stmt(p)?;
         }
+        // The back edge, always conditional. `for {}` has no condition, so it
+        // branches on a constant `true` — one extra push and pop per iteration,
+        // in exchange for a shape the tracing JIT will compile. An `Op::Jump`
+        // here is what fusevm's recorder declines: the same `for {}` measured
+        // with an unconditional back edge reports `trace-eligible=true
+        // traced=false`, and with this one `traced=true`.
         match cond {
-            Some(c) => {
-                self.expr(c)?;
-                self.b.emit(Op::JumpIfTrue(top), 0);
-            }
+            Some(c) => self.expr(c)?,
             None => {
-                self.b.emit(Op::Jump(top), 0);
+                self.b.emit(Op::LoadTrue, 0);
             }
         }
+        self.b.emit(Op::JumpIfTrue(top), 0);
         let end = self.b.current_pos();
 
         let scope = self.loops.pop().unwrap();

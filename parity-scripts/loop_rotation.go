@@ -114,7 +114,8 @@ done:
 	}
 	fmt.Println("self-terminating", sink, stop)
 
-	// `for {}` keeps an unconditional back edge; break is the only exit.
+	// `for {}` has no condition, so it branches back on a constant `true`;
+	// `break` is still the only exit.
 	inf := 0
 	for {
 		inf++
