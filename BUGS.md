@@ -259,48 +259,32 @@ half:
   nondeterministic and not reproducible at all; the depth-0 `&{…}` form is the
   only part worth matching.
 
-## A `*T` is copied at every bind site, so writes through it are lost
+## `&x` on an existing variable produces a pointer that copies when bound
 
 ```go
 type pt struct{ X int }
-func bump(q *pt) { q.X = 7 }
-
-p := &pt{1}
+x := pt{1}
+p := &x
 q := p
 q.X = 7
-fmt.Println(p.X)              // go: 7   go-rs: 1
-
-bump(p)
-fmt.Println(p.X)              // go: 7   go-rs: 1
-
-arr := []*pt{p}
-arr[0].X = 5
-fmt.Println(p.X)              // go: 5   go-rs: 1
+fmt.Println(x.X)              // go: 7   go-rs: 1
 ```
 
-Go copies a struct **value** at an assignment, an argument bind, a return, a
-container store and a `range` binding — and copies nothing at all through a
-pointer. go-rs emits the copy from the *static* type, and its static types have
-no pointers in them: `Compiler::type_name` answers `pt` for both `p` and `*p`
-("a `*Point` handle dispatches methods and reads fields like a `Point`"), so
-every one of those sites copies. `emit_value` exempts only a literal `&x`
-written at the site itself, which is why `f(&x)` works and `q := p; f(p)` does
-not.
+A bind copies a struct value and shares a pointer, which the run time decides
+from the `by_ref` mark `&T{…}` and `new(T)` leave on their handle
+(`host::struct_bind`). `&x` on an *existing* variable is a different thing: it
+is a no-op on the shared handle, so there is no separate object to mark, and
+marking the one there is would mark `x` too — which would make `x == y` compare
+by identity where Go compares field by field.
 
-The two shapes are indistinguishable in the emitted code — `v := *p` and
-`q := p` both lower to `GetVar(p); CallBuiltin(GSTRUCT_COPY, 1)` (`go --disasm`)
-— so the tempting one-line fix, making `struct_copy` a no-op on a `by_ref`
-handle, trades this bug for its mirror image: `v := *p` would then alias.
+So a pointer taken that way carries no mark and copies when it is bound again.
+Passing it straight down works — `f(&x)` is exempt because the `&` is written at
+the call site — and so does a pointer-receiver method on it; it is only the
+second bind (`p := &x; q := p`, or `f(p)`) that loses the aliasing.
 
-Closing it means keeping the `*` in the static type and deciding the copy from
-that (a `Deref` expression copies, a pointer-typed expression does not), rather
-than stripping it in `base_type` before the copy site sees it.
-
-This is also what blocks a minimal `io.Writer` (see **Unsupported stdlib
-calls**): the interface machinery itself is fine — a program-declared
-`interface{ Write([]byte) (int, error) }` dispatches to a `*buf` method
-correctly when the receiver is reached directly — but a writer is by definition
-something a program *passes*, and a passed `*buf` accumulates into a copy.
+Closing it needs a real pointer object with its own identity, which is the same
+representation change the printing half of **A pointer to a struct prints
+without `&`** wants.
 
 ## `append` capacity misses Go's malloc size-class rounding
 
@@ -387,10 +371,10 @@ What a minimal one would take, measured against what is already here:
   source loading and cannot name a vendored type. Either the boundary grows a
   types-from-source mode, or those two names are special-cased onto the
   vendored buffer type.
-- **The actual blocker is above them all**: a `*T` passed as an argument is
-  copied (see **A `*T` is copied at every bind site**), so a writer accumulates
-  into a copy and the caller sees nothing. Any `io.Writer` built before that is
-  fixed would be a writer that silently discards.
+- **The blocker that used to sit above them all is gone.** A `*T` passed as an
+  argument was copied, so a writer accumulated into a copy and the caller saw
+  nothing; a bind now shares an allocated pointer, and `w.Write` through an
+  interface parameter reaches the caller's buffer.
 
 `strconv.FormatFloat` is implemented for the `f`, `F`, `e`, `E`, `g` and `G`
 verbs at both `bitSize`s, including `prec == -1`. The two remaining verbs —
