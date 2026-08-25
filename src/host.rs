@@ -1750,6 +1750,15 @@ fn key_eq(a: &Value, b: &Value) -> bool {
         // three distinct keys of a `map[any]V` into one.
         (Value::Str(_) | Value::Bool(_) | Value::Obj(_) | Value::Undef, _)
         | (_, Value::Str(_) | Value::Bool(_) | Value::Obj(_) | Value::Undef) => false,
+        // An integer and a float are two more different Go types, so `m[1]` and
+        // `m[1.0]` are two keys of a `map[any]V`. Comparing them by `to_float`
+        // merged those as well. It is the *compiler* that makes this safe: an
+        // untyped constant in a `map[float64]V` index is converted to the key
+        // type before it is pushed (`Compiler::emit_map_key`), so a float key
+        // never arrives here as a `Value::Int`.
+        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => false,
+        // Within a kind, the value decides — and a `NaN` equals nothing, itself
+        // included, exactly as Go's map says.
         _ => a.to_float() == b.to_float(),
     }
 }
@@ -1767,7 +1776,9 @@ enum MapKey {
     Nil,
     Str(std::sync::Arc<String>),
     Bool(bool),
-    Num(u64),
+    Int(i64),
+    /// A float's bits, so `1` and `1.0` stay two keys of a `map[any]V`.
+    Float(u64),
     /// A struct key: its type name and its *field values'* projections in
     /// declaration order — the field names are not part of it, because
     /// [`key_eq`] does not compare them either.
@@ -1820,9 +1831,15 @@ fn map_key(v: &Value) -> Option<MapKey> {
                 _ => None,
             }
         }),
+        // Two variants, because `key_eq` never equates an integer with a float.
+        // `-0.0` normalises to `0.0` so the two hash alike, as `==` says they
+        // are; a `NaN` has no projection, which is also Go's answer — a `NaN`
+        // key equals nothing, not even itself, so every insert of one adds an
+        // entry no lookup can ever reach.
+        Value::Int(n) => Some(MapKey::Int(*n)),
         other => {
             let f = other.to_float();
-            (!f.is_nan()).then(|| MapKey::Num(if f == 0.0 { 0.0 } else { f }.to_bits()))
+            (!f.is_nan()).then(|| MapKey::Float(if f == 0.0 { 0.0 } else { f }.to_bits()))
         }
     }
 }

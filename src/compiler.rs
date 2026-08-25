@@ -184,6 +184,12 @@ fn f32_op_code(op: BinOp) -> Option<i64> {
 /// A top-level function's signature, for call resolution and return typing.
 struct FuncSig {
     arity: usize,
+    /// Each parameter's declared Go type, in order. Go converts an untyped
+    /// constant argument to the parameter's type at the call — `f(1)` on a
+    /// `func f(x float64)` passes a `float64` — and nothing downstream can tell
+    /// the two apart once the value has been pushed, so the call site is where
+    /// the conversion has to happen.
+    param_tys: Vec<String>,
     result: NumType,
     /// The Go type name of the first result (for struct/method type inference).
     result_ty: String,
@@ -298,6 +304,10 @@ struct Compiler {
     /// It is the only static-type path to a method call's result, which `%T`
     /// needs when the method returns a defined type.
     method_result_ty: HashMap<(String, String), String>,
+    /// Each method's declared parameter types, keyed by `(receiver type,
+    /// method name)`. Go converts an untyped constant argument to the
+    /// parameter's type at the call, the same as for a plain function.
+    method_param_tys: HashMap<(String, String), Vec<String>>,
     /// Each interface type's method set, keyed by its name — both declared
     /// (`type Stringer interface{…}`) and anonymous (`interface{ Unwrap() error }`,
     /// registered by the parser under a canonical name). Only method-bearing
@@ -1192,6 +1202,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut methods: HashMap<(String, String), usize> = HashMap::new();
     let mut method_nresults: HashMap<(String, String), usize> = HashMap::new();
     let mut method_result_ty: HashMap<(String, String), String> = HashMap::new();
+    let mut method_param_tys: HashMap<(String, String), Vec<String>> = HashMap::new();
     // Methods declared with a *value* receiver (`func (t T)`, not `func (t *T)`).
     // Go binds such a receiver to a copy, so the method cannot mutate the caller's
     // struct; a pointer receiver binds the struct itself and is meant to.
@@ -1201,6 +1212,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             Some(r) => {
                 methods.insert((base_type(&r.ty), f.name.clone()), f.params.len());
                 method_nresults.insert((base_type(&r.ty), f.name.clone()), f.results.len());
+                method_param_tys.insert(
+                    (base_type(&r.ty), f.name.clone()),
+                    f.params.iter().map(|p| p.ty.clone()).collect(),
+                );
                 if let [result] = f.results.as_slice() {
                     method_result_ty.insert((base_type(&r.ty), f.name.clone()), result.clone());
                 }
@@ -1213,6 +1228,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                     f.name.clone(),
                     FuncSig {
                         arity: f.params.len(),
+                        param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
                         result: f
                             .results
                             .first()
@@ -1337,6 +1353,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         value_recv_methods,
         method_nresults,
         method_result_ty,
+        method_param_tys,
         iface_methods,
         iface_names,
         defined_types: prog.defined.iter().cloned().collect(),
@@ -1784,18 +1801,19 @@ impl Compiler {
     /// Emit a call to a closure whose value is already on the stack (as the
     /// deepest argument, "self"): evaluate the args and call `$lambda_id`.
     fn emit_closure_call(&mut self, id: i64, args: &[Expr], line: u32) -> Result<(), String> {
-        self.emit_closure_call_args(args)?;
+        // The lambda's own parameter types are known here, so an untyped
+        // constant argument converts the way it does for a named function.
+        let param_tys: Vec<String> = self
+            .lambdas
+            .get(id as usize)
+            .map(|l| l.params.iter().map(|p| p.ty.clone()).collect())
+            .unwrap_or_default();
+        for (i, a) in args.iter().enumerate() {
+            self.emit_arg(a, param_tys.get(i))?;
+        }
         let idx = self.b.add_name(&format!("$lambda_{id}"));
         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
         self.emit_panic_check(line);
-        Ok(())
-    }
-
-    /// Evaluate the arguments of a closure call (struct-copied like any call).
-    fn emit_closure_call_args(&mut self, args: &[Expr]) -> Result<(), String> {
-        for a in args {
-            self.emit_value(a)?;
-        }
         Ok(())
     }
 
@@ -2289,7 +2307,7 @@ impl Compiler {
                 line,
             } => {
                 let nt = match (ty, init) {
-                    (Some(t), _) => numtype_of_ty(t),
+                    (Some(t), _) => numtype_of_ty(&self.underlying(&base_type(t))),
                     (None, Some(e)) => self.infer(e),
                     (None, None) => NumType::Unknown,
                 };
@@ -2588,7 +2606,10 @@ impl Compiler {
                 self.expr(chan)?;
                 // A send transfers a *copy* of a struct value: the sender may go
                 // on mutating its own variable without the receiver seeing it.
-                self.emit_value(val)?;
+                // It also converts an untyped constant to the element type, so
+                // `ch <- 1` on a `chan float64` sends a float.
+                let elem = self.chan_elem_ty(chan);
+                self.emit_typed(val, &elem)?;
                 self.b.emit(Op::ChanSend, *line);
             }
             Stmt::Select {
@@ -3195,7 +3216,7 @@ impl Compiler {
                 let ok = format!("$mgok{n}");
                 let val = format!("$mgv{n}");
                 self.expr(recv)?;
-                self.expr(index)?;
+                self.emit_map_key(recv, index)?;
                 // `v, ok := m[k]` zeroes `v` on a miss exactly as `m[k]` does,
                 // so it takes the same value-type zero — and the type it names
                 // is what the destructured `v` is then declared as, which keeps
@@ -3355,11 +3376,16 @@ impl Compiler {
             }
             Expr::Index { recv, index } => {
                 self.expr(recv)?;
-                self.expr(index)?;
+                self.emit_map_key(recv, index)?;
                 if op == AssignOp::Set {
                     // `m[k] = v` / `xs[i] = v` stores a *copy* of a struct value,
-                    // so a later write to `v` is not visible through the container.
-                    self.emit_value(value)?;
+                    // so a later write to `v` is not visible through the
+                    // container — and converts an untyped constant to the
+                    // element type, so `a[0] = 1` on a `[]float64` stores a
+                    // float rather than an integer that only the static type
+                    // says is one.
+                    let elem = self.elem_type_of(&self.type_name(recv));
+                    self.emit_typed(value, &elem)?;
                 } else {
                     self.b.emit(Op::Dup2, line);
                     let argc = self.emit_map_miss_zero(recv, line)?;
@@ -3392,7 +3418,10 @@ impl Compiler {
                 let c = self.b.add_constant(Value::str(field.clone()));
                 self.b.emit(Op::LoadConst(c), line);
                 if op == AssignOp::Set {
-                    self.expr(value)?;
+                    // `s.f = 1` on a `float64` field stores a float, the same
+                    // conversion the field's own literal `T{1}` performs.
+                    let fty = self.field_ty(recv, field);
+                    self.emit_typed(value, &fty)?;
                 } else {
                     self.b.emit(Op::Dup2, line);
                     self.b.emit(Op::CallBuiltin(host::GFIELD_GET, 2), line);
@@ -3754,6 +3783,69 @@ impl Compiler {
         Err(format!("go-rs: invalid map key type {key_ty}{where_}"))
     }
 
+    /// The declared type of `recv.field`, or `""` when the receiver's struct
+    /// type is not known here.
+    fn field_ty(&self, recv: &Expr, field: &str) -> String {
+        let rt = self.type_name(recv);
+        self.struct_fields
+            .get(&rt)
+            .and_then(|fs| fs.iter().find(|(n, _)| n == field))
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default()
+    }
+
+    /// The underlying type of `ty` — a defined type resolves to its base, so
+    /// `type celsius float64` answers `float64`. (Go rejects a `type` cycle, so
+    /// following the chain terminates.)
+    fn underlying(&self, ty: &str) -> String {
+        match self.defined_types.get(ty) {
+            Some(base) if base != ty => self.underlying(base),
+            _ => ty.to_string(),
+        }
+    }
+
+    /// Whether `ty` is a float type, following defined types to their base.
+    fn is_float_ty(&self, ty: &str) -> bool {
+        numtype_of_ty(&self.underlying(&base_type(ty))) == NumType::Float
+    }
+
+    /// Emit one call argument, converted to the parameter's declared type.
+    ///
+    /// Go converts an untyped constant to the parameter's type at the call, so
+    /// `f(1)` on a `func f(x float64)` passes a `float64`. Without this the
+    /// callee's parameter holds a `Value::Int` that only its *static* type says
+    /// is a float — enough for arithmetic, which reads the static type, and not
+    /// enough for `%T` or for a map key, which read the value.
+    fn emit_arg(&mut self, a: &Expr, param_ty: Option<&String>) -> Result<(), String> {
+        match param_ty {
+            Some(t) if self.is_float_ty(t) => {
+                let t = self.underlying(&base_type(t));
+                self.emit_typed(a, &t)
+            }
+            _ => self.emit_value(a),
+        }
+    }
+
+    /// Emit `m[k]`'s key, converted to the map's declared key type.
+    ///
+    /// An untyped constant in a `map[float64]V` index — `f[1]` — is a `float64`
+    /// in Go, and once it has been pushed as a `Value::Int` nothing at run time
+    /// can tell it from the integer it now looks like. The conversion therefore
+    /// has to happen where the declared key type is known, which is here.
+    ///
+    /// Only a float key type needs it. Every other conversion [`Self::emit_typed`]
+    /// would add is the identity or a struct copy, and copying a key per
+    /// *lookup* is exactly the work the hash index was added to avoid.
+    fn emit_map_key(&mut self, recv: &Expr, index: &Expr) -> Result<(), String> {
+        match map_key_ty(&self.type_name(recv)) {
+            Some(k) if self.is_float_ty(k) => {
+                let k = self.underlying(&base_type(k));
+                self.emit_typed(index, &k)
+            }
+            _ => self.expr(index),
+        }
+    }
+
     fn emit_map_miss_zero(&mut self, recv: &Expr, line: u32) -> Result<u8, String> {
         let Some(v_ty) = map_value_ty(&self.type_name(recv)).map(str::to_string) else {
             return Ok(2);
@@ -3904,7 +3996,7 @@ impl Compiler {
             }
             Expr::Index { recv, index } => {
                 self.expr(recv)?;
-                self.expr(index)?;
+                self.emit_map_key(recv, index)?;
                 let argc = self.emit_map_miss_zero(recv, 0)?;
                 self.b.emit(Op::CallBuiltin(host::GINDEX_GET, argc), 0);
                 self.emit_panic_check(0); // index out of range is recoverable
@@ -3950,6 +4042,11 @@ impl Compiler {
             } => {
                 let (key_ty, val_ty, pairs) = (key_ty.clone(), val_ty.clone(), pairs.clone());
                 self.check_map_key(&key_ty, 0)?;
+                // The key is typed by the map's *underlying* key type, so a
+                // `map[celsius]V{1: …}` stores the same `float64` a `c[1]`
+                // index looks up — a defined type and its base have to agree
+                // about which of the two a literal `1` becomes.
+                let key_ty = self.underlying(&base_type(&key_ty));
                 self.emit_lit_chunked(host::GMAP_LIT, 0, 2, pairs.len(), 0, |c, i| {
                     let (k, v) = &pairs[i];
                     c.emit_typed(k, &key_ty)?;
@@ -4124,9 +4221,13 @@ impl Compiler {
             self.emit_zero(ty, 0);
             return Ok(());
         }
+        // A defined type's destination is its base's: `type celsius float64`
+        // takes an untyped constant as a `float64`, and a `type f32 float32`
+        // rounds to 32 bits.
+        let ty = &self.underlying(&base_type(ty));
         // A `float32` destination rounds to 32 bits — `var f float32 = 1.0/3.0`
         // holds the `f32` nearest one third, not the `f64` one.
-        if base_type(ty) == "float32" && !self.is_f32(e) {
+        if ty == "float32" && !self.is_f32(e) {
             self.emit_value(e)?;
             let c = self.b.add_constant(Value::str("float32"));
             self.b.emit(Op::LoadConst(c), 0);
@@ -4358,8 +4459,13 @@ impl Compiler {
             }
             self.expr(recv)?;
             self.emit_recv_copy(&ty, method);
-            for a in args {
-                self.emit_value(a)?;
+            let param_tys = self
+                .method_param_tys
+                .get(&(ty.clone(), method.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            for (i, a) in args.iter().enumerate() {
+                self.emit_arg(a, param_tys.get(i))?;
             }
             let idx = self.b.add_name(&format!("{ty}.{method}"));
             self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
@@ -5631,7 +5737,14 @@ impl Compiler {
                     // other builtin here takes no struct by value, so the copy is
                     // asked for only where Go performs one.
                     if id == host::GAPPEND && i > 0 {
-                        self.emit_value(a)?;
+                        // The appended element takes the slice's element type,
+                        // so `append(s, 1)` on a `[]float64` appends a float.
+                        let elem = self.elem_type_of(&self.type_name(&args[0]));
+                        self.emit_typed(a, &elem)?;
+                    } else if id == host::GDELETE && i == 1 {
+                        // `delete(m, 1)` on a `map[float64]V` looks the key up
+                        // the same way `m[1]` does, so it converts the same way.
+                        self.emit_map_key(&args[0], a)?;
                     } else {
                         self.expr(a)?;
                     }
@@ -5685,6 +5798,7 @@ impl Compiler {
             if let Some(sig) = self.funcs.get(name) {
                 let variadic = sig.variadic;
                 let arity = sig.arity;
+                let param_tys = sig.param_tys.clone();
                 if variadic {
                     // Fixed params come first; the trailing arguments are packed
                     // into the variadic slice parameter (or, for `f(xs...)`, the
@@ -5696,8 +5810,8 @@ impl Compiler {
                             args.len()
                         ));
                     }
-                    for a in &args[..fixed] {
-                        self.emit_value(a)?;
+                    for (i, a) in args[..fixed].iter().enumerate() {
+                        self.emit_arg(a, param_tys.get(i))?;
                     }
                     if spread {
                         // `f(a, xs...)` — the last argument is the slice itself.
@@ -5720,8 +5834,8 @@ impl Compiler {
                         args.len()
                     ));
                 }
-                for a in args {
-                    self.emit_value(a)?;
+                for (i, a) in args.iter().enumerate() {
+                    self.emit_arg(a, param_tys.get(i))?;
                 }
                 let idx = self.b.add_name(name);
                 self.b.emit(Op::Call(idx, args.len() as u8), line);

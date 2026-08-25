@@ -407,12 +407,22 @@ What is left is the crossing the values cannot show. `int`, `int8`…`int64`,
 `go_type_name` names every one of them `int`, so two of different width look
 like the same dynamic type and are compared by value.
 
-The same crossing shows as a **map key**: `key_eq` (`src/host.rs`) partitions
-keys into nil, string, bool and number, so `map[any]int` keeps a `"1"`, a `true`
-and a `nil` apart — but an `int` `1` and a `float64` `1.0` are one key there,
-where Go has two. `key_eq` cannot use `iface_eq`'s stricter rule, because an
-untyped integer literal in a float-keyed map (`map[float64]int{1: 5}`) reaches it
-as a `Value::Int` and has to find the `float64` entry.
+The same crossing shows as a **map key**, and only that crossing now:
+
+```go
+m := map[any]string{}
+m[1] = "int"
+m[int64(1)] = "int64"
+fmt.Println(len(m))                 // go: 2   go-rs: 1
+```
+
+`key_eq` (`src/host.rs`) partitions keys into nil, string, bool, integer and
+float, so `map[any]V` keeps a `"1"`, a `true`, a `nil`, a `1` and a `1.0` apart.
+It could not do the integer/float half until the *compiler* stopped letting an
+untyped constant reach a float destination as a `Value::Int`
+(`Compiler::emit_map_key` and the argument, field, element, `append` and channel
+-send conversions beside it). Two integer widths remain one key, for the same
+reason two of them compare equal above: the width is in the static type.
 
 Closing it needs the Go type on the value, which is a representation change,
 and it is the *same* one the `float32` and `uint64` entries above want — all
