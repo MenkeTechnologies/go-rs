@@ -123,6 +123,27 @@ fn numtype_of_ty(ty: &str) -> NumType {
     }
 }
 
+/// The value type written in a `map[K]V`, exactly as written — `*T` keeps its
+/// star, which is what tells a nil pointer apart from a zero struct. `None` for
+/// anything that is not a map type.
+///
+/// The key can carry brackets of its own (`map[[2]int]V`) and so can the value
+/// (`map[string][]T`), so the key ends at the `]` that closes the one `map[`
+/// opened — found by depth, not by the first or last `]`.
+fn map_value_ty(ty: &str) -> Option<&str> {
+    let rest = ty.strip_prefix("map[")?;
+    let mut depth = 0usize;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' if depth == 0 => return Some(&rest[i + 1..]),
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The element type named by a container type — `[]T` and `map[K]V` both yield
 /// `T`/`V`. `None` for anything that is not a container.
 fn elem_of_type(ty: &str) -> Option<String> {
@@ -3161,15 +3182,25 @@ impl Compiler {
                 let val = format!("$mgv{n}");
                 self.expr(recv)?;
                 self.expr(index)?;
-                self.b.emit(Op::CallBuiltin(host::GMAP_GET2, 2), line);
+                // `v, ok := m[k]` zeroes `v` on a miss exactly as `m[k]` does,
+                // so it takes the same value-type zero — and the type it names
+                // is what the destructured `v` is then declared as, which keeps
+                // `%T` and the width-sensitive arithmetic on it right.
+                let argc = self.emit_map_miss_zero(recv, line)?;
+                self.b.emit(Op::CallBuiltin(host::GMAP_GET2, argc), line);
                 self.types.insert(pair.clone(), NumType::Unknown);
                 self.emit_set(&pair, line);
 
+                let v_ty = match argc {
+                    3 => self.elem_type_of(&self.type_name(recv)),
+                    _ => String::new(),
+                };
+                let v_num_ty = numtype_of_ty(&v_ty);
                 self.emit_get(&pair, line);
                 self.b.emit(Op::LoadInt(0), line);
                 self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
-                self.types.insert(val.clone(), NumType::Unknown);
-                self.decl_types.insert(val.clone(), String::new());
+                self.types.insert(val.clone(), v_num_ty);
+                self.decl_types.insert(val.clone(), v_ty.clone());
                 self.emit_set(&val, line);
 
                 self.emit_get(&pair, line);
@@ -3180,8 +3211,8 @@ impl Compiler {
                 Ok(Some(CommaOk {
                     value: val,
                     ok,
-                    value_num_ty: NumType::Unknown,
-                    value_decl_ty: String::new(),
+                    value_num_ty: v_num_ty,
+                    value_decl_ty: v_ty,
                 }))
             }
             _ => Ok(None),
@@ -3317,7 +3348,8 @@ impl Compiler {
                     self.emit_value(value)?;
                 } else {
                     self.b.emit(Op::Dup2, line);
-                    self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+                    let argc = self.emit_map_miss_zero(recv, line)?;
+                    self.b.emit(Op::CallBuiltin(host::GINDEX_GET, argc), line);
                     self.expr(value)?;
                     let f32ish = self.is_f32(target) || self.is_f32(value);
                     let u64ish = self.is_u64(target);
@@ -3645,6 +3677,33 @@ impl Compiler {
         self.emit_default(numtype_of_ty(ty), line);
     }
 
+    /// Emit the extra argument a map index takes: the value a *missing* key
+    /// yields. Go's answer is the value type's zero — `""` for a
+    /// `map[K]string`, `false` for a `map[K]bool`, a nil slice, a nil pointer,
+    /// a zero struct — and the host cannot work any of that out. It sees a key
+    /// that is not there and a map that does not carry its value type, so its
+    /// own default is the integer `0`, which is right for exactly the numeric
+    /// case. The value type is known here and nowhere else.
+    ///
+    /// Answers the argument count to call the builtin with: 3 when a zero was
+    /// emitted, 2 when the receiver is not a statically known map — a slice or
+    /// string index, or an expression whose type this pass could not name — and
+    /// the host's default stands.
+    ///
+    /// The argument is evaluated before the call, so a struct value type costs
+    /// one zero-struct construction per lookup whether the key is there or not.
+    /// Every other value type's zero is a single constant-load op.
+    fn emit_map_miss_zero(&mut self, recv: &Expr, line: u32) -> Result<u8, String> {
+        let Some(v_ty) = map_value_ty(&self.type_name(recv)).map(str::to_string) else {
+            return Ok(2);
+        };
+        if v_ty.is_empty() {
+            return Ok(2);
+        }
+        self.emit_elem_zero(&v_ty, line)?;
+        Ok(3)
+    }
+
     fn emit_default(&mut self, nt: NumType, line: u32) {
         match nt {
             NumType::Int => self.b.emit(Op::LoadInt(0), line),
@@ -3785,7 +3844,8 @@ impl Compiler {
             Expr::Index { recv, index } => {
                 self.expr(recv)?;
                 self.expr(index)?;
-                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
+                let argc = self.emit_map_miss_zero(recv, 0)?;
+                self.b.emit(Op::CallBuiltin(host::GINDEX_GET, argc), 0);
                 self.emit_panic_check(0); // index out of range is recoverable
             }
             Expr::Slice {
@@ -4447,22 +4507,7 @@ impl Compiler {
         if let Some(elem) = container.strip_prefix("[]") {
             return base_type(elem);
         }
-        let Some(rest) = container.strip_prefix("map[") else {
-            return String::new();
-        };
-        // The key can carry brackets of its own (`map[[2]int]V`) and so can the
-        // value (`map[string][]T`), so the key ends at the `]` that closes the
-        // one `map[` opened — found by depth, not by first or last `]`.
-        let mut depth = 0usize;
-        for (i, ch) in rest.char_indices() {
-            match ch {
-                '[' => depth += 1,
-                ']' if depth == 0 => return base_type(&rest[i + 1..]),
-                ']' => depth -= 1,
-                _ => {}
-            }
-        }
-        String::new()
+        base_type(map_value_ty(container).unwrap_or(""))
     }
 
     /// Emit one operand of a comparison. `*p` loads the pointed-to struct as a

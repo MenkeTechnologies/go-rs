@@ -2154,9 +2154,11 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             Some(HostObj::Map(m)) => m[i].1.clone(),
             _ => Value::Undef,
         }),
-        // Go returns the value type's zero value for a missing key; 0 covers the
-        // common numeric case (use comma-ok for the typed zero of other types).
-        None => Value::Int(0),
+        // Go returns the value type's zero for a missing key. The map does not
+        // carry its value type, so the compiler passes that zero as a third
+        // argument wherever the receiver is statically a map; without one, the
+        // integer `0` stands, which is right for the numeric case.
+        None => args.get(2).cloned().unwrap_or(Value::Int(0)),
     }
 }
 
@@ -2202,15 +2204,18 @@ fn b_map_get2(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let recv = args.first().cloned().unwrap_or(Value::Undef);
     let key = args.get(1).cloned().unwrap_or(Value::Undef);
+    // The value a missing key yields — the value type's zero, which only the
+    // compiler knows and passes as a third argument. See [`b_index_get`].
+    let absent = args.get(2).cloned().unwrap_or(Value::Int(0));
     let (val, present) = match recv {
         Value::Obj(id) => match map_find_index(id, &key) {
             Some(i) => HEAP.with(|h| match h.borrow().get(id as usize) {
                 Some(HostObj::Map(m)) => (m[i].1.clone(), true),
-                _ => (Value::Undef, false),
+                _ => (absent.clone(), false),
             }),
-            None => (Value::Int(0), false),
+            None => (absent, false),
         },
-        _ => (Value::Undef, false),
+        _ => (absent, false),
     };
     Value::Obj(heap_alloc(HostObj::slice(vec![val, Value::bool(present)])))
 }
