@@ -321,6 +321,63 @@ mod tests {
         assert!(!report.reaches_native(), "{report}");
     }
 
+    /// `for i := range n` walks `0 … n-1`, so the loop binds `$i` itself rather
+    /// than reading it back out of a materialized key list. That removes the
+    /// per-iteration `GINDEX_GET`, and with it the last `CallBuiltin` in the
+    /// body — which is what the tracing tier refuses outright (`fusevm`'s
+    /// `is_trace_op_allowed_at`: `Op::CallBuiltin(_, _) => false`). Rotation
+    /// alone did not reach this loop form; dropping the key list did.
+    #[test]
+    fn a_range_over_an_integer_reaches_a_compiled_trace() {
+        let report = report(
+            "package main\nfunc f(n int) int { t := 0; for i := range n { t = (t + i) % 1000003 }; return t }\nfunc main() { _ = f(200000) }",
+        )
+        .expect("runs");
+        let counted = report.chunks[0]
+            .loops
+            .iter()
+            .find(|l| l.trace_eligible)
+            .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
+        assert!(counted.traced, "{report}");
+        assert!(report.reaches_native(), "{report}");
+    }
+
+    /// The same loop, in a function that also has a slice parameter, is
+    /// trace-**eligible** and still never runs a trace.
+    ///
+    /// Nothing about the loop changed — the slice is not read inside it. The
+    /// refusal is `fusevm`'s: `VM::refresh_slot_buffers` classifies a frame's
+    /// slots and sets one `slots_all_numeric` flag for the whole frame, and
+    /// `lookup_trace_for_backward` returns the anchor unentered whenever that
+    /// flag is false and a numeric hook is installed — which go-rs always
+    /// installs, because Go's fixed-width overflow is what it decides. A
+    /// `Value::Obj` slice handle in any slot of the frame therefore keeps every
+    /// loop in that function interpreted.
+    ///
+    /// fusevm already does the finer thing for globals (flagged per index, with
+    /// the trace's entry guard refusing only on the indices it reads) and
+    /// already knows which slots a trace touches (`collect_trace_slots`), so
+    /// the per-slot version is available upstream — but it is not reachable
+    /// from a frontend, which cannot keep a Go program's slices, maps, strings
+    /// and structs out of its frames.
+    ///
+    /// This asserts the ceiling rather than working around it: when fusevm
+    /// gains the per-slot gate, this test fails and says where to look.
+    #[test]
+    fn a_slice_in_the_frame_keeps_a_numeric_loop_interpreted() {
+        let report = report(
+            "package main\nfunc f(s []int, n int) int { t := 0; for i := range n { t = (t + i) % 1000003 }; return t }\nfunc main() { _ = f([]int{1}, 200000) }",
+        )
+        .expect("runs");
+        let counted = report.chunks[0]
+            .loops
+            .iter()
+            .find(|l| l.trace_eligible)
+            .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
+        assert!(!counted.traced, "{report}");
+        assert!(!report.reaches_native(), "{report}");
+    }
+
     /// A program whose only work is a print reaches no tier: the builtin call
     /// is what keeps the whole chunk out of the block tier, and the loops the
     /// linked runtime helpers contribute are not even trace-eligible.
