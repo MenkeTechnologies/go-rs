@@ -274,14 +274,22 @@ mod tests {
     }
 
     /// A Go `for` inside a function counts in frame slots, so its body holds
-    /// nothing the tiers refuse and fusevm's recorder accepts the sequence. It
-    /// still installs no trace: `for` is emitted in the unrotated shape — a
-    /// forward `JumpIfFalse` exit closed by an unconditional backward `Jump` —
-    /// which the trace compiler records and then declines. This pins the gap
-    /// the report exists to expose; if go-rs's loop lowering is rotated later,
-    /// this test is the one that says so.
+    /// nothing the tiers refuse and fusevm's recorder accepts the sequence —
+    /// and it now reaches a compiled trace.
+    ///
+    /// This used to assert the opposite, and said so: `for` was emitted in the
+    /// unrotated shape — a forward `JumpIfFalse` exit closed by an
+    /// unconditional backward `Jump` — which the trace compiler records and
+    /// then declines, so the hottest shape a Go program has stayed in the
+    /// interpreter however hot it got. `Compiler::compile_for` now emits every
+    /// `for` rotated, which is the shape
+    /// [`a_rotated_slot_loop_reaches_a_compiled_trace`] proves fusevm accepts.
+    ///
+    /// Keeping it as an assertion rather than deleting it is the point: rotate
+    /// the lowering back, or emit a loop body holding an op the tiers refuse,
+    /// and this fails.
     #[test]
-    fn a_go_for_loop_is_trace_eligible_but_installs_no_trace() {
+    fn a_go_for_loop_reaches_a_compiled_trace() {
         let report = report(
             "package main\nfunc f(n int) int { t := 0; for i := 0; i < n; i++ { t += i }; return t }\nfunc main() { _ = f(200000) }",
         )
@@ -291,8 +299,25 @@ mod tests {
             .iter()
             .find(|l| l.trace_eligible)
             .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
-        assert!(!counted.traced, "{report}");
+        assert!(counted.traced, "{report}");
         assert!(!counted.blacklisted, "{report}");
+        assert!(report.reaches_native(), "{report}");
+    }
+
+    /// `for {}` has no condition to branch on, so its back edge stays an
+    /// unconditional `Jump` and the tracing tier declines it — the one loop
+    /// form rotation cannot reach. Separating it from the test above is what
+    /// keeps "reaches native" honest about which shapes actually do.
+    #[test]
+    fn a_bare_for_keeps_its_unconditional_back_edge() {
+        let report = report(
+            "package main\nfunc f(n int) int { t, i := 0, 0; for { if i >= n { break }; t += i; i++ }; return t }\nfunc main() { _ = f(200000) }",
+        )
+        .expect("runs");
+        assert!(
+            report.chunks[0].loops.iter().all(|l| !l.traced),
+            "{report}"
+        );
         assert!(!report.reaches_native(), "{report}");
     }
 
