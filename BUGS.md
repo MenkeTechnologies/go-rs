@@ -223,21 +223,6 @@ them distinct.
 Closing it means giving a scalar pointer a heap cell of its own, which changes
 what every `&x` and `*p` on a scalar costs.
 
-## A composite literal cannot elide a defined or pointer element type
-
-```go
-type ints []int
-m := map[string]ints{"a": {1}}      // go: builds     go-rs: undefined struct type `ints`
-p := map[string]*point{"a": {1, 2}} // go: builds     go-rs: undefined struct type `*point`
-```
-
-Go lets a composite literal inside another one drop the element type, including
-when that type is a defined slice/map type or a pointer to a struct (`{1, 2}`
-meaning `&point{1, 2}`). go-rs resolves an elided literal as a *struct* literal
-of the element type name, so a defined non-struct type and a `*T` both reach
-`struct_lit` and are rejected. Writing the type out (`ints{1}`, `&point{1, 2}`)
-works.
-
 ## A pointer to a struct prints without `&`
 
 ```go

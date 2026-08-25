@@ -4155,6 +4155,34 @@ impl Compiler {
         type_name: &str,
         given: &[(Option<String>, Expr)],
     ) -> Result<(), String> {
+        // `[]*T{{…}}` elides a *pointer* element: Go reads the inner literal as
+        // `&T{…}`. The parser only has the element type's text, so the star is
+        // resolved here — including the mark that makes the result a pointer
+        // rather than a struct value, which is what `&T{…}` written out does.
+        if let Some(inner) = type_name.strip_prefix('*') {
+            let inner = inner.to_string();
+            self.struct_lit(&inner, given)?;
+            self.b.emit(Op::CallBuiltin(host::GPTR_MARK, 1), 0);
+            return Ok(());
+        }
+        // A defined type over a slice or array (`type ints []int`) elides to
+        // *its base's* literal. The parser reaches every elided element through
+        // the struct form, because only here is the base known.
+        if let Some(base) = self.defined_types.get(type_name).cloned() {
+            if base != type_name {
+                if let Some(elem) = array_elem_ty(&base)
+                    .map(str::to_string)
+                    .or_else(|| base.strip_prefix("[]").map(str::to_string))
+                {
+                    let lit = Expr::SliceLit {
+                        elem_ty: elem,
+                        elems: given.iter().map(|(_, v)| v.clone()).collect(),
+                        array_len: array_len_of(&base),
+                    };
+                    return self.expr(&lit);
+                }
+            }
+        }
         let decl = self
             .struct_fields
             .get(type_name)
