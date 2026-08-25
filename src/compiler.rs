@@ -4055,6 +4055,11 @@ impl Compiler {
                         return Ok(());
                     }
                 }
+                // A *method value* (`q.Area`) or *method expression*
+                // (`sq.Area`) in a value position — neither is a field read.
+                if self.method_value(recv, field)? {
+                    return Ok(());
+                }
                 self.expr(recv)?;
                 let c = self.b.add_constant(Value::str(field.clone()));
                 self.b.emit(Op::LoadConst(c), 0);
@@ -4544,6 +4549,125 @@ impl Compiler {
         {
             self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
         }
+    }
+
+    /// Emit the closure a *method value* or *method expression* denotes, and
+    /// answer whether the selector was one. `false` leaves an ordinary field
+    /// read to the caller.
+    ///
+    /// Go has two forms, and they differ in where the receiver comes from:
+    ///
+    /// - `q.Area` is a **method value**. The receiver is evaluated and *copied*
+    ///   where the value is written, so a later write to `q` is not seen
+    ///   through it. That is why this emits rather than rewriting: the copy is
+    ///   `emit_value`, which copies a struct and shares a pointer — so a
+    ///   pointer-receiver method value still writes through, as Go's does.
+    /// - `sq.Area` is a **method expression**, a plain function whose first
+    ///   parameter is the receiver.
+    ///
+    /// Both end as a `func` literal that calls the method, so closures do the
+    /// work and the call dispatches exactly as a written one would — including
+    /// dynamically, when the receiver's type is an interface.
+    fn method_value(&mut self, recv: &Expr, field: &str) -> Result<bool, String> {
+        // `sq.Area` — the receiver names a *type*, not a value. A variable
+        // shadowing a type name is still a variable.
+        let is_type = matches!(recv, Expr::Ident(n)
+            if self.structs.contains(n) && !self.decl_types.contains_key(n));
+        let ty = match (is_type, recv) {
+            (true, Expr::Ident(n)) => n.clone(),
+            _ => self.type_name(recv),
+        };
+        if ty.is_empty() {
+            return Ok(false);
+        }
+        let key = (ty.clone(), field.to_string());
+        // A concrete type declares the method; an interface only names it, and
+        // its method set carries the shape (`Get/0:int`).
+        let (arity, ptys, results) = match self.methods.get(&key) {
+            Some(&arity) => (
+                arity,
+                self.method_param_tys.get(&key).cloned().unwrap_or_default(),
+                match self.method_result_ty.get(&key) {
+                    Some(r) if self.method_nresults.get(&key).copied().unwrap_or(0) > 0 => {
+                        vec![r.clone()]
+                    }
+                    _ => Vec::new(),
+                },
+            ),
+            None => {
+                let prefix = format!("{field}/");
+                let Some(sig) = self
+                    .iface_of(&ty)
+                    .and_then(|ms| ms.iter().find(|m| m.starts_with(&prefix)))
+                    .cloned()
+                else {
+                    return Ok(false);
+                };
+                let (head, res) = sig.split_once(':').unwrap_or((sig.as_str(), ""));
+                let arity: usize = head[prefix.len()..].parse().unwrap_or(0);
+                let results = match res.is_empty() {
+                    true => Vec::new(),
+                    false => res.split(',').map(str::to_string).collect(),
+                };
+                (arity, vec![String::new(); arity], results)
+            }
+        };
+        // Only the first result is carried: the compiler's own signature tables
+        // record one, and a multi-result method value is rare enough that a
+        // wrong arity here would be worse than the current field-read error.
+        let results = results.into_iter().take(1).collect::<Vec<_>>();
+        let params: Vec<Param> = (0..arity)
+            .map(|i| Param {
+                // Cannot collide with anything the program wrote.
+                name: format!("$mp{i}"),
+                ty: ptys.get(i).cloned().unwrap_or_default(),
+            })
+            .collect();
+        let args: Vec<Expr> = params.iter().map(|p| Expr::Ident(p.name.clone())).collect();
+
+        let (params, target) = match is_type {
+            // The method expression takes its receiver as the first parameter.
+            true => {
+                let mut all = vec![Param {
+                    name: "$mr".to_string(),
+                    ty: ty.clone(),
+                }];
+                all.extend(params);
+                (all, Expr::Ident("$mr".to_string()))
+            }
+            // The method value binds the receiver evaluated *here*. Storing it
+            // through `emit_value` is what copies a struct and shares a
+            // pointer, which is exactly Go's rule for the two receiver kinds.
+            false => {
+                let n = self.temp_counter;
+                self.temp_counter += 1;
+                let tmp = format!("$mv{n}");
+                self.emit_value(recv)?;
+                self.types.insert(tmp.clone(), NumType::Unknown);
+                self.decl_types.insert(tmp.clone(), ty.clone());
+                self.emit_set(&tmp, 0);
+                (params, Expr::Ident(tmp))
+            }
+        };
+        let call = Expr::Call {
+            func: Box::new(Expr::Selector {
+                recv: Box::new(target),
+                field: field.to_string(),
+            }),
+            args,
+            spread: false,
+            line: 0,
+        };
+        let body = match results.is_empty() {
+            true => vec![Stmt::ExprStmt(call)],
+            false => vec![Stmt::Return(vec![call], 0)],
+        };
+        self.expr(&Expr::FuncLit {
+            params,
+            results,
+            body,
+        })?;
+        Ok(true)
     }
 
     /// Lower a method call `recv.method(args)`. The receiver's static type names
