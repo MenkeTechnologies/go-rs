@@ -304,21 +304,29 @@ mod tests {
         assert!(report.reaches_native(), "{report}");
     }
 
-    /// `for {}` has no condition to branch on, so its back edge stays an
-    /// unconditional `Jump` and the tracing tier declines it — the one loop
-    /// form rotation cannot reach. Separating it from the test above is what
-    /// keeps "reaches native" honest about which shapes actually do.
+    /// `for {}` has no condition, so nothing about rotation applies to it —
+    /// and it reaches a compiled trace anyway, because its back edge branches
+    /// on a constant `true` rather than being an `Op::Jump`.
+    ///
+    /// The difference is entirely fusevm's, and it is not the static
+    /// eligibility check: `is_trace_eligible` accepts `Op::Jump(anchor)` as a
+    /// close. Measured, the same `for {}` with an unconditional back edge
+    /// reports `trace-eligible=true traced=false`, and with `LoadTrue` +
+    /// `JumpIfTrue` reports `traced=true`. This test is what keeps the
+    /// constant-`true` branch from being tidied back into a `Jump`.
     #[test]
-    fn a_bare_for_keeps_its_unconditional_back_edge() {
+    fn a_bare_for_reaches_a_compiled_trace() {
         let report = report(
-            "package main\nfunc f(n int) int { t, i := 0, 0; for { if i >= n { break }; t += i; i++ }; return t }\nfunc main() { _ = f(200000) }",
+            "package main\nfunc f(n int) int { t, i := 0, 0; for { if i >= n { break }; t = (t + i) % 1000003; i++ }; return t }\nfunc main() { _ = f(200000) }",
         )
         .expect("runs");
-        assert!(
-            report.chunks[0].loops.iter().all(|l| !l.traced),
-            "{report}"
-        );
-        assert!(!report.reaches_native(), "{report}");
+        let counted = report.chunks[0]
+            .loops
+            .iter()
+            .find(|l| l.trace_eligible)
+            .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
+        assert!(counted.traced, "{report}");
+        assert!(report.reaches_native(), "{report}");
     }
 
     /// `for i := range n` walks `0 … n-1`, so the loop binds `$i` itself rather
