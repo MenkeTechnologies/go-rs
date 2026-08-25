@@ -72,6 +72,13 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if strconv_errors {
         add_num_error_type(&mut main);
     }
+    // `strings.Builder` is a *type* in a package whose functions are host
+    // builtins, so it cannot arrive through the source-package path; it is
+    // synthesized and qualified instead. Gated on the import, because a program
+    // that never names `strings` cannot name the type either.
+    if main.imports.iter().any(|p| p == "strings") {
+        add_strings_builder(&mut main)?;
+    }
     add_sort_slice(&mut main);
     add_stringify(&mut main);
     Ok(main)
@@ -244,6 +251,18 @@ fn uses_strconv_error(prog: &Program) -> bool {
         Expr::Call { func, .. } => PARSERS.iter().any(|f| is_selector(func, "strconv", f)),
         e => is_selector(e, "strconv", "ErrSyntax") || is_selector(e, "strconv", "ErrRange"),
     })
+}
+
+/// Synthesize `strings.Builder` and its method set from real Go source, then
+/// qualify it under `strings` so the declaration is named exactly what a
+/// program writes. See `goroot/strings_builder.go` for why the type cannot come
+/// in through [`load_recursive`] like `errors` and `io` do.
+fn add_strings_builder(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/strings_builder.go"))?;
+    qualify(&mut pkg, "strings", true);
+    prog.types.append(&mut pkg.types);
+    prog.funcs.append(&mut pkg.funcs);
+    Ok(())
 }
 
 /// Synthesize the three error types `fmt.Errorf` constructs, mirroring Go's
