@@ -274,6 +274,15 @@ pub const GDYNDIV: u16 = 950;
 /// `[value]` → the same handle, marked as a Go pointer (`&T{…}` / `new(T)`) so
 /// `==` compares it by address rather than field by field.
 pub const GPTR_MARK: u16 = 955;
+
+/// `&x` on an existing variable — allocate a [`HostObj::Ptr`] addressing the
+/// value's handle. A value that is not a heap object has no address to take, so
+/// it passes through unchanged (see BUGS.md on `&` of a scalar).
+pub const GPTR_TO: u16 = 859;
+
+/// `*p = v` — overwrite the struct `p` points at, in place, so every other
+/// pointer to it and the variable itself all see the new value.
+pub const GDEREF_SET: u16 = 990;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -426,6 +435,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GDYNDIV, b_dyndiv);
     vm.register_builtin(GFDIV, b_fdiv);
     vm.register_builtin(GPTR_MARK, b_ptr_mark);
+    vm.register_builtin(GPTR_TO, b_ptr_to);
+    vm.register_builtin(GDEREF_SET, b_deref_set);
     vm.register_builtin(GNIL_OF, b_nil_of);
     vm.register_builtin(GF32_BOX, b_f32_box);
     vm.register_builtin(GF32_ARITH, b_f32_arith);
@@ -542,7 +553,7 @@ fn type_tag_of(v: &Value) -> String {
         Value::Float(_) => "float64".to_string(),
         Value::Str(_) => "string".to_string(),
         Value::Bool(_) => "bool".to_string(),
-        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(follow(*id) as usize) {
             Some(HostObj::Struct { type_name, .. }) => type_name.clone(),
             Some(HostObj::Slice { .. }) | Some(HostObj::SliceView { .. }) => "[]".to_string(),
             Some(HostObj::Map(_)) => "map".to_string(),
@@ -1070,7 +1081,9 @@ fn b_typeof(vm: &mut VM, argc: u8) -> Value {
     match args.first() {
         Some(Value::Obj(id)) => HEAP.with(|h| {
             let h = h.borrow();
-            match h.get(*id as usize) {
+            // Through a pointer: dynamic dispatch switches on the *pointee*'s
+            // type, which is the type whose method set the pointer satisfies.
+            match h.get(follow(*id) as usize) {
                 Some(HostObj::Struct { type_name, .. }) => Value::str(type_name.clone()),
                 _ => Value::str(""),
             }
@@ -1184,6 +1197,17 @@ pub(crate) enum HostObj {
     },
     /// A map, insertion-ordered for stable iteration; keys compared by value.
     Map(GoMap),
+    /// A pointer to another heap object: what `&x` on an existing *variable*
+    /// evaluates to.
+    ///
+    /// `&T{…}` can mark its own handle `by_ref` because that handle is born a
+    /// pointer and nothing else refers to it. `&x` cannot: the handle is `x`'s,
+    /// and marking it would make `x` itself compare by identity where Go
+    /// compares field by field. So the pointer becomes an object of its own,
+    /// which leaves the pointee's identity exactly as it was — and gives two
+    /// `&x` of the same variable the same `target` to compare, which is Go's
+    /// rule for pointer equality.
+    Ptr { target: u32 },
     /// A struct: its type name and ordered `(field, value)` pairs.
     ///
     /// `by_ref` marks a handle produced by `&T{…}` / `new(T)` — a Go *pointer*
@@ -2130,6 +2154,7 @@ fn b_lit_extend(vm: &mut VM, argc: u8) -> Value {
         Struct,
         Other,
     }
+    let id = follow(id);
     let kind = HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Slice { .. }) => Kind::Slice,
         Some(HostObj::Map(_)) => Kind::Map,
@@ -2612,15 +2637,45 @@ fn b_ptr_mark(vm: &mut VM, argc: u8) -> Value {
     v
 }
 
+/// Resolve a handle through any [`HostObj::Ptr`] indirection to the object it
+/// points at. Every reader that wants the *pointed-to* struct goes through this;
+/// the two that must not are [`struct_bind`], which has to hand a pointer back
+/// unchanged, and pointer equality, which compares the target rather than
+/// reading it.
+///
+/// The bound terminates a `**T` chain and a cycle alike; nothing in go-rs builds
+/// either, so it is a guard rather than a limit.
+fn follow(id: u32) -> u32 {
+    let mut cur = id;
+    for _ in 0..16 {
+        let next = HEAP.with(|h| match h.borrow().get(cur as usize) {
+            Some(HostObj::Ptr { target }) => Some(*target),
+            _ => None,
+        });
+        match next {
+            Some(t) => cur = t,
+            None => break,
+        }
+    }
+    cur
+}
+
+/// The identity Go's `==` compares two pointers by: a [`HostObj::Ptr`]'s target
+/// (so two `&x` of one variable are equal and `&x` / `&y` are not), or a
+/// `by_ref` handle itself (so two `&T{…}` are distinct). `None` for anything
+/// that is not a pointer.
+fn ptr_identity(v: &Value) -> Option<u32> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Ptr { target }) => Some(*target),
+        Some(HostObj::Struct { by_ref: true, .. }) => Some(*id),
+        _ => None,
+    })
+}
+
 /// Whether `v` is a handle Go would compare by address (a `&T{…}` pointer).
 fn is_ptr(v: &Value) -> bool {
-    let Value::Obj(id) = v else { return false };
-    HEAP.with(|h| {
-        matches!(
-            h.borrow().get(*id as usize),
-            Some(HostObj::Struct { by_ref: true, .. })
-        )
-    })
+    ptr_identity(v).is_some()
 }
 
 /// Go's `==` on two values go-rs holds as heap handles. A pointer compares by
@@ -2631,8 +2686,10 @@ pub(crate) fn ptr_eq(a: &Value, b: &Value) -> Option<bool> {
     if !is_ptr(a) && !is_ptr(b) {
         return None;
     }
-    Some(match (a, b) {
-        (Value::Obj(x), Value::Obj(y)) => x == y,
+    Some(match (ptr_identity(a), ptr_identity(b)) {
+        // Both are pointers: equal exactly when they address the same object.
+        (Some(x), Some(y)) => x == y,
+        // One is; a pointer never equals a non-pointer.
         _ => false,
     })
 }
@@ -2692,6 +2749,7 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
             return Value::Undef;
         }
     };
+    let id = follow(id);
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
@@ -2775,6 +2833,8 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
             return Value::Undef;
         }
     };
+    // Resolved before the mutable borrow: `follow` takes a shared one.
+    let id = follow(id);
     let ok = HEAP.with(|h| {
         let mut h = h.borrow_mut();
         // A write to a promoted field lands on the embedded struct that owns
@@ -2833,6 +2893,55 @@ fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
     Value::Undef
 }
 
+fn b_ptr_to(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    match v {
+        // A pointer to a heap object addresses that object. Two `&x` of the
+        // same variable are two `Ptr`s with one target, which is what makes
+        // them `==` while `&x` and `&y` are not.
+        Value::Obj(id) => Value::Obj(heap_alloc(HostObj::Ptr { target: id })),
+        // A scalar is not a heap object, so there is no address to take and the
+        // value stands in for the pointer — the gap BUGS.md records.
+        other => other,
+    }
+}
+
+fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let target = args.first().cloned().unwrap_or(Value::Undef);
+    let val = args.get(1).cloned().unwrap_or(Value::Undef);
+    let Value::Obj(id) = target else {
+        ffi_fault(
+            vm,
+            "go-rs: invalid memory address or nil pointer dereference".to_string(),
+        );
+        return Value::Undef;
+    };
+    // The *pointee* is overwritten rather than rebound, which is what makes the
+    // write visible through every other pointer to it and through the variable
+    // itself. The source is copied first: `*p = q` must not alias `q`'s fields.
+    let id = follow(id);
+    let fields = match struct_copy(val.clone()) {
+        Value::Obj(src) => HEAP.with(|h| match h.borrow().get(follow(src) as usize) {
+            Some(HostObj::Struct { fields, .. }) => Some(fields.clone()),
+            _ => None,
+        }),
+        _ => None,
+    };
+    match fields {
+        Some(f) => HEAP.with(|h| {
+            if let Some(HostObj::Struct { fields, .. }) = h.borrow_mut().get_mut(id as usize) {
+                *fields = f;
+            }
+        }),
+        None => {
+            ffi_fault(vm, "go-rs: cannot assign through this pointer".to_string());
+        }
+    }
+    val
+}
+
 fn b_struct_bind(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     struct_bind(args.first().cloned().unwrap_or(Value::Undef))
@@ -2854,7 +2963,7 @@ fn struct_bind(v: Value) -> Value {
     let is_ptr = HEAP.with(|h| {
         matches!(
             h.borrow().get(id as usize),
-            Some(HostObj::Struct { by_ref: true, .. })
+            Some(HostObj::Struct { by_ref: true, .. }) | Some(HostObj::Ptr { .. })
         )
     });
     if is_ptr {
@@ -2930,6 +3039,7 @@ fn array_copy(v: Value, elem_ty: &str) -> Value {
 /// which is what makes a self-referential `*T` node type copy correctly.
 fn struct_copy(v: Value) -> Value {
     let Value::Obj(id) = v else { return v };
+    let id = follow(id);
     let parts = HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Struct {
             type_name, fields, ..
@@ -3237,7 +3347,7 @@ pub(crate) fn go_type_name(v: &Value) -> String {
         Value::Undef => "<nil>".to_string(),
         Value::Obj(id) => HEAP.with(|h| {
             let h = h.borrow();
-            match h.get(*id as usize) {
+            match h.get(follow(*id) as usize) {
                 // A `fmt`-tagged slice names its written element type, which is
                 // the only way `[]uint8` and `[]int32` are distinguishable from
                 // `[]int` — their elements are all plain integers.
@@ -3282,6 +3392,8 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 // Every receive site maps the sentinel away, so it is only
                 // reachable if one was missed; name it after what it stands for.
                 Some(HostObj::ChanClosed) => "<nil>".to_string(),
+                // Unreachable: `follow` resolved any pointer above.
+                Some(HostObj::Ptr { .. }) => "<nil>".to_string(),
                 // A spread marker is expanded by `pop_args` before any builtin sees it;
                 // naming it at all means one leaked, so name it after what it holds.
                 Some(HostObj::Spread(xs)) => xs
@@ -3544,9 +3656,12 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             .collect::<Vec<_>>()
             .join(sep)
     };
+    let id = follow(id);
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
+            // Unreachable: `follow` resolved any pointer above.
+            Some(HostObj::Ptr { .. }) => String::new(),
             Some(HostObj::Slice {
                 elems: a, elem_ty, ..
             }) => {
@@ -4501,7 +4616,7 @@ fn nil_composite_kind(v: &Value) -> Option<NilKind> {
 /// A struct's `(field, value)` pairs, or `None` when the value is not a struct.
 fn struct_fields_of(v: &Value) -> Option<Vec<(String, Value)>> {
     let Value::Obj(id) = v else { return None };
-    HEAP.with(|h| match h.borrow().get(*id as usize) {
+    HEAP.with(|h| match h.borrow().get(follow(*id) as usize) {
         Some(HostObj::Struct { fields, .. }) => Some(fields.clone()),
         _ => None,
     })

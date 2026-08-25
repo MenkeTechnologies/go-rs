@@ -3473,6 +3473,26 @@ impl Compiler {
                 self.b.emit(Op::Pop, line);
                 self.emit_panic_check(line); // nil dereference is recoverable
             }
+            // `*p = v` overwrites the struct `p` points at, in place — so the
+            // variable it addresses and every other pointer to it see the write.
+            // Rebinding `p` instead would leave all of them on the old value.
+            Expr::Unary {
+                op: UnOp::Deref,
+                rhs,
+            } => {
+                self.expr(rhs)?;
+                match op {
+                    AssignOp::Set => self.emit_value(value)?,
+                    _ => {
+                        return Err(format!(
+                            "go-rs: compound assignment through a pointer is not supported (line {line})"
+                        ))
+                    }
+                }
+                self.b.emit(Op::CallBuiltin(host::GDEREF_SET, 2), line);
+                self.b.emit(Op::Pop, line);
+                self.emit_panic_check(line);
+            }
             _ => {
                 return Err(format!(
                     "go-rs: cannot assign to this expression (line {line})"
@@ -3925,8 +3945,19 @@ impl Compiler {
                     // field. Mark the fresh handle so `==` knows. Taking the
                     // address of an existing variable shares its handle, which
                     // must keep comparing as the value it already is.
-                    if matches!(op, UnOp::Addr) && matches!(**rhs, Expr::StructLit { .. }) {
-                        self.b.emit(Op::CallBuiltin(host::GPTR_MARK, 1), 0);
+                    if matches!(op, UnOp::Addr) {
+                        if matches!(**rhs, Expr::StructLit { .. }) {
+                            self.b.emit(Op::CallBuiltin(host::GPTR_MARK, 1), 0);
+                        } else {
+                            // `&x` on an existing variable cannot mark the
+                            // handle — it is `x`'s, and marking it would make
+                            // `x` itself compare by identity where Go compares
+                            // field by field. It allocates a pointer *object*
+                            // instead, which leaves `x` exactly as it was and
+                            // gives the pointer an address of its own to bind,
+                            // store and compare by.
+                            self.b.emit(Op::CallBuiltin(host::GPTR_TO, 1), 0);
+                        }
                     }
                 } else if matches!(op, UnOp::Neg) && matches!(**rhs, Expr::Float(f, _) if f == 0.0)
                 {
