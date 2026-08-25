@@ -166,6 +166,46 @@ suspended goroutine still holds its VM). Closing it needs a fusevm release
 where the VM borrows or `Arc`-shares its chunk; the published pin is the
 contract.
 
+## One slice in a frame keeps every loop in that function interpreted — waiting on a fusevm release
+
+```go
+func f(s []int, n int) int {
+	t := 0
+	for i := range n { t = (t + i) % 1000003 }   // never traced
+	return t
+}
+```
+
+Every Go loop form go-rs emits is now shaped for fusevm's tracing JIT — the
+three-clause `for`, the condition-only `for`, `for {}` and `range` over an
+integer all report `traced=true` under `go --tiers`, and `src/tiers.rs` asserts
+each of them. The loop above is *identical* to the one asserted there, and
+reports `trace-eligible=true traced=false`, because the enclosing function also
+has a slice parameter.
+
+`VM::refresh_slot_buffers` classifies a frame's slots and sets one
+`slots_all_numeric` flag for the **whole frame**;
+`lookup_trace_for_backward` returns the anchor unentered whenever that flag is
+false and a numeric hook is installed — which go-rs always installs, because
+Go's fixed-width overflow is what it decides. A slice, map, string or struct is
+a `Value::Obj`, so one of them anywhere in the frame keeps every loop in that
+function in the interpreter however numeric the loop itself is.
+
+It cannot be closed from the frontend: a Go program cannot keep its composite
+values out of its frames. fusevm already does the finer thing for globals
+(flagged per index, with the trace's entry guard refusing only on the indices it
+reads) and already knows which slots a trace touches
+(`jit::collect_trace_slots`), so the per-slot version is a change in the same
+file — but the published pin is the contract. Every value is correct either way;
+this is a cost, not a divergence.
+
+The other loop form that stays interpreted is `range` over a **slice, map or
+string with a value variable**: the body has to call `GRANGE_VAL` to fetch the
+element, and `jit::is_trace_op_allowed_at` refuses any `Op::CallBuiltin`
+outright. That one is representational — a Go slice is a handle into go-rs's own
+heap, not a `fusevm::Value::Array`, so there is no native op that can read an
+element.
+
 ## `&x` on a scalar has no address, so two pointers to equal values compare equal
 
 ```go
