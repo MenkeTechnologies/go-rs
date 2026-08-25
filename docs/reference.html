@@ -2113,9 +2113,10 @@ for !done { … }</code></pre>
         <article class="doc-entry" id="doc-divergence-from-go-14">
           <h3><a class="doc-anchor" href="#doc-divergence-from-go-14">#</a> <code>unsupported package calls</code></h3>
           <pre><code class="lang-go">pkg.Func(…)</code></pre>
-          <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`fmt.Fprintln\``. The wired sets are exactly the ones this reference lists — 6 in fmt, 20 in strings, 6 in strconv, 26 functions and 7 constants in math, 5 in sort, and 1 in os.</p>
+          <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`strings.Map\``. The wired sets are exactly the ones this reference lists. `fmt.Fprint`/`Fprintf`/`Fprintln` are not among them because they are not builtins at all — each rewrites to `w.Write([]byte(fmt.Sprint*(…)))`, so writer-directed output is ordinary method dispatch on whatever the program passed.</p>
           <pre><code class="lang-go">fmt.Sprintf(…)   // wired
-fmt.Fprintf(…)   // not</code></pre>
+fmt.Fprintf(w, …)  // rewritten to w.Write
+strings.Map(…)   // not</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-15">
           <h3><a class="doc-anchor" href="#doc-divergence-from-go-15">#</a> <code>map iteration order</code></h3>

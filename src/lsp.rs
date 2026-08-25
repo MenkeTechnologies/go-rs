@@ -2335,8 +2335,8 @@ const CORPUS: &[Entry] = &[
         "unsupported package calls",
         "Divergence from Go",
         "pkg.Func(…)",
-        "Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \\`fmt.Fprintln\\``. The wired sets are exactly the ones this reference lists — 6 in fmt, 20 in strings, 6 in strconv, 26 functions and 7 constants in math, 5 in sort, and 1 in os.",
-        "fmt.Sprintf(…)   // wired\nfmt.Fprintf(…)   // not",
+        "Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \\`strings.Map\\``. The wired sets are exactly the ones this reference lists. `fmt.Fprint`/`Fprintf`/`Fprintln` are not among them because they are not builtins at all — each rewrites to `w.Write([]byte(fmt.Sprint*(…)))`, so writer-directed output is ordinary method dispatch on whatever the program passed.",
+        "fmt.Sprintf(…)   // wired\nfmt.Fprintf(w, …)  // rewritten to w.Write\nstrings.Map(…)   // not",
     ),
     e(
         "map iteration order",

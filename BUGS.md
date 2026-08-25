@@ -348,33 +348,23 @@ the pointer entry above.
 
 ## Unsupported stdlib calls
 
-`fmt.Fprintln` / `fmt.Fprintf` / `fmt.Fprint` (writer-directed output) and
-`strings.Builder`'s methods (`WriteString`, `WriteRune`, `String`) are rejected
-at compile time. Each is a build failure rather than a wrong answer, so a
-program using one does not run at all. Both want the same thing: an `io.Writer`
-that is a value the program holds.
+Writer-directed output is implemented. `fmt.Fprint` / `Fprintf` / `Fprintln`
+rewrite to `w.Write([]byte(fmt.Sprint*(…)))`, `io` is vendored
+(`goroot/io.go`: `Writer`, `StringWriter`, `WriteString`), and
+`strings.Builder` and `os.Stdout` / `os.Stderr` are synthesized and qualified
+under their native packages (`goroot/strings_builder.go`, `goroot/os_file.go`).
 
-What a minimal one would take, measured against what is already here:
+What is still missing from that corner:
 
-- **The interface is not the problem.** A program-declared
-  `interface{ Write(p []byte) (n int, err error) }` and a `*buf` implementing it
-  compile and dispatch today, and `w.Write([]byte(fmt.Sprintf(…)))` is the whole
-  of `Fprintf`. `fmt.Fprint*` could be a compiler desugaring to exactly that, on
-  machinery that already exists.
-- **`import "io"` needs a vendored `goroot/io.go`.** `io` is not in
-  `pkg::NATIVE`, so it already routes to source loading — but the fallback is
-  real `$GOROOT/src/io`, which go-rs cannot parse (`expected RParen, found
-  Ident("int")`). A trimmed `Writer`/`StringWriter` file is the same treatment
-  `goroot/sync.go` documents for itself. `bytes.Buffer` is the same shape.
-- **`strings.Builder` and `os.Stdout` sit behind the native boundary.**
-  `strings` and `os` *are* in `pkg::NATIVE`, so a selector on them never reaches
-  source loading and cannot name a vendored type. Either the boundary grows a
-  types-from-source mode, or those two names are special-cased onto the
-  vendored buffer type.
-- **The blocker that used to sit above them all is gone.** A `*T` passed as an
-  argument was copied, so a writer accumulated into a copy and the caller saw
-  nothing; a bind now shares an allocated pointer, and `w.Write` through an
-  interface parameter reaches the caller's buffer.
+- **`bytes.Buffer`** — the same shape as `strings.Builder`, and `bytes` is not
+  native, so it is the ordinary vendored-source path rather than a synthesis.
+- **`strings.Builder.Cap`** is deliberately absent: go-rs cannot reserve
+  capacity, so answering it would mean answering wrongly. `Grow` is a no-op,
+  which nothing can observe once `Cap` is gone. A program calling `Cap` gets a
+  compile error.
+- **`os.File` is only the two standard streams.** There is no `Open`, `Create`
+  or `Read` — `writeFd` is the package's one intrinsic and only ever sees
+  descriptors 1 and 2.
 
 `strconv.FormatFloat` is implemented for the `f`, `F`, `e`, `E`, `g` and `G`
 verbs at both `bitSize`s, including `prec == -1`. The two remaining verbs —
