@@ -219,6 +219,49 @@ half:
   nondeterministic and not reproducible at all; the depth-0 `&{…}` form is the
   only part worth matching.
 
+## A `*T` is copied at every bind site, so writes through it are lost
+
+```go
+type pt struct{ X int }
+func bump(q *pt) { q.X = 7 }
+
+p := &pt{1}
+q := p
+q.X = 7
+fmt.Println(p.X)              // go: 7   go-rs: 1
+
+bump(p)
+fmt.Println(p.X)              // go: 7   go-rs: 1
+
+arr := []*pt{p}
+arr[0].X = 5
+fmt.Println(p.X)              // go: 5   go-rs: 1
+```
+
+Go copies a struct **value** at an assignment, an argument bind, a return, a
+container store and a `range` binding — and copies nothing at all through a
+pointer. go-rs emits the copy from the *static* type, and its static types have
+no pointers in them: `Compiler::type_name` answers `pt` for both `p` and `*p`
+("a `*Point` handle dispatches methods and reads fields like a `Point`"), so
+every one of those sites copies. `emit_value` exempts only a literal `&x`
+written at the site itself, which is why `f(&x)` works and `q := p; f(p)` does
+not.
+
+The two shapes are indistinguishable in the emitted code — `v := *p` and
+`q := p` both lower to `GetVar(p); CallBuiltin(GSTRUCT_COPY, 1)` (`go --disasm`)
+— so the tempting one-line fix, making `struct_copy` a no-op on a `by_ref`
+handle, trades this bug for its mirror image: `v := *p` would then alias.
+
+Closing it means keeping the `*` in the static type and deciding the copy from
+that (a `Deref` expression copies, a pointer-typed expression does not), rather
+than stripping it in `base_type` before the copy site sees it.
+
+This is also what blocks a minimal `io.Writer` (see **Unsupported stdlib
+calls**): the interface machinery itself is fine — a program-declared
+`interface{ Write([]byte) (int, error) }` dispatches to a `*buf` method
+correctly when the receiver is reached directly — but a writer is by definition
+something a program *passes*, and a passed `*buf` accumulates into a copy.
+
 ## `append` capacity misses Go's malloc size-class rounding
 
 ```go
@@ -285,7 +328,29 @@ the pointer entry above.
 `strings.Builder`'s methods (`WriteString`, `WriteRune`, `String`) are rejected
 at compile time. Each is a build failure rather than a wrong answer, so a
 program using one does not run at all. Both want the same thing: an `io.Writer`
-that is a value the program holds, which go-rs has no representation for.
+that is a value the program holds.
+
+What a minimal one would take, measured against what is already here:
+
+- **The interface is not the problem.** A program-declared
+  `interface{ Write(p []byte) (n int, err error) }` and a `*buf` implementing it
+  compile and dispatch today, and `w.Write([]byte(fmt.Sprintf(…)))` is the whole
+  of `Fprintf`. `fmt.Fprint*` could be a compiler desugaring to exactly that, on
+  machinery that already exists.
+- **`import "io"` needs a vendored `goroot/io.go`.** `io` is not in
+  `pkg::NATIVE`, so it already routes to source loading — but the fallback is
+  real `$GOROOT/src/io`, which go-rs cannot parse (`expected RParen, found
+  Ident("int")`). A trimmed `Writer`/`StringWriter` file is the same treatment
+  `goroot/sync.go` documents for itself. `bytes.Buffer` is the same shape.
+- **`strings.Builder` and `os.Stdout` sit behind the native boundary.**
+  `strings` and `os` *are* in `pkg::NATIVE`, so a selector on them never reaches
+  source loading and cannot name a vendored type. Either the boundary grows a
+  types-from-source mode, or those two names are special-cased onto the
+  vendored buffer type.
+- **The actual blocker is above them all**: a `*T` passed as an argument is
+  copied (see **A `*T` is copied at every bind site**), so a writer accumulates
+  into a copy and the caller sees nothing. Any `io.Writer` built before that is
+  fixed would be a writer that silently discards.
 
 `strconv.FormatFloat` is implemented for the `f`, `F`, `e`, `E`, `g` and `G`
 verbs at both `bitSize`s, including `prec == -1`. The two remaining verbs —
