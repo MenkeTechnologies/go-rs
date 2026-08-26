@@ -174,7 +174,7 @@ jobs:
           linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
           {
             printf 'class GoRs < Formula\n'
-            printf '  desc "Go on the fusevm bytecode VM — compiles to fusevm::Chunk, three-tier Cranelift JIT"\n'
+            printf '  desc "Compiled Go runtime on the fusevm bytecode VM + Cranelift JIT"\n'
             printf '  homepage "https://github.com/MenkeTechnologies/go-rs"\n'
             printf '  license "MIT"\n'
             printf '  version "%s"\n\n' "$V"
