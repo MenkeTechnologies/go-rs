@@ -275,7 +275,7 @@ pub const GDYNDIV: u16 = 950;
 /// `==` compares it by address rather than field by field.
 pub const GPTR_MARK: u16 = 955;
 
-/// `&x` on an existing variable — allocate a [`HostObj::Ptr`] addressing the
+/// `&x` on an existing variable — allocate a `HostObj::Ptr` addressing the
 /// value's handle. A value that is not a heap object has no address to take, so
 /// it passes through unchanged (see BUGS.md on `&` of a scalar).
 pub const GPTR_TO: u16 = 859;
