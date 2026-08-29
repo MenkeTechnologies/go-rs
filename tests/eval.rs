@@ -1469,6 +1469,51 @@ func main() {
 }
 
 #[test]
+fn func_typed_parameter_is_not_captured_by_an_unrelated_closure_name() {
+    // `closure_vars` maps a name to the lambda it was bound to, for static
+    // dispatch. It used to survive the end of a function body, so `apply`'s
+    // parameter `f` dispatched to whatever lambda `main` had bound to `f` —
+    // silently answering with the wrong closure rather than failing.
+    let src = "\
+package main
+import \"fmt\"
+func apply(f func(int) int, v int) int { return f(v) }
+func twice(f func(int) int, v int) int { return f(f(v)) }
+func main() {
+	f := func(n int) int { return n * 10 }
+	fmt.Println(apply(func(n int) int { return n + 1 }, 10))
+	fmt.Println(twice(func(n int) int { return n + 1 }, 10))
+	fmt.Println(f(10))
+}
+";
+    assert_stdout(src, "11\n12\n100\n");
+}
+
+#[test]
+fn multi_value_return_through_a_func_value() {
+    // The result count of a call through a func value comes from the literal's
+    // own declared results. Without it the returned tuple stayed a single value
+    // and `q, r := dm(17, 5)` bound the whole slice to `q`.
+    let src = "\
+package main
+import \"fmt\"
+func divmod(a, b int) (int, int) { return a / b, a % b }
+func main() {
+	lit := func(a, b int) (int, int) { return a + b, a - b }
+	s, d := lit(9, 4)
+	fmt.Println(s, d)
+	dm := divmod
+	q, r := dm(17, 5)
+	fmt.Println(q, r)
+	three := func() (int, string, bool) { return 1, \"two\", true }
+	a, b, c := three()
+	fmt.Println(a, b, c)
+}
+";
+    assert_stdout(src, "13 5\n3 2\n1 two true\n");
+}
+
+#[test]
 fn declared_function_used_as_a_value() {
     // A declared function named in a value position is a function value. It had
     // no lowering at all — `apply(dbl)` read `dbl` as a variable and failed with

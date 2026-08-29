@@ -207,6 +207,9 @@ struct LambdaInfo {
     /// True if the last parameter is variadic; the call site packs the trailing
     /// arguments into it exactly as it does for a declared function.
     variadic: bool,
+    /// How many results the literal declares, so a call through it destructures
+    /// a multi-value return the way a declared function's does.
+    nresults: usize,
     /// Free variables captured from the enclosing scope, in capture order.
     captures: Vec<String>,
     /// Aligned with `captures`: whether each was captured by reference (a shared
@@ -1460,6 +1463,12 @@ impl Compiler {
         let mut scope = Scope::new();
         self.types.clear();
         self.decl_types.clear();
+        // Names bound to a function literal are per *function*, like the slots
+        // they live in. Carrying them across a body made a parameter dispatch
+        // to whatever lambda an unrelated function had bound to that name:
+        // `apply(f func(int) int, v int)` answered with `main`'s `f` rather than
+        // the closure it was handed.
+        self.closure_vars.clear();
 
         // A method binds its receiver to slot 0; parameters follow.
         let mut slot = 0u16;
@@ -1569,7 +1578,13 @@ impl Compiler {
     /// Lower a function literal: emit its closure value (captured variables +
     /// lambda id) and register the lambda for later subroutine compilation.
     /// Returns the lambda id (for static closure-call dispatch).
-    fn emit_funclit(&mut self, params: &[Param], body: &[Stmt], variadic: bool) -> i64 {
+    fn emit_funclit(
+        &mut self,
+        params: &[Param],
+        body: &[Stmt],
+        variadic: bool,
+        nresults: usize,
+    ) -> i64 {
         let captures = self.free_vars(params, body);
         let id = self.lambdas.len() as i64;
         // Build the closure: push each captured value, then the target lambda's
@@ -1598,6 +1613,7 @@ impl Compiler {
             params: params.to_vec(),
             body: body.to_vec(),
             variadic,
+            nresults,
             captures,
             cell_captures,
             capture_types,
@@ -1796,7 +1812,7 @@ impl Compiler {
             spread: false,
             line,
         })];
-        self.emit_funclit(&[], &body, false);
+        self.emit_funclit(&[], &body, false, 0);
         self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 1), line);
         self.b.emit(Op::Pop, line);
         Ok(())
@@ -1836,11 +1852,10 @@ impl Compiler {
     /// first parameter — so a declared function cannot be the target of a
     /// dynamic call at all. A synthesized literal with the same signature can,
     /// and it is the shape a method value already takes.
-    fn emit_func_value(&mut self, name: &str) -> Result<(), String> {
+    fn emit_func_value(&mut self, name: &str) -> Result<i64, String> {
         let sig = &self.funcs[name];
         let (arity, variadic, nresults) = (sig.arity, sig.variadic, sig.nresults);
         let param_tys = sig.param_tys.clone();
-        let result_ty = sig.result_ty.clone();
         let params: Vec<Param> = (0..arity)
             .map(|i| Param {
                 // Cannot collide with anything the program wrote.
@@ -1861,16 +1876,7 @@ impl Compiler {
             0 => vec![Stmt::ExprStmt(call)],
             _ => vec![Stmt::Return(vec![call], 0)],
         };
-        let results = match nresults {
-            0 => Vec::new(),
-            _ => vec![result_ty],
-        };
-        self.expr(&Expr::FuncLit {
-            params,
-            results,
-            body,
-            variadic,
-        })
+        Ok(self.emit_funclit(&params, &body, variadic, nresults))
     }
 
     /// A collected lambda's parameter types and whether the last one is variadic.
@@ -1943,6 +1949,11 @@ impl Compiler {
         let mut scope = Scope::new();
         self.types.clear();
         self.decl_types.clear();
+        // Same reason as in `compile_func`: a lambda body is compiled with a
+        // fresh symbol table, so a closure name it inherited from whichever
+        // function was compiled before it is not its own. A captured closure is
+        // still called — through `active_captures` and `Op::CallDynamic`.
+        self.closure_vars.clear();
         // Re-seed the captured names with the types the enclosing scope had, so
         // a captured channel, `float32` or `uint64` keeps lowering by its type.
         for (name, ty) in captures.iter().zip(&capture_types) {
@@ -2733,9 +2744,9 @@ impl Compiler {
                         params,
                         body,
                         variadic,
-                        ..
+                        results,
                     } => {
-                        let id = self.emit_funclit(params, body, *variadic);
+                        let id = self.emit_funclit(params, body, *variadic, results.len());
                         let (ptys, var) = self.lambda_sig(id);
                         let argc =
                             self.emit_call_operands(&ptys, var, args, *spread, "closure", *line)?;
@@ -4064,7 +4075,8 @@ impl Compiler {
                 // `f := dbl`, `[]func(int) int{dbl}`) is a function value, not a
                 // variable read.
                 if self.is_func_value(name) {
-                    return self.emit_func_value(name);
+                    self.emit_func_value(name)?;
+                    return Ok(());
                 }
                 self.emit_get(name, 0)
             }
@@ -4314,9 +4326,9 @@ impl Compiler {
                 params,
                 body,
                 variadic,
-                ..
+                results,
             } => {
-                self.emit_funclit(params, body, *variadic);
+                self.emit_funclit(params, body, *variadic, results.len());
             }
         }
         Ok(())
@@ -4415,14 +4427,21 @@ impl Compiler {
                 params,
                 body,
                 variadic,
-                ..
+                results,
             } => {
-                let id = self.emit_funclit(params, body, *variadic);
+                let id = self.emit_funclit(params, body, *variadic, results.len());
                 self.closure_vars.insert(name.to_string(), id);
             }
             Expr::Ident(src) if self.closure_vars.contains_key(src) => {
                 let id = self.closure_vars[src];
                 self.emit_value(e)?;
+                self.closure_vars.insert(name.to_string(), id);
+            }
+            // A declared function bound to a name (`dm := divmod`): record the
+            // forwarding lambda, so calls through the name resolve its signature
+            // statically the way a literal's do.
+            Expr::Ident(src) if self.is_func_value(src) => {
+                let id = self.emit_func_value(src)?;
                 self.closure_vars.insert(name.to_string(), id);
             }
             _ => {
@@ -4931,7 +4950,19 @@ impl Compiler {
     fn call_result_count(&self, e: &Expr) -> Option<usize> {
         if let Expr::Call { func, .. } = e {
             match func.as_ref() {
-                Expr::Ident(name) => return self.funcs.get(name).map(|s| s.nresults),
+                Expr::Ident(name) => {
+                    if let Some(s) = self.funcs.get(name) {
+                        return Some(s.nresults);
+                    }
+                    // A variable statically bound to a function literal: the
+                    // literal declared its results, so `q, r := dm(…)` on a
+                    // closure destructures like a declared function's tuple.
+                    return self
+                        .closure_vars
+                        .get(name)
+                        .and_then(|id| self.lambdas.get(*id as usize))
+                        .map(|l| l.nresults);
+                }
                 Expr::Selector { recv, field } => {
                     // A native package function that returns `(value, error)`.
                     if let Expr::Ident(pkg) = recv.as_ref() {
@@ -5859,10 +5890,10 @@ impl Compiler {
             params,
             body,
             variadic,
-            ..
+            results,
         } = func
         {
-            let id = self.emit_funclit(params, body, *variadic);
+            let id = self.emit_funclit(params, body, *variadic, results.len());
             self.emit_closure_call(id, args, spread, line)?;
             return Ok(());
         }
