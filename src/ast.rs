@@ -364,6 +364,10 @@ pub enum Expr {
         params: Vec<Param>,
         results: Vec<String>,
         body: Vec<Stmt>,
+        /// True if the last parameter is variadic (`a ...T`). As on a declared
+        /// function, `Param::ty` then names the *element* type; the call site
+        /// packs the trailing arguments into the slice the body binds.
+        variadic: bool,
     },
     /// A type assertion `expr.(ty)` (`ty == "type"` marks the type-switch guard).
     TypeAssert {

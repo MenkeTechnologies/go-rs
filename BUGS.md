@@ -587,31 +587,39 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
 
-## A variadic closure binds its parameters wrong
+## A variadic closure called through a func value binds its parameters wrong
 
 ```go
-p := func(f string, a ...any) { fmt.Println(f, len(a)) }
-p("c0")
-p("c1", 1)
-// go:    c0 0 / c1 1
-// go-rs: <func> 2 / c1 0
+func apply(f func(string, ...int) int) { fmt.Println(f("dyn", 4, 5, 6)) }
+apply(func(l string, ns ...int) int { fmt.Println(l, len(ns)); return len(ns) })
+// go:    dyn 3 / 3
+// go-rs: 5 0 / 0
 ```
 
-A call through a *func value* is dispatched by `Op::CallDynamic`, which pushes
-one stack slot per written argument. Only a call to a named function packs the
-trailing arguments into the variadic slice parameter (`Compiler::call`, the
-`self.funcs.get(name)` arm), so a closure receives the wrong number of operands
-and every parameter binds one slot off — the closure handle itself lands in the
-first parameter.
+`Op::CallDynamic` pushes one stack slot per written argument, so a variadic
+callee reached through it receives the wrong number of operands and every
+parameter binds one slot off. The same happens for an element of a slice of
+funcs (`fns[0]("idx", 1, 2)`), which is the other expression that produces a
+function value with no statically known target.
 
-Closing it needs the variadic bit to survive to the call site, and it currently
-does not exist past the parser: `Expr::FuncLit` (src/ast.rs) carries `params`,
-`results` and `body`, but no `variadic` flag, even though `Parser::params`
-computes one. So the work is (a) add `variadic` to `Expr::FuncLit` and to
-`LambdaInfo`, (b) record each func-literal binding's signature the way
-`self.funcs` records a declared function's, and (c) pack at the `CallDynamic`
-site from that signature. Spreading into one (`g(xs...)`) is the same gap seen
-from the other side.
+A closure whose lambda *is* statically known — `p := func(f string, a ...any)`,
+an immediately-invoked literal, `go` on either — no longer is: `Expr::FuncLit`
+carries the `variadic` flag the parser already computed, `LambdaInfo` records
+it, and `Compiler::emit_call_operands` packs the trailing arguments into the
+slice exactly as the declared-function arm does. The gate is
+`parity-scripts/variadic_closure.go`.
+
+(The entry this replaces blamed `Op::CallDynamic` for the `p := func(…)` form
+too. That was wrong: `p` is in `closure_vars`, so it lowered through
+`emit_closure_call` and a plain `Op::Call` — the packing was simply missing
+there.)
+
+What is left is the dynamic half, and it needs more than a flag. A function
+type is erased to the bare name `"func"` by `Parser::type_name`, so a
+func-typed parameter has no arity and no variadic bit to read at the call site,
+and the operand count is fixed in the bytecode before the closure exists —
+there is nothing to pack from and nothing to ask at run time. Closing it means
+carrying a real function signature through the type system.
 
 ## A string cannot hold invalid UTF-8
 

@@ -1469,6 +1469,34 @@ func main() {
 }
 
 #[test]
+fn variadic_closure_packs_its_trailing_arguments() {
+    // A closure's variadic parameter binds a *slice* of the trailing arguments,
+    // like a declared function's. Before the flag survived to the call site the
+    // literal's parameters bound one operand off: `p("none")` printed the
+    // closure handle as `tag` and read a length of 2.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	p := func(tag string, a ...any) { fmt.Println(tag, len(a), a) }
+	p(\"none\")
+	p(\"many\", 1, \"x\")
+	only := func(ns ...int) int { return len(ns) }
+	xs := []int{5, 6, 7}
+	fmt.Println(only(), only(1, 2), only(xs...))
+	func(pre string, ys ...string) { fmt.Println(pre, len(ys), ys) }(\"iife\", \"a\", \"b\")
+	out := make(chan string)
+	go func(tag string, ns ...int) { out <- fmt.Sprint(tag, len(ns), ns) }(\"go\", 1, 2, 3)
+	fmt.Println(<-out)
+}
+";
+    assert_stdout(
+        src,
+        "none 0 []\nmany 2 [1 x]\n0 2 3\niife 2 [a b]\ngo3 [1 2 3]\n",
+    );
+}
+
+#[test]
 fn switch_fallthrough() {
     let src = "\
 package main

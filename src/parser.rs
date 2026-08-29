@@ -2235,8 +2235,7 @@ impl Parser {
             // A function literal (closure): `func(params) results { body }`.
             Tok::Func => {
                 self.expect(&Tok::LParen)?;
-                // Variadic closures are uncommon; the flag is dropped for FuncLit.
-                let (params, _) = self.params()?;
+                let (params, variadic) = self.params()?;
                 self.expect(&Tok::RParen)?;
                 // Closures keep only result types (named results on a func literal
                 // are uncommon; the name is dropped).
@@ -2246,6 +2245,7 @@ impl Parser {
                     params,
                     results,
                     body,
+                    variadic,
                 })
             }
             other => Err(format!(

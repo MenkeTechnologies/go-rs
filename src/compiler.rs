@@ -204,6 +204,9 @@ struct FuncSig {
 struct LambdaInfo {
     params: Vec<Param>,
     body: Vec<Stmt>,
+    /// True if the last parameter is variadic; the call site packs the trailing
+    /// arguments into it exactly as it does for a declared function.
+    variadic: bool,
     /// Free variables captured from the enclosing scope, in capture order.
     captures: Vec<String>,
     /// Aligned with `captures`: whether each was captured by reference (a shared
@@ -1566,7 +1569,7 @@ impl Compiler {
     /// Lower a function literal: emit its closure value (captured variables +
     /// lambda id) and register the lambda for later subroutine compilation.
     /// Returns the lambda id (for static closure-call dispatch).
-    fn emit_funclit(&mut self, params: &[Param], body: &[Stmt]) -> i64 {
+    fn emit_funclit(&mut self, params: &[Param], body: &[Stmt], variadic: bool) -> i64 {
         let captures = self.free_vars(params, body);
         let id = self.lambdas.len() as i64;
         // Build the closure: push each captured value, then the target lambda's
@@ -1594,6 +1597,7 @@ impl Compiler {
         self.lambdas.push(LambdaInfo {
             params: params.to_vec(),
             body: body.to_vec(),
+            variadic,
             captures,
             cell_captures,
             capture_types,
@@ -1792,7 +1796,7 @@ impl Compiler {
             spread: false,
             line,
         })];
-        self.emit_funclit(&[], &body);
+        self.emit_funclit(&[], &body, false);
         self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 1), line);
         self.b.emit(Op::Pop, line);
         Ok(())
@@ -1800,21 +1804,72 @@ impl Compiler {
 
     /// Emit a call to a closure whose value is already on the stack (as the
     /// deepest argument, "self"): evaluate the args and call `$lambda_id`.
-    fn emit_closure_call(&mut self, id: i64, args: &[Expr], line: u32) -> Result<(), String> {
-        // The lambda's own parameter types are known here, so an untyped
-        // constant argument converts the way it does for a named function.
-        let param_tys: Vec<String> = self
-            .lambdas
-            .get(id as usize)
-            .map(|l| l.params.iter().map(|p| p.ty.clone()).collect())
-            .unwrap_or_default();
-        for (i, a) in args.iter().enumerate() {
-            self.emit_arg(a, param_tys.get(i))?;
-        }
+    fn emit_closure_call(
+        &mut self,
+        id: i64,
+        args: &[Expr],
+        spread: bool,
+        line: u32,
+    ) -> Result<(), String> {
+        let (param_tys, variadic) = self.lambda_sig(id);
+        let argc = self.emit_call_operands(&param_tys, variadic, args, spread, "closure", line)?;
         let idx = self.b.add_name(&format!("$lambda_{id}"));
-        self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+        self.b.emit(Op::Call(idx, argc as u8 + 1), line);
         self.emit_panic_check(line);
         Ok(())
+    }
+
+    /// A collected lambda's parameter types and whether the last one is variadic.
+    fn lambda_sig(&self, id: i64) -> (Vec<String>, bool) {
+        match self.lambdas.get(id as usize) {
+            Some(l) => (
+                l.params.iter().map(|p| p.ty.clone()).collect(),
+                l.variadic && !l.params.is_empty(),
+            ),
+            None => (Vec::new(), false),
+        }
+    }
+
+    /// Push a call's operands and return how many landed on the stack (the
+    /// callee's arity). The declared parameter types are known here, so an
+    /// untyped constant argument converts to the parameter's type; a variadic
+    /// callee takes one operand per fixed parameter and a *slice* of the rest,
+    /// which is what the trailing parameter is bound to inside the body. For
+    /// `f(a, xs...)` the already-a-slice argument is passed through.
+    fn emit_call_operands(
+        &mut self,
+        param_tys: &[String],
+        variadic: bool,
+        args: &[Expr],
+        spread: bool,
+        what: &str,
+        line: u32,
+    ) -> Result<usize, String> {
+        if !variadic {
+            for (i, a) in args.iter().enumerate() {
+                self.emit_arg(a, param_tys.get(i))?;
+            }
+            return Ok(args.len());
+        }
+        let fixed = param_tys.len() - 1;
+        if args.len() < fixed {
+            return Err(format!(
+                "go-rs: {what} needs at least {fixed} argument(s), got {} (line {line})",
+                args.len()
+            ));
+        }
+        for (i, a) in args[..fixed].iter().enumerate() {
+            self.emit_arg(a, param_tys.get(i))?;
+        }
+        if spread {
+            self.emit_value(&args[fixed])?;
+        } else {
+            let rest = args[fixed..].to_vec();
+            self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, rest.len(), line, |c, i| {
+                c.emit_value(&rest[i])
+            })?;
+        }
+        Ok(param_tys.len())
     }
 
     /// Compile a collected lambda to a `$lambda_N` subroutine. Slot 0 is the
@@ -1842,11 +1897,19 @@ impl Compiler {
                 self.decl_types.insert(name.clone(), ty.clone());
             }
         }
+        let variadic = self.lambdas[id].variadic;
         let mut slot = 1u16; // slot 0 reserved for the closure ("self")
-        for p in &params {
+        for (n, p) in params.iter().enumerate() {
             scope.slots.insert(p.name.clone(), slot);
-            self.types.insert(p.name.clone(), numtype_of_ty(&p.ty));
-            self.decl_types.insert(p.name.clone(), base_type(&p.ty));
+            // As on a declared function, the variadic parameter's written type
+            // is its *element* type; inside the body the name is the slice.
+            let ty = if variadic && n + 1 == params.len() {
+                format!("[]{}", base_type(&p.ty))
+            } else {
+                base_type(&p.ty)
+            };
+            self.types.insert(p.name.clone(), numtype_of_ty(&ty));
+            self.decl_types.insert(p.name.clone(), ty);
             slot += 1;
         }
         scope.next_slot = slot;
@@ -2583,7 +2646,10 @@ impl Compiler {
                 ..
             } => self.compile_for_range(key, val, iter, body, label)?,
             Stmt::Go { call, line } => {
-                let Expr::Call { func, args, .. } = call else {
+                let Expr::Call {
+                    func, args, spread, ..
+                } = call
+                else {
                     return Err(format!(
                         "go-rs: `go` requires a function call (line {line})"
                     ));
@@ -2591,30 +2657,36 @@ impl Compiler {
                 match func.as_ref() {
                     // `go f(args)` — a top-level function.
                     Expr::Ident(name) if self.funcs.contains_key(name) => {
-                        for a in args {
-                            self.emit_value(a)?;
-                        }
+                        let sig = &self.funcs[name];
+                        let (ptys, var) = (sig.param_tys.clone(), sig.variadic);
+                        let argc =
+                            self.emit_call_operands(&ptys, var, args, *spread, name, *line)?;
                         let idx = self.b.add_name(name);
-                        self.b.emit(Op::Go(idx, args.len() as u8), *line);
+                        self.b.emit(Op::Go(idx, argc as u8), *line);
                     }
                     // `go f(args)` where `f` is a closure variable.
                     Expr::Ident(name) if self.closure_vars.contains_key(name) => {
                         let id = self.closure_vars[name];
                         self.emit_get(name, *line);
-                        for a in args {
-                            self.emit_value(a)?;
-                        }
+                        let (ptys, var) = self.lambda_sig(id);
+                        let argc =
+                            self.emit_call_operands(&ptys, var, args, *spread, name, *line)?;
                         let idx = self.b.add_name(&format!("$lambda_{id}"));
-                        self.b.emit(Op::Go(idx, args.len() as u8 + 1), *line);
+                        self.b.emit(Op::Go(idx, argc as u8 + 1), *line);
                     }
                     // `go func(){ … }(args)` — an immediately-invoked closure.
-                    Expr::FuncLit { params, body, .. } => {
-                        let id = self.emit_funclit(params, body);
-                        for a in args {
-                            self.emit_value(a)?;
-                        }
+                    Expr::FuncLit {
+                        params,
+                        body,
+                        variadic,
+                        ..
+                    } => {
+                        let id = self.emit_funclit(params, body, *variadic);
+                        let (ptys, var) = self.lambda_sig(id);
+                        let argc =
+                            self.emit_call_operands(&ptys, var, args, *spread, "closure", *line)?;
                         let idx = self.b.add_name(&format!("$lambda_{id}"));
-                        self.b.emit(Op::Go(idx, args.len() as u8 + 1), *line);
+                        self.b.emit(Op::Go(idx, argc as u8 + 1), *line);
                     }
                     _ => {
                         return Err(format!(
@@ -4176,8 +4248,13 @@ impl Compiler {
                 self.b.emit(Op::ChanMake, 0);
             }
             Expr::Recv { chan } => self.emit_recv(chan, 0)?,
-            Expr::FuncLit { params, body, .. } => {
-                self.emit_funclit(params, body);
+            Expr::FuncLit {
+                params,
+                body,
+                variadic,
+                ..
+            } => {
+                self.emit_funclit(params, body, *variadic);
             }
         }
         Ok(())
@@ -4272,8 +4349,13 @@ impl Compiler {
             }
         }
         match e {
-            Expr::FuncLit { params, body, .. } => {
-                let id = self.emit_funclit(params, body);
+            Expr::FuncLit {
+                params,
+                body,
+                variadic,
+                ..
+            } => {
+                let id = self.emit_funclit(params, body, *variadic);
                 self.closure_vars.insert(name.to_string(), id);
             }
             Expr::Ident(src) if self.closure_vars.contains_key(src) => {
@@ -4666,6 +4748,10 @@ impl Compiler {
             params,
             results,
             body,
+            // The synthesis reads an arity out of the method tables, not a
+            // signature, so a method *value* of a variadic method still binds
+            // one parameter per written argument.
+            variadic: false,
         })?;
         Ok(true)
     }
@@ -5707,9 +5793,15 @@ impl Compiler {
             }
         }
         // An immediately-invoked function literal: `func(...){...}(args)`.
-        if let Expr::FuncLit { params, body, .. } = func {
-            let id = self.emit_funclit(params, body);
-            self.emit_closure_call(id, args, line)?;
+        if let Expr::FuncLit {
+            params,
+            body,
+            variadic,
+            ..
+        } = func
+        {
+            let id = self.emit_funclit(params, body, *variadic);
+            self.emit_closure_call(id, args, spread, line)?;
             return Ok(());
         }
         if let Expr::Selector { recv, field } = func {
@@ -6096,7 +6188,7 @@ impl Compiler {
             // A variable statically known to hold a closure — dispatch directly.
             if let Some(&id) = self.closure_vars.get(name) {
                 self.emit_get(name, line);
-                self.emit_closure_call(id, args, line)?;
+                self.emit_closure_call(id, args, spread, line)?;
                 return Ok(());
             }
             // A function value held in a variable — a func-typed parameter, a
