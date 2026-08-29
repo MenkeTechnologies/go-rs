@@ -1819,6 +1819,60 @@ impl Compiler {
         Ok(())
     }
 
+    /// Whether `name` in a value position is a declared function rather than a
+    /// variable — a local, a capture or a package-level `var` of the same name
+    /// shadows it, as it does in Go.
+    fn is_func_value(&self, name: &str) -> bool {
+        self.funcs.contains_key(name)
+            && !self.is_enclosing_var(name)
+            && !self.scope.as_ref().is_some_and(|s| s.has(name))
+    }
+
+    /// Emit a declared function as a *value*: a closure that forwards to it.
+    ///
+    /// The forwarding is not indirection for its own sake. `Op::CallDynamic`
+    /// enters a subroutine whose slot 0 holds the closure itself, which is true
+    /// of a `$lambda_N` and false of a declared function, where slot 0 is the
+    /// first parameter — so a declared function cannot be the target of a
+    /// dynamic call at all. A synthesized literal with the same signature can,
+    /// and it is the shape a method value already takes.
+    fn emit_func_value(&mut self, name: &str) -> Result<(), String> {
+        let sig = &self.funcs[name];
+        let (arity, variadic, nresults) = (sig.arity, sig.variadic, sig.nresults);
+        let param_tys = sig.param_tys.clone();
+        let result_ty = sig.result_ty.clone();
+        let params: Vec<Param> = (0..arity)
+            .map(|i| Param {
+                // Cannot collide with anything the program wrote.
+                name: format!("$fv{i}"),
+                ty: param_tys.get(i).cloned().unwrap_or_default(),
+            })
+            .collect();
+        let args: Vec<Expr> = params.iter().map(|p| Expr::Ident(p.name.clone())).collect();
+        let call = Expr::Call {
+            func: Box::new(Expr::Ident(name.to_string())),
+            args,
+            // The wrapper's own trailing parameter is already the packed slice,
+            // so the forward spreads it rather than packing it a second time.
+            spread: variadic,
+            line: 0,
+        };
+        let body = match nresults {
+            0 => vec![Stmt::ExprStmt(call)],
+            _ => vec![Stmt::Return(vec![call], 0)],
+        };
+        let results = match nresults {
+            0 => Vec::new(),
+            _ => vec![result_ty],
+        };
+        self.expr(&Expr::FuncLit {
+            params,
+            results,
+            body,
+            variadic,
+        })
+    }
+
     /// A collected lambda's parameter types and whether the last one is variadic.
     fn lambda_sig(&self, id: i64) -> (Vec<String>, bool) {
         match self.lambdas.get(id as usize) {
@@ -4005,7 +4059,15 @@ impl Compiler {
                 self.b
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
             }
-            Expr::Ident(name) => self.emit_get(name, 0),
+            Expr::Ident(name) => {
+                // A declared function named in a *value* position (`apply(dbl)`,
+                // `f := dbl`, `[]func(int) int{dbl}`) is a function value, not a
+                // variable read.
+                if self.is_func_value(name) {
+                    return self.emit_func_value(name);
+                }
+                self.emit_get(name, 0)
+            }
             Expr::Unary { op, rhs } => {
                 // `&x` / `*p` are reference/identity on go-rs's heap handles — no
                 // copy, no op. Emitting the operand yields the shared handle, so a

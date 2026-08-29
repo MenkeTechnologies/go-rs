@@ -621,6 +621,36 @@ and the operand count is fixed in the bytecode before the closure exists —
 there is nothing to pack from and nothing to ask at run time. Closing it means
 carrying a real function signature through the type system.
 
+## A call through a func value yields one result and cannot be a struct field
+
+```go
+dm := func(a, b int) (int, int) { return a / b, a % b }
+q, r := dm(17, 5)
+fmt.Println(q, r)   // go: 3 2   go-rs: [3 2] <nil>
+
+type pipe struct{ stage func(int) int }
+p := pipe{stage: func(n int) int { return n * 2 }}
+p.stage(8)          // go-rs: no method `stage` with 1 argument(s)
+```
+
+Two separate holes on the same expression:
+
+- `Compiler::call_result_count` resolves a result count from `self.funcs` (a
+  declared function), from `host::stdlib` (a native package call) and from the
+  method tables. A closure has none of those — `LambdaInfo` does not record the
+  literal's result count even though `Expr::FuncLit` carries `results` — so a
+  multi-result call through a func value looks like one value and the whole
+  returned tuple lands in the first name. This is why the corpus reads a
+  func-typed struct field into a variable before calling it.
+- A `recv.field(args)` whose `field` is a func-typed *field* rather than a
+  method is rejected: the `Expr::Selector` arm of `Compiler::call` looks the
+  name up as a method and errors out instead of falling through to
+  `Compiler::call_value`, which is what handles every other expression that
+  yields a function value.
+
+Reading the field first (`stage := p.stage; stage(8)`) works, and so does a
+single-result call.
+
 ## A string cannot hold invalid UTF-8
 
 ```go

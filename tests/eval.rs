@@ -1469,6 +1469,30 @@ func main() {
 }
 
 #[test]
+fn declared_function_used_as_a_value() {
+    // A declared function named in a value position is a function value. It had
+    // no lowering at all — `apply(dbl)` read `dbl` as a variable and failed with
+    // "call of a nil or unknown function value" at run time.
+    let src = "\
+package main
+import \"fmt\"
+func dbl(n int) int { return n * 2 }
+func inc(n int) int { return n + 1 }
+func apply(f func(int) int, v int) int { return f(v) }
+func main() {
+	fmt.Println(apply(dbl, 21), apply(inc, 41))
+	f := dbl
+	fmt.Println(f(5), f == nil)
+	fns := []func(int) int{dbl, inc}
+	fmt.Println(fns[0](10), fns[1](10))
+	dbl := 99
+	fmt.Println(dbl)
+}
+";
+    assert_stdout(src, "42 42\n10 false\n20 11\n99\n");
+}
+
+#[test]
 fn variadic_closure_packs_its_trailing_arguments() {
     // A closure's variadic parameter binds a *slice* of the trailing arguments,
     // like a declared function's. Before the flag survived to the call site the
