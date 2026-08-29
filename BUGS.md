@@ -61,6 +61,31 @@ A `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, for the
 reason in the pointer entry below: go-rs holds a pointer and its pointee as one
 handle.
 
+## A nil pointer in an interface compares equal to nil
+
+```go
+type E struct{}
+func (e *E) Error() string { return "boom" }
+var p *E = nil
+var i error = p
+fmt.Println(i == nil)   // go: false   go-rs: true
+fmt.Printf("%T\n", i)   // go: *main.E go-rs: <nil>
+_, ok := i.(*E)         // go: true    go-rs: false
+```
+
+An interface value in Go is a (type, value) pair, and it is nil only when both
+halves are. A nil `*E` stored in an `error` therefore carries a type and is not
+nil — the classic "returned a nil pointer, the caller's `err != nil` fired
+anyway" trap, and the one case where getting this wrong changes control flow
+rather than output. go-rs represents a nil pointer as `Value::Undef`, which
+`go_type_name` maps to `<nil>`, so the pointee type is gone by the time the
+comparison, the assertion, or `%T` asks for it.
+
+This is the representation change described two entries above, seen from the
+other side: a nil slice keeps its type because it is a `HostObj::Slice`, while
+a nil pointer keeps none because it is the same `Undef` every other nil is.
+Giving nil pointers a typed representation closes this and the `%T` half of the
+defined-type entry together; both are the same missing name-on-the-value.
 ## `%T` of an empty map describes it from its contents
 
 ```go
