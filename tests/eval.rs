@@ -1469,6 +1469,31 @@ func main() {
 }
 
 #[test]
+fn func_typed_struct_field_is_called_as_a_value() {
+    // `p.stage(8)` used to be looked up as a method named `stage` and rejected
+    // with "no method `stage` with 1 argument(s)".
+    let src = "\
+package main
+import \"fmt\"
+type pipe struct {
+	stage func(int) int
+	name  string
+}
+func dbl(n int) int { return n * 2 }
+func (p pipe) run(v int) int { return p.stage(v) }
+func main() {
+	p := pipe{stage: dbl, name: \"double\"}
+	fmt.Println(p.name, p.stage(8), p.run(21))
+	q := &pipe{stage: func(n int) int { return n + 100 }}
+	fmt.Println(q.stage(1))
+	q.stage = dbl
+	fmt.Println(q.stage(1))
+}
+";
+    assert_stdout(src, "double 16 42\n101\n2\n");
+}
+
+#[test]
 fn func_typed_parameter_is_not_captured_by_an_unrelated_closure_name() {
     // `closure_vars` maps a name to the lambda it was bound to, for static
     // dispatch. It used to survive the end of a function body, so `apply`'s

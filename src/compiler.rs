@@ -4898,6 +4898,18 @@ impl Compiler {
             .iface_of(&ty)
             .is_some_and(|ms| ms.iter().any(|m| m.starts_with(&format!("{method}/"))));
         if candidates.is_empty() && !declared_by_iface {
+            // `p.stage(8)` where `stage` is a func-typed *field* rather than a
+            // method. Go tells the two apart by the name's declaration, and a
+            // type cannot declare both, so the field is what the call means:
+            // read it and dispatch the value it holds, as every other
+            // expression yielding a function value is dispatched.
+            if self.field_ty(recv, method).starts_with("func") {
+                let field = Expr::Selector {
+                    recv: Box::new(recv.clone()),
+                    field: method.to_string(),
+                };
+                return self.call_value(&field, args, line);
+            }
             return Err(format!(
                 "go-rs: no method `{method}` with {} argument(s) (line {line})",
                 args.len()

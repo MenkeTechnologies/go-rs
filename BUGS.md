@@ -621,24 +621,48 @@ and the operand count is fixed in the bytecode before the closure exists —
 there is nothing to pack from and nothing to ask at run time. Closing it means
 carrying a real function signature through the type system.
 
-## Calling a func-typed struct field is rejected as an unknown method
+## A func value reached through an erased type yields one result
 
 ```go
-type pipe struct{ stage func(int) int }
-p := pipe{stage: func(n int) int { return n * 2 }}
-p.stage(8)   // go-rs: no method `stage` with 1 argument(s)
+type pipe struct{ pair func(int) (int, int) }
+p := pipe{pair: func(n int) (int, int) { return n, n + 1 }}
+a, b := p.pair(4)                        // go: 4 5   go-rs: [4 5] <nil>
+
+func apply(f func(string, ...int) int) { fmt.Println(f("dyn", 4, 5, 6)) }
+apply(func(l string, ns ...int) int { return len(ns) })   // go: 3   go-rs: 0
 ```
 
-The `Expr::Selector` arm of `Compiler::call` looks the name up as a method and
-errors out instead of falling through to `Compiler::call_value`, which is what
-handles every other expression that yields a function value. Reading the field
-into a name first (`stage := p.stage; stage(8)`) works, which is what
-`parity-scripts/func_value_of_declared_func.go` does.
+Both are the same missing fact. `Parser::type_name` erases a function type to
+the bare name `"func"`, so a func-typed *field*, *parameter* or *container
+element* carries no signature: neither the result count `Compiler::call_result_count`
+needs to destructure a tuple, nor the arity `Compiler::emit_call_operands` needs
+to pack a variadic call's trailing arguments. The operand count is fixed in the
+bytecode before the closure exists, so there is nothing to ask at run time
+either. Closing it means carrying a real function signature through the type
+system.
 
-The multi-result half of this entry is closed: `LambdaInfo` records the
-literal's result count, so `q, r := dm(17, 5)` through a func value
-destructures like a declared function's tuple
-(`parity-scripts/func_value_dispatch.go`).
+A func value whose literal is statically known is unaffected — `dm := func(a, b
+int) (int, int)`, `dm := divmod`, and a variadic `p := func(f string, a ...any)`
+all resolve their signature from `LambdaInfo`
+(`parity-scripts/func_value_dispatch.go`,
+`parity-scripts/variadic_closure.go`). So is a single-result call through a
+field (`parity-scripts/func_typed_field_call.go`).
+
+## A func held in a container *inside* a struct cannot be called
+
+```go
+type reg struct{ handlers map[string]func(string) string }
+r := reg{handlers: map[string]func(string) string{"up": f}}
+r.handlers["up"]("hey")
+// go:    hey!
+// go-rs: no method `handlers` with 1 argument(s)
+```
+
+`fns[i](x)` on a plain slice or map works, and so does a func-typed field
+(`p.stage(8)`). Indexing a container that is itself a *field* is the
+combination that is not routed: the call lowering reads `r.handlers` as a
+method name rather than as a field to index and then call. Binding the
+container to a name first (`h := r.handlers; h["up"]("hey")`) works.
 
 ## A string cannot hold invalid UTF-8
 
