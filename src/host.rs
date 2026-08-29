@@ -2289,6 +2289,13 @@ fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
     let elem_ty = args.first().map(go_str).unwrap_or_default();
     let mut out: Vec<Value> = Vec::new();
     let mut extend_from = |v: &Value| {
+        // `append(b, s...)` where `s` is a *string* is Go's one non-slice
+        // spread: it appends the string's bytes to a `[]byte`. Without this the
+        // operand matched nothing and the append silently returned `b`.
+        if let Value::Str(s) = v {
+            out.extend(s.as_bytes().iter().map(|b| Value::Int(*b as i64)));
+            return;
+        }
         if let Value::Obj(id) = v {
             if let Some((_, _, len)) = slice_backing(*id) {
                 for i in 0..len {

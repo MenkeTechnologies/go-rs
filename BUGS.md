@@ -648,6 +648,27 @@ all resolve their signature from `LambdaInfo`
 `parity-scripts/variadic_closure.go`). So is a single-result call through a
 field (`parity-scripts/func_typed_field_call.go`).
 
+## `append` through a pointer to a slice is refused
+
+```go
+var s []int
+p := &s
+*p = append(*p, 1)
+// go:    s == [1]
+// go-rs: first argument to append must be a slice
+```
+
+`&x` on a composite allocates a `HostObj::Ptr` addressing the variable's
+handle, and `*p` is lowered as identity on that handle — the builtins that take
+a *struct* follow the pointer, but `append` sees the `Ptr` object and rejects
+it. The accumulator idiom `func add(out *[]int, v int) { *out = append(*out, v) }`
+is the common way to hit it. Reading through the pointer first is not a
+workaround here: the write has to go back through it.
+
+Closing it means the slice builtins (`append`, `len`, `cap`, index, `range`)
+following a `Ptr` to its target the way the struct ones do, which is a
+host-side rule rather than a compiler one.
+
 ## A func held in a container *inside* a struct cannot be called
 
 ```go

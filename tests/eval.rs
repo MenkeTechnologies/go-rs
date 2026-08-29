@@ -1469,6 +1469,29 @@ func main() {
 }
 
 #[test]
+fn append_spreads_a_string_as_its_bytes() {
+    // `append(b, s...)` is Go's one non-slice spread. The operand matched no
+    // arm of the spread builtin, so the append silently returned `b` unchanged
+    // — a wrong answer, not an error.
+    let src = "\
+package main
+import \"fmt\"
+func main() {
+	b := []byte(\"abc\")
+	b = append(b, \"def\"...)
+	fmt.Println(string(b), len(b))
+	var nilb []byte
+	nilb = append(nilb, \"hi\"...)
+	fmt.Println(string(nilb), len(nilb))
+	utf := []byte{}
+	utf = append(utf, \"é中\"...)
+	fmt.Println(len(utf), utf)
+}
+";
+    assert_stdout(src, "abcdef 6\nhi 2\n5 [195 169 228 184 173]\n");
+}
+
+#[test]
 fn func_typed_struct_field_is_called_as_a_value() {
     // `p.stage(8)` used to be looked up as a method named `stage` and rejected
     // with "no method `stage` with 1 argument(s)".
