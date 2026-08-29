@@ -14,6 +14,9 @@ func dbl(n int) int         { return n * 2 }
 func inc(n int) int         { return n + 1 }
 func shout(s string) string { return strings.ToUpper(s) }
 func announce()             { fmt.Println("announced") }
+func tally(label string, ns ...int) string {
+	return fmt.Sprint(label, len(ns), ns)
+}
 
 type pipeline struct {
 	stage func(int) int
@@ -53,6 +56,13 @@ func main() {
 	a()
 	s := shout
 	fmt.Println(s("hi"))
+
+	// A *variadic* declared function keeps its signature as a value: the
+	// wrapper's trailing parameter is the packed slice, spread into the call.
+	t := tally
+	fmt.Println(t("none"), t("two", 1, 2))
+	ns := []int{3, 4, 5}
+	fmt.Println(t("spread", ns...))
 
 	// A stdlib callback slot that takes a func value.
 	words := []string{"pear", "fig", "apple"}
