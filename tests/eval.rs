@@ -1469,6 +1469,35 @@ func main() {
 }
 
 #[test]
+fn slice_operations_read_through_a_pointer() {
+    // A `*[]T` addresses the slice, so the slice builtins have to follow it.
+    // They did not: `len(*p)` answered 0, `range *p` iterated nothing, and
+    // `(*p)[0]` and `append(*p, x)` faulted.
+    let src = "\
+package main
+import \"fmt\"
+func total(p *[]int) int {
+	sum := 0
+	for _, v := range *p {
+		sum += v
+	}
+	return sum
+}
+func main() {
+	s := []int{1, 2, 3}
+	p := &s
+	fmt.Println(len(*p), (*p)[1], total(p))
+	fmt.Println(append(*p, 4))
+	(*p)[0] = 9
+	fmt.Println(s)
+	var empty []int
+	fmt.Println(len(*(&empty)))
+}
+";
+    assert_stdout(src, "3 2 6\n[1 2 3 4]\n[9 2 3]\n0\n");
+}
+
+#[test]
 fn append_spreads_a_string_as_its_bytes() {
     // `append(b, s...)` is Go's one non-slice spread. The operand matched no
     // arm of the spread builtin, so the append silently returned `b` unchanged

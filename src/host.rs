@@ -1650,6 +1650,7 @@ fn heap_alloc(obj: HostObj) -> u32 {
 /// [`HostObj::Slice`] is its own backing at offset 0; a [`HostObj::SliceView`]
 /// names the backing it shares. `None` if `id` is not a slice.
 fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
+    let id = follow(id);
     HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Slice { elems: a, .. }) => Some((id, 0, a.len())),
         Some(HostObj::SliceView {
@@ -1671,6 +1672,7 @@ fn slice_backing(id: u32) -> Option<(u32, usize, usize)> {
 /// A slice handle's capacity — `len` for a slice that owns its backing, the
 /// recorded `cap` for a view. `None` if `id` is not a slice.
 fn slice_cap(id: u32) -> Option<usize> {
+    let id = follow(id);
     HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Slice { elems: a, .. }) => Some(a.len()),
         Some(HostObj::SliceView { cap, .. }) => Some(*cap),
@@ -2509,6 +2511,8 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
     let recv = args.remove(0);
     match recv {
         Value::Obj(id) => {
+            // `append(*p, x)` hands over the pointer, not the slice it addresses.
+            let id = follow(id);
             // Appending to a sub-slice view reallocates into a fresh slice (its
             // own backing), so it never clobbers the parent's elements.
             let is_view = HEAP

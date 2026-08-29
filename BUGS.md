@@ -648,26 +648,39 @@ all resolve their signature from `LambdaInfo`
 `parity-scripts/variadic_closure.go`). So is a single-result call through a
 field (`parity-scripts/func_typed_field_call.go`).
 
-## `append` through a pointer to a slice is refused
+## Rebinding through a pointer to a slice, and reading through a pointer to a map
 
 ```go
 var s []int
 p := &s
-*p = append(*p, 1)
-// go:    s == [1]
-// go-rs: first argument to append must be a slice
+*p = append(*p, 1)          // go-rs: cannot assign through a pointer to a
+                            //        non-composite value
+m := map[string]int{"a": 1}
+mp := &m
+fmt.Println(len(*mp))       // go: 1   go-rs: 0
+fmt.Println((*mp)["a"])     // go-rs: invalid index target
+var e []int
+fmt.Println(*(&e) == nil)   // go: true   go-rs: false
 ```
 
-`&x` on a composite allocates a `HostObj::Ptr` addressing the variable's
-handle, and `*p` is lowered as identity on that handle — the builtins that take
-a *struct* follow the pointer, but `append` sees the `Ptr` object and rejects
-it. The accumulator idiom `func add(out *[]int, v int) { *out = append(*out, v) }`
-is the common way to hit it. Reading through the pointer first is not a
-workaround here: the write has to go back through it.
+*Reading* through a `*[]T` is fixed — `len`, `cap`, indexing (read and write),
+`range` and `append`'s operand all follow the `HostObj::Ptr` to the slice
+(`parity-scripts/pointer_to_slice.go`). Three things around it do not:
 
-Closing it means the slice builtins (`append`, `len`, `cap`, index, `range`)
-following a `Ptr` to its target the way the struct ones do, which is a
-host-side rule rather than a compiler one.
+- **`*p = <slice>`.** `b_deref_set` overwrites the *pointee in place*, which is
+  right for a struct and wrong for a slice: a slice rebind has to change the
+  header the variable holds, and go-rs models a slice as one object, so an
+  in-place overwrite would also be seen through a `t := s` taken earlier, which
+  Go leaves alone. Making it right needs `&s` to address the variable's storage
+  rather than the slice object — the same change the scalar `&x` entry above
+  wants. The accumulator idiom
+  `func add(out *[]int, v int) { *out = append(*out, v) }` is what reaches it.
+- **A pointer to a map.** `len`, indexing and `range` read the `Ptr` rather than
+  the map. Maps are reached through several accessors rather than the two the
+  slice reads share, so the same `follow` is more than a two-line change; `*mp`
+  on its own (printing, assigning) is right.
+- **`*p == nil`.** The comparison sees the pointer, not the pointee, so a
+  dereferenced nil slice is not `nil`.
 
 ## A func held in a container *inside* a struct cannot be called
 
