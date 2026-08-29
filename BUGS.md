@@ -587,66 +587,41 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
 
-## A variadic closure called through a func value binds its parameters wrong
+## A function type is erased, so a call through one mis-binds and mis-destructures
 
 ```go
 func apply(f func(string, ...int) int) { fmt.Println(f("dyn", 4, 5, 6)) }
 apply(func(l string, ns ...int) int { fmt.Println(l, len(ns)); return len(ns) })
 // go:    dyn 3 / 3
 // go-rs: 5 0 / 0
-```
 
-`Op::CallDynamic` pushes one stack slot per written argument, so a variadic
-callee reached through it receives the wrong number of operands and every
-parameter binds one slot off. The same happens for an element of a slice of
-funcs (`fns[0]("idx", 1, 2)`), which is the other expression that produces a
-function value with no statically known target.
-
-A closure whose lambda *is* statically known — `p := func(f string, a ...any)`,
-an immediately-invoked literal, `go` on either — no longer is: `Expr::FuncLit`
-carries the `variadic` flag the parser already computed, `LambdaInfo` records
-it, and `Compiler::emit_call_operands` packs the trailing arguments into the
-slice exactly as the declared-function arm does. The gate is
-`parity-scripts/variadic_closure.go`.
-
-(The entry this replaces blamed `Op::CallDynamic` for the `p := func(…)` form
-too. That was wrong: `p` is in `closure_vars`, so it lowered through
-`emit_closure_call` and a plain `Op::Call` — the packing was simply missing
-there.)
-
-What is left is the dynamic half, and it needs more than a flag. A function
-type is erased to the bare name `"func"` by `Parser::type_name`, so a
-func-typed parameter has no arity and no variadic bit to read at the call site,
-and the operand count is fixed in the bytecode before the closure exists —
-there is nothing to pack from and nothing to ask at run time. Closing it means
-carrying a real function signature through the type system.
-
-## A func value reached through an erased type yields one result
-
-```go
 type pipe struct{ pair func(int) (int, int) }
 p := pipe{pair: func(n int) (int, int) { return n, n + 1 }}
-a, b := p.pair(4)                        // go: 4 5   go-rs: [4 5] <nil>
-
-func apply(f func(string, ...int) int) { fmt.Println(f("dyn", 4, 5, 6)) }
-apply(func(l string, ns ...int) int { return len(ns) })   // go: 3   go-rs: 0
+a, b := p.pair(4)   // go: 4 5   go-rs: [4 5] <nil>
 ```
 
-Both are the same missing fact. `Parser::type_name` erases a function type to
-the bare name `"func"`, so a func-typed *field*, *parameter* or *container
-element* carries no signature: neither the result count `Compiler::call_result_count`
-needs to destructure a tuple, nor the arity `Compiler::emit_call_operands` needs
-to pack a variadic call's trailing arguments. The operand count is fixed in the
-bytecode before the closure exists, so there is nothing to ask at run time
-either. Closing it means carrying a real function signature through the type
-system.
+One missing fact behind both. `Parser::type_name` erases a function type to the
+bare name `"func"`, so a func-typed *parameter*, *field* or *container element*
+carries no signature — neither the arity `Compiler::emit_call_operands` needs to
+pack a variadic call's trailing arguments (every written argument takes a stack
+slot of its own, so each parameter binds one slot off and the closure handle
+lands in the first), nor the result count `Compiler::call_result_count` needs to
+destructure a tuple. The operand count is fixed in the bytecode before the
+closure exists, so there is nothing to ask at run time either. Closing it means
+carrying a real function signature through the type system.
 
-A func value whose literal is statically known is unaffected — `dm := func(a, b
-int) (int, int)`, `dm := divmod`, and a variadic `p := func(f string, a ...any)`
-all resolve their signature from `LambdaInfo`
-(`parity-scripts/func_value_dispatch.go`,
-`parity-scripts/variadic_closure.go`). So is a single-result call through a
-field (`parity-scripts/func_typed_field_call.go`).
+A func value whose lambda *is* statically known is unaffected. `p := func(f
+string, a ...any)`, an immediately-invoked literal and `go` on either pack their
+trailing arguments (`Expr::FuncLit` carries the `variadic` flag the parser
+already computed and `LambdaInfo` records it); `dm := func(a, b int) (int, int)`
+and `dm := divmod` destructure their tuple from the same record. The gates are
+`parity-scripts/variadic_closure.go`, `parity-scripts/func_value_dispatch.go`
+and `parity-scripts/func_typed_field_call.go`.
+
+(An earlier version of this entry blamed `Op::CallDynamic` for the `p :=
+func(…)` form too. That was wrong: `p` is in `closure_vars`, so it lowered
+through `emit_closure_call` and a plain `Op::Call` — the packing was simply
+missing there.)
 
 ## Rebinding through a pointer to a slice, and reading through a pointer to a map
 
