@@ -1,6 +1,6 @@
 [package]
 name = "go-rs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.80"
 description = "Go on the fusevm bytecode VM — compiles to fusevm::Chunk, runs on a shared three-tier Cranelift JIT"
