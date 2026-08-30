@@ -86,6 +86,7 @@ pub fn link(mut main: Program) -> Result<Program, String> {
         add_os_file(&mut main)?;
     }
     add_sort_slice(&mut main);
+    add_sort_search(&mut main);
     add_stringify(&mut main);
     Ok(main)
 }
@@ -107,6 +108,86 @@ fn add_sort_slice(prog: &mut Program) {
         if let Some(mut f) = p.funcs.pop() {
             f.name = "$sortSlice".to_string();
             prog.funcs.push(f);
+        }
+    }
+}
+
+/// Synthesize the rest of package `sort`: the binary searches and the
+/// "is it already sorted" predicates.
+///
+/// Written in Go and parsed for the same reason `$sortSlice` is: `sort.Search`
+/// and `sort.SliceIsSorted` take a VM closure, which a host builtin cannot call.
+/// The four that take no closure ride along in the same form rather than
+/// becoming host builtins, so the whole package is described in one place and
+/// the search halves cannot drift apart.
+///
+/// `Search` is Go's contract exactly: the smallest `i` in `[0, n)` for which
+/// `f(i)` is true, and `n` when there is none — which is what makes
+/// `SearchInts` answer `len(a)` for a value past the end rather than -1.
+fn add_sort_search(prog: &mut Program) {
+    let each: [(&str, &str); 8] = [
+        (
+            "$sortSearch",
+            "func h(n int, f func(int) bool) int {\n\
+             \ti, j := 0, n\n\
+             \tfor i < j {\n\
+             \t\tm := (i + j) / 2\n\
+             \t\tif !f(m) {\n\t\t\ti = m + 1\n\t\t} else {\n\t\t\tj = m\n\t\t}\n\
+             \t}\n\treturn i\n}\n",
+        ),
+        (
+            "$searchInts",
+            "func h(a []int, x int) int {\n\
+             \ti, j := 0, len(a)\n\
+             \tfor i < j {\n\t\tm := (i + j) / 2\n\
+             \t\tif a[m] < x {\n\t\t\ti = m + 1\n\t\t} else {\n\t\t\tj = m\n\t\t}\n\
+             \t}\n\treturn i\n}\n",
+        ),
+        (
+            "$searchStrings",
+            "func h(a []string, x string) int {\n\
+             \ti, j := 0, len(a)\n\
+             \tfor i < j {\n\t\tm := (i + j) / 2\n\
+             \t\tif a[m] < x {\n\t\t\ti = m + 1\n\t\t} else {\n\t\t\tj = m\n\t\t}\n\
+             \t}\n\treturn i\n}\n",
+        ),
+        (
+            "$searchFloat64s",
+            "func h(a []float64, x float64) int {\n\
+             \ti, j := 0, len(a)\n\
+             \tfor i < j {\n\t\tm := (i + j) / 2\n\
+             \t\tif a[m] < x {\n\t\t\ti = m + 1\n\t\t} else {\n\t\t\tj = m\n\t\t}\n\
+             \t}\n\treturn i\n}\n",
+        ),
+        (
+            "$intsAreSorted",
+            "func h(a []int) bool {\n\tfor i := 1; i < len(a); i++ {\n\
+             \t\tif a[i] < a[i-1] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n",
+        ),
+        (
+            "$stringsAreSorted",
+            "func h(a []string) bool {\n\tfor i := 1; i < len(a); i++ {\n\
+             \t\tif a[i] < a[i-1] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n",
+        ),
+        (
+            "$float64sAreSorted",
+            "func h(a []float64) bool {\n\tfor i := 1; i < len(a); i++ {\n\
+             \t\tif a[i] < a[i-1] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n",
+        ),
+        (
+            "$sliceIsSorted",
+            "func h(s any, less func(int, int) bool) bool {\n\
+             \tfor i := len(s) - 1; i > 0; i-- {\n\
+             \t\tif less(i, i-1) {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n",
+        ),
+    ];
+    for (name, body) in each {
+        let src = format!("package p\n{body}");
+        if let Ok(mut p) = crate::parse(&src) {
+            if let Some(mut f) = p.funcs.pop() {
+                f.name = name.to_string();
+                prog.funcs.push(f);
+            }
         }
     }
 }

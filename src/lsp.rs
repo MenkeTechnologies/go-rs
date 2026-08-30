@@ -1447,7 +1447,8 @@ const CORPUS: &[Entry] = &[
         "The smallest `int`, equal to `math.MinInt64` on every target.",
         "best := math.MinInt",
     ),
-    // ── Package sort (host::stdlib ids 875-877, plus the `$sortSlice` lowering) ──
+    // ── Package sort (host::stdlib ids 875-877, plus the `$sortSlice` /
+    // `$sortSearch` family the compiler lowers to; see `pkg::add_sort_search`) ──
     e(
         "sort.Ints",
         "Package sort",
@@ -1482,6 +1483,62 @@ const CORPUS: &[Entry] = &[
         "sort.SliceStable(x any, less func(i, j int) bool)",
         "The same `$sortSlice` insertion sort as `sort.Slice`. Because that sort is already stable, the two functions are indistinguishable here.",
         "sort.SliceStable(xs, less)",
+    ),
+    e(
+        "sort.Search",
+        "Package sort",
+        "sort.Search(n int, f func(i int) bool) int",
+        "The smallest `i` in `[0, n)` for which `f(i)` is true, or `n` when there is none. `f` must be false for a prefix and true for the rest — the search assumes that and does not verify it. Lowered to `$sortSearch` for the same reason `sort.Slice` is: a host builtin cannot call a VM closure.",
+        "i := sort.Search(len(a), func(i int) bool { return a[i] >= x })",
+    ),
+    e(
+        "sort.SearchInts",
+        "Package sort",
+        "sort.SearchInts(a []int, x int) int",
+        "The index of the first element of the sorted slice that is >= `x`, or `len(a)` when every element is smaller — so a hit and a miss are told apart by comparing `a[i]` to `x`, not by a negative return.",
+        "i := sort.SearchInts([]int{1, 3, 5}, 3)   // 1",
+    ),
+    e(
+        "sort.SearchStrings",
+        "Package sort",
+        "sort.SearchStrings(a []string, x string) int",
+        "`sort.SearchInts` over a sorted `[]string`, comparing lexicographically.",
+        "i := sort.SearchStrings([]string{\"a\", \"c\"}, \"c\")   // 1",
+    ),
+    e(
+        "sort.SearchFloat64s",
+        "Package sort",
+        "sort.SearchFloat64s(a []float64, x float64) int",
+        "`sort.SearchInts` over a sorted `[]float64`.",
+        "i := sort.SearchFloat64s([]float64{1.5, 2.5}, 2.5)   // 1",
+    ),
+    e(
+        "sort.IntsAreSorted",
+        "Package sort",
+        "sort.IntsAreSorted(a []int) bool",
+        "Whether the slice is already in ascending order. An empty or one-element slice is sorted.",
+        "sort.IntsAreSorted([]int{1, 2, 2})   // true",
+    ),
+    e(
+        "sort.StringsAreSorted",
+        "Package sort",
+        "sort.StringsAreSorted(a []string) bool",
+        "`sort.IntsAreSorted` over a `[]string`.",
+        "sort.StringsAreSorted([]string{\"a\", \"b\"})   // true",
+    ),
+    e(
+        "sort.Float64sAreSorted",
+        "Package sort",
+        "sort.Float64sAreSorted(a []float64) bool",
+        "`sort.IntsAreSorted` over a `[]float64`.",
+        "sort.Float64sAreSorted([]float64{1, 2})   // true",
+    ),
+    e(
+        "sort.SliceIsSorted",
+        "Package sort",
+        "sort.SliceIsSorted(x any, less func(i, j int) bool) bool",
+        "Whether the slice is already ordered by the comparator. Takes a VM closure, so it is lowered to `$sliceIsSorted` alongside `sort.Slice`.",
+        "sort.SliceIsSorted(xs, func(i, j int) bool { return xs[i] < xs[j] })",
     ),
     // ── Package os (host::stdlib id 880) ──
     e(

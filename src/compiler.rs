@@ -6112,8 +6112,26 @@ impl Compiler {
                 // comparator is a VM closure a host builtin can't call, so lower
                 // to the linker-synthesized `$sortSlice` (an in-language insertion
                 // sort that calls `less`).
-                if pkg == "sort" && (field == "Slice" || field == "SliceStable") {
-                    return self.call(&Expr::Ident("$sortSlice".to_string()), args, false, line);
+                if pkg == "sort" {
+                    // The searches and the sorted-predicates ride the same
+                    // route: two of them take a closure, and the rest are
+                    // written beside those so the halves of one algorithm
+                    // cannot drift apart. See `pkg::add_sort_search`.
+                    let synth = match field.as_str() {
+                        "Slice" | "SliceStable" => Some("$sortSlice"),
+                        "Search" => Some("$sortSearch"),
+                        "SearchInts" => Some("$searchInts"),
+                        "SearchStrings" => Some("$searchStrings"),
+                        "SearchFloat64s" => Some("$searchFloat64s"),
+                        "IntsAreSorted" => Some("$intsAreSorted"),
+                        "StringsAreSorted" => Some("$stringsAreSorted"),
+                        "Float64sAreSorted" => Some("$float64sAreSorted"),
+                        "SliceIsSorted" => Some("$sliceIsSorted"),
+                        _ => None,
+                    };
+                    if let Some(target) = synth {
+                        return self.call(&Expr::Ident(target.to_string()), args, false, line);
+                    }
                 }
                 if matches!(pkg.as_str(), "strings" | "strconv" | "math" | "sort" | "os") {
                     let id = host::stdlib::resolve(pkg, field).ok_or_else(|| {
