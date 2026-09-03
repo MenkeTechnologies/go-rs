@@ -143,7 +143,7 @@ Real Go, executed on fusevm:
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
 Goroutines, channels, and `select` run on a **cooperative scheduler in the
-shared `fusevm` VM** (`fusevm::sched`, from the pinned `fusevm` 0.17.0): each
+shared `fusevm` VM** (`fusevm::sched`, from the pinned `fusevm` 0.26.0): each
 goroutine is its own VM sharing the program and the single-threaded heap,
 yielding at channel operations. **Generics are handled by erasure** — type-parameter and
 type-argument brackets are consumed and dropped, and the dynamically-typed value
@@ -331,7 +331,7 @@ superset):
   wrap at their declared width through `++`, compound assignment, binary and
   unary operators, struct fields, slice elements and function results.
 - **`len(ch)` / `cap(ch)` report 0.** The scheduler owns the channel buffer and
-  fusevm 0.17.0 exposes no op to read its length or capacity, so the frontend
+  fusevm 0.26.0 exposes no op to read its length or capacity, so the frontend
   has nothing to ask. Every other channel operation is correct. This is
   **waiting on a fusevm release** rather than on design work (see
   [`BUGS.md`](BUGS.md)).
