@@ -403,6 +403,51 @@ does `x.(error)`. The synthesized `errors`/`fmt` error types keep the `main.`
 qualifier of the one package go-rs compiles, and lose the `*` for the reason in
 the pointer entry above.
 
+## A stdlib function used as a value panics
+
+```go
+f := fmt.Println            // go: prints via f   go-rs: panic: nil pointer dereference
+var _ = strings.ToUpper     // same, at package level
+fs := []func(...any) (int, error){fmt.Println}
+```
+
+Any reference to a stdlib function that is not an immediate call crashes with
+`panic: runtime error: invalid memory address or nil pointer dereference` — at
+package level or inside a function, for `fmt`, `strings`, `os`, whichever
+package. A *user-defined* function used the same way is fine (`dm := divmod`),
+so this is specific to the native packages.
+
+`Compiler::expr`'s `Expr::Selector` arm resolves a package selector by trying
+`stdlib::resolve_const`, then the `os.Stdout` / `strconv.Err*` special cases,
+then `method_value`. A stdlib *function* matches none of them, so it falls
+through to the generic field read: `self.expr(recv)` evaluates the package name
+`fmt` as if it were a variable, which is nil, and `GFIELD_GET` dereferences it.
+
+Closing it means giving the selector a value to produce. `stdlib::resolve`
+already maps `(pkg, func)` to a builtin id, but a builtin id is not callable as
+a value — `CallBuiltin` fixes its arity at compile time, and a func value is
+called through `Op::Call` with an arity nothing knows until run time. The
+tractable form is to synthesize a Go-source wrapper per referenced function
+(`func $fmtPrintln(a ...any) (int, error) { return fmt.Println(a...) }`) and
+lower the selector to that, the way `pkg.rs` already synthesizes `sort.Search`
+and friends — the pieces it needs (a variadic forward with `a...`, a user
+function used as a value) both work today.
+
+## The heap is never collected, so a print in a loop retains its result
+
+`heap_alloc` only pushes; nothing frees, and `heap_reset` runs once per program.
+Every heap value a program builds is retained for the run, so a loop that builds
+one per iteration grows without bound. 200k iterations of `fmt.Fprintln(os.Stdout,
+"x")` — which returns `(n, err)` through the writer's `Write` — peak at 99 MB
+against 11.5 MB for the same loop as `fmt.Println("x")`, about 440 bytes an
+iteration.
+
+This is why `fmt.Print`/`Printf`/`Println` have two builtin ids each: the
+statement form answers `Undef` and allocates nothing, and only a print whose
+result is read builds the pair (`Compiler::discard_print`). That keeps the
+common case free but does not address the general problem — any loop over
+`strconv.Atoi`, `append`, or a struct literal has the same shape.
+
 ## Unsupported stdlib calls
 
 Writer-directed output is implemented. `fmt.Fprint` / `Fprintf` / `Fprintln`

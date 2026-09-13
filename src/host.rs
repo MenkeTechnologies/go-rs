@@ -18,6 +18,16 @@ pub const GPRINTLN: u16 = 800;
 pub const GPRINT: u16 = 801;
 /// `fmt.Printf` — format string + args, to stdout.
 pub const GPRINTF: u16 = 802;
+/// `fmt.Println` in a value position — prints, then answers `(n, nil)`.
+///
+/// Split from [`GPRINTLN`] because the pair is a heap slice and the heap is
+/// never collected, so a statement-position print must not build one. The
+/// compiler picks between them; see `Compiler::discard_print`.
+pub const GPRINTLN_N: u16 = 808;
+/// `fmt.Print` in a value position — prints, then answers `(n, nil)`.
+pub const GPRINT_N: u16 = 809;
+/// `fmt.Printf` in a value position — prints, then answers `(n, nil)`.
+pub const GPRINTF_N: u16 = 986;
 /// Go builtin `println` — space-separated, trailing newline, to stderr.
 pub const GEPRINTLN: u16 = 803;
 /// Go builtin `print` — no spacing, to stderr.
@@ -367,6 +377,9 @@ pub const GNIL_OF: u16 = 956;
 /// later waves (slices, maps, `strings`/`strconv`, structs) grow into.
 pub fn install(vm: &mut VM) {
     vm.register_builtin(GPRINTLN, b_println);
+    vm.register_builtin(GPRINTLN_N, b_println_n);
+    vm.register_builtin(GPRINT_N, b_print_n);
+    vm.register_builtin(GPRINTF_N, b_printf_n);
     vm.register_builtin(GPRINT, b_print);
     vm.register_builtin(GPRINTF, b_printf);
     vm.register_builtin(GEPRINTLN, b_eprintln);
@@ -4045,6 +4058,38 @@ fn b_printf(vm: &mut VM, argc: u8) -> Value {
     Value::Undef
 }
 
+/// `(n int, err error)` for a print that wrote `text`.
+///
+/// `n` counts BYTES, not runes — `fmt.Println("héllo")` is 7, matching Go. The
+/// error is always nil here: these three write to stdout through `print!`, which
+/// panics rather than reporting a failure, so there is no failure to report.
+fn printed(text: &str) -> Value {
+    let n = Value::Int(text.len() as i64);
+    Value::Obj(heap_alloc(HostObj::slice(vec![n, Value::Undef])))
+}
+
+fn b_println_n(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let text: Vec<String> = args.iter().map(go_str).collect();
+    let line = format!("{}\n", text.join(" "));
+    print!("{line}");
+    printed(&line)
+}
+
+fn b_print_n(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let text = go_print_spacing(&args);
+    print!("{text}");
+    printed(&text)
+}
+
+fn b_printf_n(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let text = sprintf(&args);
+    print!("{text}");
+    printed(&text)
+}
+
 fn b_eprintln(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let text: Vec<String> = args.iter().map(go_str).collect();
@@ -5123,6 +5168,13 @@ pub mod stdlib {
                 | ("strconv", "ParseInt")
                 | ("strconv", "ParseFloat")
                 | ("strconv", "ParseBool")
+                // The three printers return `(n int, err error)` too, so
+                // `n, err := fmt.Println(…)` destructures instead of binding
+                // both names to nil, and `x := fmt.Println(…)` is refused as
+                // the multiple-value assignment Go calls it.
+                | ("fmt", "Print")
+                | ("fmt", "Printf")
+                | ("fmt", "Println")
         )
     }
 

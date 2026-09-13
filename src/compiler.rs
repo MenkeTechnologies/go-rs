@@ -279,8 +279,33 @@ struct LoopScope {
     is_switch: bool,
 }
 
+/// Whether `e` is a call to one of the three `fmt` functions that print and
+/// return `(n int, err error)`. Used to decide whether that pair is worth
+/// building; see [`Compiler::discard_print`].
+fn is_fmt_print_call(e: &Expr) -> bool {
+    let Expr::Call { func, .. } = e else {
+        return false;
+    };
+    let Expr::Selector { recv, field } = func.as_ref() else {
+        return false;
+    };
+    matches!(recv.as_ref(), Expr::Ident(p) if p == "fmt")
+        && matches!(field.as_str(), "Print" | "Printf" | "Println")
+}
+
 struct Compiler {
     b: ChunkBuilder,
+    /// Set only while lowering an expression *statement* whose top-level call is
+    /// one of `fmt.Print`/`Printf`/`Println`, and consumed by the first such call
+    /// that sees it.
+    ///
+    /// Those three return `(n int, err error)`. Building that pair costs a heap
+    /// slice, and the heap is never collected (`heap_alloc` only pushes), so
+    /// paying it on every print would retain ~440 bytes per call for a value
+    /// nothing reads — measured at 99 MB against 11.5 MB over 200k prints. The
+    /// statement form therefore keeps the cheap builtin that answers `Undef`,
+    /// and only a print whose result is actually used builds the pair.
+    discard_print: bool,
     /// `None` while lowering `main` (global scope); `Some` inside a subroutine.
     scope: Option<Scope>,
     /// Static numeric category of the variables in the current function.
@@ -1348,6 +1373,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
 
     let mut c = Compiler {
         b: ChunkBuilder::new(),
+        discard_print: false,
         scope: None,
         types: HashMap::new(),
         decl_types: HashMap::new(),
@@ -2588,7 +2614,13 @@ impl Compiler {
                 self.assign(target, op, &one, *line)?;
             }
             Stmt::ExprStmt(e) => {
+                // Armed only when the statement's OWN top-level call is a print,
+                // never when one merely appears somewhere inside it: in
+                // `sink(fmt.Println(x))` the print's result IS read, so it must
+                // still build its pair.
+                self.discard_print = is_fmt_print_call(e);
                 self.expr(e)?;
+                self.discard_print = false;
                 // Every expression leaves exactly one value; a bare expression
                 // statement discards it.
                 self.b.emit(Op::Pop, 0);
@@ -6018,10 +6050,17 @@ impl Compiler {
                             line,
                         );
                     }
+                    // Consumed here, so only the outermost call of an expression
+                    // statement takes it: arguments are lowered below with the
+                    // flag already cleared, and a print among them keeps its pair.
+                    let discard = std::mem::take(&mut self.discard_print);
                     let id = match field.as_str() {
-                        "Println" => host::GPRINTLN,
-                        "Print" => host::GPRINT,
-                        "Printf" => host::GPRINTF,
+                        "Println" if discard => host::GPRINTLN,
+                        "Print" if discard => host::GPRINT,
+                        "Printf" if discard => host::GPRINTF,
+                        "Println" => host::GPRINTLN_N,
+                        "Print" => host::GPRINT_N,
+                        "Printf" => host::GPRINTF_N,
                         "Sprintf" => host::GSPRINTF,
                         "Sprint" => host::GSPRINT,
                         "Sprintln" => host::GSPRINTLN,
