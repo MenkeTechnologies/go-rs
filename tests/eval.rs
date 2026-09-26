@@ -3161,6 +3161,36 @@ func main() { fmt.Println(order, a, b, c) }
     assert_eq!(out, "[c b a init1 init2] 42 20 2\n");
 }
 
+/// `clear` (Go 1.21) empties a map in place — every alias sees it — and zeroes
+/// a slice's elements without changing its length, through a sub-slice's
+/// shared backing too. Struct elements each get their own zero and pointer
+/// elements become nil. It used to be an undefined name.
+#[test]
+fn clear_builtin_on_maps_and_slices() {
+    let (out, ok) = run(r#"package main
+import "fmt"
+type pt struct{ X int }
+func main() {
+	m := map[string]int{"a": 1}
+	alias := m
+	clear(m)
+	fmt.Println(len(m), len(alias))
+	s := []int{1, 2, 3, 4}
+	clear(s[1:3])
+	fmt.Println(s, len(s))
+	ps := []pt{{1}, {2}}
+	clear(ps)
+	ps[0].X = 5
+	fmt.Println(ps)
+	ptrs := []*pt{{X: 1}}
+	clear(ptrs)
+	fmt.Println(ptrs[0] == nil)
+}
+"#);
+    assert!(ok, "{out:?}");
+    assert_eq!(out, "0 0\n[1 0 0 4] 4\n[{5} {0}]\ntrue\n");
+}
+
 /// An element whose type is a pointer, interface, function, channel, slice or
 /// map zeroes to nil. `make([]*T, n)` and `var a [2]error` used to fill with
 /// the integer 0, so `== nil` was false and they printed `0`; a slice or map

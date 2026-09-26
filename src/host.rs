@@ -293,6 +293,12 @@ pub const GPTR_TO: u16 = 859;
 /// `*p = v` — overwrite the struct `p` points at, in place, so every other
 /// pointer to it and the variable itself all see the new value.
 pub const GDEREF_SET: u16 = 990;
+
+/// `[x, zero, "elemTy"]` → `clear(x)` (Go 1.21): a map loses every entry; a
+/// slice keeps its length and has each element set to a fresh copy of `zero`,
+/// the element type's zero value (`elemTy` decides whether that copy recurses,
+/// as for [`GARRAY_COPY`]). Writes through a sub-slice's shared backing.
+pub const GCLEAR: u16 = 991;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -458,6 +464,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GREG_METHODS, b_reg_methods);
     vm.register_builtin(GIFACE_OK, b_iface_ok);
     vm.register_builtin(GASSERT_IFACE, b_assert_iface);
+    vm.register_builtin(GCLEAR, b_clear);
     stdlib::install(vm);
 }
 
@@ -2994,6 +3001,33 @@ fn struct_bind(v: Value) -> Value {
         return v;
     }
     struct_copy(v)
+}
+
+/// `clear(x)` — see [`GCLEAR`].
+fn b_clear(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let Some(Value::Obj(id)) = args.first().cloned() else {
+        return Value::Undef; // a nil map or slice: nothing to clear
+    };
+    let zero = args.get(1).cloned().unwrap_or(Value::Undef);
+    let elem_ty = args.get(2).map(go_str).unwrap_or_default();
+    let is_map = HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        match h.get_mut(id as usize) {
+            Some(HostObj::Map(m)) => {
+                *m = GoMap::from_pairs(Vec::new());
+                true
+            }
+            _ => false,
+        }
+    });
+    if !is_map {
+        let len = slice_backing(id).map(|(_, _, l)| l).unwrap_or(0);
+        for i in 0..len {
+            slice_set(id, i, value_copy(zero.clone(), &elem_ty));
+        }
+    }
+    Value::Undef
 }
 
 /// Copy a fixed-size array value (Go array value semantics), given its written

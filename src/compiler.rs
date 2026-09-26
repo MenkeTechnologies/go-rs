@@ -6317,6 +6317,36 @@ impl Compiler {
             if name == "errors.As" {
                 return self.errors_as(args, line);
             }
+            // `clear(x)` — empties a map, or zeroes every element of a slice.
+            // The element's zero value is the static type's, so it is built
+            // here and handed to the host with the element type that decides
+            // how each element gets its own copy of it.
+            if name == "clear" && args.len() == 1 {
+                // `clear(s[i:j])` has the element type of what it slices.
+                let container = match &args[0] {
+                    Expr::Slice { recv, .. } => self.type_name(recv),
+                    a => self.type_name(a),
+                };
+                // The element type as written: `[]*T` must zero to a nil
+                // pointer, not a `T`, so the `*` that `elem_type_of` strips
+                // is kept.
+                let container = self.underlying(&container);
+                let elem = array_elem_ty(&container)
+                    .or_else(|| container.strip_prefix("[]"))
+                    .or_else(|| map_value_ty(&container))
+                    .unwrap_or("")
+                    .to_string();
+                self.expr(&args[0])?;
+                if self.structs.contains(&self.underlying(&elem)) {
+                    self.struct_lit(&self.underlying(&elem), &[])?;
+                } else {
+                    self.emit_zero(&elem, line);
+                }
+                let c = self.b.add_constant(Value::str(elem));
+                self.b.emit(Op::LoadConst(c), line);
+                self.b.emit(Op::CallBuiltin(host::GCLEAR, 3), line);
+                return Ok(());
+            }
             // The vendored `errors` package's one host intrinsic: the runtime type
             // tag a type switch dispatches on, which `asTag` compares against.
             // The `os` package's one host intrinsic: the write behind
