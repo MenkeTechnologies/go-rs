@@ -683,7 +683,7 @@ fn collect_locals(s: &Stmt, out: &mut HashSet<String>) {
 
 /// Free-name walk of a statement: a referenced identifier not in `bound` is free
 /// (added to `out`). `bound` grows monotonically (matching [`Compiler::fv_stmt`]).
-fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
+pub(crate) fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
     let fe = free_expr;
     match s {
         Stmt::Var { name, init, .. } => {

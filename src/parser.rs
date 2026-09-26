@@ -394,15 +394,29 @@ impl Parser {
         let mut main = Vec::new();
         // Package-level `var`/`const` declarations, collected separately so
         // `func main` (which sets the main body) does not overwrite them; they
-        // are prepended to the main body to run first (no separate init phase).
+        // are prepended to the main body, in initialization order, to run first.
         let mut globals = Vec::new();
         let mut funcs = Vec::new();
+        let mut init_calls = Vec::new();
         while !matches!(self.peek(), Tok::Eof) {
             match self.peek() {
                 Tok::Func => {
-                    let f = self.func_decl()?;
+                    let mut f = self.func_decl()?;
                     if f.name == "main" && f.receiver.is_none() {
                         main = f.body;
+                    } else if f.name == "init" && f.receiver.is_none() {
+                        // A package may declare any number of `init` functions;
+                        // none can be named or called, so each gets a unique
+                        // name and one call, in source order, after the
+                        // package-level variables are initialized.
+                        f.name = format!("init${}", init_calls.len() + 1);
+                        init_calls.push(Stmt::ExprStmt(Expr::Call {
+                            func: Box::new(Expr::Ident(f.name.clone())),
+                            args: Vec::new(),
+                            spread: false,
+                            line: f.line,
+                        }));
+                        funcs.push(f);
                     } else {
                         funcs.push(f);
                     }
@@ -426,7 +440,10 @@ impl Parser {
             self.skip_semis();
         }
 
-        // Globals run before the main body.
+        // Package initialization: the package-level variables in dependency
+        // order, then every `init` function in source order, then `main`.
+        let mut globals = init_order(globals, &funcs);
+        globals.extend(init_calls);
         globals.extend(main);
         let main = globals;
 
@@ -2684,6 +2701,103 @@ impl Parser {
             elem_zero: Box::new(self.zero_value_expr(elem_ty)),
         })
     }
+}
+
+/// Order package-level declarations for initialization, per the Go spec's
+/// "Package initialization": repeatedly take the earliest declaration, in
+/// source order, whose initializer depends on no variable still uninitialized.
+/// A declaration depends on the package-level names its initializer mentions,
+/// and — transitively — on those mentioned by the bodies of the package
+/// functions it (or they) reference. So `var a = b + 1; var b = f(); func f()
+/// int { return c }; var c = 2` initializes `c`, `b`, `a`.
+///
+/// Grouped `var (…)` / `const (…)` blocks are flattened, because the rule is
+/// per variable, not per group. A dependency cycle cannot occur in a program
+/// Go accepts; if one is left, the rest keep their source order.
+fn init_order(decls: Vec<Stmt>, funcs: &[Func]) -> Vec<Stmt> {
+    fn flatten(s: Stmt, out: &mut Vec<Stmt>) {
+        match s {
+            Stmt::Block(ss) => ss.into_iter().for_each(|s| flatten(s, out)),
+            s => out.push(s),
+        }
+    }
+    fn declared(s: &Stmt) -> Vec<String> {
+        match s {
+            Stmt::Var { name, .. } => vec![name.clone()],
+            Stmt::Short { names, .. } => names.clone(),
+            _ => Vec::new(),
+        }
+    }
+    fn mentions(s: &Stmt) -> HashSet<String> {
+        let mut out = HashSet::new();
+        match s {
+            // The declared name itself is not a dependency of its initializer.
+            Stmt::Var { init: Some(e), .. } => {
+                crate::compiler::free_stmt(&Stmt::ExprStmt(e.clone()), &mut HashSet::new(), &mut out)
+            }
+            Stmt::Var { init: None, .. } => {}
+            s => crate::compiler::free_stmt(s, &mut HashSet::new(), &mut out),
+        }
+        out
+    }
+    let mut units = Vec::new();
+    decls.into_iter().for_each(|s| flatten(s, &mut units));
+
+    let funcs: HashMap<&str, &Func> = funcs
+        .iter()
+        .filter(|f| f.receiver.is_none())
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    let owner: HashMap<String, usize> = units
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| declared(s).into_iter().map(move |n| (n, i)))
+        .collect();
+    // Each unit's dependencies: the other units owning a name it reaches.
+    let deps: Vec<HashSet<usize>> = units
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut seen_funcs = HashSet::new();
+            let mut pending: Vec<String> = mentions(s).into_iter().collect();
+            let mut out = HashSet::new();
+            while let Some(name) = pending.pop() {
+                if let Some(&j) = owner.get(&name) {
+                    if j != i {
+                        out.insert(j);
+                    }
+                } else if let Some(f) = funcs.get(name.as_str()) {
+                    if seen_funcs.insert(name) {
+                        let mut bound: HashSet<String> =
+                            f.params.iter().map(|p| p.name.clone()).collect();
+                        bound.extend(f.result_names.iter().cloned());
+                        let mut free = HashSet::new();
+                        f.body
+                            .iter()
+                            .for_each(|s| crate::compiler::free_stmt(s, &mut bound, &mut free));
+                        pending.extend(free);
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    let mut done = vec![false; units.len()];
+    let mut order = Vec::with_capacity(units.len());
+    while order.len() < units.len() {
+        let ready = (0..units.len())
+            .find(|&i| !done[i] && deps[i].iter().all(|&j| done[j]))
+            .or_else(|| (0..units.len()).find(|&i| !done[i]))
+            .expect("an undone unit remains");
+        done[ready] = true;
+        order.push(ready);
+    }
+    let mut slots: Vec<Option<Stmt>> = units.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each unit is placed once"))
+        .collect()
 }
 
 /// The predeclared integer types — a conversion to one keeps a constant integer.

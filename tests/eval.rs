@@ -3139,3 +3139,24 @@ func main() {
     assert_eq!(out, "[1 2 0] [9 2 0] [1 5 0]\n");
 }
 
+/// Package variables initialize in dependency order (through the bodies of
+/// the functions they call), then every `init` runs in source order, then
+/// `main`. go-rs used to run the declarations in source order — so `var a =
+/// b` read `b` before it was set — and never ran `init` at all.
+#[test]
+fn package_initialization_order_and_init_functions() {
+    let (out, ok) = run(r#"package main
+import "fmt"
+var order []string
+func mark(s string, v int) int { order = append(order, s); return v }
+var a = mark("a", b+1)
+var b = mark("b", f())
+func f() int { return c * 10 }
+var c = mark("c", 2)
+func init() { order = append(order, "init1"); a *= 2 }
+func init() { order = append(order, "init2") }
+func main() { fmt.Println(order, a, b, c) }
+"#);
+    assert!(ok, "{out:?}");
+    assert_eq!(out, "[c b a init1 init2] 42 20 2\n");
+}
