@@ -43,7 +43,11 @@ pub fn parse(src: &str) -> Result<Program, String> {
         local_types: Vec::new(),
         local_interfaces: Vec::new(),
         defined: HashMap::new(),
+        int_consts: HashMap::new(),
     };
+    // Integer constants first: a defined type's base can be an array sized by
+    // one (`type d [MaxCase]rune`).
+    p.scan_int_consts();
     // Pre-scan `type Name <base>` over a non-struct base, with the real type
     // grammar rather than a token pattern — the base can be any type expression
     // (`map[string][]int`, `func(int) (int, error)`). A use site can precede the
@@ -86,6 +90,11 @@ struct Parser {
     /// go-rs carries the name only where it is observable: `%T`, `%#v` and method
     /// dispatch.
     defined: HashMap<String, String>,
+    /// Integer constants by name — every top-level `const` (pre-scanned, so a
+    /// use may precede the declaration) plus the local ones in scope — so an
+    /// array length written as a constant expression (`[MaxCase]rune`,
+    /// `[N*2]int`) folds to the `[N]T` value type instead of decaying to `[]T`.
+    int_consts: HashMap<String, i64>,
 }
 
 /// The canonical name of an interface type with method set `methods`:
@@ -152,8 +161,34 @@ fn type_spec_positions(tokens: &[Token]) -> Vec<usize> {
 
 /// The token index just past an optional `[ … ]` generic type-parameter list at
 /// `j`, or `j` itself when there is none.
+/// Whether the `[` at `j`, just after a type declaration's name, opens a
+/// generic type-parameter list rather than the declaration's slice or array
+/// base. A parameter list names a parameter and then its constraint (`[T any]`,
+/// `[K comparable, V any]`, `[T ~int | ~float64]`, `[S []E, E any]`); an array
+/// length is an expression (`[3]`, `[N]`, `[N*2]`, `[len(x)]`), and a slice
+/// has nothing between the brackets. `[P *C]` reads either way, and the spec
+/// resolves it as an array length, which this does too.
+fn bracket_opens_type_params(tokens: &[Token], j: usize) -> bool {
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    matches!(kind(j), Some(Tok::LBracket))
+        && matches!(kind(j + 1), Some(Tok::Ident(_)))
+        && matches!(
+            kind(j + 2),
+            Some(
+                Tok::Ident(_)
+                    | Tok::Comma
+                    | Tok::Tilde
+                    | Tok::Interface
+                    | Tok::LBracket
+                    | Tok::Func
+                    | Tok::Chan
+                    | Tok::Struct
+            )
+        )
+}
+
 fn skip_type_param_tokens(tokens: &[Token], j: usize) -> usize {
-    if !matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::LBracket)) {
+    if !bracket_opens_type_params(tokens, j) {
         return j;
     }
     let mut j = j;
@@ -202,8 +237,10 @@ fn scan_generic_names(tokens: &[Token]) -> HashSet<String> {
         match &tokens[i].kind {
             Tok::Type => {
                 // `type Name [` …
-                if let (Some(Tok::Ident(n)), Some(Tok::LBracket)) = (kind(i + 1), kind(i + 2)) {
-                    names.insert(n.clone());
+                if let Some(Tok::Ident(n)) = kind(i + 1) {
+                    if bracket_opens_type_params(tokens, i + 2) {
+                        names.insert(n.clone());
+                    }
                 }
             }
             Tok::Func => {
@@ -424,6 +461,65 @@ impl Parser {
         })
     }
 
+    /// The constant integer value of `e` under the constants in scope.
+    fn const_int(&self, e: &Expr) -> Option<i64> {
+        const_int_of(e, &self.int_consts)
+    }
+
+    /// Record the integer value of each constant a `const` statement declares
+    /// (a `Stmt::Var`, or a `Stmt::Block` of them for a group). A constant
+    /// whose value does not fold — a string, a float, a name not yet known —
+    /// is skipped. Returns whether anything new was learned.
+    fn record_int_consts(&mut self, s: &Stmt) -> bool {
+        match s {
+            Stmt::Var {
+                name,
+                init: Some(e),
+                ..
+            } => match self.const_int(e) {
+                Some(v) if self.int_consts.get(name) != Some(&v) => {
+                    self.int_consts.insert(name.clone(), v);
+                    true
+                }
+                _ => false,
+            },
+            Stmt::Block(ss) => ss
+                .iter()
+                .fold(false, |learned, s| self.record_int_consts(s) || learned),
+            _ => false,
+        }
+    }
+
+    /// Fill [`Parser::int_consts`] from every top-level `const` declaration,
+    /// ahead of the program walk, so an array length may name a constant
+    /// declared later in the file (or in a later file of the package). The
+    /// declarations are re-evaluated until nothing new folds, which settles a
+    /// constant defined in terms of one declared after it. A declaration that
+    /// fails to parse here is left for the walk to report in source order.
+    fn scan_int_consts(&mut self) {
+        let saved = self.pos;
+        let mut decls = Vec::new();
+        let mut depth = 0usize;
+        for i in 0..self.tokens.len() {
+            match self.tokens[i].kind {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth = depth.saturating_sub(1),
+                Tok::Const if depth == 0 => {
+                    self.pos = i;
+                    if let Ok(s) = self.const_stmt() {
+                        decls.push(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.pos = saved;
+        while decls
+            .iter()
+            .fold(false, |learned, s| self.record_int_consts(s) || learned)
+        {}
+    }
+
     /// Fill [`Parser::defined`] by parsing every `type Name <base>` declaration
     /// whose base is neither a struct nor an interface, ahead of the program
     /// walk. Each is parsed with [`Parser::type_decl`] itself, so the base is
@@ -479,7 +575,7 @@ impl Parser {
         // is a parameter name. `type mySlice []int` and `type myArr [3]int`
         // open the *base* type with the same token, and eating those brackets
         // would leave the base as its element type — `mySlice` over `int`.
-        if matches!(self.peek(), Tok::LBracket) && !self.brackets_open_a_type() {
+        if bracket_opens_type_params(&self.tokens, self.pos) {
             self.skip_type_brackets()?;
         }
         // A defined type over a non-struct base: `type Weekday int`,
@@ -943,7 +1039,8 @@ impl Parser {
                     if matches!(self.peek(), Tok::Ellipsis) {
                         self.advance();
                     } else {
-                        len = const_int_of(&self.expr()?).filter(|n| *n >= 0);
+                        let n = self.expr()?;
+                        len = self.const_int(&n).filter(|n| *n >= 0);
                     }
                 }
                 self.expect(&Tok::RBracket)?;
@@ -1037,12 +1134,15 @@ impl Parser {
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
         self.expect(&Tok::LBrace)?;
         self.skip_semis();
+        // A constant declared in the block goes out of scope at its `}`.
+        let outer_consts = self.int_consts.clone();
         let mut stmts = Vec::new();
         while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
             stmts.push(self.stmt()?);
             self.skip_semis();
         }
         self.expect(&Tok::RBrace)?;
+        self.int_consts = outer_consts;
         Ok(stmts)
     }
 
@@ -1068,7 +1168,11 @@ impl Parser {
         }
         match self.peek() {
             Tok::Var => self.var_stmt(),
-            Tok::Const => self.const_stmt(),
+            Tok::Const => {
+                let s = self.const_stmt()?;
+                self.record_int_consts(&s);
+                Ok(s)
+            }
             // `type T …` in a function body. It declares no run-time work, so it
             // lowers to nothing; the declaration itself is hoisted to the
             // program (a defined type goes into `defined` inside `type_decl`).
@@ -1187,7 +1291,8 @@ impl Parser {
                 self.advance();
                 None
             } else {
-                const_int_of(&self.expr()?)
+                let n = self.expr()?;
+                self.const_int(&n)
                     .filter(|n| *n >= 0)
                     .map(|n| n as usize)
             };
@@ -2026,6 +2131,20 @@ impl Parser {
                         // `Stack[int]{ … }` — a generic struct composite literal.
                         if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&base) {
                             e = self.struct_literal(base)?;
+                        } else if matches!(self.peek(), Tok::LBrace) {
+                            // `Pair[int]{ … }` over a slice, array or map base —
+                            // the base's literal under the defined name, as for a
+                            // non-generic defined type in `primary`.
+                            if let Some(ty) = self.defined_composite_base(&base) {
+                                let line = self.line();
+                                let lit = self.elided_literal(&ty)?;
+                                e = Expr::Call {
+                                    func: Box::new(Expr::Ident(base)),
+                                    args: vec![lit],
+                                    spread: false,
+                                    line,
+                                };
+                            }
                         }
                         continue;
                     }
@@ -2296,7 +2415,7 @@ impl Parser {
             None
         } else {
             let n = self.expr()?;
-            const_int_of(&n).map(|n| n as usize)
+            self.const_int(&n).map(|n| n as usize)
         };
         self.expect(&Tok::RBracket)?;
         let elem_ty = self.type_name()?;
@@ -2316,7 +2435,7 @@ impl Parser {
                 let first = self.expr()?;
                 if self.eat(&Tok::Colon) {
                     // `idx: value` — an index-keyed element.
-                    let idx = const_int_of(&first).ok_or_else(|| {
+                    let idx = self.const_int(&first).ok_or_else(|| {
                         format!(
                             "go-rs: array index in a composite literal must be a constant (line {})",
                             self.line()
@@ -2384,17 +2503,6 @@ impl Parser {
             return self.expr();
         }
         self.elided_literal(ty)
-    }
-
-    /// Whether the `[` at the cursor opens a slice or array *type* rather than a
-    /// generic type-parameter list: `[]T` has nothing between the brackets, and
-    /// `[3]T` / `[...]T` a length. A parameter list always names a parameter
-    /// first (`[T any]`).
-    fn brackets_open_a_type(&self) -> bool {
-        matches!(
-            self.tokens.get(self.pos + 1).map(|t| &t.kind),
-            Some(Tok::RBracket) | Some(Tok::Int(_)) | Some(Tok::Ellipsis)
-        )
     }
 
     /// The base of a defined type whose base is a composite — a slice, an array
@@ -2578,19 +2686,38 @@ impl Parser {
     }
 }
 
+/// The predeclared integer types — a conversion to one keeps a constant integer.
+const INT_TYPE_NAMES: &[&str] = &[
+    "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64",
+    "uintptr", "byte", "rune",
+];
+
 /// The constant integer value of an expression, if it folds to one — used for
-/// array sizes and index-keyed array-literal elements. Handles literals and the
-/// simple unary/binary arithmetic that appears in array bounds.
-fn const_int_of(e: &Expr) -> Option<i64> {
+/// array sizes and index-keyed array-literal elements. Handles literals, named
+/// integer constants from `consts`, a conversion to an integer type
+/// (`int(N)`), and the unary/binary arithmetic that appears in array bounds.
+fn const_int_of(e: &Expr, consts: &HashMap<String, i64>) -> Option<i64> {
     match e {
         Expr::Int(n) => Some(*n),
+        Expr::Ident(name) => consts.get(name).copied(),
+        Expr::Call {
+            func,
+            args,
+            spread: false,
+            ..
+        } if args.len() == 1 => match func.as_ref() {
+            Expr::Ident(t) if INT_TYPE_NAMES.contains(&t.as_str()) => {
+                const_int_of(&args[0], consts)
+            }
+            _ => None,
+        },
         Expr::Unary {
             op: crate::ast::UnOp::Neg,
             rhs,
-        } => const_int_of(rhs).map(|n| -n),
+        } => const_int_of(rhs, consts).map(|n| -n),
         Expr::Binary { op, lhs, rhs } => {
             use crate::ast::BinOp;
-            let (a, b) = (const_int_of(lhs)?, const_int_of(rhs)?);
+            let (a, b) = (const_int_of(lhs, consts)?, const_int_of(rhs, consts)?);
             match op {
                 BinOp::Add => Some(a + b),
                 BinOp::Sub => Some(a - b),

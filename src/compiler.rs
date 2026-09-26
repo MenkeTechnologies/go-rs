@@ -4721,8 +4721,12 @@ impl Compiler {
     /// be decided at run time: an array and a slice are the same heap object, so
     /// only the written type says whether an element is itself an array (copy)
     /// or a slice (share).
+    ///
+    /// A defined type is a value type exactly when its base is: `type d
+    /// [3]rune` copies as `[3]rune` does.
     fn emit_copy_for(&mut self, ty: &str) {
-        if let Some(elem) = array_elem_ty(ty) {
+        let base = self.underlying(ty);
+        if let Some(elem) = array_elem_ty(&base) {
             let c = self.b.add_constant(Value::str(elem.to_string()));
             self.b.emit(Op::LoadConst(c), 0);
             self.b.emit(Op::CallBuiltin(host::GARRAY_COPY, 2), 0);

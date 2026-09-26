@@ -3092,3 +3092,50 @@ fn a_comparable_map_key_type_still_builds() {
         assert_eq!(out, "0\n", "map[{key_ty}]int");
     }
 }
+
+/// An array length written as a named constant — declared before or after
+/// the use, local, converted, or in arithmetic — is a fixed-size array, not a
+/// slice: its zero value has N elements and a short literal is padded to N.
+/// Before, any length that was not a bare literal decayed to `[]T`, and a
+/// defined type over one (`type d [MaxCase]rune`, how `unicode` declares its
+/// case tables) was read as a generic type-parameter list and failed to parse.
+#[test]
+fn array_length_named_by_a_constant() {
+    let (out, ok) = run(r#"package main
+import "fmt"
+type d [MaxCase]rune
+const MaxCase = 3
+func main() {
+	var z [MaxCase * 2]int
+	s := [int(MaxCase)]string{"a"}
+	const n = 2
+	var g [n][MaxCase]bool
+	x := d{1}
+	fmt.Println(len(z), len(s), len(g), len(g[0]), x)
+	fmt.Printf("%T %T\n", z, x)
+}
+"#);
+    assert!(ok, "{out:?}");
+    assert_eq!(out, "6 3 2 3 [1 0 0]\n[6]int main.d\n");
+}
+
+/// A defined type over an array is a value type like its base: assigning it
+/// copies, so writing the copy leaves the original alone.
+#[test]
+fn defined_array_type_copies_on_assignment() {
+    let (out, ok) = run(r#"package main
+import "fmt"
+type d [3]rune
+func main() {
+	a := d{1, 2}
+	b := a
+	b[0] = 9
+	var c d = a
+	c[1] = 5
+	fmt.Println(a, b, c)
+}
+"#);
+    assert!(ok, "{out:?}");
+    assert_eq!(out, "[1 2 0] [9 2 0] [1 5 0]\n");
+}
+
