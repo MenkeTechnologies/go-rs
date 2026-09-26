@@ -2210,8 +2210,9 @@ sw:
 
 #[test]
 fn label_on_a_non_loop_is_rejected() {
-    // A label can only introduce a `for` or a `switch`, so labeling anything
-    // else is a compile error rather than a label that binds to nothing.
+    // Any statement may carry a label, but Go rejects one that no `goto`,
+    // `break` or `continue` uses — so this label, which nothing names, is a
+    // compile error rather than a label that binds to nothing.
     let src = "\
 package main
 func main() {
@@ -3216,4 +3217,41 @@ func main() {
         out,
         "true true true true true\n[<nil> <nil>] [<nil>] [[] []]\n[]int(nil)\n"
     );
+}
+
+/// `goto` jumps backward (forming a loop) and forward (skipping code) within
+/// its function, to a label on any statement; an undefined label is a build
+/// error. `goto` was not a keyword, and a label on anything but a `for` or
+/// `switch` was rejected.
+#[test]
+fn goto_jumps_to_a_label_in_the_same_function() {
+    let (out, ok) = run(r#"package main
+import "fmt"
+func gcd(a, b int) int {
+loop:
+	if b != 0 {
+		a, b = b, a%b
+		goto loop
+	}
+	return a
+}
+func main() {
+	fmt.Println(gcd(48, 18))
+	n := 0
+	if n == 0 {
+		goto skip
+	}
+	fmt.Println("skipped")
+skip:
+	fmt.Println("done")
+}
+"#);
+    assert!(ok, "{out:?}");
+    assert_eq!(out, "6\ndone\n");
+
+    let (err, ok) = run_capturing_stderr(
+        "package main\nfunc main() {\n\tgoto nowhere\n}\n",
+    );
+    assert!(!ok, "an undefined label was accepted: {err:?}");
+    assert!(err.contains("label `nowhere` not defined"), "{err:?}");
 }

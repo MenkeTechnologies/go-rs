@@ -845,7 +845,11 @@ impl Qualifier {
                 }
             }
             Stmt::Block(b) => self.stmts(b, &mut bound.clone()),
-            Stmt::Fallthrough(_) | Stmt::Break(..) | Stmt::Continue(..) => {}
+            Stmt::Fallthrough(_)
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Goto(..)
+            | Stmt::Label(..) => {}
         }
     }
 

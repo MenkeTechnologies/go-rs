@@ -194,6 +194,13 @@ pub enum Stmt {
     },
     /// `fallthrough` — transfer to the next `switch` case's body.
     Fallthrough(u32),
+    /// `goto label` — jump to the statement `label:` introduces in the same
+    /// function.
+    Goto(String, u32),
+    /// The position of a `label:` — the target of a `goto`. It is emitted as
+    /// its own statement, just before the statement the label introduces, so
+    /// the labeled statement itself is left as it is.
+    Label(String, u32),
     /// `break`.
     /// `break` / `break label` — the label names an enclosing labeled loop or
     /// `switch`, which is the one this leaves.
@@ -415,10 +422,10 @@ pub enum BinOp {
     AndNot,
 }
 
-/// Attach a `label:` to the statement it introduces. Only a `for` or a `switch`
-/// can carry one, because those are the only things a labeled `break` or
-/// `continue` can name; anything else is a compile error rather than a label
-/// that silently binds to nothing.
+/// Attach a `label:` to the statement it introduces, when that statement is a
+/// `for` or a `switch` — the only things a labeled `break` or `continue` can
+/// name. Returns whether it was one; any statement may still be the target of
+/// a `goto`, which the parser marks separately.
 pub fn set_stmt_label(s: &mut Stmt, name: &str) -> bool {
     match s {
         Stmt::For { label, .. } | Stmt::ForRange { label, .. } | Stmt::Switch { label, .. } => {

@@ -1175,19 +1175,23 @@ impl Parser {
         // introduces rather than becoming a statement of its own, because that
         // is the only thing it can attach to.
         if self.at_label() {
+            let line = self.line();
             let Tok::Ident(label) = self.advance() else {
                 unreachable!("at_label checked the token")
             };
             self.advance(); // `:`
             self.skip_semis();
-            let mut inner = self.stmt()?;
-            if !set_stmt_label(&mut inner, &label) {
-                return Err(format!(
-                    "go-rs: label `{label}` must introduce a `for` or `switch` (line {})",
-                    self.line()
-                ));
-            }
-            return Ok(inner);
+            // A label may end its block, labeling an empty statement.
+            let mut inner = if matches!(self.peek(), Tok::RBrace) {
+                Stmt::Block(Vec::new())
+            } else {
+                self.stmt()?
+            };
+            // A `for` or `switch` also carries the label, for a labeled
+            // `break`/`continue`; any statement can be a `goto` target, which
+            // is the position the `Label` marks.
+            set_stmt_label(&mut inner, &label);
+            return Ok(Stmt::Block(vec![Stmt::Label(label, line), inner]));
         }
         match self.peek() {
             Tok::Var => self.var_stmt(),
@@ -1229,6 +1233,11 @@ impl Parser {
                 let line = self.line();
                 self.advance();
                 Ok(Stmt::Continue(line, self.opt_label()))
+            }
+            Tok::Goto => {
+                let line = self.line();
+                self.advance();
+                Ok(Stmt::Goto(self.ident()?, line))
             }
             Tok::Fallthrough => {
                 let line = self.line();

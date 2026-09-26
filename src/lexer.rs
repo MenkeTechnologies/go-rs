@@ -57,6 +57,7 @@ pub enum Tok {
     Select,
     Switch,
     Fallthrough,
+    Goto,
     Defer,
     // punctuation
     LBrace,
@@ -539,6 +540,7 @@ fn keyword_or_ident(word: &str) -> Tok {
         "select" => Tok::Select,
         "switch" => Tok::Switch,
         "fallthrough" => Tok::Fallthrough,
+        "goto" => Tok::Goto,
         "defer" => Tok::Defer,
         _ => Tok::Ident(word.to_string()),
     }

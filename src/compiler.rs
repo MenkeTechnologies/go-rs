@@ -385,6 +385,14 @@ struct Compiler {
     /// Forward jumps (from `panic` sites and post-call unwind checks) to the
     /// current function's panic epilogue; patched when that epilogue is emitted.
     panic_jumps: Vec<usize>,
+    /// The current function body's `label:` positions, and the `goto` jumps
+    /// waiting for them — resolved by [`Self::resolve_gotos`] once the whole
+    /// body is emitted, since a `goto` may jump forward.
+    labels: HashMap<String, (usize, u32)>,
+    gotos: Vec<(String, usize, u32)>,
+    /// Labels a labeled `break`/`continue` named in the current body — with
+    /// the `goto` targets, the labels that are used. Go rejects any other.
+    branch_labels: HashSet<String>,
     /// This function's params/locals that are captured by a nested closure and
     /// so live in a shared heap cell (Go's capture-by-reference). Reads/writes go
     /// through the cell; a captured cell handle is shared with the closure.
@@ -489,7 +497,11 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
                     || cases.iter().any(|c| body_uses_panic(&c.body))
                     || default.as_deref().is_some_and(body_uses_panic)
             }
-            Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => false,
+            Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Fallthrough(_)
+            | Stmt::Goto(..)
+            | Stmt::Label(..) => false,
         }
     }
     body.iter().any(st)
@@ -826,7 +838,11 @@ pub(crate) fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet
             }
         }
         Stmt::Block(b) => b.iter().for_each(|s| free_stmt(s, bound, out)),
-        Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => {}
+        Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Fallthrough(_)
+            | Stmt::Goto(..)
+            | Stmt::Label(..) => {}
     }
 }
 
@@ -998,7 +1014,11 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
             }
         }
         Stmt::Block(b) => b.iter().for_each(|s| walk_stmt_exprs(s, f)),
-        Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => {}
+        Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Fallthrough(_)
+            | Stmt::Goto(..)
+            | Stmt::Label(..) => {}
     }
 }
 
@@ -1391,6 +1411,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         defined_types: prog.defined.iter().cloned().collect(),
         loops: Vec::new(),
         main_exits: Vec::new(),
+        labels: HashMap::new(),
+        gotos: Vec::new(),
+        branch_labels: HashSet::new(),
         temp_counter: 0,
         lambdas: Vec::new(),
         closure_vars: HashMap::new(),
@@ -1440,6 +1463,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     for s in &prog.main {
         c.stmt(s)?;
     }
+    c.resolve_gotos()?;
     // `return` inside `main`, and any panic unwind, jump here; run any deferred
     // calls (a deferred `recover()` may clear the panic), then fall off.
     let end = c.b.current_pos();
@@ -1583,6 +1607,7 @@ impl Compiler {
         for s in &f.body {
             self.stmt(s)?;
         }
+        self.resolve_gotos()?;
         // Fall-off: return the named results (their current values, possibly set
         // by a deferred func) or nil for unnamed results.
         if self.named_results.is_empty() {
@@ -1645,6 +1670,32 @@ impl Compiler {
             capture_types,
         });
         id
+    }
+
+    /// Patch every `goto` of the body just emitted to its label, and start the
+    /// next body with none. A label is scoped to its function, so a body's
+    /// label table never outlives it. As in Go, a `goto` to a label the body
+    /// does not define is an error, and so is a label nothing uses.
+    fn resolve_gotos(&mut self) -> Result<(), String> {
+        let labels = std::mem::take(&mut self.labels);
+        let mut used = std::mem::take(&mut self.branch_labels);
+        for (name, j, line) in std::mem::take(&mut self.gotos) {
+            let (target, _) = *labels
+                .get(&name)
+                .ok_or_else(|| format!("go-rs: label `{name}` not defined (line {line})"))?;
+            self.b.patch_jump(j, target);
+            used.insert(name);
+        }
+        let mut unused: Vec<(&String, u32)> = labels
+            .iter()
+            .filter(|(name, _)| !used.contains(*name))
+            .map(|(name, &(_, line))| (name, line))
+            .collect();
+        unused.sort_by_key(|&(_, line)| line);
+        if let Some((name, line)) = unused.first() {
+            return Err(format!("go-rs: label `{name}` defined and not used (line {line})"));
+        }
+        Ok(())
     }
 
     /// Return from the current function: run any deferred calls (LIFO), drop the
@@ -2037,6 +2088,7 @@ impl Compiler {
         for s in &body {
             self.stmt(s)?;
         }
+        self.resolve_gotos()?;
         self.b.emit(Op::LoadUndef, 0);
         self.emit_return(0);
         self.emit_panic_epilogue(&[], 0);
@@ -2261,7 +2313,11 @@ impl Compiler {
                     self.fv_stmt(s, bound, caps);
                 }
             }
-            Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => {}
+            Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Fallthrough(_)
+            | Stmt::Goto(..)
+            | Stmt::Label(..) => {}
         }
     }
 
@@ -2795,6 +2851,16 @@ impl Compiler {
             // `fallthrough` is realized structurally by `compile_switch` (it
             // detects a case body ending in one); here it emits nothing.
             Stmt::Fallthrough(_) => {}
+            Stmt::Label(name, line) => {
+                let pos = self.b.current_pos();
+                if self.labels.insert(name.clone(), (pos, *line)).is_some() {
+                    return Err(format!("go-rs: label `{name}` already defined (line {line})"));
+                }
+            }
+            Stmt::Goto(name, line) => {
+                let j = self.b.emit(Op::Jump(0), *line);
+                self.gotos.push((name.clone(), j, *line));
+            }
             Stmt::Defer { call, line } => self.compile_defer(call, *line)?,
             Stmt::Send { chan, val, line } => {
                 self.expr(chan)?;
@@ -2847,6 +2913,7 @@ impl Compiler {
                         .ok_or_else(|| format!("go-rs: `break` outside a loop (line {line})"))?,
                 };
                 scope.breaks.push(j);
+                self.branch_labels.extend(label.iter().cloned());
             }
             Stmt::Continue(line, label) => {
                 let j = self.b.emit(Op::Jump(0), *line);
@@ -2870,6 +2937,7 @@ impl Compiler {
                         .ok_or_else(|| format!("go-rs: `continue` outside a loop (line {line})"))?,
                 };
                 scope.continues.push(j);
+                self.branch_labels.extend(label.iter().cloned());
             }
             Stmt::Block(stmts) => {
                 for s in stmts {
@@ -6935,8 +7003,9 @@ fn stmt_line(s: &Stmt) -> u32 {
         | Stmt::TypeSwitch { line, .. }
         | Stmt::Fallthrough(line)
         | Stmt::Break(line, _)
-        | Stmt::Continue(line, _) => *line,
-        Stmt::ExprStmt(_) | Stmt::Block(_) => 0,
+        | Stmt::Continue(line, _)
+        | Stmt::Goto(_, line) => *line,
+        Stmt::ExprStmt(_) | Stmt::Block(_) | Stmt::Label(..) => 0,
     }
 }
 
@@ -6977,7 +7046,11 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                 || cases.iter().any(|c| body_has_ffi(&c.body))
                 || default.as_ref().is_some_and(|d| body_has_ffi(d))
         }
-        Stmt::IncDec { .. } | Stmt::Break(..) | Stmt::Continue(..) | Stmt::Fallthrough(_) => false,
+        Stmt::IncDec { .. } | Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Fallthrough(_)
+            | Stmt::Goto(..)
+            | Stmt::Label(..) => false,
     })
 }
 
