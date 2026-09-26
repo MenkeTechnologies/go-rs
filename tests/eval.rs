@@ -3160,3 +3160,30 @@ func main() { fmt.Println(order, a, b, c) }
     assert!(ok, "{out:?}");
     assert_eq!(out, "[c b a init1 init2] 42 20 2\n");
 }
+
+/// An element whose type is a pointer, interface, function, channel, slice or
+/// map zeroes to nil. `make([]*T, n)` and `var a [2]error` used to fill with
+/// the integer 0, so `== nil` was false and they printed `0`; a slice or map
+/// element was a non-nil empty value.
+#[test]
+fn reference_typed_elements_zero_to_nil() {
+    let (out, ok) = run(r#"package main
+import "fmt"
+type T struct{ n int }
+func main() {
+	ps := make([]*T, 2)
+	var errs [1]error
+	fs := make([]func(), 1)
+	var grid [2][]int
+	ms := make([]map[string]int, 1)
+	fmt.Println(ps[0] == nil, errs[0] == nil, fs[0] == nil, grid[0] == nil, ms[0] == nil)
+	fmt.Println(ps, errs, grid)
+	fmt.Printf("%#v\n", []int(nil))
+}
+"#);
+    assert!(ok, "{out:?}");
+    assert_eq!(
+        out,
+        "true true true true true\n[<nil> <nil>] [<nil>] [[] []]\n[]int(nil)\n"
+    );
+}

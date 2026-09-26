@@ -25,7 +25,8 @@ pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = lex(src)?;
     // Pre-scan `type <IDENT> struct` so a `T{…}` composite literal can be told
     // apart from an identifier `T` followed by a block `{`.
-    let struct_names = scan_struct_names(&tokens);
+    let struct_names = scan_type_names(&tokens, &Tok::Struct);
+    let iface_names = scan_type_names(&tokens, &Tok::Interface);
     // Pre-scan generic declarations — a `func Name[…]` / `type Name[…]` (Go 1.18
     // type parameters). go-rs is dynamically typed on the fusevm value model, so
     // generics are handled by *erasure*: the type-parameter and type-argument
@@ -36,6 +37,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         tokens,
         pos: 0,
         struct_names,
+        iface_names,
         generic_names,
         no_composite: false,
         anon_structs: HashMap::new(),
@@ -62,6 +64,8 @@ struct Parser {
     pos: usize,
     /// Names declared as `type T struct` — enables `T{…}` composite literals.
     struct_names: HashSet<String>,
+    /// Names declared as `type I interface` — their zero value is `nil`.
+    iface_names: HashSet<String>,
     /// Names declared generic (`func F[…]` / `type T[…]`) — enables telling an
     /// instantiation `F[int](…)` apart from an index expression `xs[i]`.
     generic_names: HashSet<String>,
@@ -209,17 +213,19 @@ fn skip_type_param_tokens(tokens: &[Token], j: usize) -> usize {
     j
 }
 
-/// Collect names declared as `type Name struct` — including generic structs
-/// `type Name[T any] struct`, where an optional `[ … ]` type-parameter list sits
-/// between the name and `struct`. Enables `Name{…}` composite-literal parsing.
-fn scan_struct_names(tokens: &[Token]) -> HashSet<String> {
+/// Collect names declared as `type Name <kind>` — `kind` is `Tok::Struct` or
+/// `Tok::Interface` — including generic ones (`type Name[T any] struct`), where
+/// an optional `[ … ]` type-parameter list sits between the name and the
+/// keyword. Struct names enable `Name{…}` composite-literal parsing; interface
+/// names give a `[]Name` / `[N]Name` element its nil zero value.
+fn scan_type_names(tokens: &[Token], kind: &Tok) -> HashSet<String> {
     let mut names = HashSet::new();
     for p in type_spec_positions(tokens) {
         let Tok::Ident(n) = &tokens[p].kind else {
             continue;
         };
         let j = skip_type_param_tokens(tokens, p + 1);
-        if matches!(tokens.get(j).map(|t| &t.kind), Some(Tok::Struct)) {
+        if tokens.get(j).map(|t| &t.kind) == Some(kind) {
             names.insert(n.clone());
         }
     }
@@ -1369,18 +1375,14 @@ impl Parser {
                 array_len: Some(n),
             };
         }
-        if let Some(inner) = ty.strip_prefix("[]") {
-            return Expr::SliceLit {
-                elem_ty: inner.to_string(),
-                elems: Vec::new(),
-                array_len: None,
-            };
-        }
-        if let Some((key_ty, val_ty)) = split_map_type(ty) {
-            return Expr::MapLit {
-                key_ty,
-                val_ty,
-                pairs: Vec::new(),
+        // A slice or map zeroes to its typed nil, `[]T(nil)`: it prints `[]` /
+        // `map[]`, has length 0, and compares equal to `nil`.
+        if ty.starts_with("[]") || split_map_type(ty).is_some() {
+            return Expr::Call {
+                func: Box::new(Expr::Ident(ty.to_string())),
+                args: vec![Expr::Ident("nil".to_string())],
+                spread: false,
+                line: self.line(),
             };
         }
         if self.struct_names.contains(ty) {
@@ -1388,6 +1390,16 @@ impl Parser {
                 type_name: ty.to_string(),
                 fields: Vec::new(),
             };
+        }
+        // A pointer, channel, function or interface zeroes to `nil` — so
+        // `make([]*T, n)`, `var a [2]error` hold nils, not the integer 0.
+        if ty.starts_with('*')
+            || ty.starts_with("chan ")
+            || ty.starts_with("interface{")
+            || matches!(ty, "func" | "error" | "any")
+            || self.iface_names.contains(ty)
+        {
+            return Expr::Ident("nil".to_string());
         }
         zero_expr(ty)
     }
@@ -2492,6 +2504,19 @@ impl Parser {
         let key_ty = self.type_name()?;
         self.expect(&Tok::RBracket)?;
         let val_ty = self.type_name()?;
+        // `map[K]V(x)` — a conversion, not a literal.
+        if matches!(self.peek(), Tok::LParen) {
+            let line = self.line();
+            self.advance();
+            let arg = self.expr()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::Call {
+                func: Box::new(Expr::Ident(format!("map[{key_ty}]{val_ty}"))),
+                args: vec![arg],
+                spread: false,
+                line,
+            });
+        }
         self.expect(&Tok::LBrace)?;
         let mut pairs = Vec::new();
         while !matches!(self.peek(), Tok::RBrace) {

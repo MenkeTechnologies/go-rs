@@ -5143,6 +5143,11 @@ impl Compiler {
                 // which is what tells `fmt` the result is text rather than a
                 // list of numbers.
                 Expr::Ident(name) if matches!(name.as_str(), "[]byte" | "[]rune") => name.clone(),
+                // `[]T(x)` / `map[K]V(x)` — a conversion to a written slice or
+                // map type has that type.
+                Expr::Ident(name) if name.starts_with("[]") || name.starts_with("map[") => {
+                    name.clone()
+                }
                 // A conversion to a defined type has that type, which is the
                 // only place its name enters the value flow: `Weekday(3)` is an
                 // `int` at run time and a `main.Weekday` to `%T`.
@@ -6194,6 +6199,21 @@ impl Compiler {
 
         // Bare-name call: a language builtin or a user function.
         if let Expr::Ident(name) = func {
+            // `[]T(nil)` / `map[K]V(nil)` — the typed nil of that slice or map
+            // type, which is also how the parser spells a slice or map
+            // element's zero value. Any other operand of a conversion to a
+            // written slice or map type already has its representation.
+            if args.len() == 1 && (name.starts_with("[]") || name.starts_with("map[")) {
+                if matches!(&args[0], Expr::Ident(n) if n == "nil") {
+                    let c = self.b.add_constant(Value::str(name.clone()));
+                    self.b.emit(Op::LoadConst(c), line);
+                    self.b.emit(Op::CallBuiltin(host::GNIL_OF, 1), line);
+                    return Ok(());
+                }
+                if !is_conversion_type(name) {
+                    return self.expr(&args[0]);
+                }
+            }
             // A type conversion `T(x)` — a builtin numeric/string/bool type name
             // applied to a single value.
             if args.len() == 1 && is_conversion_type(name) {
