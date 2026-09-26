@@ -3255,3 +3255,59 @@ skip:
     assert!(!ok, "an undefined label was accepted: {err:?}");
     assert!(err.contains("label `nowhere` not defined"), "{err:?}");
 }
+
+/// A package the binary vendors resolves to the binary's own copy, not to a
+/// copy `go install-std` wrote to `$GO_RS_HOME/src` earlier. That copy is a
+/// snapshot of an older binary's source; when it won, an upgraded binary kept
+/// running it, and `errors.Is` stayed undefined after `errors` gained it.
+/// A package the binary does not vendor still resolves from there.
+#[test]
+fn vendored_package_wins_over_a_stale_installed_copy() {
+    let home = tempfile::tempdir().expect("temp home");
+    let stale = home.path().join("src/errors");
+    std::fs::create_dir_all(&stale).expect("mkdir");
+    std::fs::write(
+        stale.join("errors.go"),
+        "package errors\nfunc New(text string) error { return &e{text} }\ntype e struct{ s string }\nfunc (x *e) Error() string { return x.s }\n",
+    )
+    .expect("write stale errors");
+    let own = home.path().join("src/greet");
+    std::fs::create_dir_all(&own).expect("mkdir");
+    std::fs::write(
+        own.join("greet.go"),
+        "package greet\nfunc Hi() string { return \"hi\" }\n",
+    )
+    .expect("write greet");
+
+    let mut f = tempfile::Builder::new()
+        .suffix(".go")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(
+        br#"package main
+import (
+	"errors"
+	"fmt"
+	"greet"
+)
+var ErrX = errors.New("x")
+func main() {
+	fmt.Println(errors.Is(fmt.Errorf("w: %w", ErrX), ErrX), greet.Hi())
+}
+"#,
+    )
+    .expect("write source");
+    let out = Command::new(env!("CARGO_BIN_EXE_go"))
+        .env("GO_RS_HOME", home.path())
+        .arg("run")
+        .arg(f.path())
+        .output()
+        .expect("spawn go binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout:?} {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout, "true hi\n");
+}

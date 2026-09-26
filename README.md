@@ -302,10 +302,11 @@ rational arithmetic and rounds to `f64` once, matching Go's arbitrary-precision
 constant semantics (a very long decimal or a non-terminating division whose exact
 terms leave the `f64`-exact range falls back to runtime `f64`).
 
-**Bundled packages.** `go install-std` writes the vendored standard-library
-packages that run on go-rs into `~/.go-rs/src` (currently `errors`, `sync`,
-`unicode/utf16`, `cmp`); imports resolve there first, then from the binary's
-vendored copies, then from `$GOROOT/src`. Any package placed under `~/.go-rs/src`
+**Bundled packages.** The standard-library packages vendored into the binary
+(`errors`, `sync`, `unicode/utf16`, `cmp`, `io`, `bytes`) always resolve to the
+binary's own copy; any other import resolves from `~/.go-rs/src`, then from
+`$GOROOT/src`. `go install-std` writes the vendored packages into
+`~/.go-rs/src` as readable source. Any package placed under `~/.go-rs/src`
 (or `$GOPATH/src`) is importable — go-rs is an executor for real Go source, not a
 curated subset.
 

@@ -950,19 +950,25 @@ impl Qualifier {
     }
 }
 
-/// Locate a package's source. Checks the embedded vendored standard library
-/// first, then `$GOROOT/src/<path>` for development.
+/// Locate a package's source: the standard library vendored into the
+/// binary, then `~/.go-rs/src/<path>`, then `$GOROOT/src/<path>`.
+///
+/// The vendored copy comes first because it is the one this binary was built
+/// and tested against. A copy `go install-std` wrote to `~/.go-rs/src` is a
+/// snapshot of some *earlier* binary's vendored source, and letting it win
+/// meant an upgrade kept running the stale package — `errors.Is` stayed
+/// undefined after the binary gained it.
 fn resolve_source(path: &str) -> Option<String> {
-    // 1. The installed stdlib under `~/.go-rs/src/<path>` (see `go install-std`).
+    // 1. The stdlib vendored into the binary.
+    if let Some(src) = vendored_source(path) {
+        return Some(src);
+    }
+    // 2. A package under `~/.go-rs/src/<path>`.
     if let Some(home) = gors_home() {
         let dir = home.join("src").join(path);
         if let Some(src) = read_package_dir(&dir) {
             return Some(src);
         }
-    }
-    // 2. The stdlib vendored into the binary.
-    if let Some(src) = vendored_source(path) {
-        return Some(src);
     }
     // 3. A local Go toolchain's `$GOROOT/src/<path>` (development fallback).
     let goroot = std::env::var("GOROOT").ok().or_else(goroot_from_go)?;
@@ -980,18 +986,13 @@ pub fn gors_home() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".go-rs"))
 }
 
-/// The vendored standard-library packages (import path → single-file source),
-/// written to `~/.go-rs/src/<path>/<name>.go` by `go install-std`.
-pub const VENDORED: &[&str] = &["errors", "sync", "unicode/utf16", "cmp"];
-
-/// Install the vendored standard library into `~/.go-rs/src/`. Returns the
-/// number of packages written.
+/// Install the vendored standard library into `~/.go-rs/src/` — every package
+/// in [`crate::stdlib_vendor::PACKAGES`], each as `<path>/<name>.go`. Returns
+/// the number of packages written.
 pub fn install_stdlib() -> Result<usize, String> {
     let home = gors_home().ok_or("go-rs: cannot determine home directory")?;
     let mut n = 0;
-    for &path in VENDORED {
-        let src = vendored_source(path)
-            .ok_or_else(|| format!("go-rs: vendored source missing for `{path}`"))?;
+    for &(path, src) in crate::stdlib_vendor::PACKAGES {
         let dir = home.join("src").join(path);
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("go-rs: cannot create {}: {e}", dir.display()))?;
