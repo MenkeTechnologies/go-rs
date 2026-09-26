@@ -169,7 +169,7 @@ const CORPUS: &[Entry] = &[
         "break",
         "Keyword",
         "break",
-        "Leaves the innermost enclosing `for` loop or `switch`. Labelled break is not parsed.",
+        "Leaves the innermost enclosing `for` loop or `switch`, or — as `break L` — the enclosing one labeled `L`.",
         "for { if done { break } }",
     ),
     e(
@@ -220,6 +220,13 @@ const CORPUS: &[Entry] = &[
         "switch [init;] [tag] { case …: … }",
         "Multi-way branch in either the tagged form (`switch x`, each case compared to `x`) or the expression form (`switch`, each case a boolean). The first match runs and then leaves the switch — there is no implicit fallthrough. `case a, b:` matches either.",
         "switch {\ncase n < 0:\n\tneg()\ndefault:\n\tpos()\n}",
+    ),
+    e(
+        "goto",
+        "Keyword",
+        "goto L",
+        "Jumps to the statement labeled `L:` in the same function, forward or backward. Any statement may carry the label, including an empty one at the end of a block.",
+        "loop:\n\tif b != 0 {\n\t\ta, b = b, a%b\n\t\tgoto loop\n\t}",
     ),
     e(
         "fallthrough",
@@ -289,8 +296,8 @@ const CORPUS: &[Entry] = &[
         "init",
         "Predeclared Identifier",
         "func init()",
-        "Go runs every `init` function before `main`. go-rs parses `func init` as an ordinary function and never calls it — its body runs only if something calls it by name. Package-level `var` initializers, by contrast, do run first, in dependency-load order.",
-        "func init() { … }   // never runs on its own",
+        "Runs once before `main`, after every package-level variable is initialized. A package may declare several; they run in source order, and none can be called by name.",
+        "func init() { cache = load() }",
     ),
     // ── Type (compiler.rs `numtype_of_ty` + the type-name grammar) ──
     e(
@@ -2138,7 +2145,7 @@ const CORPUS: &[Entry] = &[
         "break statement",
         "Statement",
         "break",
-        "Leaves the innermost loop or switch. Labelled break is not parsed.",
+        "Leaves the innermost loop or switch; `break L` leaves the enclosing loop or switch labeled `L`.",
         "if err != nil { break }",
     ),
     e(
@@ -2333,13 +2340,6 @@ const CORPUS: &[Entry] = &[
         "fmt.Println(xs) // pass the slice",
     ),
     e(
-        "func init",
-        "Divergence from Go",
-        "func init()",
-        "Parsed as an ordinary function and never called. Package-level `var` initializers do run before `main`, so move initialization there.",
-        "var registry = buildRegistry()",
-    ),
-    e(
         "append aliasing",
         "Divergence from Go",
         "append(s, v)",
@@ -2380,13 +2380,6 @@ const CORPUS: &[Entry] = &[
         "func F[T any](…)",
         "Type parameters, constraint interfaces and type arguments are parsed and discarded — the dynamic value model runs one compiled body for every instantiation. The visible consequence is that `var zero T` is nil rather than the concrete type's zero value, which is what breaks `cmp.Or`.",
         "func Sum[T Number](xs []T) T",
-    ),
-    e(
-        "labels and goto",
-        "Divergence from Go",
-        "L: for { break L }",
-        "Statement labels, labelled `break`/`continue`, and `goto` are not implemented. Restructure with a flag or an extra function.",
-        "done := false\nfor !done { … }",
     ),
     e(
         "unsupported package calls",
