@@ -151,7 +151,7 @@
         <article class="doc-entry" id="doc-keyword-14">
           <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>break</code></h3>
           <pre><code class="lang-go">break</code></pre>
-          <p>Leaves the innermost enclosing `for` loop or `switch`. Labelled break is not parsed.</p>
+          <p>Leaves the innermost enclosing `for` loop or `switch`, or — as `break L` — the enclosing one labeled `L`.</p>
           <pre><code class="lang-go">for { if done { break } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-15">
@@ -206,7 +206,17 @@ default:
 }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-22">
-          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>fallthrough</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>goto</code></h3>
+          <pre><code class="lang-go">goto L</code></pre>
+          <p>Jumps to the statement labeled `L:` in the same function, forward or backward. Any statement may carry the label, including an empty one at the end of a block.</p>
+          <pre><code class="lang-go">loop:
+	if b != 0 {
+		a, b = b, a%b
+		goto loop
+	}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-23">
+          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>fallthrough</code></h3>
           <pre><code class="lang-go">fallthrough</code></pre>
           <p>Transfers control into the next case's body without evaluating its expression. Must be the last statement of its case.</p>
           <pre><code class="lang-go">case 2:
@@ -215,8 +225,8 @@ default:
 case 3:
 	q()</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-23">
-          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>defer</code></h3>
+        <article class="doc-entry" id="doc-keyword-24">
+          <h3><a class="doc-anchor" href="#doc-keyword-24">#</a> <code>defer</code></h3>
           <pre><code class="lang-go">defer f(args)</code></pre>
           <p>Schedules a call to run when the enclosing function returns, in LIFO order. `f` and its arguments are evaluated at the `defer` statement, not at return. A deferred function literal is where `recover` can stop a panic.</p>
           <pre><code class="lang-go">defer func() { recover() }()</code></pre>
@@ -270,8 +280,8 @@ case 3:
         <article class="doc-entry" id="doc-predeclared-identifier-8">
           <h3><a class="doc-anchor" href="#doc-predeclared-identifier-8">#</a> <code>init</code></h3>
           <pre><code class="lang-go">func init()</code></pre>
-          <p>Go runs every `init` function before `main`. go-rs parses `func init` as an ordinary function and never calls it — its body runs only if something calls it by name. Package-level `var` initializers, by contrast, do run first, in dependency-load order.</p>
-          <pre><code class="lang-go">func init() { … }   // never runs on its own</code></pre>
+          <p>Runs once before `main`, after every package-level variable is initialized. A package may declare several; they run in source order, and none can be called by name.</p>
+          <pre><code class="lang-go">func init() { cache = load() }</code></pre>
         </article>
       </section>
 
@@ -604,75 +614,81 @@ case 3:
           <pre><code class="lang-go">delete(m, "a")</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-7">
-          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>make</code></h3>
+          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>clear</code></h3>
+          <pre><code class="lang-go">clear(x map[K]V | []T)</code></pre>
+          <p>Empties a map in place, so every alias sees it empty; on a slice, sets each element to its type's zero value and leaves the length alone, writing through the backing array a sub-slice shares.</p>
+          <pre><code class="lang-go">clear(seen)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-8">
+          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>make</code></h3>
           <pre><code class="lang-go">make([]T, n [, cap]) []T</code></pre>
           <p>Allocates a slice of `n` elements set to `T`'s zero value. The capacity argument is parsed and ignored — the capacity is always the length. A negative length raises a runtime fault.</p>
           <pre><code class="lang-go">xs := make([]int, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-8">
-          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>make</code></h3>
+        <article class="doc-entry" id="doc-builtin-9">
+          <h3><a class="doc-anchor" href="#doc-builtin-9">#</a> <code>make</code></h3>
           <pre><code class="lang-go">make(map[K]V) map[K]V</code></pre>
           <p>Allocates an empty map. Go's optional size hint is not accepted here.</p>
           <pre><code class="lang-go">m := make(map[string]int)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-9">
-          <h3><a class="doc-anchor" href="#doc-builtin-9">#</a> <code>make</code></h3>
+        <article class="doc-entry" id="doc-builtin-10">
+          <h3><a class="doc-anchor" href="#doc-builtin-10">#</a> <code>make</code></h3>
           <pre><code class="lang-go">make(chan T [, n]) chan T</code></pre>
           <p>Allocates a channel with buffer capacity `n`, or unbuffered when `n` is omitted. Lowers to `Op::ChanMake`, so the channel lives in the scheduler rather than on the host heap.</p>
           <pre><code class="lang-go">ch := make(chan int, 8)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-10">
-          <h3><a class="doc-anchor" href="#doc-builtin-10">#</a> <code>new</code></h3>
+        <article class="doc-entry" id="doc-builtin-11">
+          <h3><a class="doc-anchor" href="#doc-builtin-11">#</a> <code>new</code></h3>
           <pre><code class="lang-go">new(T) *T</code></pre>
           <p>Allocates a zero value of `T` and returns a handle to it — the empty composite literal `&amp;T{}` for a declared struct, and the address of the type's zero for a basic type. Since a go-rs pointer is the value's handle, `new(T)` and `&amp;T{}` produce the same thing.</p>
           <pre><code class="lang-go">p := new(Point)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-11">
-          <h3><a class="doc-anchor" href="#doc-builtin-11">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-builtin-12">
+          <h3><a class="doc-anchor" href="#doc-builtin-12">#</a> <code>min</code></h3>
           <pre><code class="lang-go">min(x, y …T) T</code></pre>
           <p>The smallest argument. When every argument is a string they compare lexicographically; otherwise comparison is numeric and the winning argument is returned unchanged, so an int input yields an int rather than a float.</p>
           <pre><code class="lang-go">min(3, 1, 2)   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-12">
-          <h3><a class="doc-anchor" href="#doc-builtin-12">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-builtin-13">
+          <h3><a class="doc-anchor" href="#doc-builtin-13">#</a> <code>max</code></h3>
           <pre><code class="lang-go">max(x, y …T) T</code></pre>
           <p>The largest argument, with the same string/numeric rule as `min`.</p>
           <pre><code class="lang-go">max(3, 1, 2)   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-13">
-          <h3><a class="doc-anchor" href="#doc-builtin-13">#</a> <code>panic</code></h3>
+        <article class="doc-entry" id="doc-builtin-14">
+          <h3><a class="doc-anchor" href="#doc-builtin-14">#</a> <code>panic</code></h3>
           <pre><code class="lang-go">panic(v any)</code></pre>
           <p>Records `v` as the in-flight panic and jumps to the function's deferred-call drain, then unwinds to the caller's. Uncaught, the program prints `panic: v` on stderr and exits non-zero.</p>
           <pre><code class="lang-go">panic("unreachable")</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-14">
-          <h3><a class="doc-anchor" href="#doc-builtin-14">#</a> <code>recover</code></h3>
+        <article class="doc-entry" id="doc-builtin-15">
+          <h3><a class="doc-anchor" href="#doc-builtin-15">#</a> <code>recover</code></h3>
           <pre><code class="lang-go">recover() any</code></pre>
           <p>Inside a deferred call, stops the in-flight panic and returns its value; nil when no panic is active. Outside a deferred call it always returns nil.</p>
           <pre><code class="lang-go">defer func() {
 	if r := recover(); r != nil { fmt.Println(r) }
 }()</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-15">
-          <h3><a class="doc-anchor" href="#doc-builtin-15">#</a> <code>close</code></h3>
+        <article class="doc-entry" id="doc-builtin-16">
+          <h3><a class="doc-anchor" href="#doc-builtin-16">#</a> <code>close</code></h3>
           <pre><code class="lang-go">close(ch chan T)</code></pre>
           <p>Closes a channel through `Op::ChanClose`; further receives yield the zero value. Note that closing does not make `for v := range ch` iterate — that form yields zero iterations either way.</p>
           <pre><code class="lang-go">close(done)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-16">
-          <h3><a class="doc-anchor" href="#doc-builtin-16">#</a> <code>println</code></h3>
+        <article class="doc-entry" id="doc-builtin-17">
+          <h3><a class="doc-anchor" href="#doc-builtin-17">#</a> <code>println</code></h3>
           <pre><code class="lang-go">println(args …any)</code></pre>
           <p>The predeclared debug print: operands space-separated with a trailing newline, written to stderr. Distinct from `fmt.Println`, which writes stdout.</p>
           <pre><code class="lang-go">println("debug", x)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-17">
-          <h3><a class="doc-anchor" href="#doc-builtin-17">#</a> <code>print</code></h3>
+        <article class="doc-entry" id="doc-builtin-18">
+          <h3><a class="doc-anchor" href="#doc-builtin-18">#</a> <code>print</code></h3>
           <pre><code class="lang-go">print(args …any)</code></pre>
           <p>The predeclared debug print with no trailing newline, written to stderr.</p>
           <pre><code class="lang-go">print("debug")</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-18">
-          <h3><a class="doc-anchor" href="#doc-builtin-18">#</a> <code>__rust_compile</code></h3>
+        <article class="doc-entry" id="doc-builtin-19">
+          <h3><a class="doc-anchor" href="#doc-builtin-19">#</a> <code>__rust_compile</code></h3>
           <pre><code class="lang-go">__rust_compile(b64 string, line int)</code></pre>
           <p>The lowering target of a `rust { … }` block, not something to write by hand. It compiles the base64-encoded Rust body through the host toolchain and registers its `extern "C"` exports, which then become callable as ordinary bare-name Go calls.</p>
           <pre><code class="lang-go">rust { pub extern "C" fn addrs(a: i64, b: i64) -&gt; i64 { a + b } }</code></pre>
@@ -1325,6 +1341,54 @@ case 3:
           <p>The same `$sortSlice` insertion sort as `sort.Slice`. Because that sort is already stable, the two functions are indistinguishable here.</p>
           <pre><code class="lang-go">sort.SliceStable(xs, less)</code></pre>
         </article>
+        <article class="doc-entry" id="doc-package-sort-6">
+          <h3><a class="doc-anchor" href="#doc-package-sort-6">#</a> <code>sort.Search</code></h3>
+          <pre><code class="lang-go">sort.Search(n int, f func(i int) bool) int</code></pre>
+          <p>The smallest `i` in `[0, n)` for which `f(i)` is true, or `n` when there is none. `f` must be false for a prefix and true for the rest — the search assumes that and does not verify it. Lowered to `$sortSearch` for the same reason `sort.Slice` is: a host builtin cannot call a VM closure.</p>
+          <pre><code class="lang-go">i := sort.Search(len(a), func(i int) bool { return a[i] &gt;= x })</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-7">
+          <h3><a class="doc-anchor" href="#doc-package-sort-7">#</a> <code>sort.SearchInts</code></h3>
+          <pre><code class="lang-go">sort.SearchInts(a []int, x int) int</code></pre>
+          <p>The index of the first element of the sorted slice that is &gt;= `x`, or `len(a)` when every element is smaller — so a hit and a miss are told apart by comparing `a[i]` to `x`, not by a negative return.</p>
+          <pre><code class="lang-go">i := sort.SearchInts([]int{1, 3, 5}, 3)   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-8">
+          <h3><a class="doc-anchor" href="#doc-package-sort-8">#</a> <code>sort.SearchStrings</code></h3>
+          <pre><code class="lang-go">sort.SearchStrings(a []string, x string) int</code></pre>
+          <p>`sort.SearchInts` over a sorted `[]string`, comparing lexicographically.</p>
+          <pre><code class="lang-go">i := sort.SearchStrings([]string{"a", "c"}, "c")   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-9">
+          <h3><a class="doc-anchor" href="#doc-package-sort-9">#</a> <code>sort.SearchFloat64s</code></h3>
+          <pre><code class="lang-go">sort.SearchFloat64s(a []float64, x float64) int</code></pre>
+          <p>`sort.SearchInts` over a sorted `[]float64`.</p>
+          <pre><code class="lang-go">i := sort.SearchFloat64s([]float64{1.5, 2.5}, 2.5)   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-10">
+          <h3><a class="doc-anchor" href="#doc-package-sort-10">#</a> <code>sort.IntsAreSorted</code></h3>
+          <pre><code class="lang-go">sort.IntsAreSorted(a []int) bool</code></pre>
+          <p>Whether the slice is already in ascending order. An empty or one-element slice is sorted.</p>
+          <pre><code class="lang-go">sort.IntsAreSorted([]int{1, 2, 2})   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-11">
+          <h3><a class="doc-anchor" href="#doc-package-sort-11">#</a> <code>sort.StringsAreSorted</code></h3>
+          <pre><code class="lang-go">sort.StringsAreSorted(a []string) bool</code></pre>
+          <p>`sort.IntsAreSorted` over a `[]string`.</p>
+          <pre><code class="lang-go">sort.StringsAreSorted([]string{"a", "b"})   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-12">
+          <h3><a class="doc-anchor" href="#doc-package-sort-12">#</a> <code>sort.Float64sAreSorted</code></h3>
+          <pre><code class="lang-go">sort.Float64sAreSorted(a []float64) bool</code></pre>
+          <p>`sort.IntsAreSorted` over a `[]float64`.</p>
+          <pre><code class="lang-go">sort.Float64sAreSorted([]float64{1, 2})   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-13">
+          <h3><a class="doc-anchor" href="#doc-package-sort-13">#</a> <code>sort.SliceIsSorted</code></h3>
+          <pre><code class="lang-go">sort.SliceIsSorted(x any, less func(i, j int) bool) bool</code></pre>
+          <p>Whether the slice is already ordered by the comparator. Takes a VM closure, so it is lowered to `$sliceIsSorted` alongside `sort.Slice`.</p>
+          <pre><code class="lang-go">sort.SliceIsSorted(xs, func(i, j int) bool { return xs[i] &lt; xs[j] })</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-package-os">
@@ -1882,7 +1946,7 @@ case 3:
         <article class="doc-entry" id="doc-statement-24">
           <h3><a class="doc-anchor" href="#doc-statement-24">#</a> <code>break statement</code></h3>
           <pre><code class="lang-go">break</code></pre>
-          <p>Leaves the innermost loop or switch. Labelled break is not parsed.</p>
+          <p>Leaves the innermost loop or switch; `break L` leaves the enclosing loop or switch labeled `L`.</p>
           <pre><code class="lang-go">if err != nil { break }</code></pre>
         </article>
         <article class="doc-entry" id="doc-statement-25">
@@ -2060,66 +2124,53 @@ println(addrs(2, 3))</code></pre>
           <pre><code class="lang-go">fmt.Println(xs) // pass the slice</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-6">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-6">#</a> <code>func init</code></h3>
-          <pre><code class="lang-go">func init()</code></pre>
-          <p>Parsed as an ordinary function and never called. Package-level `var` initializers do run before `main`, so move initialization there.</p>
-          <pre><code class="lang-go">var registry = buildRegistry()</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-divergence-from-go-7">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-7">#</a> <code>append aliasing</code></h3>
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-6">#</a> <code>append aliasing</code></h3>
           <pre><code class="lang-go">append(s, v)</code></pre>
           <p>The non-spread form extends the backing array in place and returns the same handle, so the append is visible through every alias of `s`. Go copies to a new array once capacity is exceeded, which detaches the result. Code that relies on that detachment behaves differently here.</p>
           <pre><code class="lang-go">b := append(a, 1)   // a and b stay the same slice</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-8">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-8">#</a> <code>interface{} in a type position</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-7">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-7">#</a> <code>interface{} in a type position</code></h3>
           <pre><code class="lang-go">var x interface{}</code></pre>
           <p>Not parsed. `interface{ … }` is accepted in a `type` declaration and as a generic constraint, but not where a variable, parameter or field type is expected. Write `any`.</p>
           <pre><code class="lang-go">var x any</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-9">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-9">#</a> <code>embedded fields</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-8">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-8">#</a> <code>embedded fields</code></h3>
           <pre><code class="lang-go">type D struct { Base }</code></pre>
           <p>Anonymous (embedded) struct fields are not parsed — every field needs a name. There is no field or method promotion; write the field explicitly and forward the methods.</p>
           <pre><code class="lang-go">type D struct { base Base }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-10">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-10">#</a> <code>local type declarations</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-9">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-9">#</a> <code>local type declarations</code></h3>
           <pre><code class="lang-go">func f() { type T … }</code></pre>
           <p>Only top-level `type` declarations are parsed. A `type` inside a function body is a syntax error; move it to file scope.</p>
           <pre><code class="lang-go">type T struct{ a int }
 
 func f() { … }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-11">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-11">#</a> <code>elided composite element types</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-10">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-10">#</a> <code>elided composite element types</code></h3>
           <pre><code class="lang-go">[][]int{{1, 2}}</code></pre>
           <p>Go lets a nested composite literal omit its element type. go-rs requires it in both slice and map literals.</p>
           <pre><code class="lang-go">[][]int{[]int{1, 2}}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-12">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>generics are erased</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-11">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-11">#</a> <code>generics are erased</code></h3>
           <pre><code class="lang-go">func F[T any](…)</code></pre>
           <p>Type parameters, constraint interfaces and type arguments are parsed and discarded — the dynamic value model runs one compiled body for every instantiation. The visible consequence is that `var zero T` is nil rather than the concrete type's zero value, which is what breaks `cmp.Or`.</p>
           <pre><code class="lang-go">func Sum[T Number](xs []T) T</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-13">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-13">#</a> <code>labels and goto</code></h3>
-          <pre><code class="lang-go">L: for { break L }</code></pre>
-          <p>Statement labels, labelled `break`/`continue`, and `goto` are not implemented. Restructure with a flag or an extra function.</p>
-          <pre><code class="lang-go">done := false
-for !done { … }</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-divergence-from-go-14">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-14">#</a> <code>unsupported package calls</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-12">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>unsupported package calls</code></h3>
           <pre><code class="lang-go">pkg.Func(…)</code></pre>
           <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`strings.Map\``. The wired sets are exactly the ones this reference lists. `fmt.Fprint`/`Fprintf`/`Fprintln` are not among them because they are not builtins at all — each rewrites to `w.Write([]byte(fmt.Sprint*(…)))`, so writer-directed output is ordinary method dispatch on whatever the program passed.</p>
           <pre><code class="lang-go">fmt.Sprintf(…)   // wired
 fmt.Fprintf(w, …)  // rewritten to w.Write
 strings.Map(…)   // not</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-15">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-15">#</a> <code>map iteration order</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-13">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-13">#</a> <code>map iteration order</code></h3>
           <pre><code class="lang-go">for k := range m</code></pre>
           <p>Go deliberately randomizes map iteration order. go-rs keeps a map's pairs in insertion order and ranges them in that order, so iteration is deterministic. Do not rely on that determinism in code meant to also build with the Go toolchain.</p>
           <pre><code class="lang-go">for k, v := range m { … }   // insertion order</code></pre>

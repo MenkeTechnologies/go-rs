@@ -674,6 +674,13 @@ const CORPUS: &[Entry] = &[
         "delete(m, \"a\")",
     ),
     e(
+        "clear",
+        "Builtin",
+        "clear(x map[K]V | []T)",
+        "Empties a map in place, so every alias sees it empty; on a slice, sets each element to its type's zero value and leaves the length alone, writing through the backing array a sub-slice shares.",
+        "clear(seen)",
+    ),
+    e(
         "make",
         "Builtin",
         "make([]T, n [, cap]) []T",
