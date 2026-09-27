@@ -813,3 +813,27 @@ the same `Sprintf` (reading `%w` off the format separately to pick the wrap
 type), so the one format path has to accept `%w` and render it as `%v`. Keeping
 `Errorf` correct is worth more than rejecting a verb that is only ever written
 inside it. Separating them means giving `Errorf` its own formatter entry point.
+
+## `import "slices"` / `import "maps"` stop in the runtime packages below them
+
+```go
+import "slices"   // go-rs: expected `LBrace`, found `RParen` on line 1027
+```
+
+The two packages themselves parse and link: a type parameter's composite
+literal (`append(S{}, s...)` in `slices.Clone`), a declaration without a body
+(`maps.clone`, implemented in the runtime), a parameter list of bare types
+(`iter`'s `newcoro(func(*coro)) *coro`), index-keyed slice literals and
+`//go:build` constraints all work. What stops the import is below them:
+`slices` and `maps` import `iter`, which imports `runtime` and
+`internal/race` → `internal/abi`. `internal/abi` converts `unsafe.Pointer`s to
+pointer-to-array types (`(*[1 << 16]Method)(p)`, the reported line — numbered
+in the package's concatenated source) and `runtime` is the Go runtime itself;
+neither is something go-rs can load from source. `iter`'s `Seq` / `Seq2` are
+also consumed with range-over-func (`for v := range seq`), which go-rs does
+not lower — such a loop currently runs zero times.
+
+Closing it needs `iter` supplied without its runtime half (the `Seq`/`Seq2`
+types, with `Pull`/`Pull2` built on go-rs's own goroutines) and range-over-func
+lowered to a call of the sequence with a synthesized `yield` closure that
+carries `break`/`continue`/`return` out of the body.

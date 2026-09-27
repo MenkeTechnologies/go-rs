@@ -326,8 +326,15 @@ superset):
 - **Dependencies on the compiler/runtime boundary.** A package that reaches
   `unsafe`, `//go:linkname` to runtime symbols, `.s` assembly, `cgo`, or
   `reflect` cannot yet run from source (e.g. `math/bits` links to
-  `runtime.overflowError`; `slices` uses `unsafe`). `fmt`/`strings`/`strconv`/
-  `math`/`sort`/`os` are provided by the native runtime layer instead.
+  `runtime.overflowError`). `slices`, `maps` and `iter` now *parse* — the
+  parser takes a type parameter's composite literal (`S{}` for `S ~[]E`),
+  bodiless `//go:linkname` declarations, bare-type parameter lists and
+  index-keyed slice literals, and the loader honours `//go:build`
+  constraints — but `iter` imports `runtime` and `internal/race` →
+  `internal/abi`, whose unsafe pointer conversions (`(*[1 << 16]T)(p)`) and
+  runtime internals go-rs cannot load, and range-over-func is not lowered.
+  `fmt`/`strings`/`strconv`/`math`/`sort`/`os` are provided by the native
+  runtime layer instead.
 - **Generics are erased, so a type-parameter zero value is untyped** — `var zero
   T; x != zero` (e.g. `cmp.Or`) compares against `nil` rather than the
   instantiated type's zero. Needs monomorphization or a typed-zero sentinel.
