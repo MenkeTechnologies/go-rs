@@ -46,6 +46,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         local_interfaces: Vec::new(),
         defined: HashMap::new(),
         int_consts: HashMap::new(),
+        type_param_cores: HashMap::new(),
     };
     // Integer constants first: a defined type's base can be an array sized by
     // one (`type d [MaxCase]rune`).
@@ -99,6 +100,12 @@ struct Parser {
     /// array length written as a constant expression (`[MaxCase]rune`,
     /// `[N*2]int`) folds to the `[N]T` value type instead of decaying to `[]T`.
     int_consts: HashMap<String, i64>,
+    /// The type parameters of the generic function being parsed whose
+    /// constraint has a composite core type (`S ~[]E`, `M ~map[K]V`), as
+    /// name → that core type. Generics are erased, so a composite literal of
+    /// the parameter (`S{}`, as `slices.Clone` writes one) is a literal of its
+    /// core type.
+    type_param_cores: HashMap<String, String>,
 }
 
 /// The canonical name of an interface type with method set `methods`:
@@ -407,7 +414,22 @@ impl Parser {
         while !matches!(self.peek(), Tok::Eof) {
             match self.peek() {
                 Tok::Func => {
-                    let mut f = self.func_decl()?;
+                    let (mut f, has_body) = self.func_decl()?;
+                    if !has_body {
+                        // A declaration without a body names a function
+                        // implemented outside Go. In a program that is a
+                        // build error, as it is for `go`; in a package it is
+                        // one the host supplies (`maps.clone`, see
+                        // `pkg::INTRINSICS`), so there is nothing to declare.
+                        if package == "main" {
+                            return Err(format!(
+                                "go-rs: missing function body for `{}` on line {}",
+                                f.name, f.line
+                            ));
+                        }
+                        self.skip_semis();
+                        continue;
+                    }
                     if f.name == "main" && f.receiver.is_none() {
                         main = f.body;
                     } else if f.name == "init" && f.receiver.is_none() {
@@ -537,7 +559,15 @@ impl Parser {
             }
         }
         self.pos = saved;
-        while decls.iter().filter(|s| self.record_int_consts(s)).count() > 0 {}
+        // A valid dependency chain settles in at most one pass per declaration.
+        // The bound matters for source that declares one name twice with
+        // different values (the walk reports that): each pass would otherwise
+        // flip the name between them forever.
+        for _ in 0..=decls.len() {
+            if decls.iter().filter(|s| self.record_int_consts(s)).count() == 0 {
+                break;
+            }
+        }
     }
 
     /// Fill [`Parser::defined`] by parsing every `type Name <base>` declaration
@@ -862,7 +892,7 @@ impl Parser {
         }
     }
 
-    fn func_decl(&mut self) -> Result<Func, String> {
+    fn func_decl(&mut self) -> Result<(Func, bool), String> {
         let line = self.line();
         self.expect(&Tok::Func)?;
         // Optional method receiver: `func (r T) name(...)`, or the unnamed form
@@ -897,26 +927,114 @@ impl Parser {
             None
         };
         let name = self.ident()?;
-        // Erase a generic type-parameter list: `func F[T any](…)`.
-        if matches!(self.peek(), Tok::LBracket) {
-            self.skip_type_brackets()?;
-        }
-        self.expect(&Tok::LParen)?;
-        let (params, variadic) = self.params()?;
-        self.expect(&Tok::RParen)?;
-        let (result_names, results): (Vec<String>, Vec<String>) =
-            self.results()?.into_iter().unzip();
-        let body = self.block()?;
-        Ok(Func {
+        // Erase a generic type-parameter list: `func F[T any](…)`, keeping only
+        // the composite core types a `T{…}` literal in the body needs.
+        let cores = if matches!(self.peek(), Tok::LBracket) {
+            self.type_param_list()?
+        } else {
+            HashMap::new()
+        };
+        let outer = std::mem::replace(&mut self.type_param_cores, cores);
+        let rest = self.func_rest();
+        self.type_param_cores = outer;
+        let (params, variadic, result_names, results, body) = rest?;
+        let has_body = body.is_some();
+        let func = Func {
             name,
             receiver,
             params,
             variadic,
             results,
             result_names,
-            body,
+            body: body.unwrap_or_default(),
             line,
-        })
+        };
+        Ok((func, has_body))
+    }
+
+    /// A function declaration after its name and type parameters: the
+    /// signature, then the body — `None` for a declaration without one
+    /// (`func clone(m any) any`), which the spec allows for a function
+    /// implemented outside Go.
+    #[allow(clippy::type_complexity)]
+    fn func_rest(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<Param>,
+            bool,
+            Vec<String>,
+            Vec<String>,
+            Option<Vec<Stmt>>,
+        ),
+        String,
+    > {
+        self.expect(&Tok::LParen)?;
+        let (params, variadic) = self.params()?;
+        self.expect(&Tok::RParen)?;
+        let (result_names, results): (Vec<String>, Vec<String>) =
+            self.results()?.into_iter().unzip();
+        let body = if matches!(self.peek(), Tok::Semi | Tok::Eof) {
+            None
+        } else {
+            Some(self.block()?)
+        };
+        Ok((params, variadic, result_names, results, body))
+    }
+
+    /// Parse a function's type-parameter list `[S ~[]E, E any]`, returning the
+    /// parameters whose constraint is one composite type (`[]E`, `~[]E`,
+    /// `map[K]V`, `~map[K]V`) as name → that core type. Any other constraint
+    /// (`any`, `cmp.Ordered`, `~int | ~float64`, an interface) is skipped:
+    /// generics are erased, and only a composite literal of the parameter
+    /// (`S{}`, as `slices.Clone` writes one) needs to know what it stands for.
+    fn type_param_list(&mut self) -> Result<HashMap<String, String>, String> {
+        let mut cores = HashMap::new();
+        self.expect(&Tok::LBracket)?;
+        let mut names = Vec::new();
+        while !matches!(self.peek(), Tok::RBracket | Tok::Eof) {
+            names.push(self.ident()?);
+            // `[K, V any]` — names sharing the constraint that follows.
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            let start = self.pos;
+            self.eat(&Tok::Tilde);
+            let composite = matches!(self.peek(), Tok::LBracket)
+                || matches!(self.peek(), Tok::Ident(n) if n == "map");
+            let core = if composite {
+                self.type_name().ok()
+            } else {
+                None
+            };
+            match core {
+                Some(core) if matches!(self.peek(), Tok::Comma | Tok::RBracket) => {
+                    for n in names.drain(..) {
+                        cores.insert(n, core.clone());
+                    }
+                }
+                _ => {
+                    self.pos = start;
+                    let mut depth = 0usize;
+                    loop {
+                        match self.peek() {
+                            Tok::Comma | Tok::RBracket if depth == 0 => break,
+                            Tok::LBracket | Tok::LParen | Tok::LBrace => depth += 1,
+                            Tok::RBracket | Tok::RParen | Tok::RBrace => depth -= 1,
+                            Tok::Eof => {
+                                return Err("go-rs: unterminated `[` in type parameters".to_string())
+                            }
+                            _ => {}
+                        }
+                        self.advance();
+                    }
+                    names.clear();
+                }
+            }
+            self.eat(&Tok::Comma);
+        }
+        self.expect(&Tok::RBracket)?;
+        Ok(cores)
     }
 
     /// Parse a parameter list. Supports grouped parameters that share a type
@@ -926,6 +1044,25 @@ impl Parser {
         let mut params = Vec::new();
         let mut variadic = false;
         if matches!(self.peek(), Tok::RParen) {
+            return Ok((params, variadic));
+        }
+        // A list of bare types — `func newcoro(func(*coro)) *coro`, `func(int,
+        // string)` — declares parameters the body cannot name. Each gets a
+        // placeholder no identifier can spell.
+        if !self.paren_list_is_named() {
+            loop {
+                if self.eat(&Tok::Ellipsis) {
+                    variadic = true;
+                }
+                let ty = self.type_name()?;
+                params.push(Param {
+                    name: format!("$arg{}", params.len()),
+                    ty,
+                });
+                if !self.eat(&Tok::Comma) || matches!(self.peek(), Tok::RParen) {
+                    break;
+                }
+            }
             return Ok((params, variadic));
         }
         // Collect (name, optional-type) entries, then back-fill inherited types.
@@ -974,7 +1111,7 @@ impl Parser {
     /// unnamed result. A parenthesized list is *named* iff any identifier in it is
     /// immediately followed by a type (Go requires all-or-none).
     fn results(&mut self) -> Result<Vec<(String, String)>, String> {
-        if matches!(self.peek(), Tok::LBrace) {
+        if matches!(self.peek(), Tok::LBrace | Tok::Semi | Tok::Eof) {
             return Ok(Vec::new());
         }
         if self.eat(&Tok::LParen) {
@@ -1015,6 +1152,16 @@ impl Parser {
                 // unnamed result list.
                 Tok::Ident(n) if n == "map" => {}
                 Tok::Ident(_) if depth == 1 && self.type_starts_at(i + 1) => return true,
+                // `xs ...T` — a named variadic parameter.
+                Tok::Ident(_)
+                    if depth == 1
+                        && matches!(
+                            self.tokens.get(i + 1).map(|t| &t.kind),
+                            Some(Tok::Ellipsis)
+                        ) =>
+                {
+                    return true
+                }
                 _ => {}
             }
             i += 1;
@@ -2358,6 +2505,14 @@ impl Parser {
                     // or map: the literal is the base's, and the defined name is
                     // kept as the conversion `T(<base literal>)` — which is what
                     // the type already means, and needs no new node.
+                    // `S{ … }` where `S` is a type parameter with a composite
+                    // core type (`S ~[]E`): erased, it is a literal of the core.
+                    _ if matches!(self.peek(), Tok::LBrace)
+                        && self.type_param_cores.contains_key(&s) =>
+                    {
+                        let core = self.type_param_cores[&s].clone();
+                        self.elided_literal(&core)
+                    }
                     _ if matches!(self.peek(), Tok::LBrace)
                         && self.defined_composite_base(&s).is_some() =>
                     {
@@ -2427,7 +2582,7 @@ impl Parser {
         }
         // Each element may elide the type: `[]T{ {…}, {…} }` means
         // `[]T{ T{…}, T{…} }`, for a struct `T` and for a container `T` alike.
-        let elems = self.brace_list(|p| p.elem_or_expr(&elem_ty))?;
+        let elems = self.indexed_elems(&elem_ty, None)?;
         Ok(Expr::SliceLit {
             elem_ty,
             elems,
@@ -2452,49 +2607,8 @@ impl Parser {
         };
         self.expect(&Tok::RBracket)?;
         let elem_ty = self.type_name()?;
-        self.expect(&Tok::LBrace)?;
-        // Collect (index, value) placements; a sequential value takes the running
-        // index, an index-keyed value resets it.
-        let mut placed: Vec<(usize, Expr)> = Vec::new();
-        let mut next_idx = 0usize;
-        while !matches!(self.peek(), Tok::RBrace) {
-            // A bare `{ … }` is an elided composite of the element type, and
-            // cannot be an index key, so it is always sequential.
-            if matches!(self.peek(), Tok::LBrace) {
-                let v = self.elided_literal(&elem_ty)?;
-                placed.push((next_idx, v));
-                next_idx += 1;
-            } else {
-                let first = self.expr()?;
-                if self.eat(&Tok::Colon) {
-                    // `idx: value` — an index-keyed element.
-                    let idx = self.const_int(&first).ok_or_else(|| {
-                        format!(
-                            "go-rs: array index in a composite literal must be a constant (line {})",
-                            self.line()
-                        )
-                    })? as usize;
-                    let v = self.elem_or_expr(&elem_ty)?;
-                    placed.push((idx, v));
-                    next_idx = idx + 1;
-                } else {
-                    placed.push((next_idx, first));
-                    next_idx += 1;
-                }
-            }
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
-        self.expect(&Tok::RBrace)?;
-        // Final length: the declared `[N]`, else one past the highest index.
-        let len = fixed_len.unwrap_or_else(|| placed.iter().map(|(i, _)| i + 1).max().unwrap_or(0));
-        let mut elems: Vec<Expr> = (0..len).map(|_| self.zero_value_expr(&elem_ty)).collect();
-        for (idx, v) in placed {
-            if idx < elems.len() {
-                elems[idx] = v;
-            }
-        }
+        let elems = self.indexed_elems(&elem_ty, fixed_len)?;
+        let len = elems.len();
         Ok(Expr::SliceLit {
             elem_ty,
             elems,
@@ -2571,11 +2685,7 @@ impl Parser {
         // (and so its value semantics); a gap left by a short `{…}` is the
         // element type's own zero, exactly as in the written `[N]T{…}` form.
         if let (Some(inner), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
-            let mut elems = self.brace_list(|p| p.elem_or_expr(inner))?;
-            elems.truncate(n);
-            while elems.len() < n {
-                elems.push(self.zero_value_expr(inner));
-            }
+            let elems = self.indexed_elems(inner, Some(n))?;
             return Ok(Expr::SliceLit {
                 elem_ty: inner.to_string(),
                 elems,
@@ -2583,7 +2693,7 @@ impl Parser {
             });
         }
         if let Some(inner) = ty.strip_prefix("[]") {
-            let elems = self.brace_list(|p| p.elem_or_expr(inner))?;
+            let elems = self.indexed_elems(inner, None)?;
             return Ok(Expr::SliceLit {
                 elem_ty: inner.to_string(),
                 elems,
@@ -2612,6 +2722,61 @@ impl Parser {
         // Anything else names a struct — a declared one, an inline `struct{…}`,
         // or a qualified `pkg.T` the parser can't see the definition of.
         self.struct_literal(ty.to_string())
+    }
+
+    /// The `{ … }` element list of a slice or array literal of element type
+    /// `elem_ty`, laid out by index. An element is sequential (`v`) or keyed by
+    /// a constant index (`3: v`, `Invalid: "invalid"` as `internal/abi` writes
+    /// its kind-name table); a sequential element takes the index after the
+    /// previous one, and a gap is the element type's zero. The length is
+    /// `fixed_len` for a `[N]T`, else one past the highest index.
+    ///
+    /// Elements are laid out, not evaluated, here: a keyed list whose indices
+    /// run backwards evaluates its elements in index order rather than source
+    /// order, which only a side-effecting element can observe.
+    fn indexed_elems(
+        &mut self,
+        elem_ty: &str,
+        fixed_len: Option<usize>,
+    ) -> Result<Vec<Expr>, String> {
+        let mut placed: Vec<(usize, Expr)> = Vec::new();
+        let mut next = 0usize;
+        let mut keyed = false;
+        self.brace_list(|p| {
+            // A bare `{ … }` is an elided composite of the element type and
+            // cannot be an index key, so it is always sequential.
+            let (idx, v) = if matches!(p.peek(), Tok::LBrace) {
+                (next, p.elided_literal(elem_ty)?)
+            } else {
+                let first = p.expr()?;
+                if p.eat(&Tok::Colon) {
+                    let idx = p.const_int(&first).filter(|i| *i >= 0).ok_or_else(|| {
+                        format!(
+                            "go-rs: index in a composite literal must be a non-negative constant (line {})",
+                            p.line()
+                        )
+                    })? as usize;
+                    keyed = true;
+                    (idx, p.elem_or_expr(elem_ty)?)
+                } else {
+                    (next, first)
+                }
+            };
+            placed.push((idx, v));
+            next = idx + 1;
+            Ok(())
+        })?;
+        let len = fixed_len.unwrap_or_else(|| placed.iter().map(|(i, _)| i + 1).max().unwrap_or(0));
+        if !keyed && placed.len() == len {
+            return Ok(placed.into_iter().map(|(_, v)| v).collect());
+        }
+        let mut elems: Vec<Expr> = (0..len).map(|_| self.zero_value_expr(elem_ty)).collect();
+        for (idx, v) in placed {
+            if idx < len {
+                elems[idx] = v;
+            }
+        }
+        Ok(elems)
     }
 
     /// `{ a, b, … }` — a comma-separated brace list, each element parsed by `f`.
@@ -2842,9 +3007,17 @@ const INT_TYPE_NAMES: &[&str] = &[
 /// integer constants from `consts`, a conversion to an integer type
 /// (`int(N)`), and the unary/binary arithmetic that appears in array bounds.
 fn const_int_of(e: &Expr, consts: &HashMap<String, i64>) -> Option<i64> {
+    i64::try_from(const_int_wide(e, consts)?).ok()
+}
+
+/// [`const_int_of`] before its result is narrowed to `i64`. Go constants are
+/// exact, so an intermediate may leave `i64` and come back (`1 << 70 >> 68` is
+/// `4`); folding in `i128` keeps every such expression whose steps fit there,
+/// and one that overflows even that is not folded rather than wrapped.
+fn const_int_wide(e: &Expr, consts: &HashMap<String, i64>) -> Option<i128> {
     match e {
-        Expr::Int(n) => Some(*n),
-        Expr::Ident(name) => consts.get(name).copied(),
+        Expr::Int(n) => Some(i128::from(*n)),
+        Expr::Ident(name) => consts.get(name).map(|&n| i128::from(n)),
         Expr::Call {
             func,
             args,
@@ -2852,25 +3025,30 @@ fn const_int_of(e: &Expr, consts: &HashMap<String, i64>) -> Option<i64> {
             ..
         } if args.len() == 1 => match func.as_ref() {
             Expr::Ident(t) if INT_TYPE_NAMES.contains(&t.as_str()) => {
-                const_int_of(&args[0], consts)
+                const_int_wide(&args[0], consts)
             }
             _ => None,
         },
         Expr::Unary {
             op: crate::ast::UnOp::Neg,
             rhs,
-        } => const_int_of(rhs, consts).map(|n| -n),
+        } => const_int_wide(rhs, consts)?.checked_neg(),
         Expr::Binary { op, lhs, rhs } => {
             use crate::ast::BinOp;
-            let (a, b) = (const_int_of(lhs, consts)?, const_int_of(rhs, consts)?);
+            let (a, b) = (const_int_wide(lhs, consts)?, const_int_wide(rhs, consts)?);
             match op {
-                BinOp::Add => Some(a + b),
-                BinOp::Sub => Some(a - b),
-                BinOp::Mul => Some(a * b),
-                BinOp::Div if b != 0 => Some(a / b),
-                BinOp::Mod if b != 0 => Some(a % b),
-                BinOp::Shl => Some(a << b),
-                BinOp::Shr => Some(a >> b),
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div => a.checked_div(b),
+                BinOp::Mod => a.checked_rem(b),
+                BinOp::Shl => u32::try_from(b)
+                    .ok()
+                    .and_then(|s| a.checked_shl(s))
+                    .filter(|r| r >> b == a),
+                // Shifting every bit out leaves the sign, as it does for an
+                // exact constant.
+                BinOp::Shr => u32::try_from(b).ok().map(|s| a >> s.min(i128::BITS - 1)),
                 _ => None,
             }
         }

@@ -3387,3 +3387,47 @@ fn strings_functions_taking_a_closure() {
         "bcê\n3 5 false\n\"é\" \"é34\" \"12é\"\n[\"a\" \"bb\" \"c\"]\n"
     );
 }
+
+/// A generic function's type parameter with a composite core type takes a
+/// composite literal (`S{}` for `S ~[]E`, `M{}` for `M ~map[K]V`) — the form
+/// `slices.Clone` is written in, which stopped `import "slices"` at parse
+/// time. A parameter list of bare types (`func(int, string)`) is the other
+/// form Go's own source uses (`iter`'s `newcoro(func(*coro)) *coro`).
+/// Expected output is `go run`'s (go1.27.1).
+#[test]
+fn type_parameter_composite_literal_and_unnamed_params() {
+    let src = include_str!("../parity-scripts/generic_core_type_literals.go");
+    assert_stdout(src, "[1 2 3] [9 2 3] 0 true\n2 1 2\n42 ignored\n");
+}
+
+/// Index-keyed slice literals (`[]string{Invalid: "invalid", …}`, as
+/// `internal/abi` writes its kind-name table), keyed elided array elements,
+/// and a constant whose intermediate leaves `int64` (`1 << 70 >> 68`). Keys
+/// were a parse error on a slice literal, and the constant overflowed the
+/// fold. Expected output is `go run`'s (go1.27.1).
+#[test]
+fn keyed_slice_literals_and_wide_constant_folds() {
+    let src = include_str!("../parity-scripts/keyed_slice_literals.go");
+    assert_stdout(
+        src,
+        "4 [\"invalid\" \"bool\" \"\" \"string\"]\n[[1 2] [0 0] [0 0] [7 8]] 4\n[9 0 0 0 0 1 2]\n4 [0 0 0 0]\n",
+    );
+}
+
+/// A function declared without a body is implemented outside Go; in a
+/// program that is a build error, as `go` reports it (`missing function
+/// body`), not a parse error at the next token.
+#[test]
+fn function_without_body_in_main_is_rejected() {
+    let (out, ok) = run_capturing_stderr("package main\n\nfunc f(x int) int\n\nfunc main() {}\n");
+    assert!(!ok);
+    assert!(out.contains("missing function body for `f`"), "{out:?}");
+}
+
+/// A name declared twice with different constant values used to spin the
+/// array-length constant pre-scan forever, each pass flipping the name
+/// between the two values.
+#[test]
+fn redeclared_constant_does_not_hang_the_parser() {
+    let _ = gors::parse("package main\n\nconst X = 1\nconst X = 2\n\nfunc main() {}\n");
+}
