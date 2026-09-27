@@ -506,9 +506,9 @@ impl Parser {
                 }
                 _ => false,
             },
-            Stmt::Block(ss) => ss
-                .iter()
-                .fold(false, |learned, s| self.record_int_consts(s) || learned),
+            // Every statement is recorded — not `any`, which would stop at the
+            // first that folds.
+            Stmt::Block(ss) => ss.iter().filter(|s| self.record_int_consts(s)).count() > 0,
             _ => false,
         }
     }
@@ -537,10 +537,7 @@ impl Parser {
             }
         }
         self.pos = saved;
-        while decls
-            .iter()
-            .fold(false, |learned, s| self.record_int_consts(s) || learned)
-        {}
+        while decls.iter().filter(|s| self.record_int_consts(s)).count() > 0 {}
     }
 
     /// Fill [`Parser::defined`] by parsing every `type Name <base>` declaration
@@ -1324,9 +1321,7 @@ impl Parser {
                 None
             } else {
                 let n = self.expr()?;
-                self.const_int(&n)
-                    .filter(|n| *n >= 0)
-                    .map(|n| n as usize)
+                self.const_int(&n).filter(|n| *n >= 0).map(|n| n as usize)
             };
             self.expect(&Tok::RBracket)?;
             let elem = self.type_name()?;
@@ -2766,9 +2761,11 @@ fn init_order(decls: Vec<Stmt>, funcs: &[Func]) -> Vec<Stmt> {
         let mut out = HashSet::new();
         match s {
             // The declared name itself is not a dependency of its initializer.
-            Stmt::Var { init: Some(e), .. } => {
-                crate::compiler::free_stmt(&Stmt::ExprStmt(e.clone()), &mut HashSet::new(), &mut out)
-            }
+            Stmt::Var { init: Some(e), .. } => crate::compiler::free_stmt(
+                &Stmt::ExprStmt(e.clone()),
+                &mut HashSet::new(),
+                &mut out,
+            ),
             Stmt::Var { init: None, .. } => {}
             s => crate::compiler::free_stmt(s, &mut HashSet::new(), &mut out),
         }

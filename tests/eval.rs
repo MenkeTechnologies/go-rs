@@ -3249,9 +3249,7 @@ skip:
     assert!(ok, "{out:?}");
     assert_eq!(out, "6\ndone\n");
 
-    let (err, ok) = run_capturing_stderr(
-        "package main\nfunc main() {\n\tgoto nowhere\n}\n",
-    );
+    let (err, ok) = run_capturing_stderr("package main\nfunc main() {\n\tgoto nowhere\n}\n");
     assert!(!ok, "an undefined label was accepted: {err:?}");
     assert!(err.contains("label `nowhere` not defined"), "{err:?}");
 }
