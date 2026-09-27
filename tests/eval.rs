@@ -3373,3 +3373,17 @@ fn a_defined_type_in_an_imported_package_links() {
     );
     assert_eq!(stdout, "Wed Wed 2\nweek.Day week.Days\n");
 }
+
+/// `strings.Map` and the `*Func` family call the closure they are handed; they
+/// used to be rejected as unsupported calls. Expected output is `go run`'s
+/// (go1.27.1).
+#[test]
+fn strings_functions_taking_a_closure() {
+    let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\nfunc main() {\n\tfmt.Println(strings.Map(func(r rune) rune {\n\t\tif r == 'x' {\n\t\t\treturn -1\n\t\t}\n\t\treturn r + 1\n\t}, \"axbé\"))\n\tdigit := func(r rune) bool { return r >= '0' && r <= '9' }\n\tfmt.Println(strings.IndexFunc(\"éa1b2\", digit), strings.LastIndexFunc(\"éa1b2\", digit), strings.ContainsFunc(\"ab\", digit))\n\tfmt.Printf(\"%q %q %q\\n\", strings.TrimFunc(\"12é34\", digit), strings.TrimLeftFunc(\"12é34\", digit), strings.TrimRightFunc(\"12é34\", digit))\n\tfmt.Printf(\"%q\\n\", strings.FieldsFunc(\"a1bb22c\", digit))\n}\n";
+    let (out, ok) = run(src);
+    assert!(ok, "{out:?}");
+    assert_eq!(
+        out,
+        "bcê\n3 5 false\n\"é\" \"é34\" \"12é\"\n[\"a\" \"bb\" \"c\"]\n"
+    );
+}

@@ -79,6 +79,7 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     // that never names `strings` cannot name the type either.
     if main.imports.iter().any(|p| p == "strings") {
         add_strings_builder(&mut main)?;
+        add_strings_func(&mut main)?;
     }
     // `os.Stdout` / `os.Stderr` the same way. Their initializers are
     // package-level vars, so they are spliced ahead of the program's own
@@ -351,6 +352,31 @@ fn add_os_file(prog: &mut Program) -> Result<(), String> {
     prog.funcs.append(&mut pkg.funcs);
     let inits = std::mem::take(&mut pkg.main);
     prog.main.splice(0..0, inits);
+    Ok(())
+}
+
+/// The `strings` functions taking a function argument, synthesized from
+/// `goroot/strings_func.go` as `$strings<Name>` — a host builtin cannot call the
+/// VM closure they are handed. The compiler routes `strings.<Name>` to them.
+pub const STRINGS_FUNC: &[&str] = &[
+    "Map",
+    "IndexFunc",
+    "LastIndexFunc",
+    "ContainsFunc",
+    "TrimLeftFunc",
+    "TrimRightFunc",
+    "TrimFunc",
+    "FieldsFunc",
+];
+
+fn add_strings_func(prog: &mut Program) -> Result<(), String> {
+    let pkg = crate::parse(include_str!("../goroot/strings_func.go"))?;
+    for mut f in pkg.funcs {
+        if STRINGS_FUNC.contains(&f.name.as_str()) {
+            f.name = format!("$strings{}", f.name);
+            prog.funcs.push(f);
+        }
+    }
     Ok(())
 }
 

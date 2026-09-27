@@ -6462,6 +6462,12 @@ impl Compiler {
                         return self.call(&Expr::Ident(target.to_string()), args, false, line);
                     }
                 }
+                // `strings.Map` and the `*Func` family take a closure too, and
+                // ride the same route to their synthesized Go bodies.
+                if pkg == "strings" && crate::pkg::STRINGS_FUNC.contains(&field.as_str()) {
+                    let target = format!("$strings{field}");
+                    return self.call(&Expr::Ident(target), args, false, line);
+                }
                 if matches!(pkg.as_str(), "strings" | "strconv" | "math" | "sort" | "os") {
                     let id = host::stdlib::resolve(pkg, field).ok_or_else(|| {
                         format!("go-rs: unsupported call `{pkg}.{field}` (line {line})")
