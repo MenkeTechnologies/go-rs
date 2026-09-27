@@ -309,7 +309,16 @@ binary's own copy; any other import resolves from `~/.go-rs/src`, then from
 `$GOROOT/src`. `go install-std` writes the vendored packages into
 `~/.go-rs/src` as readable source. Any package placed under `~/.go-rs/src`
 (or `$GOPATH/src`) is importable — go-rs is an executor for real Go source, not a
-curated subset.
+curated subset. A package's defined non-struct types (`type SpecialCase
+[]CaseRange`) are qualified and linked like its structs, which is what lets
+`unicode` run from its real source, and `%T` names a package's type by its
+package (`week.Day`, not `main.Day`).
+
+`strings.Map` and the `strings` functions taking a function (`IndexFunc`,
+`LastIndexFunc`, `ContainsFunc`, `TrimFunc`, `TrimLeftFunc`, `TrimRightFunc`,
+`FieldsFunc`) are written in Go ([`goroot/strings_func.go`](goroot/strings_func.go))
+and synthesized into a program that imports `strings`, because a native builtin
+cannot call the closure it is handed.
 
 **Blockers** (defects to close, not intentional scope — go-rs targets a Go
 superset):
@@ -354,7 +363,8 @@ superset):
   map value prints bare.** A defined value converted to an interface carries its
   type name, so methods dispatch through the interface, type switches and
   assertions match it, `==` compares type then value, and `fmt` prints it — and
-  a `[]T` of it — through `String()` / `Error()`. A generic parameter is erased
+  a `[]T` of it, a method result of its type, and an element of a defined slice
+  of it — through `String()` / `Error()`. A generic parameter is erased
   to its constraint and a nested field is formatted by the host, so
   `show[T any](Weekday(3))` prints `3` where Go prints the method's text (see
   [`BUGS.md`](BUGS.md)).

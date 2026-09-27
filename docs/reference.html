@@ -988,55 +988,103 @@ case 3:
           <pre><code class="lang-go">strings.Compare("a", "b")   // -1</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strings-22">
-          <h3><a class="doc-anchor" href="#doc-package-strings-22">#</a> <code>strings.Replace</code></h3>
+          <h3><a class="doc-anchor" href="#doc-package-strings-22">#</a> <code>strings.Map</code></h3>
+          <pre><code class="lang-go">strings.Map(mapping func(rune) rune, s string) string</code></pre>
+          <p>`s` with every rune replaced by `mapping(r)`; a negative result drops the rune, and one that is not a valid code point becomes U+FFFD. A host builtin cannot call a VM closure, so this and the other `strings` functions taking a function are written in Go (`goroot/strings_func.go`) and synthesized into a program that imports `strings`.</p>
+          <pre><code class="lang-go">strings.Map(unicode.ToUpper, "go")   // GO</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-23">
+          <h3><a class="doc-anchor" href="#doc-package-strings-23">#</a> <code>strings.IndexFunc</code></h3>
+          <pre><code class="lang-go">strings.IndexFunc(s string, f func(rune) bool) int</code></pre>
+          <p>The byte index of the first rune satisfying `f`, or -1.</p>
+          <pre><code class="lang-go">strings.IndexFunc("ab1", unicode.IsDigit)   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-24">
+          <h3><a class="doc-anchor" href="#doc-package-strings-24">#</a> <code>strings.LastIndexFunc</code></h3>
+          <pre><code class="lang-go">strings.LastIndexFunc(s string, f func(rune) bool) int</code></pre>
+          <p>The byte index of the last rune satisfying `f`, or -1.</p>
+          <pre><code class="lang-go">strings.LastIndexFunc("a1b2c", unicode.IsDigit)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-25">
+          <h3><a class="doc-anchor" href="#doc-package-strings-25">#</a> <code>strings.ContainsFunc</code></h3>
+          <pre><code class="lang-go">strings.ContainsFunc(s string, f func(rune) bool) bool</code></pre>
+          <p>Whether any rune of `s` satisfies `f`.</p>
+          <pre><code class="lang-go">strings.ContainsFunc("gym", isVowel)   // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-26">
+          <h3><a class="doc-anchor" href="#doc-package-strings-26">#</a> <code>strings.TrimFunc</code></h3>
+          <pre><code class="lang-go">strings.TrimFunc(s string, f func(rune) bool) string</code></pre>
+          <p>`s` without its leading and trailing runes that satisfy `f`.</p>
+          <pre><code class="lang-go">strings.TrimFunc("¡Hi!", unicode.IsPunct)   // Hi</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-27">
+          <h3><a class="doc-anchor" href="#doc-package-strings-27">#</a> <code>strings.TrimLeftFunc</code></h3>
+          <pre><code class="lang-go">strings.TrimLeftFunc(s string, f func(rune) bool) string</code></pre>
+          <p>`s` without its leading runes that satisfy `f`.</p>
+          <pre><code class="lang-go">strings.TrimLeftFunc("12ab", unicode.IsDigit)   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-28">
+          <h3><a class="doc-anchor" href="#doc-package-strings-28">#</a> <code>strings.TrimRightFunc</code></h3>
+          <pre><code class="lang-go">strings.TrimRightFunc(s string, f func(rune) bool) string</code></pre>
+          <p>`s` without its trailing runes that satisfy `f`.</p>
+          <pre><code class="lang-go">strings.TrimRightFunc("ab12", unicode.IsDigit)   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-29">
+          <h3><a class="doc-anchor" href="#doc-package-strings-29">#</a> <code>strings.FieldsFunc</code></h3>
+          <pre><code class="lang-go">strings.FieldsFunc(s string, f func(rune) bool) []string</code></pre>
+          <p>`s` split around each run of runes satisfying `f`; never nil, and empty when every rune satisfies it.</p>
+          <pre><code class="lang-go">strings.FieldsFunc("a;b;;c", func(r rune) bool { return r == ';' })   // [a b c]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-30">
+          <h3><a class="doc-anchor" href="#doc-package-strings-30">#</a> <code>strings.Replace</code></h3>
           <pre><code class="lang-go">strings.Replace(s, old, new string, n int) string</code></pre>
           <p>`s` with the first `n` occurrences of `old` replaced by `new`; a negative `n` replaces every occurrence. An empty `old` returns `s` unchanged, where Go would insert `new` between every rune.</p>
           <pre><code class="lang-go">strings.Replace("aaa", "a", "b", 2)   // bba</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-23">
-          <h3><a class="doc-anchor" href="#doc-package-strings-23">#</a> <code>strings.ReplaceAll</code></h3>
+        <article class="doc-entry" id="doc-package-strings-31">
+          <h3><a class="doc-anchor" href="#doc-package-strings-31">#</a> <code>strings.ReplaceAll</code></h3>
           <pre><code class="lang-go">strings.ReplaceAll(s, old, new string) string</code></pre>
           <p>`s` with every occurrence of `old` replaced by `new`. An empty `old` returns `s` unchanged.</p>
           <pre><code class="lang-go">strings.ReplaceAll("a,b", ",", "-")   // a-b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-24">
-          <h3><a class="doc-anchor" href="#doc-package-strings-24">#</a> <code>strings.Fields</code></h3>
+        <article class="doc-entry" id="doc-package-strings-32">
+          <h3><a class="doc-anchor" href="#doc-package-strings-32">#</a> <code>strings.Fields</code></h3>
           <pre><code class="lang-go">strings.Fields(s string) []string</code></pre>
           <p>The substrings of `s` separated by runs of Unicode whitespace, with empty fields dropped.</p>
           <pre><code class="lang-go">len(strings.Fields("  a  b "))   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-25">
-          <h3><a class="doc-anchor" href="#doc-package-strings-25">#</a> <code>strings.Count</code></h3>
+        <article class="doc-entry" id="doc-package-strings-33">
+          <h3><a class="doc-anchor" href="#doc-package-strings-33">#</a> <code>strings.Count</code></h3>
           <pre><code class="lang-go">strings.Count(s, substr string) int</code></pre>
           <p>The number of non-overlapping occurrences of `substr` in `s`. An empty substring returns the number of code points plus one, matching Go.</p>
           <pre><code class="lang-go">strings.Count("cheese", "e")   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-26">
-          <h3><a class="doc-anchor" href="#doc-package-strings-26">#</a> <code>strings.TrimPrefix</code></h3>
+        <article class="doc-entry" id="doc-package-strings-34">
+          <h3><a class="doc-anchor" href="#doc-package-strings-34">#</a> <code>strings.TrimPrefix</code></h3>
           <pre><code class="lang-go">strings.TrimPrefix(s, prefix string) string</code></pre>
           <p>`s` without a leading `prefix`, or `s` unchanged when the prefix is absent. Removes at most one occurrence.</p>
           <pre><code class="lang-go">strings.TrimPrefix("go-rs", "go-")   // rs</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-27">
-          <h3><a class="doc-anchor" href="#doc-package-strings-27">#</a> <code>strings.TrimSuffix</code></h3>
+        <article class="doc-entry" id="doc-package-strings-35">
+          <h3><a class="doc-anchor" href="#doc-package-strings-35">#</a> <code>strings.TrimSuffix</code></h3>
           <pre><code class="lang-go">strings.TrimSuffix(s, suffix string) string</code></pre>
           <p>`s` without a trailing `suffix`, or `s` unchanged when the suffix is absent.</p>
           <pre><code class="lang-go">strings.TrimSuffix("a.go", ".go")   // a</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-28">
-          <h3><a class="doc-anchor" href="#doc-package-strings-28">#</a> <code>strings.Trim</code></h3>
+        <article class="doc-entry" id="doc-package-strings-36">
+          <h3><a class="doc-anchor" href="#doc-package-strings-36">#</a> <code>strings.Trim</code></h3>
           <pre><code class="lang-go">strings.Trim(s, cutset string) string</code></pre>
           <p>`s` with every leading and trailing character that appears in `cutset` removed.</p>
           <pre><code class="lang-go">strings.Trim("xxhixx", "x")   // hi</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-29">
-          <h3><a class="doc-anchor" href="#doc-package-strings-29">#</a> <code>strings.Title</code></h3>
+        <article class="doc-entry" id="doc-package-strings-37">
+          <h3><a class="doc-anchor" href="#doc-package-strings-37">#</a> <code>strings.Title</code></h3>
           <pre><code class="lang-go">strings.Title(s string) string</code></pre>
           <p>Each space-separated word with its first character upper-cased. It splits on the ASCII space only, where Go's deprecated Title splits on every non-letter.</p>
           <pre><code class="lang-go">strings.Title("hello wide world")   // Hello Wide World</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strings-30">
-          <h3><a class="doc-anchor" href="#doc-package-strings-30">#</a> <code>strings.EqualFold</code></h3>
+        <article class="doc-entry" id="doc-package-strings-38">
+          <h3><a class="doc-anchor" href="#doc-package-strings-38">#</a> <code>strings.EqualFold</code></h3>
           <pre><code class="lang-go">strings.EqualFold(s, t string) bool</code></pre>
           <p>Case-insensitive equality — but ASCII-only. Go performs full Unicode case folding, so `EqualFold("HÉ", "hé")` is true in Go and false here.</p>
           <pre><code class="lang-go">strings.EqualFold("Go", "GO")   // true</code></pre>
@@ -2164,10 +2212,10 @@ func f() { … }</code></pre>
         <article class="doc-entry" id="doc-divergence-from-go-12">
           <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>unsupported package calls</code></h3>
           <pre><code class="lang-go">pkg.Func(…)</code></pre>
-          <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`strings.Map\``. The wired sets are exactly the ones this reference lists. `fmt.Fprint`/`Fprintf`/`Fprintln` are not among them because they are not builtins at all — each rewrites to `w.Write([]byte(fmt.Sprint*(…)))`, so writer-directed output is ordinary method dispatch on whatever the program passed.</p>
+          <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`strings.Cut\``. The wired sets are exactly the ones this reference lists. `fmt.Fprint`/`Fprintf`/`Fprintln` are not among them because they are not builtins at all — each rewrites to `w.Write([]byte(fmt.Sprint*(…)))`, so writer-directed output is ordinary method dispatch on whatever the program passed.</p>
           <pre><code class="lang-go">fmt.Sprintf(…)   // wired
 fmt.Fprintf(w, …)  // rewritten to w.Write
-strings.Map(…)   // not</code></pre>
+strings.Cut(…)   // not</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-13">
           <h3><a class="doc-anchor" href="#doc-divergence-from-go-13">#</a> <code>map iteration order</code></h3>

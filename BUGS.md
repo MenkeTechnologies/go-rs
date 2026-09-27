@@ -59,8 +59,9 @@ what dispatch, type switches, assertions, `==` and `%T` read, so a `Weekday` in
 an `any` behaves as Go's does. Two conversions are not seen: a generic
 parameter is erased to its constraint rather than typed as an interface, and a
 struct field or map value is formatted by the host, which cannot call a
-method. A top-level operand and a `[]T` / `[N]T` / `[]any` are rendered through
-the method. The same erasure keeps `float32` / `uint64` widths out of an `any`,
+method. A top-level operand — including a method result of the defined type and an
+element of a defined slice of it — and a `[]T` / `[N]T` / `[]any` (or a defined
+type over one) are rendered through the method. The same erasure keeps `float32` / `uint64` widths out of an `any`,
 and a `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, for the
 reason in the pointer entry below.
 
