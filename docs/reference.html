@@ -1072,7 +1072,7 @@ case 3:
         <article class="doc-entry" id="doc-package-strconv-5">
           <h3><a class="doc-anchor" href="#doc-package-strconv-5">#</a> <code>strconv.FormatInt</code></h3>
           <pre><code class="lang-go">strconv.FormatInt(i int64, base int) string</code></pre>
-          <p>The integer rendered in base 2, 8, 10 or 16. Go supports every base from 2 to 36; go-rs renders any other base in decimal.</p>
+          <p>The integer in any base from 2 to 36 (digits then lowercase letters), a negative one as `-` and its magnitude. Any other base panics with Go's message.</p>
           <pre><code class="lang-go">strconv.FormatInt(255, 16)   // "ff"</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strconv-6">

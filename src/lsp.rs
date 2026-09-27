@@ -1191,7 +1191,7 @@ const CORPUS: &[Entry] = &[
         "strconv.FormatInt",
         "Package strconv",
         "strconv.FormatInt(i int64, base int) string",
-        "The integer rendered in base 2, 8, 10 or 16. Go supports every base from 2 to 36; go-rs renders any other base in decimal.",
+        "The integer in any base from 2 to 36 (digits then lowercase letters), a negative one as `-` and its magnitude. Any other base panics with Go's message.",
         "strconv.FormatInt(255, 16)   // \"ff\"",
     ),
     e(

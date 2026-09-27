@@ -325,6 +325,15 @@ teaching `*p` to read through one. That changes what every `&x` and `*p` on a
 scalar costs, and every loop holding such a variable would leave the tracing
 tier, so it is a deliberate trade rather than an oversight.
 
+The one place a pointer to a non-struct is made implicitly is closed: calling a
+pointer-receiver method on a defined slice or integer type (`func (s *Stack)
+Push(v int) { *s = append(*s, v) }`) hands the method a cell holding the
+receiver, reads and writes `*s` through it, and stores the result back into the
+variable, field or element the method was called on
+(`parity-scripts/pointer_receiver_defined_types.go`). The cell lives for the
+call, so a method that keeps `s` beyond it sees none of the caller's later
+writes.
+
 ## A pointer to a struct prints without `&`
 
 ```go
