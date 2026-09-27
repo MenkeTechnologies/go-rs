@@ -33,7 +33,7 @@ ch <- 1
 fmt.Println(len(ch), cap(ch))   // go: 1 1     go-rs: 0 0
 ```
 
-The scheduler owns the channel buffer, and fusevm 0.26.0's channel surface is
+The scheduler owns the channel buffer, and fusevm 0.26.7's channel surface is
 `Op::ChanMake` / `ChanSend` / `ChanRecv` / `ChanRecvOk` / `ChanClose` /
 `Select` — there is no op that reads a channel's length or capacity, so the
 frontend has nothing to ask and `len`/`cap` fall through to their "not a container" answer of 0. Every
@@ -130,7 +130,7 @@ fmt.Println(0, 1, 2, /* … 256 arguments in total … */)
 // go-rs: compile error — `fmt.Println` takes at most 255 arguments here
 ```
 
-fusevm 0.26.0's `Op::CallBuiltin` carries its argument count in a `u8`
+fusevm 0.26.7's `Op::CallBuiltin` carries its argument count in a `u8`
 (`CallBuiltin(u16, u8)`, and `BuiltinHandler = fn(&mut VM, u8)`), so one call
 can take at most 255 stack values. A *composite literal* is not bounded by this
 — it is built in chunks, the first through its literal builtin and each later
@@ -254,7 +254,7 @@ The order is what decides it. A `select` that runs *after* a peer parked works �
 a receive case fed by a blocked sender is fine, and why the corpus file covers
 that shape. It is a `select` that parks *first* that is lost.
 
-Two things in `fusevm-0.26.0/src/sched.rs` combine:
+Two things in `fusevm-0.26.7/src/sched.rs` combine:
 
 - A select's send case does not register in the channel's `send_q`
   (`SchedReq::Select` pushes the goroutine onto `select_waiters` instead,
