@@ -1147,21 +1147,141 @@ fn is_buildable_go_file(p: &std::path::Path) -> bool {
             return false;
         }
     }
-    // Exclude generator/example files carrying an `ignore` build constraint
-    // (`//go:build ignore` or the legacy `// +build ignore`) — they are not part
-    // of the package build (e.g. math/bits/make_examples.go).
-    if let Ok(text) = std::fs::read_to_string(p) {
-        for line in text.lines().take(30) {
-            let l = line.trim();
-            if !l.is_empty() && !l.starts_with("//") && !l.starts_with("package ") {
-                break; // past the header; build constraints only appear above it
-            }
-            if (l.starts_with("//go:build") || l.starts_with("// +build")) && l.contains("ignore") {
-                return false;
-            }
+    match std::fs::read_to_string(p) {
+        Ok(text) => header_constraints_hold(&text),
+        Err(_) => true,
+    }
+}
+
+/// Whether the build constraints in a file's header admit it to this build.
+/// A `//go:build` line decides alone when present; otherwise every legacy
+/// `// +build` line must hold. `ignore` names no tag of this build, which is
+/// what keeps generator files out (`math/bits/make_examples.go`), and so does
+/// `race` — the pair `internal/race/{race,norace}.go` both declare `Enabled`,
+/// and taking both made the package's constants disagree with themselves.
+fn header_constraints_hold(text: &str) -> bool {
+    let mut plus_build = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if !l.is_empty() && !l.starts_with("//") {
+            break; // past the header; build constraints only appear above it
+        }
+        if let Some(expr) = l.strip_prefix("//go:build") {
+            return build_expr_holds(expr);
+        }
+        if let Some(expr) = l.strip_prefix("// +build") {
+            plus_build.push(expr.to_string());
         }
     }
-    true
+    plus_build.iter().all(|line| {
+        // `// +build a,b !c` — space-separated options OR, comma-joined terms AND.
+        line.split_whitespace().any(|opt| {
+            opt.split(',').all(|term| match term.strip_prefix('!') {
+                Some(t) => !build_tag_holds(t),
+                None => build_tag_holds(term),
+            })
+        })
+    })
+}
+
+/// Evaluate a `//go:build` expression (`linux && (arm64 || amd64)`, `!race`)
+/// the way `go/build/constraint` does: `||` binds loosest, then `&&`, then
+/// `!`, with parentheses. A malformed expression holds for nothing.
+fn build_expr_holds(expr: &str) -> bool {
+    let mut toks = Vec::new();
+    let mut rest = expr.trim();
+    while !rest.is_empty() {
+        let (tok, n) = if rest.starts_with("&&") || rest.starts_with("||") {
+            (&rest[..2], 2)
+        } else if rest.starts_with(['!', '(', ')']) {
+            (&rest[..1], 1)
+        } else {
+            let n = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+                .unwrap_or(rest.len());
+            if n == 0 {
+                return false;
+            }
+            (&rest[..n], n)
+        };
+        toks.push(tok);
+        rest = rest[n..].trim_start();
+    }
+    fn or(t: &[&str], i: &mut usize) -> Option<bool> {
+        let mut v = and(t, i)?;
+        while t.get(*i) == Some(&"||") {
+            *i += 1;
+            v |= and(t, i)?;
+        }
+        Some(v)
+    }
+    fn and(t: &[&str], i: &mut usize) -> Option<bool> {
+        let mut v = not(t, i)?;
+        while t.get(*i) == Some(&"&&") {
+            *i += 1;
+            v &= not(t, i)?;
+        }
+        Some(v)
+    }
+    fn not(t: &[&str], i: &mut usize) -> Option<bool> {
+        let tok = *t.get(*i)?;
+        *i += 1;
+        match tok {
+            "!" => not(t, i).map(|v| !v),
+            "(" => {
+                let v = or(t, i)?;
+                if t.get(*i) != Some(&")") {
+                    return None;
+                }
+                *i += 1;
+                Some(v)
+            }
+            "&&" | "||" | ")" => None,
+            tag => Some(build_tag_holds(tag)),
+        }
+    }
+    let mut i = 0;
+    or(&toks, &mut i)
+        .filter(|_| i == toks.len())
+        .unwrap_or(false)
+}
+
+/// Whether one build tag is satisfied: the host `GOOS`/`GOARCH` (with `unix`
+/// for a Unix-like `GOOS`, as `go/build` defines it), the `gc` toolchain the
+/// stdlib is written for, and the release tags `go1.1` … up to the language
+/// level go-rs reports. `cgo`, `race` and every `goexperiment.*` are off,
+/// matching `CGO_ENABLED="0"` in `go env`.
+fn build_tag_holds(tag: &str) -> bool {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        o => o,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        a => a,
+    };
+    const UNIX: &[&str] = &[
+        "aix",
+        "android",
+        "darwin",
+        "dragonfly",
+        "freebsd",
+        "hurd",
+        "illumos",
+        "ios",
+        "linux",
+        "netbsd",
+        "openbsd",
+        "solaris",
+    ];
+    if let Some(minor) = tag.strip_prefix("go1.") {
+        let level = crate::banner::GO_COMPAT_VERSION
+            .strip_prefix("1.")
+            .and_then(|m| m.parse::<u32>().ok());
+        return matches!((minor.parse::<u32>(), level), (Ok(m), Some(l)) if m <= l);
+    }
+    tag == os || tag == arch || tag == "gc" || (tag == "unix" && UNIX.contains(&os))
 }
 
 fn is_known_os(s: &str) -> bool {
@@ -1254,4 +1374,70 @@ fn goroot_from_go() -> Option<String> {
 /// packages are verified to run on go-rs).
 fn vendored_source(path: &str) -> Option<String> {
     crate::stdlib_vendor::source(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_expr_holds, header_constraints_hold};
+
+    /// The tags of the host this test runs on, spelled as `go/build` spells them.
+    fn host() -> (&'static str, &'static str) {
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            o => o,
+        };
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            a => a,
+        };
+        (os, arch)
+    }
+
+    #[test]
+    fn build_expressions_follow_go_build_constraint_precedence() {
+        let (os, arch) = host();
+        assert!(build_expr_holds("!race"));
+        assert!(!build_expr_holds("race"));
+        assert!(!build_expr_holds("ignore"));
+        assert!(!build_expr_holds("gccgo"));
+        assert!(build_expr_holds("gc"));
+        assert!(!build_expr_holds("cgo"));
+        assert!(!build_expr_holds("goexperiment.regabiargs"));
+        assert!(build_expr_holds(&format!("{os} && {arch}")));
+        assert!(build_expr_holds(&format!("plan9 || {arch}")));
+        // `&&` binds tighter than `||`: `a || (b && c)`.
+        assert!(build_expr_holds(&format!("{os} || race && cgo")));
+        assert!(!build_expr_holds(&format!("({os} || race) && cgo")));
+        assert!(build_expr_holds(&format!("!({os} && race)")));
+        assert!(build_expr_holds("go1.18 && !go1.99"));
+        // Malformed input admits nothing.
+        assert!(!build_expr_holds(&format!("{os} &&")));
+        assert!(!build_expr_holds(&format!("({os}")));
+    }
+
+    #[test]
+    fn go_build_line_decides_and_plus_build_lines_all_hold() {
+        // `internal/race` ships `race.go` and `norace.go`, both declaring
+        // `Enabled`; only one belongs to a build.
+        assert!(header_constraints_hold(
+            "// Copyright\n\n//go:build !race\n\npackage race\n"
+        ));
+        assert!(!header_constraints_hold(
+            "//go:build race\n\npackage race\n"
+        ));
+        assert!(!header_constraints_hold(
+            "// +build ignore\n\npackage main\n"
+        ));
+        let (os, _) = host();
+        assert!(header_constraints_hold(&format!(
+            "// +build plan9 {os}\n// +build !race\n\npackage p\n"
+        )));
+        assert!(!header_constraints_hold(&format!(
+            "// +build {os},race\n\npackage p\n"
+        )));
+        // A constraint below the package clause is a comment, not a constraint.
+        assert!(header_constraints_hold("package p\n\n//go:build ignore\n"));
+        assert!(header_constraints_hold("package p\n"));
+    }
 }
