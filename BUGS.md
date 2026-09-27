@@ -41,25 +41,28 @@ other channel operation is correct. Closing this needs a fusevm release
 carrying a channel-length op; vendoring or path-overriding fusevm to add one is
 not an option — the published pin is the contract.
 
-## A defined type's name does not survive assignment to an interface
+## A defined type reached only through a type parameter or a nested value prints bare
 
 ```go
 type Weekday int
-var a any = Weekday(3)
-fmt.Printf("%T\n", a)   // go: main.Weekday   go-rs: int
+func (d Weekday) String() string { return "Wed" }
+func show[T any](v T) { fmt.Println(v) }
+show(Weekday(3))                      // go: Wed      go-rs: 3
+fmt.Println(struct{ D Weekday }{3})   // go: {Wed}    go-rs: {3}
 ```
 
-A defined type is represented exactly like its base, so its name lives in the
-static type; `named_box_spec` (`src/compiler.rs`) reads that at the `fmt` call
-site and tags the operand. An operand whose static type is `any` has no name to
-read — the same erasure that makes a `float32` or a `uint64` lose its width
-through an `any` parameter. Closing it needs the name on the value rather than
-at the call site, which is a representation change: a defined type would stop
-being free.
-
-A `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, for the
-reason in the pointer entry below: go-rs holds a pointer and its pointee as one
-handle.
+A defined non-struct value is boxed with its type name
+(`HostObj::Named`) when it is converted to an interface — assignment,
+argument, return, composite element, map key, channel send, `==` against an
+interface — and unwrapped where it leaves one for a concrete type. That is
+what dispatch, type switches, assertions, `==` and `%T` read, so a `Weekday` in
+an `any` behaves as Go's does. Two conversions are not seen: a generic
+parameter is erased to its constraint rather than typed as an interface, and a
+struct field or map value is formatted by the host, which cannot call a
+method. A top-level operand and a `[]T` / `[N]T` / `[]any` are rendered through
+the method. The same erasure keeps `float32` / `uint64` widths out of an `any`,
+and a `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, for the
+reason in the pointer entry below.
 
 ## A nil pointer in an interface compares equal to nil
 
@@ -360,25 +363,20 @@ so it cannot compute the byte size. Sniffing it from the element values would
 give the wrong answer for `[]byte` (1 byte) and for struct elements, so it is
 left unrounded rather than confidently wrong.
 
-## `%T` after `fmt`'s `Stringer` dispatch names the rendered type
+## `%T` in a computed format string names the rendered type
 
 ```go
 var v any = myErr{"e"}       // myErr has an Error() string method
-fmt.Printf("%T\n", v)        // go: main.myErr    go-rs: string
+f := "%T\n"
+fmt.Printf(f, v)             // go: main.myErr    go-rs: string
 ```
 
-Every `fmt` argument is wrapped in the linker-synthesized `$stringify`, which
-calls `Error()`/`String()` on the types that have one — that is how a value
-implementing `error` prints through its method. `%T` is the one verb that wants
-the operand *before* that dispatch, and it sees the `string` the wrapper
-returned. A value whose type has no such method is unaffected, as is `%T` on a
-concrete variable.
-
-Closing it means not wrapping the arguments a literal format string sends to
-`%T`: the compiler already has the format string at the call site, so it can map
-verb positions to argument positions and skip the wrapper for those. It needs a
-format-string scan in `src/compiler.rs`, and a non-literal format string (a
-variable) would still go through the wrapper.
+`fmt` reaches `Error()`/`String()` through the linker-synthesized `$stringify`,
+which the compiler wraps around an operand only when its verb prints text. For
+a literal format the compiler reads each operand's verb, so `%T`, `%d` and
+`%#v` see the operand itself. A format held in a variable is only known at run
+time, and every operand is then wrapped as `%v` would need — so `%T` sees the
+`string` the method returned.
 
 ## A failed anonymous-interface assertion names its method set, not its signature
 

@@ -2336,7 +2336,7 @@ const CORPUS: &[Entry] = &[
         "%T on a defined type",
         "Divergence from Go",
         "fmt.Printf(\"%T\", d)",
-        "A defined type over a non-struct base (`type Weekday int`) is erased by the parser, so `%T` names the base: `int`, not `main.Weekday`. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.",
+        "A defined type over a non-struct base (`type Weekday int`) is represented as its base, and named from the static type: `%T` of a `Weekday` operand, or of one stored in an interface (which carries the name), is `main.Weekday`; through a generic parameter it is the base. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.",
         "fmt.Printf(\"%T\", a) // [3]int",
     ),
     e(

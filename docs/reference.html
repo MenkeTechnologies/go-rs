@@ -2114,7 +2114,7 @@ println(addrs(2, 3))</code></pre>
         <article class="doc-entry" id="doc-divergence-from-go-4">
           <h3><a class="doc-anchor" href="#doc-divergence-from-go-4">#</a> <code>%T on a defined type</code></h3>
           <pre><code class="lang-go">fmt.Printf("%T", d)</code></pre>
-          <p>A defined type over a non-struct base (`type Weekday int`) is erased by the parser, so `%T` names the base: `int`, not `main.Weekday`. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.</p>
+          <p>A defined type over a non-struct base (`type Weekday int`) is represented as its base, and named from the static type: `%T` of a `Weekday` operand, or of one stored in an interface (which carries the name), is `main.Weekday`; through a generic parameter it is the base. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.</p>
           <pre><code class="lang-go">fmt.Printf("%T", a) // [3]int</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-5">
