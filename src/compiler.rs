@@ -6457,6 +6457,9 @@ impl Compiler {
                     }
                     let argc = Self::call_arity(args.len(), &format!("{pkg}.{field}"), line)?;
                     self.b.emit(Op::CallBuiltin(id, argc), line);
+                    // A stdlib call that panics (`strconv.FormatInt` with a bad
+                    // base) unwinds to a `recover` like any other.
+                    self.emit_panic_check(line);
                     return Ok(());
                 }
             }

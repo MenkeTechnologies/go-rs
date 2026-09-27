@@ -3321,3 +3321,17 @@ fn pointer_receiver_on_a_defined_non_struct_type_writes_back() {
     assert!(ok, "{out:?}");
     assert_eq!(out, "[1 2] 2\n1\n[7] [0 11]\n");
 }
+
+/// `strconv.FormatInt` of a negative number is a sign and a magnitude, in any
+/// base from 2 to 36; it was the two's-complement bits in bases 2/8/16 and
+/// decimal in every other base.
+#[test]
+fn format_int_signs_the_magnitude_in_every_base() {
+    let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"strconv\"\n)\n\nfunc main() {\n\tfmt.Println(strconv.FormatInt(-255, 16), strconv.FormatInt(-255, 2), strconv.FormatInt(255, 36), strconv.FormatInt(-255, 7))\n\tdefer func() { fmt.Println(recover()) }()\n\tfmt.Println(strconv.FormatInt(5, 1))\n}\n";
+    let (out, ok) = run(src);
+    assert!(ok, "{out:?}");
+    assert_eq!(
+        out,
+        "-ff -11111111 73 -513\nstrconv: illegal AppendInt/FormatInt base\n"
+    );
+}

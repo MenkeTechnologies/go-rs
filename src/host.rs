@@ -5576,12 +5576,28 @@ pub mod stdlib {
         let args = pop_args(vm, argc);
         let n = args.first().map(|v| v.to_int()).unwrap_or(0);
         let base = args.get(1).map(|v| v.to_int()).unwrap_or(10);
-        Value::str(match base {
-            2 => format!("{n:b}"),
-            8 => format!("{n:o}"),
-            16 => format!("{n:x}"),
-            _ => n.to_string(),
-        })
+        // Go's `formatBits`: any base from 2 to 36, a negative number as a
+        // `-` and its magnitude — not the two's-complement bits Rust's `{:x}`
+        // writes for an `i64`.
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        if !(2..=36).contains(&base) {
+            super::plain_panic(vm, "strconv: illegal AppendInt/FormatInt base".to_string());
+            return Value::Undef;
+        }
+        let (b, mut mag) = (base as u64, n.unsigned_abs());
+        let mut out = Vec::new();
+        loop {
+            out.push(DIGITS[(mag % b) as usize]);
+            mag /= b;
+            if mag == 0 {
+                break;
+            }
+        }
+        if n < 0 {
+            out.push(b'-');
+        }
+        out.reverse();
+        Value::str(String::from_utf8(out).unwrap_or_default())
     }
 
     /// A one-string-arg → string builtin.
