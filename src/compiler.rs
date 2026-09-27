@@ -5324,6 +5324,20 @@ impl Compiler {
                     .get(name)
                     .map(|s| base_type(&s.result_ty))
                     .unwrap_or_default(),
+                // A method call has the method's declared result type:
+                // `d.Next()` is a `Day`, which is what boxes it with its name
+                // when it becomes an interface value (and so what lets `fmt`
+                // find its `String()`).
+                Expr::Selector { recv, field } => self
+                    .method_result_ty
+                    .get(&(base_type(&self.type_name(recv)), field.clone()))
+                    .filter(|_| {
+                        self.method_nresults
+                            .get(&(base_type(&self.type_name(recv)), field.clone()))
+                            == Some(&1)
+                    })
+                    .map(|t| base_type(t))
+                    .unwrap_or_default(),
                 _ => String::new(),
             },
             // A slice literal names its own type, so a variable bound to one
@@ -5353,7 +5367,7 @@ impl Compiler {
             // `s[i]` / `m[k]` has the container's element type. Naming it is what
             // makes an indexed read of a struct element copy (Go value
             // semantics): `e := xs[0]; e.N = 1` must not write through to `xs[0]`.
-            Expr::Index { recv, .. } => self.elem_type_of(&self.type_name(recv)),
+            Expr::Index { recv, .. } => self.elem_type_of(&self.underlying(&self.type_name(recv))),
             _ => String::new(),
         }
     }
@@ -5586,7 +5600,7 @@ impl Compiler {
     /// method only when it is declared on the value receiver, which is Go's
     /// method-set rule; a pointer element reaches either kind.
     fn stringify_all_helper(&self, e: &Expr) -> Option<String> {
-        let ty = self.type_name(e);
+        let ty = self.underlying(&self.type_name(e));
         let elem = ty
             .strip_prefix("[]")
             .or_else(|| array_elem_ty(&ty))?
