@@ -839,10 +839,10 @@ pub(crate) fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet
         }
         Stmt::Block(b) => b.iter().for_each(|s| free_stmt(s, bound, out)),
         Stmt::Break(..)
-            | Stmt::Continue(..)
-            | Stmt::Fallthrough(_)
-            | Stmt::Goto(..)
-            | Stmt::Label(..) => {}
+        | Stmt::Continue(..)
+        | Stmt::Fallthrough(_)
+        | Stmt::Goto(..)
+        | Stmt::Label(..) => {}
     }
 }
 
@@ -1015,10 +1015,10 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
         }
         Stmt::Block(b) => b.iter().for_each(|s| walk_stmt_exprs(s, f)),
         Stmt::Break(..)
-            | Stmt::Continue(..)
-            | Stmt::Fallthrough(_)
-            | Stmt::Goto(..)
-            | Stmt::Label(..) => {}
+        | Stmt::Continue(..)
+        | Stmt::Fallthrough(_)
+        | Stmt::Goto(..)
+        | Stmt::Label(..) => {}
     }
 }
 
@@ -1354,12 +1354,18 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     iface_methods
         .entry("error".to_string())
         .or_insert_with(|| vec![method_sig("Error", 0, &["string".to_string()])]);
+    // `fmt.Stringer` is `fmt`'s one exported interface, `interface{ String()
+    // string }`, and `fmt` is a native package with no source to declare it.
+    iface_methods
+        .entry("fmt.Stringer".to_string())
+        .or_insert_with(|| vec![method_sig("String", 0, &["string".to_string()])]);
 
     // Every interface name usable as an identity conversion, plus the two
     // predeclared ones (`error` and `any`/`interface{}`) a program never declares.
     let mut iface_names: HashSet<String> = prog.interfaces.iter().map(|i| i.name.clone()).collect();
     iface_names.insert("error".into());
     iface_names.insert("any".into());
+    iface_names.insert("fmt.Stringer".into());
 
     let has_ffi = body_has_ffi(&prog.main) || prog.funcs.iter().any(|f| body_has_ffi(&f.body));
     // Package-level names: variables/constants declared at the top level of
@@ -1693,7 +1699,9 @@ impl Compiler {
             .collect();
         unused.sort_by_key(|&(_, line)| line);
         if let Some((name, line)) = unused.first() {
-            return Err(format!("go-rs: label `{name}` defined and not used (line {line})"));
+            return Err(format!(
+                "go-rs: label `{name}` defined and not used (line {line})"
+            ));
         }
         Ok(())
     }
@@ -2551,6 +2559,13 @@ impl Compiler {
                         self.closure_vars.remove(name);
                         self.emit_zero(&t, *line);
                     }
+                    // `var s Shower = Celsius(3)` converts to the interface.
+                    // (The box is idempotent, so a name `emit_rhs` already
+                    // knows as interface-typed is not wrapped twice.)
+                    Some(e) if ty.as_ref().is_some_and(|t| self.is_iface_ty(t)) => {
+                        self.emit_rhs(name, e)?;
+                        self.emit_iface_box(e, *line);
+                    }
                     Some(e) => self.emit_rhs(name, e)?,
                     None if !is_pointer && self.structs.contains(&decl_ty) => {
                         self.struct_lit(&decl_ty, &[])?
@@ -2854,7 +2869,9 @@ impl Compiler {
             Stmt::Label(name, line) => {
                 let pos = self.b.current_pos();
                 if self.labels.insert(name.clone(), (pos, *line)).is_some() {
-                    return Err(format!("go-rs: label `{name}` already defined (line {line})"));
+                    return Err(format!(
+                        "go-rs: label `{name}` already defined (line {line})"
+                    ));
                 }
             }
             Stmt::Goto(name, line) => {
@@ -3215,6 +3232,10 @@ impl Compiler {
                     [only] => only.clone(),
                     _ => String::new(),
                 };
+                // Bound at one concrete type, the value leaves its box.
+                if self.iface_of(&bound_ty).is_none() && !type_to_tag(&bound_ty).is_empty() {
+                    self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
+                }
                 self.decl_types.insert(name.clone(), bound_ty);
                 self.emit_declare(name, line);
             }
@@ -3423,6 +3444,10 @@ impl Compiler {
                 self.emit_get(&ok, line);
                 let to_zero = self.b.emit(Op::JumpIfFalse(0), line);
                 self.emit_get(&raw, line);
+                // Asserted to a concrete type, the value leaves its box.
+                if self.iface_of(ty).is_none() && !type_to_tag(ty).is_empty() {
+                    self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
+                }
                 let done = self.b.emit(Op::Jump(0), line);
                 let zpos = self.b.current_pos();
                 self.b.patch_jump(to_zero, zpos);
@@ -4104,6 +4129,7 @@ impl Compiler {
                 let t = self.underlying(&base_type(t));
                 self.emit_typed(a, &t)
             }
+            Some(t) if self.is_iface_ty(t) => self.emit_typed(a, t),
             _ => self.emit_value(a),
         }
     }
@@ -4122,6 +4148,11 @@ impl Compiler {
         match map_key_ty(&self.type_name(recv)) {
             Some(k) if self.is_float_ty(k) => {
                 let k = self.underlying(&base_type(k));
+                self.emit_typed(index, &k)
+            }
+            // A `map[any]V` key is an interface value like any other.
+            Some(k) if self.is_iface_ty(k) => {
+                let k = k.to_string();
                 self.emit_typed(index, &k)
             }
             _ => self.expr(index),
@@ -4547,6 +4578,14 @@ impl Compiler {
             _ => {
                 self.closure_vars.remove(name);
                 self.emit_value(e)?;
+                // `s = Celsius(3)` into an interface-typed variable boxes.
+                if self
+                    .decl_types
+                    .get(name)
+                    .is_some_and(|t| self.is_iface_ty(t))
+                {
+                    self.emit_iface_box(e, 0);
+                }
             }
         }
         Ok(())
@@ -4578,6 +4617,12 @@ impl Compiler {
     }
 
     fn emit_typed(&mut self, e: &Expr, ty: &str) -> Result<(), String> {
+        // Stored into an interface, a defined value becomes a boxed one.
+        if self.is_iface_ty(ty) {
+            self.emit_value(e)?;
+            self.emit_iface_box(e, 0);
+            return Ok(());
+        }
         // A written `nil` for a slice or map type is that type's typed nil, not
         // the untyped one — `var s []int = nil` prints `[]`, like `var s []int`.
         if self.is_nil_literal(e) && (ty.starts_with("[]") || ty.starts_with("map[")) {
@@ -5038,6 +5083,10 @@ impl Compiler {
             self.b.emit(Op::StrEq, line);
             let jf = self.b.emit(Op::JumpIfFalse(0), line);
             self.emit_get(&recv_tmp, line);
+            // A defined type's method takes the value, not its interface box.
+            if self.defined_types.contains_key(t) {
+                self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
+            }
             // The dispatch arm knows the concrete type, so the value-vs-pointer
             // receiver question is answerable here even though the static type
             // was not.
@@ -5387,8 +5436,12 @@ impl Compiler {
         // Go's rule. Only `==`/`!=` — an interface is unordered, so `<` on two
         // of them is a Go compile error and never reaches here.
         if matches!(op, BinOp::Eq | BinOp::Ne) && (self.is_iface(lhs) || self.is_iface(rhs)) {
+            // The concrete side is converted to the interface type first, as
+            // Go does, so a defined value is compared with its type.
             self.emit_compare_operand(lhs)?;
+            self.emit_iface_box(lhs, 0);
             self.emit_compare_operand(rhs)?;
+            self.emit_iface_box(rhs, 0);
             self.b.emit(Op::LoadInt(i64::from(op == BinOp::Ne)), 0);
             self.b.emit(Op::CallBuiltin(host::GIFACE_EQ, 3), 0);
             return Ok(());
@@ -5462,6 +5515,64 @@ impl Compiler {
     fn is_iface(&self, e: &Expr) -> bool {
         let ty = base_type(&self.type_name(e));
         matches!(ty.as_str(), "interface{}" | "interface{ }") || self.iface_names.contains(&ty)
+    }
+
+    /// Whether a written type is an interface type — a value stored into one
+    /// is converted to an interface value.
+    fn is_iface_ty(&self, ty: &str) -> bool {
+        ty.starts_with("interface{")
+            || self.iface_names.contains(ty)
+            || self.iface_methods.contains_key(ty)
+    }
+
+    /// The synthesized `$stringifyAll_T` for a `fmt` operand whose static type
+    /// is a slice or array of a type `T` that `fmt` prints through its
+    /// `String()` / `Error()` method, or `None`. A value element uses the
+    /// method only when it is declared on the value receiver, which is Go's
+    /// method-set rule; a pointer element reaches either kind.
+    fn stringify_all_helper(&self, e: &Expr) -> Option<String> {
+        let ty = self.type_name(e);
+        let elem = ty
+            .strip_prefix("[]")
+            .or_else(|| array_elem_ty(&ty))?
+            .to_string();
+        // Elements of an interface type carry their own dynamic types, and one
+        // helper serves every such slice.
+        if self.is_iface_ty(&elem) {
+            let helper = "$stringifyAll_any".to_string();
+            return self.funcs.contains_key(&helper).then_some(helper);
+        }
+        let base = base_type(&elem);
+        let helper = format!("$stringifyAll_{base}");
+        if !self.funcs.contains_key(&helper) {
+            return None;
+        }
+        let on_value = ["String", "Error"].iter().any(|m| {
+            self.value_recv_methods
+                .contains(&(base.clone(), m.to_string()))
+        });
+        (elem.starts_with('*') || on_value).then_some(helper)
+    }
+
+    /// Box the value just emitted for `e` as an interface value when its static
+    /// type is a defined one (`type Celsius float64`).
+    ///
+    /// A defined type is represented exactly like its base, so outside an
+    /// interface it costs nothing — but an interface value is a (type, value)
+    /// pair, and the type is what dynamic dispatch, a type switch, an
+    /// assertion, `==` and `%T` all read. Stored bare, a `Celsius` in an
+    /// `any` was an `int`: its methods were unreachable (`s.String()` answered
+    /// nil), `case Celsius:` never matched and `fmt` never called `String()`.
+    /// The box is [`host::HostObj::Named`], the same tag `fmt` arguments carry;
+    /// every place a value leaves an interface for a concrete type unwraps it
+    /// ([`host::GUNNAME`]).
+    fn emit_iface_box(&mut self, e: &Expr, line: u32) {
+        let ty = self.type_name(e);
+        if self.defined_types.contains_key(&ty) {
+            let c = self.b.add_constant(Value::str(ty));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+        }
     }
 
     /// Whether `e`'s static Go type is `float32`.
@@ -6160,13 +6271,46 @@ impl Compiler {
                     // static type, and a spread slice is `[]any` whose elements
                     // each carry their own.
                     let last = args.len().saturating_sub(1);
+                    // Go's `fmt` consults `String()` / `Error()` only under the
+                    // verbs that print text — `%v %s %q %x %X` and `Errorf`'s `%w`, not `%#v` —
+                    // so `%d` of a `Stringer` enum prints its number. A literal
+                    // format says which verb each operand gets; anything else
+                    // (a computed format, an explicit `%[n]` index, `Print*`)
+                    // takes the method, as `%v` would.
+                    let verbs = match (field.as_str(), args.first()) {
+                        ("Printf" | "Sprintf", Some(Expr::Str(f))) => {
+                            let v = operand_verbs(f);
+                            (!v.iter().any(|(_, c)| *c == '[')).then_some(v)
+                        }
+                        _ => None,
+                    };
                     for (n, a) in args.iter().enumerate() {
                         if spread && n == last {
                             self.expr(a)?;
                             self.b.emit(Op::CallBuiltin(host::GSPREAD, 1), line);
                             continue;
                         }
-                        if has_stringify {
+                        let calls_methods = match (&verbs, n) {
+                            (Some(_), 0) => false,
+                            (Some(vs), n) => vs.get(n - 1).map_or(true, |(sharp, v)| {
+                                !sharp && matches!(v, 'v' | 's' | 'q' | 'x' | 'X' | 'w')
+                            }),
+                            (None, _) => true,
+                        };
+                        // A `[]T` / `[N]T` whose element type prints through a
+                        // method is rendered element by element.
+                        if has_stringify && calls_methods {
+                            if let Some(helper) = self.stringify_all_helper(a) {
+                                self.call(
+                                    &Expr::Ident(helper),
+                                    std::slice::from_ref(a),
+                                    false,
+                                    line,
+                                )?;
+                                continue;
+                            }
+                        }
+                        if has_stringify && calls_methods {
                             self.call(
                                 &Expr::Ident("$stringify".to_string()),
                                 std::slice::from_ref(a),
@@ -6561,7 +6705,9 @@ impl Compiler {
             // A conversion to an interface type — `error(e)`, `any(3)` — is the
             // identity: the dynamic value is unchanged, only its static type is.
             if args.len() == 1 && self.iface_names.contains(name) {
-                return self.expr(&args[0]);
+                self.expr(&args[0])?;
+                self.emit_iface_box(&args[0], line);
+                return Ok(());
             }
             // With an inline `rust {}` block present, an otherwise-unresolved
             // bare name may be an FFI export — dispatch it by name at runtime.
@@ -6834,9 +6980,21 @@ fn is_package(name: &str) -> bool {
 /// Walks the same shape `fmt` does: `%`, flags, width, `.` precision, verb. `%%`
 /// consumes no operand; a `*` width or precision consumes one of its own.
 fn wrap_operands(format: &str) -> Vec<usize> {
+    operand_verbs(format)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (_, v))| *v == 'w')
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The verb a literal `format` applies to each operand, in operand order, with
+/// whether it carries the `#` flag; a `*` width or precision operand is
+/// recorded as the verb `'*'`. An explicit argument index (`%[2]d`) is read as
+/// the verb `'['`, which callers treat as unknown.
+fn operand_verbs(format: &str) -> Vec<(bool, char)> {
     let chars: Vec<char> = format.chars().collect();
     let mut out = Vec::new();
-    let mut arg = 0usize;
     let mut i = 0;
     while i < chars.len() {
         if chars[i] != '%' {
@@ -6844,12 +7002,14 @@ fn wrap_operands(format: &str) -> Vec<usize> {
             continue;
         }
         i += 1;
+        let mut sharp = false;
         while i < chars.len() && matches!(chars[i], '-' | '+' | '#' | ' ' | '0') {
+            sharp |= chars[i] == '#';
             i += 1;
         }
         for _ in 0..2 {
             if i < chars.len() && chars[i] == '*' {
-                arg += 1;
+                out.push((false, '*'));
                 i += 1;
             } else {
                 while i < chars.len() && chars[i].is_ascii_digit() {
@@ -6867,10 +7027,7 @@ fn wrap_operands(format: &str) -> Vec<usize> {
         if verb == '%' {
             continue;
         }
-        if verb == 'w' {
-            out.push(arg);
-        }
-        arg += 1;
+        out.push((sharp, verb));
     }
     out
 }
@@ -7046,11 +7203,12 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                 || cases.iter().any(|c| body_has_ffi(&c.body))
                 || default.as_ref().is_some_and(|d| body_has_ffi(d))
         }
-        Stmt::IncDec { .. } | Stmt::Break(..)
-            | Stmt::Continue(..)
-            | Stmt::Fallthrough(_)
-            | Stmt::Goto(..)
-            | Stmt::Label(..) => false,
+        Stmt::IncDec { .. }
+        | Stmt::Break(..)
+        | Stmt::Continue(..)
+        | Stmt::Fallthrough(_)
+        | Stmt::Goto(..)
+        | Stmt::Label(..) => false,
     })
 }
 

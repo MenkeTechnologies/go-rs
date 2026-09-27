@@ -487,6 +487,49 @@ fn add_stringify(prog: &mut Program) {
     }
     let mut types: Vec<_> = chosen.into_iter().collect();
     types.sort(); // deterministic case order
+                  // `fmt` prints a slice or array element through its method too — `[]Color`
+                  // prints `[G B]` — and an element is not an operand the per-argument
+                  // helper sees. For each program type (a package's own are left alone) a
+                  // `$stringifyAll_T(xs []T) []any` renders the elements through the method,
+                  // and the compiler routes a `[]T` / `[N]T` operand through it.
+                  // A `[]any` holds its elements already boxed with their dynamic types, so
+                  // its one helper sends each through `$stringify` itself. Go source cannot
+                  // name `$stringify`, so the call is written against a placeholder and
+                  // renamed in the parsed loop body.
+    let src = "package p\nfunc h(xs []any) []any {\n\tout := make([]any, len(xs))\n\tfor i := 0; i < len(xs); i++ {\n\t\tout[i] = placeholder(xs[i])\n\t}\n\treturn out\n}\n";
+    if let Ok(mut p) = crate::parse(src) {
+        if let Some(mut f) = p.funcs.pop() {
+            for s in &mut f.body {
+                if let Stmt::For { body, .. } = s {
+                    for s in body {
+                        if let Stmt::Assign {
+                            value: Expr::Call { func, .. },
+                            ..
+                        } = s
+                        {
+                            **func = Expr::Ident("$stringify".to_string());
+                        }
+                    }
+                }
+            }
+            f.name = "$stringifyAll_any".to_string();
+            prog.funcs.push(f);
+        }
+    }
+    for (ty, method) in &types {
+        if ty.contains('.') {
+            continue;
+        }
+        let src = format!(
+            "package p\nfunc h(xs []{ty}) []any {{\n\tout := make([]any, len(xs))\n\tfor i := 0; i < len(xs); i++ {{\n\t\tout[i] = xs[i].{method}()\n\t}}\n\treturn out\n}}\n"
+        );
+        if let Ok(mut p) = crate::parse(&src) {
+            if let Some(mut f) = p.funcs.pop() {
+                f.name = format!("$stringifyAll_{ty}");
+                prog.funcs.push(f);
+            }
+        }
+    }
     let cases: Vec<TypeSwitchCase> = types
         .into_iter()
         .map(|(ty, method)| TypeSwitchCase {

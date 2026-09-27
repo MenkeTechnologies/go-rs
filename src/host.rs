@@ -299,6 +299,11 @@ pub const GDEREF_SET: u16 = 990;
 /// the element type's zero value (`elemTy` decides whether that copy recurses,
 /// as for [`GARRAY_COPY`]). Writes through a sub-slice's shared backing.
 pub const GCLEAR: u16 = 991;
+/// `[value]` → the value inside an interface box ([`HostObj::Named`]), or the
+/// value itself. Emitted where a value leaves an interface for its concrete
+/// type: a successful `x.(T)`, a type-switch case naming one type, and the
+/// receiver a dynamically dispatched method is handed.
+pub const GUNNAME: u16 = 992;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -412,6 +417,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GARRAY_TAG, b_array_tag);
     vm.register_builtin(GELEM_TAG, b_elem_tag);
     vm.register_builtin(GNAMED_BOX, b_named_box);
+    vm.register_builtin(GUNNAME, b_unname);
     vm.register_builtin(GSPREAD, b_spread);
     vm.register_builtin(GIFACE_EQ, b_iface_eq);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
@@ -553,8 +559,11 @@ fn b_assert(vm: &mut VM, argc: u8) -> Value {
     let v = args.first().cloned().unwrap_or(Value::Undef);
     let want = args.get(1).map(go_str).unwrap_or_default();
     let got = type_tag_of(&v);
-    if want.is_empty() || want == got {
+    if want.is_empty() {
         v
+    } else if want == got {
+        // Asserted to its concrete type, a defined value leaves its box.
+        unname(&v)
     } else {
         // Not a `runtime error: ` message: Go's `TypeAssertionError` text starts
         // at `interface conversion`.
@@ -584,6 +593,9 @@ fn type_tag_of(v: &Value) -> String {
                 NilKind::Map => "map".to_string(),
             },
             Some(HostObj::Closure { .. }) => "func".to_string(),
+            // A defined type in an interface is tagged by its own name, which
+            // is what a type switch or assertion naming it compares against.
+            Some(HostObj::Named { ty, .. }) => ty.clone(),
             _ => "nil".to_string(),
         }),
         _ => "nil".to_string(),
@@ -1105,6 +1117,7 @@ fn b_typeof(vm: &mut VM, argc: u8) -> Value {
             // type, which is the type whose method set the pointer satisfies.
             match h.get(follow(*id) as usize) {
                 Some(HostObj::Struct { type_name, .. }) => Value::str(type_name.clone()),
+                Some(HostObj::Named { ty, .. }) => Value::str(ty.clone()),
                 _ => Value::str(""),
             }
         }),
@@ -1798,6 +1811,12 @@ fn key_eq(a: &Value, b: &Value) -> bool {
                         Some(HostObj::Slice { elems: ex, .. }),
                         Some(HostObj::Slice { elems: ey, .. }),
                     ) => ex.len() == ey.len() && ex.iter().zip(ey).all(|(a, b)| key_eq(a, b)),
+                    // Two defined values in a `map[any]V` are one key when the
+                    // type and the value both match.
+                    (
+                        Some(HostObj::Named { ty: tx, inner: vx }),
+                        Some(HostObj::Named { ty: ty_, inner: vy }),
+                    ) => tx == ty_ && key_eq(vx, vy),
                     _ => false,
                 }
             })
@@ -1847,6 +1866,10 @@ enum MapKey {
     /// An array key: its elements' projections, in order. A distinct variant
     /// from [`MapKey::Struct`] because `key_eq` never equates the two.
     Array(Vec<MapKey>),
+    /// A defined value in an interface: its type name and the projection of
+    /// the value it holds, so `Celsius(1)` and `1` stay two keys of a
+    /// `map[any]V`.
+    Named(String, Box<MapKey>),
 }
 
 /// A key's hash projection, or `None` when it has none: a `NaN`, a struct or
@@ -1889,6 +1912,9 @@ fn map_key(v: &Value) -> Option<MapKey> {
                 Some(HostObj::Slice { elems, .. }) => Some(MapKey::Array(
                     elems.iter().map(map_key).collect::<Option<Vec<_>>>()?,
                 )),
+                Some(HostObj::Named { ty, inner }) => {
+                    Some(MapKey::Named(ty.clone(), Box::new(map_key(inner)?)))
+                }
                 _ => None,
             }
         }),
@@ -2747,6 +2773,8 @@ pub fn iface_eq(a: &Value, b: &Value) -> bool {
     if go_type_name(a) != go_type_name(b) {
         return false;
     }
+    // Same dynamic type: two boxed defined values compare by what they hold.
+    let (a, b) = (&unname(a), &unname(b));
     if let Some(same) = ptr_eq(a, b) {
         return same;
     }
@@ -3589,8 +3617,25 @@ fn key_ty_spelling(ty: &str) -> Option<String> {
 fn b_named_box(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let inner = args.first().cloned().unwrap_or(Value::Undef);
+    // A value that already crossed into an interface carries its own box, and
+    // the `fmt` tag of the same static type does not wrap it a second time.
+    if is_named(&inner) {
+        return inner;
+    }
     let ty = args.get(1).map(go_str).unwrap_or_default();
     Value::Obj(heap_alloc(HostObj::Named { ty, inner }))
+}
+
+/// Whether `v` is an interface box ([`HostObj::Named`]).
+fn is_named(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Named { .. })))
+}
+
+/// [`GUNNAME`] — the value inside an interface box.
+fn b_unname(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    unname(args.first().unwrap_or(&Value::Undef))
 }
 
 /// The value inside a [`HostObj::Named`] tag, or the value itself. Every part of
