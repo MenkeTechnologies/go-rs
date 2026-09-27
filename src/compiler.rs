@@ -366,6 +366,10 @@ struct Compiler {
     /// Variables statically known to hold a specific closure (name → lambda id),
     /// so `f(args)` on such a variable dispatches directly.
     closure_vars: HashMap<String, i64>,
+    /// The current function's receiver and parameters typed `*T` for a defined
+    /// non-struct `T`. Such a pointer is a heap cell holding the value (see
+    /// [`host::GDEREF`]), so `*p` reads through the cell.
+    cell_ptrs: HashSet<String>,
     /// While compiling a lambda body: its captured variables (name → index into
     /// the closure's captures). `emit_get` reads these from the closure (slot 0).
     active_captures: HashMap<String, u16>,
@@ -1423,6 +1427,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         temp_counter: 0,
         lambdas: Vec::new(),
         closure_vars: HashMap::new(),
+        cell_ptrs: HashSet::new(),
         active_captures: HashMap::new(),
         debug,
         has_ffi,
@@ -1525,6 +1530,13 @@ impl Compiler {
         // `apply(f func(int) int, v int)` answered with `main`'s `f` rather than
         // the closure it was handed.
         self.closure_vars.clear();
+        self.cell_ptrs = f
+            .receiver
+            .iter()
+            .chain(&f.params)
+            .filter(|p| p.ty.starts_with('*') && self.defined_types.contains_key(&base_type(&p.ty)))
+            .map(|p| p.name.clone())
+            .collect();
 
         // A method binds its receiver to slot 0; parameters follow.
         let mut slot = 0u16;
@@ -4217,6 +4229,9 @@ impl Compiler {
                 // pointer sees the same struct the original variable holds.
                 if matches!(op, UnOp::Addr | UnOp::Deref) {
                     self.expr(rhs)?;
+                    if matches!(op, UnOp::Deref) && self.is_cell_ptr(rhs) {
+                        self.b.emit(Op::CallBuiltin(host::GDEREF, 1), 0);
+                    }
                     // `&T{…}` (and `new(T)`, which parses to it) allocates: the
                     // result is a pointer, which Go compares by address, not by
                     // field. Mark the fresh handle so `==` knows. Taking the
@@ -5009,7 +5024,33 @@ impl Compiler {
                     args.len()
                 ));
             }
+            // A pointer-receiver method on a defined non-struct type (`func
+            // (s *Stack) Push`) can rebind the value (`*s = append(*s, v)`), and
+            // a slice or integer has no address of its own to write through. It
+            // is handed a cell holding the value, and whatever the method left
+            // in the cell is stored back into the receiver afterwards.
+            let by_value = self
+                .value_recv_methods
+                .contains(&(ty.clone(), method.to_string()));
+            let write_back = !by_value
+                && self.defined_types.contains_key(&ty)
+                && !self.is_cell_ptr(recv)
+                && matches!(
+                    recv,
+                    Expr::Ident(_) | Expr::Selector { .. } | Expr::Index { .. }
+                );
+            let cell = format!("$rcell{}", self.temp_counter);
             self.expr(recv)?;
+            if write_back {
+                self.temp_counter += 1;
+                self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), line);
+                self.types.insert(cell.clone(), NumType::Unknown);
+                self.emit_set(&cell, line);
+                self.emit_get(&cell, line);
+            } else if by_value && self.is_cell_ptr(recv) {
+                // A value method called through such a pointer takes the value.
+                self.b.emit(Op::CallBuiltin(host::GDEREF, 1), line);
+            }
             self.emit_recv_copy(&ty, method);
             let param_tys = self
                 .method_param_tys
@@ -5022,6 +5063,15 @@ impl Compiler {
             let idx = self.b.add_name(&format!("{ty}.{method}"));
             self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
             self.emit_panic_check(line);
+            if write_back {
+                let back = format!("{cell}v");
+                self.emit_get(&cell, line);
+                self.b.emit(Op::CallBuiltin(host::GCELL_GET, 1), line);
+                self.types.insert(back.clone(), NumType::Unknown);
+                self.decl_types.insert(back.clone(), ty.clone());
+                self.emit_set(&back, line);
+                self.assign(recv, AssignOp::Set, &Expr::Ident(back), line)?;
+            }
             return Ok(());
         }
 
@@ -5523,6 +5573,11 @@ impl Compiler {
         ty.starts_with("interface{")
             || self.iface_names.contains(ty)
             || self.iface_methods.contains_key(ty)
+    }
+
+    /// Whether `e` names a pointer held as a cell — see [`Self::cell_ptrs`].
+    fn is_cell_ptr(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Ident(n) if self.cell_ptrs.contains(n))
     }
 
     /// The synthesized `$stringifyAll_T` for a `fmt` operand whose static type

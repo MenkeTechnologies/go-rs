@@ -3309,3 +3309,15 @@ func main() {
     );
     assert_eq!(stdout, "true hi\n");
 }
+
+/// A pointer-receiver method on a defined slice or integer type rebinds the
+/// caller's value. It used to stop the program: `*s = …` had no address to
+/// write through ("cannot assign through a pointer to a non-composite value").
+/// Expected output is `go run`'s (go1.27.1).
+#[test]
+fn pointer_receiver_on_a_defined_non_struct_type_writes_back() {
+    let src = "package main\n\nimport \"fmt\"\n\ntype Stack []int\n\nfunc (s *Stack) Push(v int) { *s = append(*s, v) }\n\nfunc (s Stack) Len() int { return len(s) }\n\nfunc (s *Stack) Size() int { return s.Len() }\n\ntype Counter int\n\nfunc (c *Counter) Inc() { *c = *c + 1 }\n\ntype Box struct{ items Stack }\n\nfunc main() {\n\tvar s Stack\n\ts.Push(1)\n\ts.Push(2)\n\tfmt.Println(s, s.Size())\n\tvar c Counter\n\tc.Inc()\n\tfmt.Println(c)\n\tb := Box{}\n\tb.items.Push(7)\n\tcs := []Counter{0, 10}\n\tcs[1].Inc()\n\tfmt.Println(b.items, cs)\n}\n";
+    let (out, ok) = run(src);
+    assert!(ok, "{out:?}");
+    assert_eq!(out, "[1 2] 2\n1\n[7] [0 11]\n");
+}

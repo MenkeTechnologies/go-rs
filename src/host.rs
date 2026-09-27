@@ -304,6 +304,11 @@ pub const GCLEAR: u16 = 991;
 /// type: a successful `x.(T)`, a type-switch case naming one type, and the
 /// receiver a dynamically dispatched method is handed.
 pub const GUNNAME: u16 = 992;
+/// `[p]` → `*p` for a pointer to a non-struct value: the value a
+/// [`HostObj::Cell`] holds, or `p` itself (a struct, slice or map pointer is
+/// its pointee's own handle). A pointer-receiver method on a defined
+/// non-struct type is handed its receiver in such a cell.
+pub const GDEREF: u16 = 993;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -418,6 +423,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GELEM_TAG, b_elem_tag);
     vm.register_builtin(GNAMED_BOX, b_named_box);
     vm.register_builtin(GUNNAME, b_unname);
+    vm.register_builtin(GDEREF, b_deref);
     vm.register_builtin(GSPREAD, b_spread);
     vm.register_builtin(GIFACE_EQ, b_iface_eq);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
@@ -2977,6 +2983,19 @@ fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
         ffi_fault(vm, "go-rs: cannot assign through a pointer to a non-composite value (`&x` on a scalar has no address)".to_string(),);
         return Value::Undef;
     };
+    // A pointer that is a cell — a pointer-receiver method's receiver on a
+    // non-struct type — takes the new value into the cell.
+    let in_cell = HEAP.with(|h| {
+        if let Some(HostObj::Cell(slot)) = h.borrow_mut().get_mut(id as usize) {
+            *slot = val.clone();
+            true
+        } else {
+            false
+        }
+    });
+    if in_cell {
+        return val;
+    }
     // The *pointee* is overwritten rather than rebound, which is what makes the
     // write visible through every other pointer to it and through the variable
     // itself. The source is copied first: `*p = q` must not alias `q`'s fields.
@@ -3630,6 +3649,17 @@ fn b_named_box(vm: &mut VM, argc: u8) -> Value {
 fn is_named(v: &Value) -> bool {
     let Value::Obj(id) = v else { return false };
     HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Named { .. })))
+}
+
+/// [`GDEREF`] — read through a pointer to a non-struct value.
+fn b_deref(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let p = args.into_iter().next().unwrap_or(Value::Undef);
+    let Value::Obj(id) = p else { return p };
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Cell(v)) => v.clone(),
+        _ => p.clone(),
+    })
 }
 
 /// [`GUNNAME`] — the value inside an interface box.
