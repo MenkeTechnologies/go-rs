@@ -3483,7 +3483,7 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                 ),
                 // A user-declared struct is qualified by its package, and go-rs
                 // only ever compiles `package main`.
-                Some(HostObj::Struct { type_name, .. }) => format!("main.{type_name}"),
+                Some(HostObj::Struct { type_name, .. }) => package_qualified(type_name),
                 Some(HostObj::Closure { .. }) => "func()".to_string(),
                 Some(HostObj::Cell(v)) => go_type_name(v),
                 // A defined type is named, not described: `main.Weekday`, never
@@ -3526,6 +3526,16 @@ fn elem_type_name(v: Option<&Value>) -> String {
 /// predeclared names a type declared in the program, which `%T` qualifies by its
 /// package — always `main` here. Both are applied per identifier, so
 /// `map[string]pt` renames only the element.
+/// How Go names a declared type: by its package. A type the linker merged in
+/// from an imported package is already `path.Name`, and Go shows the path's last
+/// segment (`unicode/utf8.T` is `utf8.T`); anything else is `package main`'s.
+pub(crate) fn package_qualified(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((path, ty)) => format!("{}.{ty}", path.rsplit('/').next().unwrap_or(path)),
+        None => format!("main.{name}"),
+    }
+}
+
 pub(crate) fn go_type_spelling(ty: &str) -> String {
     let mut out = String::with_capacity(ty.len());
     let mut word = String::new();
@@ -3536,14 +3546,15 @@ pub(crate) fn go_type_spelling(ty: &str) -> String {
             "rune" => out.push_str("int32"),
             w if is_predeclared_type(w) => out.push_str(w),
             w => {
-                out.push_str("main.");
-                out.push_str(w);
+                out.push_str(&package_qualified(w));
             }
         }
         word.clear();
     };
     for c in ty.chars() {
-        if c.is_alphanumeric() || c == '_' {
+        // A qualified name (`pkg.T`, `a/b.T`) is one word; a leading `.` (`...T`)
+        // is punctuation.
+        if c.is_alphanumeric() || c == '_' || (!word.is_empty() && (c == '.' || c == '/')) {
             word.push(c);
         } else {
             flush(&mut word, &mut out);
@@ -3889,7 +3900,7 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                         .iter()
                         .map(|(n, v)| format!("{n}:{}", go_str_mode(v, mode)))
                         .collect();
-                    format!("main.{type_name}{{{}}}", parts.join(", "))
+                    format!("{}{{{}}}", package_qualified(type_name), parts.join(", "))
                 }
             },
             // Go prints a function value as a hex pointer; a fixed marker suffices.

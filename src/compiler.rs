@@ -4770,7 +4770,7 @@ impl Compiler {
             // A declared type — a struct or a defined type over any other base —
             // is qualified by its package.
             _ if self.structs.contains(ty) || self.defined_types.contains_key(ty) => {
-                format!("main.{ty}")
+                host::package_qualified(ty)
             }
             _ => ty.to_string(),
         }
@@ -6941,7 +6941,7 @@ fn iface_display(ty: &str) -> String {
     if name == "error" || name.starts_with("interface{") {
         name
     } else {
-        format!("main.{name}")
+        host::package_qualified(&name)
     }
 }
 

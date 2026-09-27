@@ -58,6 +58,7 @@ pub fn link(mut main: Program) -> Result<Program, String> {
         main.funcs.extend(pkg.funcs);
         main.types.extend(pkg.types);
         main.interfaces.extend(pkg.interfaces);
+        main.defined.extend(pkg.defined);
     }
     init_globals.extend(std::mem::take(&mut main.main));
     main.main = init_globals;
@@ -614,6 +615,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         for t in &prog.types {
             own.insert(t.name.clone());
         }
+        for (name, _) in &prog.defined {
+            own.insert(name.clone());
+        }
         for i in &prog.interfaces {
             // An anonymous interface (`interface{ Unwrap() error }`) is named by
             // its method set, not by the package — every package that writes the
@@ -656,6 +660,14 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         for f in &mut t.fields {
             f.ty = q.qual_type(&f.ty);
         }
+    }
+    // `type Name <base>` over a non-struct base: named like any own type, and
+    // its base may itself name one.
+    for (name, base) in &mut prog.defined {
+        if rename {
+            *name = q.qual(name);
+        }
+        *base = q.qual_type(base);
     }
     for i in &mut prog.interfaces {
         if rename && !is_anon_iface(&i.name) {

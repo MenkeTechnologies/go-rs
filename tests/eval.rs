@@ -3335,3 +3335,41 @@ fn format_int_signs_the_magnitude_in_every_base() {
         "-ff -11111111 73 -513\nstrconv: illegal AppendInt/FormatInt base\n"
     );
 }
+
+/// A defined non-struct type declared by an imported source package is
+/// qualified and linked like its struct types. It was neither, so the first
+/// package-level `var x T` naming one failed with `undefined: T` — which is
+/// what stopped `import "unicode"` (`var TurkishCase SpecialCase = …`).
+/// Expected output is `go run`'s (go1.27.1) for the same package.
+#[test]
+fn a_defined_type_in_an_imported_package_links() {
+    let home = tempfile::tempdir().expect("temp home");
+    let pkg = home.path().join("src/week");
+    std::fs::create_dir_all(&pkg).expect("mkdir");
+    std::fs::write(
+        pkg.join("week.go"),
+        "package week\n\nvar Mid Day = mid\n\nvar mid = Day(3)\n\ntype Day int\n\ntype Days []Day\n\nfunc (d Day) String() string { return [...]string{\"Sun\", \"Mon\", \"Tue\", \"Wed\"}[d] }\n\nfunc (ds Days) Last() Day { return ds[len(ds)-1] }\n",
+    )
+    .expect("write week");
+    let mut f = tempfile::Builder::new()
+        .suffix(".go")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(
+        b"package main\n\nimport (\n\t\"fmt\"\n\t\"week\"\n)\n\nfunc main() {\n\tds := week.Days{1, week.Mid}\n\tfmt.Println(week.Mid, ds.Last(), len(ds))\n\tfmt.Printf(\"%T %T\\n\", week.Mid, ds)\n}\n",
+    )
+    .expect("write source");
+    let out = Command::new(env!("CARGO_BIN_EXE_go"))
+        .env("GO_RS_HOME", home.path())
+        .arg("run")
+        .arg(f.path())
+        .output()
+        .expect("spawn go binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout:?} {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout, "Wed Wed 2\nweek.Day week.Days\n");
+}
