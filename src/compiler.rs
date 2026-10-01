@@ -328,6 +328,9 @@ struct Compiler {
     /// `(type, method)` for every method declared with a value receiver — the
     /// receiver is copied at the call, so the method's writes stay local.
     value_recv_methods: HashSet<(String, String)>,
+    /// Methods whose last parameter is variadic (`func (s *S) Add(xs ...int)`),
+    /// whose trailing arguments a call packs into a slice.
+    variadic_methods: HashSet<(String, String)>,
     /// Method result counts keyed by `(receiver type, method name)` — lets a
     /// `v, ok := recv.M()` destructure a multi-value method return.
     method_nresults: HashMap<(String, String), usize>,
@@ -1324,6 +1327,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Go binds such a receiver to a copy, so the method cannot mutate the caller's
     // struct; a pointer receiver binds the struct itself and is meant to.
     let mut value_recv_methods: HashSet<(String, String)> = HashSet::new();
+    let mut variadic_methods: HashSet<(String, String)> = HashSet::new();
     for f in &prog.funcs {
         match &f.receiver {
             Some(r) => {
@@ -1338,6 +1342,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 }
                 if !r.ty.starts_with('*') {
                     value_recv_methods.insert((base_type(&r.ty), f.name.clone()));
+                }
+                if f.variadic {
+                    variadic_methods.insert((base_type(&r.ty), f.name.clone()));
                 }
             }
             None => {
@@ -1475,6 +1482,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         struct_fields,
         methods,
         value_recv_methods,
+        variadic_methods,
         method_nresults,
         method_result_ty,
         method_param_tys,
@@ -2088,6 +2096,10 @@ impl Compiler {
         }
         if spread {
             self.emit_value(&args[fixed])?;
+        } else if args.len() == fixed {
+            // No trailing arguments: the parameter is a nil slice, as in Go.
+            let elem = param_tys.last().cloned().unwrap_or_default();
+            self.emit_zero(&format!("[]{elem}"), line);
         } else {
             let rest = args[fixed..].to_vec();
             self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, rest.len(), line, |c, i| {
@@ -5307,6 +5319,7 @@ impl Compiler {
         recv: &Expr,
         method: &str,
         args: &[Expr],
+        spread: bool,
         line: u32,
     ) -> Result<(), String> {
         let ty = self.type_name(recv);
@@ -5314,7 +5327,10 @@ impl Compiler {
         // Static dispatch: the receiver's concrete struct type is known and
         // declares the method — a direct `Op::Call` to `T.method`.
         if let Some(&arity) = self.methods.get(&(ty.clone(), method.to_string())) {
-            if arity != args.len() {
+            let variadic = self
+                .variadic_methods
+                .contains(&(ty.clone(), method.to_string()));
+            if !variadic && arity != args.len() {
                 return Err(format!(
                     "go-rs: `{ty}.{method}` takes {arity} argument(s), got {} (line {line})",
                     args.len()
@@ -5353,11 +5369,12 @@ impl Compiler {
                 .get(&(ty.clone(), method.to_string()))
                 .cloned()
                 .unwrap_or_default();
-            for (i, a) in args.iter().enumerate() {
-                self.emit_arg(a, param_tys.get(i))?;
-            }
+            // A variadic method packs its trailing arguments into the slice its
+            // last parameter binds, as a variadic function call does.
+            let what = format!("`{ty}.{method}`");
+            let argc = self.emit_call_operands(&param_tys, variadic, args, spread, &what, line)?;
             let idx = self.b.add_name(&format!("{ty}.{method}"));
-            self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+            self.b.emit(Op::Call(idx, argc as u8 + 1), line);
             self.emit_panic_check(line);
             if write_back {
                 let back = format!("{cell}v");
@@ -6794,7 +6811,7 @@ impl Compiler {
                 }
             }
             // Otherwise a method call `recv.method(args)`.
-            return self.method_call(recv, field, args, line);
+            return self.method_call(recv, field, args, spread, line);
         }
 
         // Bare-name call: a language builtin or a user function.
@@ -7067,26 +7084,8 @@ impl Compiler {
                     // Fixed params come first; the trailing arguments are packed
                     // into the variadic slice parameter (or, for `f(xs...)`, the
                     // already-a-slice argument is passed directly).
-                    let fixed = arity - 1;
-                    if args.len() < fixed {
-                        return Err(format!(
-                            "go-rs: `{name}` needs at least {fixed} argument(s), got {} (line {line})",
-                            args.len()
-                        ));
-                    }
-                    for (i, a) in args[..fixed].iter().enumerate() {
-                        self.emit_arg(a, param_tys.get(i))?;
-                    }
-                    if spread {
-                        // `f(a, xs...)` — the last argument is the slice itself.
-                        self.emit_value(&args[fixed])?;
-                    } else {
-                        // Pack the remaining arguments into a fresh slice.
-                        let rest = args[fixed..].to_vec();
-                        self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, rest.len(), line, |c, i| {
-                            c.emit_value(&rest[i])
-                        })?;
-                    }
+                    let what = format!("`{name}`");
+                    self.emit_call_operands(&param_tys, true, args, spread, &what, line)?;
                     let idx = self.b.add_name(name);
                     self.b.emit(Op::Call(idx, arity as u8), line);
                     self.emit_panic_check(line);

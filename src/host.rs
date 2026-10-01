@@ -2570,6 +2570,11 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
         Value::Obj(id) => {
             // `append(*p, x)` hands over the pointer, not the slice it addresses.
             let id = follow(id);
+            // Nothing to append: Go returns the slice itself — a nil slice
+            // stays nil, and the result shares the operand's backing.
+            if args.is_empty() {
+                return Value::Obj(id);
+            }
             // Appending to a sub-slice view reallocates into a fresh slice (its
             // own backing), so it never clobbers the parent's elements.
             let is_view = HEAP

@@ -154,6 +154,19 @@ fn hex_verbs_encode_byte_slices_bytewise() {
     );
 }
 
+/// A variadic method packs its trailing arguments (or takes a spread slice);
+/// with none, the parameter is nil — for a function and a closure too — and
+/// `append(s)` with nothing to add returns `s` itself. Expected output is
+/// `go run`'s (go1.27.1).
+#[test]
+fn variadic_methods_and_nil_variadic_parameters() {
+    assert_stdout(
+        include_str!("../parity-scripts/variadic_method.go"),
+        "3\n0\n2\ninfo: a b c | warn:  | err: x y\n10 11 16 19\nnone0 true two2 false\n\
+         [v: q]\ntrue false false\ntrue false\ntrue 1 2\n",
+    );
+}
+
 /// `r.handlers["up"](x)` indexes a func-valued map field and calls the
 /// element; a struct variable is not an import, so the brackets are no type
 /// arguments. Expected output is `go run`'s (go1.27.1).
