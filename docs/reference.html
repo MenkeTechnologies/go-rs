@@ -2226,77 +2226,71 @@ println(addrs(2, 3))</code></pre>
           <pre><code class="lang-go">for i := 0; i &lt; n; i++ { p := &amp;Point{} ; _ = p }   // never reclaimed</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-2">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-2">#</a> <code>range over a channel</code></h3>
-          <pre><code class="lang-go">for v := range ch</code></pre>
-          <p>Yields zero iterations. The range lowering asks the host for the iterable's key set, and a channel is a scheduler id rather than a heap object, so the key set comes back empty — whether or not the channel holds values or has been closed. Drain a channel with an explicit counted loop or `select` instead.</p>
-          <pre><code class="lang-go">for i := 0; i &lt; n; i++ { v := &lt;-ch; use(v) }</code></pre>
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-2">#</a> <code>range over a function</code></h3>
+          <pre><code class="lang-go">for v := range seq</code></pre>
+          <p>A Go 1.23 iterator function runs the loop body as its `yield` callback; `break`, `continue` and `return` are carried out of it as in Go. Two forms are not: a `break L` / `continue L` naming a loop outside the range-over-func loop is a compile error, and a `defer` in the body runs when that iteration's `yield` returns rather than when the enclosing function does.</p>
+          <pre><code class="lang-go">for v := range seq { if v &gt; 3 { break } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-divergence-from-go-3">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-3">#</a> <code>range over an integer</code></h3>
-          <pre><code class="lang-go">for i := range n</code></pre>
-          <p>Go 1.22's integer range yields zero iterations here, for the same reason: an integer has no key set. Write the three-clause form.</p>
-          <pre><code class="lang-go">for i := 0; i &lt; n; i++ { … }</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-divergence-from-go-4">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-4">#</a> <code>%T on a defined type</code></h3>
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-3">#</a> <code>%T on a defined type</code></h3>
           <pre><code class="lang-go">fmt.Printf("%T", d)</code></pre>
           <p>A defined type over a non-struct base (`type Weekday int`) is represented as its base, and named from the static type: `%T` of a `Weekday` operand, or of one stored in an interface (which carries the name), is `main.Weekday`; through a generic parameter it is the base. A defined struct type is named correctly, including inside a composite — `[2]main.pt`, `map[string]main.pt`. A fixed-size array carries its written type, so `%T` and `%#v` report `[3]int` rather than `[]int`.</p>
           <pre><code class="lang-go">fmt.Printf("%T", a) // [3]int</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-5">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-5">#</a> <code>call argument limit</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-4">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-4">#</a> <code>call argument limit</code></h3>
           <pre><code class="lang-go">fmt.Println(a1, a2, /* … 256 … */)</code></pre>
           <p>A call passes at most 255 arguments: fusevm holds a call's argument count in a `u8`. Over that is a compile error rather than a silently short call. Go has no such limit. A composite literal is not bounded this way — it is built in chunks, so `[]T{…}`, `map[K]V{…}` and a struct literal work at any size.</p>
           <pre><code class="lang-go">fmt.Println(xs) // pass the slice</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-6">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-6">#</a> <code>append aliasing</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-5">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-5">#</a> <code>append aliasing</code></h3>
           <pre><code class="lang-go">append(s, v)</code></pre>
           <p>The non-spread form extends the backing array in place and returns the same handle, so the append is visible through every alias of `s`. Go copies to a new array once capacity is exceeded, which detaches the result. Code that relies on that detachment behaves differently here.</p>
           <pre><code class="lang-go">b := append(a, 1)   // a and b stay the same slice</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-7">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-7">#</a> <code>interface{} in a type position</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-6">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-6">#</a> <code>interface{} in a type position</code></h3>
           <pre><code class="lang-go">var x interface{}</code></pre>
           <p>Not parsed. `interface{ … }` is accepted in a `type` declaration and as a generic constraint, but not where a variable, parameter or field type is expected. Write `any`.</p>
           <pre><code class="lang-go">var x any</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-8">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-8">#</a> <code>embedded fields</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-7">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-7">#</a> <code>embedded fields</code></h3>
           <pre><code class="lang-go">type D struct { Base }</code></pre>
           <p>Anonymous (embedded) struct fields are not parsed — every field needs a name. There is no field or method promotion; write the field explicitly and forward the methods.</p>
           <pre><code class="lang-go">type D struct { base Base }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-9">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-9">#</a> <code>local type declarations</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-8">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-8">#</a> <code>local type declarations</code></h3>
           <pre><code class="lang-go">func f() { type T … }</code></pre>
           <p>Only top-level `type` declarations are parsed. A `type` inside a function body is a syntax error; move it to file scope.</p>
           <pre><code class="lang-go">type T struct{ a int }
 
 func f() { … }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-10">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-10">#</a> <code>elided composite element types</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-9">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-9">#</a> <code>elided composite element types</code></h3>
           <pre><code class="lang-go">[][]int{{1, 2}}</code></pre>
           <p>Go lets a nested composite literal omit its element type. go-rs requires it in both slice and map literals.</p>
           <pre><code class="lang-go">[][]int{[]int{1, 2}}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-11">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-11">#</a> <code>generics are erased</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-10">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-10">#</a> <code>generics are erased</code></h3>
           <pre><code class="lang-go">func F[T any](…)</code></pre>
           <p>Type parameters, constraint interfaces and type arguments are parsed and discarded — the dynamic value model runs one compiled body for every instantiation. The visible consequence is that `var zero T` is nil rather than the concrete type's zero value, which is what breaks `cmp.Or`.</p>
           <pre><code class="lang-go">func Sum[T Number](xs []T) T</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-12">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>unsupported package calls</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-11">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-11">#</a> <code>unsupported package calls</code></h3>
           <pre><code class="lang-go">pkg.Func(…)</code></pre>
           <p>Calling a name a native package does not wire is a compile-time error, not a link error: `go-rs: unsupported call \`strings.Cut\``. The wired sets are exactly the ones this reference lists. `fmt.Fprint`/`Fprintf`/`Fprintln` are not among them because they are not builtins at all — each rewrites to `w.Write([]byte(fmt.Sprint*(…)))`, so writer-directed output is ordinary method dispatch on whatever the program passed.</p>
           <pre><code class="lang-go">fmt.Sprintf(…)   // wired
 fmt.Fprintf(w, …)  // rewritten to w.Write
 strings.Cut(…)   // not</code></pre>
         </article>
-        <article class="doc-entry" id="doc-divergence-from-go-13">
-          <h3><a class="doc-anchor" href="#doc-divergence-from-go-13">#</a> <code>map iteration order</code></h3>
+        <article class="doc-entry" id="doc-divergence-from-go-12">
+          <h3><a class="doc-anchor" href="#doc-divergence-from-go-12">#</a> <code>map iteration order</code></h3>
           <pre><code class="lang-go">for k := range m</code></pre>
           <p>Go deliberately randomizes map iteration order. go-rs keeps a map's pairs in insertion order and ranges them in that order, so iteration is deterministic. Do not rely on that determinism in code meant to also build with the Go toolchain.</p>
           <pre><code class="lang-go">for k, v := range m { … }   // insertion order</code></pre>

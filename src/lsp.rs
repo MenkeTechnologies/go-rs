@@ -2467,18 +2467,11 @@ const CORPUS: &[Entry] = &[
         "for i := 0; i < n; i++ { p := &Point{} ; _ = p }   // never reclaimed",
     ),
     e(
-        "range over a channel",
+        "range over a function",
         "Divergence from Go",
-        "for v := range ch",
-        "Yields zero iterations. The range lowering asks the host for the iterable's key set, and a channel is a scheduler id rather than a heap object, so the key set comes back empty — whether or not the channel holds values or has been closed. Drain a channel with an explicit counted loop or `select` instead.",
-        "for i := 0; i < n; i++ { v := <-ch; use(v) }",
-    ),
-    e(
-        "range over an integer",
-        "Divergence from Go",
-        "for i := range n",
-        "Go 1.22's integer range yields zero iterations here, for the same reason: an integer has no key set. Write the three-clause form.",
-        "for i := 0; i < n; i++ { … }",
+        "for v := range seq",
+        "A Go 1.23 iterator function runs the loop body as its `yield` callback; `break`, `continue` and `return` are carried out of it as in Go. Two forms are not: a `break L` / `continue L` naming a loop outside the range-over-func loop is a compile error, and a `defer` in the body runs when that iteration's `yield` returns rather than when the enclosing function does.",
+        "for v := range seq { if v > 3 { break } }",
     ),
     e(
         "%T on a defined type",

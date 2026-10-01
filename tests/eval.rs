@@ -115,6 +115,45 @@ fn math_limits_constants_and_ieee_specials() {
     );
 }
 
+/// Range over an iterator function: the body is the `yield` callback, so
+/// `break` stops the iterator, `continue` moves on, a `return` leaves the
+/// enclosing function after the iterator stops, and writes to outer variables
+/// land. Expected output is `go run`'s (go1.27.1).
+#[test]
+fn range_over_func_runs_the_body_as_yield() {
+    assert_stdout(
+        include_str!("../parity-scripts/range_over_func.go"),
+        "  stopped at 4\n  counted 4\n  exhausted\n  counted 3\n6 3\nv 0\nv 1\nv 2\n  exhausted\n\
+         w 0\nw 1\nw 3\n  stopped at 4\n  stopped at 6\n6 true\n  exhausted\n-1 false\n\
+         0a 1b 2c \nfound y none\n  exhausted\ntotal 10\n  exhausted\nlast 3\n  exhausted\n\
+         sum 3\nevens 4\n7 8 1 2 \n314\n",
+    );
+}
+
+/// A closure writing a package-level variable writes the variable every
+/// function reads, from `main`, another function or a goroutine. Expected
+/// output is `go run`'s (go1.27.1).
+#[test]
+fn closure_writes_the_package_global() {
+    assert_stdout(
+        include_str!("../parity-scripts/closure_writes_package_global.go"),
+        "2 2 [bump 1 bump 2]\n12 12 map[g:12]\n17 17 2\n2\n0 10 20 \n",
+    );
+}
+
+/// `%x` of a byte slice encodes the bytes, not a lossy string of them; `.N`
+/// limits the bytes and `% #x` prefixes each. Expected output is `go run`'s
+/// (go1.27.1).
+#[test]
+fn hex_verbs_encode_byte_slices_bytewise() {
+    assert_stdout(
+        include_str!("../parity-scripts/fmt_hex_bytes.go"),
+        "01abff|01 ab ff|01ABFF|[1 171 255]|[1 171 255]\n6869c8 [104 105 200] hi\n\
+         0x01abff|0x01 0xab 0xff|0X01 0XAB 0XFF|01ab|61|  01abff|01abff  |\n\
+         0x6162|0x61 0x62|||\ndeadbeef\n0ff0\n",
+    );
+}
+
 /// `r.handlers["up"](x)` indexes a func-valued map field and calls the
 /// element; a struct variable is not an import, so the brackets are no type
 /// arguments. Expected output is `go run`'s (go1.27.1).

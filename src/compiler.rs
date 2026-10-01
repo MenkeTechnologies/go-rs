@@ -401,6 +401,14 @@ struct Compiler {
     /// so live in a shared heap cell (Go's capture-by-reference). Reads/writes go
     /// through the cell; a captured cell handle is shared with the closure.
     boxed: HashSet<String>,
+    /// Globals some closure in the program captures. Each lives in a cell from
+    /// its declaration, so a closure that writes one and every function that
+    /// reads it see the same variable.
+    global_cells: HashSet<String>,
+    /// Set while the `yield` closure of a range-over-func loop is emitted: it
+    /// runs synchronously in the loop's own VM, so it reads and writes
+    /// globals directly instead of capturing them.
+    yield_reads_globals: bool,
     /// While compiling a lambda: which of its captures are cells (captured by
     /// reference). A cell capture is dereferenced on read and written through.
     active_cell_captures: HashSet<String>,
@@ -1490,6 +1498,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             || prog.funcs.iter().any(|f| body_uses_panic(&f.body)),
         panic_jumps: Vec::new(),
         boxed: HashSet::new(),
+        global_cells: HashSet::new(),
+        yield_reads_globals: false,
         active_cell_captures: HashSet::new(),
         named_results: Vec::new(),
         fn_results: Vec::new(),
@@ -1518,8 +1528,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             c.b.emit(Op::Pop, 0);
         }
     }
-    // main's globals captured by a closure are boxed (shared cells) too.
+    // A global some closure captures — in `main` or in any function — lives
+    // in a cell from its declaration on, so the closure and every function
+    // that reads or writes the global share it (see `global_cells`).
+    c.global_cells = global_cells(prog, &c.globals);
     c.boxed = boxed_vars(&[], &prog.main);
+    c.boxed.extend(c.global_cells.iter().cloned());
     c.fn_has_defer = body_has_defer(&prog.main);
     if c.fn_has_defer {
         c.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), 0);
@@ -2200,6 +2214,15 @@ impl Compiler {
         caps
     }
 
+    /// True if `name` is a package-level variable (or a top-level `main`
+    /// variable, which go-rs stores the same way) that no enclosing local or
+    /// capture shadows.
+    fn is_global_here(&self, name: &str) -> bool {
+        self.globals.contains(name)
+            && !self.scope_has(name)
+            && !self.active_captures.contains_key(name)
+    }
+
     /// True if `name` names a variable of the scope currently being compiled
     /// (a local/param/global, or a capture of an enclosing lambda).
     fn is_enclosing_var(&self, name: &str) -> bool {
@@ -2398,7 +2421,11 @@ impl Compiler {
     fn fv_expr(&self, e: &Expr, bound: &HashSet<String>, caps: &mut Vec<String>) {
         match e {
             Expr::Ident(n) => {
-                if !bound.contains(n) && self.is_enclosing_var(n) && !caps.contains(n) {
+                if !bound.contains(n)
+                    && self.is_enclosing_var(n)
+                    && !(self.yield_reads_globals && self.is_global_here(n))
+                    && !caps.contains(n)
+                {
                     caps.push(n.clone());
                 }
             }
@@ -2477,7 +2504,9 @@ impl Compiler {
     /// Whether `name` is captured by reference in the current function — a boxed
     /// local, or a cell capture inside a lambda (both live in a shared cell).
     fn is_boxed(&self, name: &str) -> bool {
-        self.boxed.contains(name) || self.active_cell_captures.contains(name)
+        self.boxed.contains(name)
+            || self.active_cell_captures.contains(name)
+            || (self.global_cells.contains(name) && self.is_global_here(name))
     }
 
     /// Push a variable's raw storage: the closure cell handle for a captured or
@@ -2888,6 +2917,19 @@ impl Compiler {
                 label,
                 ..
             } => self.compile_for(init, cond, post, body, label)?,
+            // A Go 1.23 iterator function is called with the body as its
+            // `yield`, not walked.
+            Stmt::ForRange {
+                key,
+                val,
+                define,
+                iter,
+                body,
+                label,
+                ..
+            } if self.is_func_iterator(iter) => {
+                self.compile_for_range_func(key, val, *define, iter, body, label)?
+            }
             Stmt::ForRange {
                 key,
                 val,
@@ -4081,6 +4123,149 @@ impl Compiler {
         }
         for j in scope.breaks {
             self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Whether a `range` operand is a function — a func-typed value (an
+    /// iterator `func(yield func(…) bool)` or a defined type over one), or a
+    /// method value `l.All` — so the loop is range-over-func.
+    fn is_func_iterator(&self, iter: &Expr) -> bool {
+        if self.underlying(&self.type_name(iter)).starts_with("func") {
+            return true;
+        }
+        // A declared function named directly: `for v := range seq`.
+        if matches!(iter, Expr::Ident(n) if self.is_func_value(n)) {
+            return true;
+        }
+        let Expr::Selector { recv, field } = iter else {
+            return false;
+        };
+        let ty = base_type(&self.type_name(recv));
+        !ty.is_empty() && self.methods.contains_key(&(ty, field.clone()))
+    }
+
+    /// `for k, v := range f` over a Go 1.23 iterator function: `f` is called
+    /// once with a `yield` closure whose body is the loop body, and the loop
+    /// ends when `f` returns. Inside the closure a `break` is `return false`
+    /// (stop the iteration), a `continue` is `return true`, and a `return`
+    /// from the enclosing function records its values, stops the iteration,
+    /// and is performed once `f` has returned — Go's own desugaring.
+    fn compile_for_range_func(
+        &mut self,
+        key: &Option<String>,
+        val: &Option<String>,
+        define: bool,
+        iter: &Expr,
+        body: &[Stmt],
+        label: &Option<String>,
+    ) -> Result<(), String> {
+        let n = self.temp_counter;
+        self.temp_counter += 1;
+        // The loop variables are the yield closure's parameters; `for k = range
+        // f` assigns them to the outer variables first.
+        let mut params = Vec::new();
+        let mut prologue = Vec::new();
+        for (i, var) in [key, val].into_iter().enumerate() {
+            let Some(var) = var else { break };
+            let param = if define && var != "_" {
+                var.clone()
+            } else {
+                format!("$rfp{n}_{i}")
+            };
+            if !define && var != "_" {
+                prologue.push(Stmt::Assign {
+                    target: Expr::Ident(var.clone()),
+                    op: AssignOp::Set,
+                    value: Expr::Ident(param.clone()),
+                    line: 0,
+                });
+            }
+            params.push(Param {
+                name: param,
+                ty: String::new(),
+            });
+        }
+        let plan = RangeFuncReturn {
+            set: format!("$rfset{n}"),
+            values: (0..self.fn_results.len())
+                .map(|i| format!("$rfret{n}_{i}"))
+                .collect(),
+        };
+        let mut uses_return = false;
+        let mut yield_body = prologue;
+        yield_body.extend(range_func_body(body, label, &plan, &mut uses_return)?);
+        yield_body.push(Stmt::Return(vec![Expr::Bool(true)], 0));
+        if uses_return {
+            self.stmt(&Stmt::Var {
+                name: plan.set.clone(),
+                ty: Some("bool".to_string()),
+                init: None,
+                line: 0,
+            })?;
+            for (name, ty) in plan.values.iter().zip(self.fn_results.clone()) {
+                self.stmt(&Stmt::Var {
+                    name: name.clone(),
+                    ty: Some(ty),
+                    init: None,
+                    line: 0,
+                })?;
+            }
+        }
+        let call = Expr::Call {
+            func: Box::new(iter.clone()),
+            args: vec![Expr::FuncLit {
+                params,
+                results: vec!["bool".to_string()],
+                body: yield_body,
+                variadic: false,
+            }],
+            spread: false,
+            line: 0,
+        };
+        // The capture analysis ran before this closure existed, so a variable
+        // the body writes is not boxed yet and the closure would write a copy.
+        // Box each one for the length of the call — the closure shares the
+        // cell — and store its final value back into the plain variable after.
+        let Expr::Call { args, .. } = &call else {
+            unreachable!()
+        };
+        let Some(Expr::FuncLit { body, .. }) = args.first() else {
+            unreachable!()
+        };
+        let mut written = Vec::new();
+        assigned_idents(body, &mut written);
+        let boxed_here: Vec<String> = written
+            .into_iter()
+            .filter(|n| !self.is_boxed(n) && !self.is_global_here(n))
+            .filter(|n| {
+                self.scope_has(n) || (self.scope.is_none() && self.types.contains_key(n.as_str()))
+            })
+            .collect();
+        for name in &boxed_here {
+            self.emit_get_raw(name, 0);
+            self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
+            self.emit_set_raw(name, 0);
+            self.boxed.insert(name.clone());
+        }
+        self.yield_reads_globals = true;
+        let called = self.stmt(&Stmt::ExprStmt(call));
+        self.yield_reads_globals = false;
+        called?;
+        for name in &boxed_here {
+            self.emit_get(name, 0);
+            self.boxed.remove(name);
+            self.emit_set_raw(name, 0);
+        }
+        if uses_return {
+            let values = plan.values.iter().map(|v| Expr::Ident(v.clone())).collect();
+            self.stmt(&Stmt::If {
+                init: None,
+                cond: Expr::Ident(plan.set.clone()),
+                then: vec![Stmt::Return(values, 0)],
+                els: Vec::new(),
+                line: 0,
+            })?;
         }
         Ok(())
     }
@@ -7442,4 +7627,297 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         _ => false,
     }
+}
+
+/// Where a `return` inside a range-over-func body leaves its values: the
+/// enclosing function's results are written to `values` and `set` is raised,
+/// and the code after the iterator call performs the return.
+struct RangeFuncReturn {
+    set: String,
+    values: Vec<String>,
+}
+
+/// A range-over-func loop body rewritten as the body of its `yield` closure:
+/// the loop's own `break` / `continue` (unlabeled, or naming its label) become
+/// `return false` / `return true`, and a `return` becomes the store described
+/// by `plan` followed by `return false`. A `break` inside a nested loop,
+/// `switch` or `select` belongs to that statement, and a `continue` inside a
+/// nested loop to that loop, so neither is rewritten there; a nested function
+/// literal keeps its own returns. `uses_return` is raised when a `return` was
+/// rewritten.
+fn range_func_body(
+    body: &[Stmt],
+    label: &Option<String>,
+    plan: &RangeFuncReturn,
+    uses_return: &mut bool,
+) -> Result<Vec<Stmt>, String> {
+    fn ours(target: &Option<String>, label: &Option<String>) -> bool {
+        target.is_none() || target == label
+    }
+    fn walk(
+        s: &Stmt,
+        label: &Option<String>,
+        plan: &RangeFuncReturn,
+        uses_return: &mut bool,
+        in_loop: bool,
+        in_breakable: bool,
+    ) -> Result<Vec<Stmt>, String> {
+        let block = |b: &[Stmt], uses_return: &mut bool, l: bool, br: bool| {
+            let mut out = Vec::new();
+            for s in b {
+                out.extend(walk(s, label, plan, uses_return, l, br)?);
+            }
+            Ok::<Vec<Stmt>, String>(out)
+        };
+        Ok(vec![match s {
+            Stmt::Break(line, target) => {
+                let nested = if target.is_none() {
+                    in_loop || in_breakable
+                } else {
+                    false
+                };
+                if !nested && ours(target, label) {
+                    Stmt::Return(vec![Expr::Bool(false)], *line)
+                } else if target.is_some() && !ours(target, label) {
+                    return Err(format!(
+                        "go-rs: a labeled `break` out of a range-over-func loop is not supported (line {line})"
+                    ));
+                } else {
+                    s.clone()
+                }
+            }
+            Stmt::Continue(line, target) => {
+                let nested = target.is_none() && in_loop;
+                if !nested && ours(target, label) {
+                    Stmt::Return(vec![Expr::Bool(true)], *line)
+                } else if target.is_some() && !ours(target, label) {
+                    return Err(format!(
+                        "go-rs: a labeled `continue` out of a range-over-func loop is not supported (line {line})"
+                    ));
+                } else {
+                    s.clone()
+                }
+            }
+            Stmt::Return(values, line) => {
+                *uses_return = true;
+                let mut out = Vec::new();
+                if !values.is_empty() {
+                    out.push(Stmt::AssignMulti {
+                        targets: plan.values.iter().map(|v| Expr::Ident(v.clone())).collect(),
+                        values: values.clone(),
+                        line: *line,
+                    });
+                }
+                out.push(Stmt::Assign {
+                    target: Expr::Ident(plan.set.clone()),
+                    op: AssignOp::Set,
+                    value: Expr::Bool(true),
+                    line: *line,
+                });
+                out.push(Stmt::Return(vec![Expr::Bool(false)], *line));
+                return Ok(out);
+            }
+            Stmt::If {
+                init,
+                cond,
+                then,
+                els,
+                line,
+            } => Stmt::If {
+                init: init.clone(),
+                cond: cond.clone(),
+                then: block(then, uses_return, in_loop, in_breakable)?,
+                els: block(els, uses_return, in_loop, in_breakable)?,
+                line: *line,
+            },
+            Stmt::Block(b) => Stmt::Block(block(b, uses_return, in_loop, in_breakable)?),
+            Stmt::For {
+                label: l,
+                init,
+                cond,
+                post,
+                body,
+                line,
+            } => Stmt::For {
+                label: l.clone(),
+                init: init.clone(),
+                cond: cond.clone(),
+                post: post.clone(),
+                body: block(body, uses_return, true, in_breakable)?,
+                line: *line,
+            },
+            Stmt::ForRange {
+                label: l,
+                key,
+                val,
+                define,
+                iter,
+                body,
+                line,
+            } => Stmt::ForRange {
+                label: l.clone(),
+                key: key.clone(),
+                val: val.clone(),
+                define: *define,
+                iter: iter.clone(),
+                body: block(body, uses_return, true, in_breakable)?,
+                line: *line,
+            },
+            Stmt::Switch {
+                label: l,
+                init,
+                tag,
+                cases,
+                default,
+                line,
+            } => {
+                let mut cs = Vec::new();
+                for c in cases {
+                    cs.push(SwitchCase {
+                        exprs: c.exprs.clone(),
+                        body: block(&c.body, uses_return, in_loop, true)?,
+                    });
+                }
+                let default = match default {
+                    Some(d) => Some(block(d, uses_return, in_loop, true)?),
+                    None => None,
+                };
+                Stmt::Switch {
+                    label: l.clone(),
+                    init: init.clone(),
+                    tag: tag.clone(),
+                    cases: cs,
+                    default,
+                    line: *line,
+                }
+            }
+            Stmt::TypeSwitch {
+                init,
+                bind,
+                expr,
+                cases,
+                default,
+                line,
+            } => {
+                let mut cs = Vec::new();
+                for c in cases {
+                    cs.push(TypeSwitchCase {
+                        types: c.types.clone(),
+                        body: block(&c.body, uses_return, in_loop, true)?,
+                    });
+                }
+                let default = match default {
+                    Some(d) => Some(block(d, uses_return, in_loop, true)?),
+                    None => None,
+                };
+                Stmt::TypeSwitch {
+                    init: init.clone(),
+                    bind: bind.clone(),
+                    expr: expr.clone(),
+                    cases: cs,
+                    default,
+                    line: *line,
+                }
+            }
+            Stmt::Select {
+                cases,
+                default,
+                line,
+            } => {
+                let mut cs = Vec::new();
+                for c in cases {
+                    cs.push(SelectClause {
+                        comm: c.comm.clone(),
+                        body: block(&c.body, uses_return, in_loop, true)?,
+                    });
+                }
+                let default = match default {
+                    Some(d) => Some(block(d, uses_return, in_loop, true)?),
+                    None => None,
+                };
+                Stmt::Select {
+                    cases: cs,
+                    default,
+                    line: *line,
+                }
+            }
+            other => other.clone(),
+        }])
+    }
+    let mut out = Vec::new();
+    for s in body {
+        out.extend(walk(s, label, plan, uses_return, false, false)?);
+    }
+    Ok(out)
+}
+
+/// Add to `out` each variable `body` assigns by name — `x = …`, `x += …`,
+/// `x, y = …`, `x++` — at any depth of nested statements, once each. A
+/// declaration (`x := …`) makes a new variable and is not an assignment.
+fn assigned_idents(body: &[Stmt], out: &mut Vec<String>) {
+    let add = |e: &Expr, out: &mut Vec<String>| {
+        if let Expr::Ident(n) = e {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+    };
+    for s in body {
+        match s {
+            Stmt::Assign { target, .. } | Stmt::IncDec { target, .. } => add(target, out),
+            Stmt::AssignMulti { targets, .. } => targets.iter().for_each(|t| add(t, out)),
+            Stmt::If {
+                init, then, els, ..
+            } => {
+                if let Some(i) = init {
+                    assigned_idents(std::slice::from_ref(i.as_ref()), out);
+                }
+                assigned_idents(then, out);
+                assigned_idents(els, out);
+            }
+            Stmt::Block(b) => assigned_idents(b, out),
+            Stmt::For {
+                init, post, body, ..
+            } => {
+                for s in [init, post].into_iter().flatten() {
+                    assigned_idents(std::slice::from_ref(s.as_ref()), out);
+                }
+                assigned_idents(body, out);
+            }
+            Stmt::ForRange { body, .. } => assigned_idents(body, out),
+            Stmt::Switch { cases, default, .. } => {
+                cases.iter().for_each(|c| assigned_idents(&c.body, out));
+                if let Some(d) = default {
+                    assigned_idents(d, out);
+                }
+            }
+            Stmt::TypeSwitch { cases, default, .. } => {
+                cases.iter().for_each(|c| assigned_idents(&c.body, out));
+                if let Some(d) = default {
+                    assigned_idents(d, out);
+                }
+            }
+            Stmt::Select { cases, default, .. } => {
+                cases.iter().for_each(|c| assigned_idents(&c.body, out));
+                if let Some(d) = default {
+                    assigned_idents(d, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The globals (`globals`: package-level and top-level `main` variables) that
+/// a function literal anywhere in the program — in `main` or in any function —
+/// names freely. Structural, so a literal capturing a function's own local of
+/// the same name counts too, which only costs that global a cell.
+fn global_cells(prog: &Program, globals: &HashSet<String>) -> HashSet<String> {
+    let mut captured = HashSet::new();
+    let bodies = prog.funcs.iter().flat_map(|f| f.body.iter());
+    for s in prog.main.iter().chain(bodies) {
+        collect_captured(s, &mut captured);
+    }
+    captured.retain(|n| globals.contains(n));
+    captured
 }

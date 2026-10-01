@@ -4674,6 +4674,11 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
     let v = &unnamed;
     if matches!(verb, 's' | 'q' | 'x' | 'X') {
         if let Some(b) = slice_bytes(v) {
+            // Hex reads the bytes themselves: a byte that is not UTF-8 on its
+            // own (`171`) must not pass through a lossy string first.
+            if matches!(verb, 'x' | 'X') {
+                return pad_text(&hex_bytes(&b, verb, spec), spec);
+            }
             let text = Value::str(String::from_utf8_lossy(&b).into_owned());
             return pad_text(&scalar_verb(&text, verb, spec), spec);
         }
@@ -4812,6 +4817,33 @@ fn struct_fields_of(v: &Value) -> Option<Vec<(String, Value)>> {
 }
 
 /// Render one non-composite operand under `verb`, unpadded.
+/// Go's `fmtSbx`: `%x` / `%X` of a string or byte slice, two digits a byte.
+/// A precision limits how many bytes are encoded; the space flag separates
+/// them, and `#` prefixes `0x` — once, or before every byte when the space
+/// flag is set too (`% #x` of `"ab"` is `0x61 0x62`). Width is the caller's.
+fn hex_bytes(bytes: &[u8], verb: char, spec: &Spec) -> String {
+    let n = spec.prec.map_or(bytes.len(), |p| p.min(bytes.len()));
+    let prefix = if verb == 'X' { "0X" } else { "0x" };
+    let mut out = String::new();
+    if spec.sharp && n > 0 {
+        out.push_str(prefix);
+    }
+    for (i, b) in bytes[..n].iter().enumerate() {
+        if spec.space && i > 0 {
+            out.push(' ');
+            if spec.sharp {
+                out.push_str(prefix);
+            }
+        }
+        if verb == 'X' {
+            out.push_str(&format!("{b:02X}"));
+        } else {
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
+}
+
 fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
     match verb {
         't' => go_str(v),
@@ -4880,27 +4912,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             int_precision(sign, "", &digits, spec.prec)
         }
         // `%x`/`%X` hex-encode a string bytewise.
-        'x' | 'X' if matches!(v, Value::Str(_)) => {
-            let upper = verb == 'X';
-            let bytes: Vec<String> = go_str(v)
-                .bytes()
-                .map(|b| {
-                    if upper {
-                        format!("{b:02X}")
-                    } else {
-                        format!("{b:02x}")
-                    }
-                })
-                .collect();
-            // The space flag separates the bytes here rather than standing in
-            // for a sign: `% x` of `"abc"` is `61 62 63`.
-            let body = bytes.join(if spec.space { " " } else { "" });
-            if spec.sharp {
-                format!("{}{body}", if upper { "0X" } else { "0x" })
-            } else {
-                body
-            }
-        }
+        'x' | 'X' if matches!(v, Value::Str(_)) => hex_bytes(go_str(v).as_bytes(), verb, spec),
         // The base-N verbs. Go prints a *signed* operand as a sign and the
         // magnitude — `%x` of `-9` is `-9`, not the two's-complement bit pattern
         // — and only an unsigned one reads all 64 bits. `#` writes the base

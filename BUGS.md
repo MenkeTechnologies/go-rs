@@ -178,6 +178,46 @@ suspended goroutine still holds its VM). Closing it needs a fusevm release
 where the VM borrows or `Arc`-shares its chunk; the published pin is the
 contract.
 
+## A goroutine does not see package-level variables — waiting on a fusevm release
+
+```go
+var counter = 5
+func work(done chan bool) { counter = 100; done <- true }
+// main: counter = 7; go work(done); <-done; fmt.Println(counter)
+// go: 100    go-rs: 7 (and a goroutine reading `counter` reads nil)
+```
+
+A package-level variable is a fusevm global, and `fusevm::sched` gives each
+goroutine its own `VM` with its own, empty, `globals` — so a function running
+as a goroutine neither reads the value `main` stored nor writes one `main`
+sees. A global that some *closure* captures is unaffected: it lives in a heap
+cell (`Compiler::global_cells`), and the heap is shared by every goroutine,
+which is why `go func() { counter++ }()` is right. Closing it for the rest
+needs the scheduler to share one globals table across its VMs (or go-rs to put
+every global in a cell, which costs a dereference on every global access).
+
+## Range-over-func: a labeled jump out of the body is rejected, and `defer` runs early
+
+```go
+outer:
+for _, s := range xs {
+	for v := range seq {
+		if v > 3 { continue outer }   // go-rs: compile error
+		defer cleanup()               // go-rs: runs when this yield call returns
+	}
+}
+```
+
+`for … range f` over an iterator function runs the body as `f`'s `yield`
+closure (`Compiler::compile_for_range_func`): the loop's own `break` and
+`continue` become `return false` / `return true` and a `return` from the
+enclosing function is recorded and performed once `f` returns. A `break L` /
+`continue L` naming a loop *outside* the range-over-func loop, and a `goto`
+out of it, are not carried across the closure boundary; the labeled forms are
+refused rather than run wrong. A `defer` in the body belongs to the closure, so
+it runs when that iteration's `yield` returns instead of when the enclosing
+function does.
+
 ## One slice in a frame keeps every loop in that function interpreted — waiting on a fusevm release
 
 ```go
@@ -785,11 +825,8 @@ literal (`append(S{}, s...)` in `slices.Clone`), a declaration without a body
 `internal/race` → `internal/abi`. `internal/abi` converts `unsafe.Pointer`s to
 pointer-to-array types (`(*[1 << 16]Method)(p)`, the reported line — numbered
 in the package's concatenated source) and `runtime` is the Go runtime itself;
-neither is something go-rs can load from source. `iter`'s `Seq` / `Seq2` are
-also consumed with range-over-func (`for v := range seq`), which go-rs does
-not lower — such a loop currently runs zero times.
+neither is something go-rs can load from source. The range-over-func loops
+that consume `iter`'s `Seq` / `Seq2` are lowered (`parity-scripts/range_over_func.go`).
 
 Closing it needs `iter` supplied without its runtime half (the `Seq`/`Seq2`
-types, with `Pull`/`Pull2` built on go-rs's own goroutines) and range-over-func
-lowered to a call of the sequence with a synthesized `yield` closure that
-carries `break`/`continue`/`return` out of the body.
+types, with `Pull`/`Pull2` built on go-rs's own goroutines).
