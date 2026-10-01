@@ -181,7 +181,7 @@
         <article class="doc-entry" id="doc-keyword-19">
           <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>chan</code></h3>
           <pre><code class="lang-go">chan T</code></pre>
-          <p>A channel type. `make(chan T, n)` builds one with buffer capacity `n`; omitting `n` gives an unbuffered channel. The element type is erased — every channel carries dynamic values. Directional forms (`&lt;-chan T`, `chan&lt;- T`) are not parsed.</p>
+          <p>A channel type. `make(chan T, n)` builds one with buffer capacity `n`; omitting `n` gives an unbuffered channel. The element type is erased — every channel carries dynamic values. The directional forms `&lt;-chan T` and `chan&lt;- T` parse as `chan T`: direction is not checked.</p>
           <pre><code class="lang-go">ch := make(chan int, 8)</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-20">
@@ -1314,46 +1314,100 @@ case 3:
           <pre><code class="lang-go">math.Cbrt(27)   // 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-math-27">
-          <h3><a class="doc-anchor" href="#doc-package-math-27">#</a> <code>math.Pi</code></h3>
+          <h3><a class="doc-anchor" href="#doc-package-math-27">#</a> <code>math.Inf</code></h3>
+          <pre><code class="lang-go">math.Inf(sign int) float64</code></pre>
+          <p>Positive infinity for `sign &gt;= 0`, negative infinity otherwise.</p>
+          <pre><code class="lang-go">lo := math.Inf(1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-28">
+          <h3><a class="doc-anchor" href="#doc-package-math-28">#</a> <code>math.NaN</code></h3>
+          <pre><code class="lang-go">math.NaN() float64</code></pre>
+          <p>An IEEE 754 not-a-number value. It compares unequal to everything, itself included; test for it with `math.IsNaN`.</p>
+          <pre><code class="lang-go">x := math.NaN()</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-29">
+          <h3><a class="doc-anchor" href="#doc-package-math-29">#</a> <code>math.IsInf</code></h3>
+          <pre><code class="lang-go">math.IsInf(f float64, sign int) bool</code></pre>
+          <p>Whether `f` is an infinity: positive for `sign &gt; 0`, negative for `sign &lt; 0`, either for `sign == 0`.</p>
+          <pre><code class="lang-go">math.IsInf(1/z, 0)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-30">
+          <h3><a class="doc-anchor" href="#doc-package-math-30">#</a> <code>math.IsNaN</code></h3>
+          <pre><code class="lang-go">math.IsNaN(f float64) bool</code></pre>
+          <p>Whether `f` is a not-a-number value.</p>
+          <pre><code class="lang-go">if math.IsNaN(x) { … }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-31">
+          <h3><a class="doc-anchor" href="#doc-package-math-31">#</a> <code>math.Signbit</code></h3>
+          <pre><code class="lang-go">math.Signbit(x float64) bool</code></pre>
+          <p>Whether `x` is negative or negative zero.</p>
+          <pre><code class="lang-go">math.Signbit(math.Copysign(0, -1))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-32">
+          <h3><a class="doc-anchor" href="#doc-package-math-32">#</a> <code>math.Copysign</code></h3>
+          <pre><code class="lang-go">math.Copysign(f, sign float64) float64</code></pre>
+          <p>A value with the magnitude of `f` and the sign of `sign`.</p>
+          <pre><code class="lang-go">math.Copysign(3, -1)   // -3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-33">
+          <h3><a class="doc-anchor" href="#doc-package-math-33">#</a> <code>math.Pi</code></h3>
           <pre><code class="lang-go">math.Pi</code></pre>
           <p>The circle constant π, resolved by the compiler to a float constant at the reference site rather than through a call.</p>
           <pre><code class="lang-go">area := math.Pi * r * r</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-math-28">
-          <h3><a class="doc-anchor" href="#doc-package-math-28">#</a> <code>math.E</code></h3>
+        <article class="doc-entry" id="doc-package-math-34">
+          <h3><a class="doc-anchor" href="#doc-package-math-34">#</a> <code>math.E</code></h3>
           <pre><code class="lang-go">math.E</code></pre>
           <p>The base of the natural logarithm, e.</p>
           <pre><code class="lang-go">math.Log(math.E)   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-math-29">
-          <h3><a class="doc-anchor" href="#doc-package-math-29">#</a> <code>math.Sqrt2</code></h3>
+        <article class="doc-entry" id="doc-package-math-35">
+          <h3><a class="doc-anchor" href="#doc-package-math-35">#</a> <code>math.Sqrt2</code></h3>
           <pre><code class="lang-go">math.Sqrt2</code></pre>
           <p>The square root of 2, as a float constant.</p>
           <pre><code class="lang-go">d := side * math.Sqrt2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-math-30">
-          <h3><a class="doc-anchor" href="#doc-package-math-30">#</a> <code>math.MaxInt64</code></h3>
+        <article class="doc-entry" id="doc-package-math-36">
+          <h3><a class="doc-anchor" href="#doc-package-math-36">#</a> <code>math.MaxInt64</code></h3>
           <pre><code class="lang-go">math.MaxInt64</code></pre>
           <p>The largest int64, 9223372036854775807.</p>
           <pre><code class="lang-go">if n == math.MaxInt64 { … }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-math-31">
-          <h3><a class="doc-anchor" href="#doc-package-math-31">#</a> <code>math.MinInt64</code></h3>
+        <article class="doc-entry" id="doc-package-math-37">
+          <h3><a class="doc-anchor" href="#doc-package-math-37">#</a> <code>math.MinInt64</code></h3>
           <pre><code class="lang-go">math.MinInt64</code></pre>
           <p>The smallest int64, -9223372036854775808.</p>
           <pre><code class="lang-go">lo := math.MinInt64</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-math-32">
-          <h3><a class="doc-anchor" href="#doc-package-math-32">#</a> <code>math.MaxInt</code></h3>
+        <article class="doc-entry" id="doc-package-math-38">
+          <h3><a class="doc-anchor" href="#doc-package-math-38">#</a> <code>math.MaxInt</code></h3>
           <pre><code class="lang-go">math.MaxInt</code></pre>
           <p>The largest `int`. go-rs stores every integer in an i64, so this is the same value as `math.MaxInt64` on every target.</p>
           <pre><code class="lang-go">best := math.MaxInt</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-math-33">
-          <h3><a class="doc-anchor" href="#doc-package-math-33">#</a> <code>math.MinInt</code></h3>
+        <article class="doc-entry" id="doc-package-math-39">
+          <h3><a class="doc-anchor" href="#doc-package-math-39">#</a> <code>math.MinInt</code></h3>
           <pre><code class="lang-go">math.MinInt</code></pre>
           <p>The smallest `int`, equal to `math.MinInt64` on every target.</p>
           <pre><code class="lang-go">best := math.MinInt</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-40">
+          <h3><a class="doc-anchor" href="#doc-package-math-40">#</a> <code>math.MaxInt32</code></h3>
+          <pre><code class="lang-go">math.MaxInt8 / MaxInt16 / MaxInt32, MinInt8 / MinInt16 / MinInt32, MaxUint8 / MaxUint16 / MaxUint32</code></pre>
+          <p>The limits of the sized integer types, as untyped integer constants.</p>
+          <pre><code class="lang-go">var n int32 = math.MaxInt32</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-41">
+          <h3><a class="doc-anchor" href="#doc-package-math-41">#</a> <code>math.MaxFloat64</code></h3>
+          <pre><code class="lang-go">math.MaxFloat64 / SmallestNonzeroFloat64, MaxFloat32 / SmallestNonzeroFloat32</code></pre>
+          <p>The largest finite value and the smallest positive (subnormal) value of each float width.</p>
+          <pre><code class="lang-go">lo := math.MaxFloat64</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-math-42">
+          <h3><a class="doc-anchor" href="#doc-package-math-42">#</a> <code>math.Phi</code></h3>
+          <pre><code class="lang-go">math.Phi / SqrtE / SqrtPi / SqrtPhi / Ln2 / Log2E / Ln10 / Log10E</code></pre>
+          <p>The golden ratio, the square roots of e, π and φ, and the logarithm conversion constants.</p>
+          <pre><code class="lang-go">bits := math.Log(x) * math.Log2E</code></pre>
         </article>
       </section>
 

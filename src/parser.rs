@@ -47,6 +47,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         defined: HashMap::new(),
         int_consts: HashMap::new(),
         type_param_cores: HashMap::new(),
+        pkg_names: HashSet::new(),
     };
     // Integer constants first: a defined type's base can be an array sized by
     // one (`type d [MaxCase]rune`).
@@ -106,6 +107,10 @@ struct Parser {
     /// the parameter (`S{}`, as `slices.Clone` writes one) is a literal of its
     /// core type.
     type_param_cores: HashMap<String, String>,
+    /// The names the file's imports bind (`strings`, or an alias), which is
+    /// what tells `pkg.Func[T](…)` 's type arguments apart from an index of a
+    /// field `r.handlers["up"](…)`.
+    pkg_names: HashSet<String>,
 }
 
 /// The canonical name of an interface type with method set `methods`:
@@ -880,11 +885,20 @@ impl Parser {
 
     fn import_path(&mut self) -> Result<String, String> {
         // Slice 1 ignores import aliases; a leading alias ident is consumed.
-        if matches!(self.peek(), Tok::Ident(_)) {
-            self.advance();
-        }
+        let alias = match self.peek() {
+            Tok::Ident(a) => {
+                let a = a.clone();
+                self.advance();
+                Some(a)
+            }
+            _ => None,
+        };
         match self.advance() {
-            Tok::Str(s) => Ok(s),
+            Tok::Str(s) => {
+                let name = alias.unwrap_or_else(|| s.rsplit('/').next().unwrap_or(&s).to_string());
+                self.pkg_names.insert(name);
+                Ok(s)
+            }
             other => Err(format!(
                 "go-rs: expected import path string, found `{other}` on line {}",
                 self.line()
@@ -1185,6 +1199,9 @@ impl Parser {
                 | Some(Tok::Struct)
                 | Some(Tok::Interface)
         )
+            // `<-chan T`, a receive-only channel type.
+            || (matches!(self.tokens.get(pos).map(|t| &t.kind), Some(Tok::Arrow))
+                && matches!(self.tokens.get(pos + 1).map(|t| &t.kind), Some(Tok::Chan)))
     }
 
     /// Parse a type name. Handles named types (`int`, `string`, `T`, …), slices
@@ -1230,8 +1247,17 @@ impl Parser {
                 let v = self.type_name()?;
                 Ok(format!("map[{k}]{v}"))
             }
-            // `chan T` — a channel type.
+            // `chan T`, and the directional `chan<- T` (send-only) and
+            // `<-chan T` (receive-only). go-rs checks no channel direction, so
+            // a directional type names the plain `chan T` every reader of a
+            // channel's type (`strip_prefix("chan ")`) already understands.
             Tok::Chan => {
+                self.advance();
+                self.eat(&Tok::Arrow);
+                Ok(format!("chan {}", self.type_name()?))
+            }
+            Tok::Arrow if matches!(self.peek_at(1), Tok::Chan) => {
+                self.advance();
                 self.advance();
                 Ok(format!("chan {}", self.type_name()?))
             }
@@ -2334,8 +2360,10 @@ impl Parser {
                 // another package — `pkg.Func[T](…)` / `pkg.Type[T]{…}` — which the
                 // local `generic_names` set can't know. Erase the type arguments.
                 // Restricted to a `pkg.Name` selector base so an index-then-call
-                // `fns[i](x)` (plain-ident base) is unaffected.
-                if matches!(&e, Expr::Selector { recv, .. } if matches!(recv.as_ref(), Expr::Ident(_)))
+                // `fns[i](x)` (plain-ident base) is unaffected, and so is an
+                // index of a field, `r.handlers["up"](x)`: `r` is no import.
+                if matches!(&e, Expr::Selector { recv, .. }
+                    if matches!(recv.as_ref(), Expr::Ident(p) if self.pkg_names.contains(p)))
                 {
                     let next = self.bracket_group_next();
                     // `pkg.Func[T](…)` — a generic call. The `(` is never a loop
@@ -2854,8 +2882,13 @@ impl Parser {
     fn make_expr(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::LParen)?;
         let ty = self.type_name()?;
-        // `make(chan T, cap)` — a channel.
-        if let Some(elem) = ty.strip_prefix("chan ") {
+        // `make(chan T, cap)` — a channel, written or through a defined
+        // channel type (`type queue chan string; make(queue, 5)`).
+        let chan_ty = match self.defined.get(&ty) {
+            Some(base) if base.starts_with("chan ") => base.clone(),
+            _ => ty.clone(),
+        };
+        if let Some(elem) = chan_ty.strip_prefix("chan ") {
             let elem_ty = elem.trim().to_string();
             let cap = if self.eat(&Tok::Comma) {
                 Some(Box::new(self.expr()?))

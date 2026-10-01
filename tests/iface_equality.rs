@@ -55,8 +55,8 @@ fn a_value_never_equals_its_own_rendering() {
     assert!(!iface_eq(&Value::str("1"), &Value::str("2")));
 }
 
-/// `NaN != NaN` in Go, as in IEEE 754 — and it is not reachable from a `.go`
-/// file here, because `math.NaN` is rejected at compile time. Comparing the
+/// `NaN != NaN` in Go, as in IEEE 754 (`parity-scripts/math_consts_inf_nan.go`
+/// compares two interfaces holding one from Go source). Comparing the
 /// rendered strings would make it equal (`"NaN" == "NaN"`), so this is the case
 /// that forces the float arm to compare as `f64`.
 #[test]

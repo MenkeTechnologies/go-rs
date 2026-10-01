@@ -334,9 +334,10 @@ fn uses_errorf(prog: &Program) -> bool {
         ("strconv", "ParseInt"),
         ("strconv", "ParseFloat"),
     ];
+    // The selector itself, called or used as a value (`conv := strconv.Atoi`):
+    // the walk reaches a call's callee too.
     program_has_expr(prog, &|e| {
-        matches!(e, Expr::Call { func, .. }
-            if ERROR_MAKERS.iter().any(|(p, f)| is_selector(func, p, f)))
+        ERROR_MAKERS.iter().any(|(p, f)| is_selector(e, p, f))
     })
 }
 
@@ -345,9 +346,11 @@ fn uses_errorf(prog: &Program) -> bool {
 fn uses_strconv_error(prog: &Program) -> bool {
     /// The `strconv` conversions whose second result is a `*NumError`.
     const PARSERS: &[&str] = &["Atoi", "ParseInt", "ParseFloat", "ParseBool"];
-    program_has_expr(prog, &|e| match e {
-        Expr::Call { func, .. } => PARSERS.iter().any(|f| is_selector(func, "strconv", f)),
-        e => is_selector(e, "strconv", "ErrSyntax") || is_selector(e, "strconv", "ErrRange"),
+    // Called or used as a value; the walk reaches a call's callee too.
+    program_has_expr(prog, &|e| {
+        PARSERS.iter().any(|f| is_selector(e, "strconv", f))
+            || is_selector(e, "strconv", "ErrSyntax")
+            || is_selector(e, "strconv", "ErrRange")
     })
 }
 
@@ -1402,6 +1405,124 @@ fn goroot_from_go() -> Option<String> {
 /// packages are verified to run on go-rs).
 fn vendored_source(path: &str) -> Option<String> {
     crate::stdlib_vendor::source(path)
+}
+
+/// The Go signature of a natively implemented stdlib function, as `go doc`
+/// prints it (result names dropped), for the wrapper [`stdlib_func_value`]
+/// writes when the function is used as a value rather than called. `None` for
+/// a name go-rs does not implement natively.
+fn stdlib_func_sig(pkg: &str, func: &str) -> Option<&'static str> {
+    Some(match (pkg, func) {
+        ("fmt", "Sprint" | "Sprintln") => "(a ...any) string",
+        ("fmt", "Sprintf") => "(format string, a ...any) string",
+        ("fmt", "Print" | "Println") => "(a ...any) (int, error)",
+        ("fmt", "Printf") => "(format string, a ...any) (int, error)",
+        ("strings", "ToUpper" | "ToLower" | "TrimSpace" | "Title") => "(s string) string",
+        ("strings", "Contains" | "HasPrefix" | "HasSuffix" | "EqualFold" | "ContainsAny") => {
+            "(s, t string) bool"
+        }
+        ("strings", "Split") => "(s, sep string) []string",
+        ("strings", "Join") => "(elems []string, sep string) string",
+        ("strings", "Repeat") => "(s string, count int) string",
+        ("strings", "Index" | "Count" | "LastIndex" | "IndexAny" | "Compare") => {
+            "(s, t string) int"
+        }
+        ("strings", "Replace") => "(s, old, new string, n int) string",
+        ("strings", "ReplaceAll") => "(s, old, new string) string",
+        ("strings", "Fields") => "(s string) []string",
+        ("strings", "TrimPrefix" | "TrimSuffix" | "Trim" | "TrimLeft" | "TrimRight") => {
+            "(s, t string) string"
+        }
+        ("strings", "ContainsRune") => "(s string, r rune) bool",
+        ("strings", "IndexRune") => "(s string, r rune) int",
+        ("strings", "IndexByte" | "LastIndexByte") => "(s string, c byte) int",
+        ("strings", "SplitN") => "(s, sep string, n int) []string",
+        ("strings", "Map") => "(mapping func(rune) rune, s string) string",
+        ("strings", "IndexFunc" | "LastIndexFunc") => "(s string, f func(rune) bool) int",
+        ("strings", "ContainsFunc") => "(s string, f func(rune) bool) bool",
+        ("strings", "TrimFunc" | "TrimLeftFunc" | "TrimRightFunc") => {
+            "(s string, f func(rune) bool) string"
+        }
+        ("strings", "FieldsFunc") => "(s string, f func(rune) bool) []string",
+        ("sort", "Search") => "(n int, f func(int) bool) int",
+        ("sort", "SearchInts") => "(a []int, x int) int",
+        ("sort", "SearchStrings") => "(a []string, x string) int",
+        ("sort", "SearchFloat64s") => "(a []float64, x float64) int",
+        ("sort", "IntsAreSorted") => "(x []int) bool",
+        ("sort", "StringsAreSorted") => "(x []string) bool",
+        ("sort", "Float64sAreSorted") => "(x []float64) bool",
+        ("strconv", "ParseBool") => "(str string) (bool, error)",
+        ("strconv", "FormatBool") => "(b bool) string",
+        ("strconv", "FormatFloat") => "(f float64, fmt byte, prec, bitSize int) string",
+        ("strconv", "QuoteRune") => "(r rune) string",
+        ("strconv", "Itoa") => "(i int) string",
+        ("strconv", "Atoi") => "(s string) (int, error)",
+        ("strconv", "ParseInt") => "(s string, base int, bitSize int) (int64, error)",
+        ("strconv", "ParseFloat") => "(s string, bitSize int) (float64, error)",
+        ("strconv", "FormatInt") => "(i int64, base int) string",
+        ("strconv", "Quote") => "(s string) string",
+        (
+            "math",
+            "Abs" | "Sqrt" | "Floor" | "Ceil" | "Round" | "Trunc" | "Sin" | "Cos" | "Tan" | "Asin"
+            | "Acos" | "Atan" | "Sinh" | "Cosh" | "Tanh" | "Exp" | "Log" | "Log2" | "Log10"
+            | "Cbrt",
+        ) => "(x float64) float64",
+        ("math", "Pow" | "Mod" | "Hypot" | "Max" | "Min" | "Atan2") => "(x, y float64) float64",
+        ("math", "Copysign") => "(f, sign float64) float64",
+        ("math", "Inf") => "(sign int) float64",
+        ("math", "NaN") => "() float64",
+        ("math", "IsInf") => "(f float64, sign int) bool",
+        ("math", "IsNaN") => "(f float64) bool",
+        ("math", "Signbit") => "(x float64) bool",
+        ("sort", "Ints") => "(x []int)",
+        ("sort", "Strings") => "(x []string)",
+        ("sort", "Float64s") => "(x []float64)",
+        ("os", "Getenv") => "(key string) string",
+        _ => return None,
+    })
+}
+
+/// `pkg.Func` used as a value (`f := strings.ToUpper`, `apply(math.Sqrt, 2)`):
+/// a function literal of `pkg.Func`'s own signature that forwards its
+/// parameters to the call, so the call is lowered exactly as a direct one is.
+/// `None` when `pkg.Func` is not a natively implemented function.
+pub fn stdlib_func_value(pkg: &str, func: &str) -> Option<Expr> {
+    let sig = stdlib_func_sig(pkg, func)?;
+    let (params, results) = split_sig(sig);
+    let parsed = crate::parse(&format!("package p\nfunc h{params} {results} {{}}\n")).ok()?;
+    let f = parsed.funcs.into_iter().next()?;
+    let args: Vec<String> = f
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if f.variadic && i + 1 == f.params.len() {
+                format!("{}...", p.name)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect();
+    let call = format!("{pkg}.{func}({})", args.join(", "));
+    let body = if results.is_empty() {
+        call
+    } else {
+        format!("return {call}")
+    };
+    let src = format!("package p\nfunc h{params} {results} {{\n\t{body}\n}}\n");
+    let f = crate::parse(&src).ok()?.funcs.into_iter().next()?;
+    Some(Expr::FuncLit {
+        params: f.params,
+        results: f.results,
+        body: f.body,
+        variadic: f.variadic,
+    })
+}
+
+/// Split a signature `(params) results` at the parameter list's closing paren.
+fn split_sig(sig: &str) -> (&str, &str) {
+    let close = sig.find(')').map_or(sig.len(), |i| i + 1);
+    (&sig[..close], sig[close..].trim())
 }
 
 #[cfg(test)]

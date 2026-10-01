@@ -31,6 +31,8 @@ pub fn build(src: &str, out: &Path) -> Result<(), String> {
                 | fusevm::Op::ChanSend
                 | fusevm::Op::ChanRecv
                 | fusevm::Op::ChanClose
+                | fusevm::Op::ChanLen
+                | fusevm::Op::ChanCap
                 | fusevm::Op::Select(..)
         )
     }) {

@@ -2515,6 +2515,23 @@ impl Compiler {
         self.scope.as_ref().is_some_and(|s| s.has(name))
     }
 
+    /// `pkg.Func` naming a natively implemented stdlib function in a value
+    /// position: the function literal that stands for it
+    /// ([`crate::pkg::stdlib_func_value`]). `None` for anything else, including
+    /// a selector on a variable that happens to share a package's name.
+    fn stdlib_func_lit(&self, e: &Expr) -> Option<Expr> {
+        let Expr::Selector { recv, field } = e else {
+            return None;
+        };
+        let Expr::Ident(pkg) = recv.as_ref() else {
+            return None;
+        };
+        if self.scope_has(pkg) || self.globals.contains(pkg) || self.decl_types.contains_key(pkg) {
+            return None;
+        }
+        crate::pkg::stdlib_func_value(pkg, field)
+    }
+
     /// Store the top of stack into a variable's raw storage (slot/global).
     fn emit_set_raw(&mut self, name: &str, line: u32) {
         // Assigning to a package global from inside a function writes the global
@@ -4421,6 +4438,12 @@ impl Compiler {
                             .emit(Op::CallBuiltin(host::stdlib::STRCONV_ERR, 1), 0);
                         return Ok(());
                     }
+                    // A native stdlib function used as a value
+                    // (`f := strings.ToUpper`) is a literal of its signature
+                    // that forwards to the call — unless `pkg` is a variable.
+                    if let Some(lit) = self.stdlib_func_lit(e) {
+                        return self.expr(&lit);
+                    }
                 }
                 // A *method value* (`q.Area`) or *method expression*
                 // (`sq.Area`) in a value position — neither is a field read.
@@ -4633,6 +4656,12 @@ impl Compiler {
     /// when `name` becomes a statically-known closure (so a later `name(args)`
     /// dispatches directly).
     fn emit_rhs(&mut self, name: &str, e: &Expr) -> Result<(), String> {
+        // A stdlib function bound to a name (`pr := fmt.Println`) binds the
+        // forwarding literal of its signature, as a closure: a variadic one then
+        // packs its arguments and a two-result one destructures.
+        if let Some(lit) = self.stdlib_func_lit(e) {
+            return self.emit_rhs(name, &lit);
+        }
         // `s = nil` on a slice- or map-typed variable rebinds it to that type's
         // typed nil, so it goes on printing `[]` / `map[]` rather than `<nil>`.
         if self.is_nil_literal(e) {
@@ -5037,14 +5066,21 @@ impl Compiler {
                 all.extend(params);
                 (all, Expr::Ident("$mr".to_string()))
             }
-            // The method value binds the receiver evaluated *here*. Storing it
-            // through `emit_value` is what copies a struct and shares a
-            // pointer, which is exactly Go's rule for the two receiver kinds.
+            // The method value binds the receiver evaluated *here*: a value
+            // receiver binds a copy (`emit_value` copies a struct), and a
+            // pointer receiver binds `&recv` — the handle itself, so
+            // `inc := c.Inc; inc()` increments `c`.
             false => {
                 let n = self.temp_counter;
                 self.temp_counter += 1;
                 let tmp = format!("$mv{n}");
-                self.emit_value(recv)?;
+                let ptr_recv =
+                    self.methods.contains_key(&key) && !self.value_recv_methods.contains(&key);
+                if ptr_recv {
+                    self.expr(recv)?;
+                } else {
+                    self.emit_value(recv)?;
+                }
                 self.types.insert(tmp.clone(), NumType::Unknown);
                 self.decl_types.insert(tmp.clone(), ty.clone());
                 self.emit_set(&tmp, 0);
@@ -5359,6 +5395,10 @@ impl Compiler {
                 rhs,
             } => self.type_name(rhs),
             Expr::Selector { recv, field } => {
+                // A stdlib function as a value has its own signature's type.
+                if let Some(lit) = self.stdlib_func_lit(e) {
+                    return self.type_name(&lit);
+                }
                 // A package-level name of a package the linker merged in
                 // (`os.Stdout`) is a global under its qualified name, and the
                 // receiver names no type of its own — so the qualified name is
@@ -6752,6 +6792,22 @@ impl Compiler {
                 "max" => Some(host::GMAX),
                 _ => None,
             };
+            // `len(ch)` / `cap(ch)`: the scheduler owns a channel's buffer, so
+            // they are its ops rather than the host's container answers.
+            if matches!(name.as_str(), "len" | "cap") && args.len() == 1 {
+                let ty = self.type_name(&args[0]);
+                if self.underlying(&ty).starts_with("chan ") {
+                    self.expr(&args[0])?;
+                    self.b.emit(Op::CallBuiltin(host::GCHAN_HANDLE, 1), line);
+                    let op = if name == "len" {
+                        Op::ChanLen
+                    } else {
+                        Op::ChanCap
+                    };
+                    self.b.emit(op, line);
+                    return Ok(());
+                }
+            }
             if let Some(id) = simple_builtin {
                 for (i, a) in args.iter().enumerate() {
                     // `append(s, v)` stores a *copy* of a struct element — the

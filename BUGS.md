@@ -17,29 +17,12 @@ Found by the differential harnesses:
   shown to fail against the code from *before* the fix it claims to cover.
 - `cargo test` — for the cases neither of the above can reach from a `.go` file.
   A rule's decision function is called directly there, which is the only way to
-  cover an input the compiler rejects (`NaN`, since `math.NaN` is a rejected
-  stdlib call) or one the pinned fusevm answers natively before the frontend is
-  asked.
+  cover an input the compiler rejects or one the pinned fusevm answers natively
+  before the frontend is asked.
 
 A gap listed here is deliberately **not** represented by a corpus file, because
 the corpus is a green byte-parity gate. Close the gap and add the corpus file in
 the same change.
-
-## `len(ch)` / `cap(ch)` report 0 — waiting on a fusevm release
-
-```go
-ch := make(chan int, 1)
-ch <- 1
-fmt.Println(len(ch), cap(ch))   // go: 1 1     go-rs: 0 0
-```
-
-The scheduler owns the channel buffer, and fusevm 0.26.7's channel surface is
-`Op::ChanMake` / `ChanSend` / `ChanRecv` / `ChanRecvOk` / `ChanClose` /
-`Select` — there is no op that reads a channel's length or capacity, so the
-frontend has nothing to ask and `len`/`cap` fall through to their "not a container" answer of 0. Every
-other channel operation is correct. Closing this needs a fusevm release
-carrying a channel-length op; vendoring or path-overriding fusevm to add one is
-not an option — the published pin is the contract.
 
 ## A defined type reached only through a type parameter or a nested value prints bare
 
@@ -411,35 +394,24 @@ does `x.(error)`. The synthesized `errors`/`fmt` error types keep the `main.`
 qualifier of the one package go-rs compiles, and lose the `*` for the reason in
 the pointer entry above.
 
-## A stdlib function used as a value panics
+## `fmt.Errorf` used as a value panics
 
 ```go
-f := fmt.Println            // go: prints via f   go-rs: panic: nil pointer dereference
-var _ = strings.ToUpper     // same, at package level
-fs := []func(...any) (int, error){fmt.Println}
+ef := fmt.Errorf            // go: an error-building func   go-rs: panic: nil pointer dereference
 ```
 
-Any reference to a stdlib function that is not an immediate call crashes with
-`panic: runtime error: invalid memory address or nil pointer dereference` — at
-package level or inside a function, for `fmt`, `strings`, `os`, whichever
-package. A *user-defined* function used the same way is fine (`dm := divmod`),
-so this is specific to the native packages.
+Every other natively implemented stdlib function is a value: `pkg::stdlib_func_value`
+writes a literal of its signature that forwards to the call
+(`func(a ...any) (int, error) { return fmt.Println(a...) }`), and the selector
+lowers to it (`parity-scripts/stdlib_func_value.go`). `fmt.Errorf` is left out
+because the forward would be wrong rather than missing: `Errorf` picks its
+result type (plain, `*wrapError`, `*wrapErrors`) by counting the `%w` verbs in
+its format at compile time, and inside the forwarder the format is a parameter,
+so `%w` would wrap nothing. Closing it needs `Errorf`'s wrap decision moved to
+run time.
 
-`Compiler::expr`'s `Expr::Selector` arm resolves a package selector by trying
-`stdlib::resolve_const`, then the `os.Stdout` / `strconv.Err*` special cases,
-then `method_value`. A stdlib *function* matches none of them, so it falls
-through to the generic field read: `self.expr(recv)` evaluates the package name
-`fmt` as if it were a variable, which is nil, and `GFIELD_GET` dereferences it.
-
-Closing it means giving the selector a value to produce. `stdlib::resolve`
-already maps `(pkg, func)` to a builtin id, but a builtin id is not callable as
-a value — `CallBuiltin` fixes its arity at compile time, and a func value is
-called through `Op::Call` with an arity nothing knows until run time. The
-tractable form is to synthesize a Go-source wrapper per referenced function
-(`func $fmtPrintln(a ...any) (int, error) { return fmt.Println(a...) }`) and
-lower the selector to that, the way `pkg.rs` already synthesizes `sort.Search`
-and friends — the pieces it needs (a variadic forward with `a...`, a user
-function used as a value) both work today.
+`%T` of any function value — a literal, a declared function or one of these —
+prints `func()`, not its signature.
 
 ## The heap is never collected, so a print in a loop retains its result
 
@@ -734,22 +706,6 @@ fmt.Println(*(&e) == nil)   // go: true   go-rs: false
   on its own (printing, assigning) is right.
 - **`*p == nil`.** The comparison sees the pointer, not the pointee, so a
   dereferenced nil slice is not `nil`.
-
-## A func held in a container *inside* a struct cannot be called
-
-```go
-type reg struct{ handlers map[string]func(string) string }
-r := reg{handlers: map[string]func(string) string{"up": f}}
-r.handlers["up"]("hey")
-// go:    hey!
-// go-rs: no method `handlers` with 1 argument(s)
-```
-
-`fns[i](x)` on a plain slice or map works, and so does a func-typed field
-(`p.stage(8)`). Indexing a container that is itself a *field* is the
-combination that is not routed: the call lowering reads `r.handlers` as a
-method name rather than as a field to index and then call. Binding the
-container to a name first (`h := r.handlers; h["up"]("hey")`) works.
 
 ## A string cannot hold invalid UTF-8
 

@@ -309,6 +309,10 @@ pub const GUNNAME: u16 = 992;
 /// its pointee's own handle). A pointer-receiver method on a defined
 /// non-struct type is handed its receiver in such a cell.
 pub const GDEREF: u16 = 993;
+/// `[ch]` → the scheduler handle `len(ch)` / `cap(ch)` ask about: the channel
+/// itself, or `-1` — a handle the scheduler never issues, so both answer `0` —
+/// for a nil channel, whose `Undef` would otherwise read as channel `0`.
+pub const GCHAN_HANDLE: u16 = 994;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -424,6 +428,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GNAMED_BOX, b_named_box);
     vm.register_builtin(GUNNAME, b_unname);
     vm.register_builtin(GDEREF, b_deref);
+    vm.register_builtin(GCHAN_HANDLE, b_chan_handle);
     vm.register_builtin(GSPREAD, b_spread);
     vm.register_builtin(GIFACE_EQ, b_iface_eq);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
@@ -3662,6 +3667,14 @@ fn is_named(v: &Value) -> bool {
     HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Named { .. })))
 }
 
+/// [`GCHAN_HANDLE`].
+fn b_chan_handle(vm: &mut VM, argc: u8) -> Value {
+    match pop_args(vm, argc).into_iter().next() {
+        Some(Value::Undef) | None => Value::Int(-1),
+        Some(ch) => ch,
+    }
+}
+
 /// [`GDEREF`] — read through a pointer to a non-struct value.
 fn b_deref(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
@@ -5179,6 +5192,13 @@ pub mod stdlib {
     pub const LOG2: u16 = 919;
     pub const LOG10: u16 = 920;
     pub const CBRT: u16 = 921;
+    // math IEEE special values.
+    pub const INF: u16 = 922;
+    pub const NAN: u16 = 923;
+    pub const IS_INF: u16 = 924;
+    pub const IS_NAN: u16 = 925;
+    pub const SIGNBIT: u16 = 926;
+    pub const COPYSIGN: u16 = 927;
     // strings.* / strconv.* (added wave).
     pub const CONTAINS_RUNE: u16 = 972;
     pub const CONTAINS_ANY: u16 = 973;
@@ -5270,6 +5290,12 @@ pub mod stdlib {
             ("math", "Log2") => LOG2,
             ("math", "Log10") => LOG10,
             ("math", "Cbrt") => CBRT,
+            ("math", "Inf") => INF,
+            ("math", "NaN") => NAN,
+            ("math", "IsInf") => IS_INF,
+            ("math", "IsNaN") => IS_NAN,
+            ("math", "Signbit") => SIGNBIT,
+            ("math", "Copysign") => COPYSIGN,
             ("sort", "Ints") => SORT_INTS,
             ("sort", "Strings") => SORT_STRINGS,
             ("sort", "Float64s") => SORT_FLOAT64S,
@@ -5309,6 +5335,29 @@ pub mod stdlib {
             ("math", "MinInt64") => Value::Int(i64::MIN),
             ("math", "MaxInt") => Value::Int(i64::MAX),
             ("math", "MinInt") => Value::Int(i64::MIN),
+            ("math", "MaxInt8") => Value::Int(i8::MAX.into()),
+            ("math", "MinInt8") => Value::Int(i8::MIN.into()),
+            ("math", "MaxInt16") => Value::Int(i16::MAX.into()),
+            ("math", "MinInt16") => Value::Int(i16::MIN.into()),
+            ("math", "MaxInt32") => Value::Int(i32::MAX.into()),
+            ("math", "MinInt32") => Value::Int(i32::MIN.into()),
+            ("math", "MaxUint8") => Value::Int(u8::MAX.into()),
+            ("math", "MaxUint16") => Value::Int(u16::MAX.into()),
+            ("math", "MaxUint32") => Value::Int(u32::MAX.into()),
+            ("math", "MaxFloat64") => Value::Float(f64::MAX),
+            // The smallest subnormal, 0x1p-1074.
+            ("math", "SmallestNonzeroFloat64") => Value::Float(f64::from_bits(1)),
+            ("math", "MaxFloat32") => Value::Float(f32::MAX.into()),
+            // The smallest float32 subnormal, 0x1p-149.
+            ("math", "SmallestNonzeroFloat32") => Value::Float(f32::from_bits(1).into()),
+            ("math", "Phi") => Value::Float(1.618_033_988_749_895),
+            ("math", "SqrtE") => Value::Float(1.648_721_270_700_128_2),
+            ("math", "SqrtPi") => Value::Float(1.772_453_850_905_516),
+            ("math", "SqrtPhi") => Value::Float(1.272_019_649_514_069),
+            ("math", "Ln2") => Value::Float(std::f64::consts::LN_2),
+            ("math", "Log2E") => Value::Float(std::f64::consts::LOG2_E),
+            ("math", "Ln10") => Value::Float(std::f64::consts::LN_10),
+            ("math", "Log10E") => Value::Float(std::f64::consts::LOG10_E),
             _ => return None,
         })
     }
@@ -5460,6 +5509,42 @@ pub mod stdlib {
         vm.register_builtin(LOG2, |vm, a| math1(vm, a, f64::log2));
         vm.register_builtin(LOG10, |vm, a| math1(vm, a, f64::log10));
         vm.register_builtin(CBRT, |vm, a| math1(vm, a, f64::cbrt));
+        // Go's `Inf(sign)`: `+Inf` for `sign >= 0`, `-Inf` otherwise.
+        vm.register_builtin(INF, |vm, a| {
+            let sign = pop_args(vm, a).first().map_or(0, |v| v.to_int());
+            Value::Float(if sign >= 0 {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            })
+        });
+        vm.register_builtin(NAN, |vm, a| {
+            pop_args(vm, a);
+            Value::Float(f64::NAN)
+        });
+        // Go's `IsInf(f, sign)`: `+Inf` for `sign > 0`, `-Inf` for `sign < 0`,
+        // either for `0`.
+        vm.register_builtin(IS_INF, |vm, a| {
+            let args = pop_args(vm, a);
+            let f = args.first().map_or(0.0, |v| v.to_float());
+            let sign = args.get(1).map_or(0, |v| v.to_int());
+            Value::Bool((sign >= 0 && f == f64::INFINITY) || (sign <= 0 && f == f64::NEG_INFINITY))
+        });
+        vm.register_builtin(IS_NAN, |vm, a| {
+            Value::Bool(
+                pop_args(vm, a)
+                    .first()
+                    .is_some_and(|v| v.to_float().is_nan()),
+            )
+        });
+        vm.register_builtin(SIGNBIT, |vm, a| {
+            Value::Bool(
+                pop_args(vm, a)
+                    .first()
+                    .is_some_and(|v| v.to_float().is_sign_negative()),
+            )
+        });
+        vm.register_builtin(COPYSIGN, |vm, a| math2(vm, a, f64::copysign));
         // sort.*
         vm.register_builtin(SORT_INTS, |vm, a| {
             sort_slice(vm, a, |x, y| x.to_int().cmp(&y.to_int()))

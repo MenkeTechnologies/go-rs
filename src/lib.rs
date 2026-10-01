@@ -104,6 +104,8 @@ fn uses_scheduler(chunk: &fusevm::Chunk) -> bool {
                 | Op::ChanSend
                 | Op::ChanRecv
                 | Op::ChanClose
+                | Op::ChanLen
+                | Op::ChanCap
                 | Op::Select(..)
         )
     })

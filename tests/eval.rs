@@ -61,6 +61,71 @@ fn hello_world() {
     );
 }
 
+/// `len`/`cap` of a channel read the scheduler's buffer (a nil channel is
+/// `0 0`, not channel 0's counts), a defined channel type `make`s a channel,
+/// and `<-chan T` / `chan<- T` parse in results, parameters and `var`s.
+/// Expected output is `go run`'s (go1.27.1).
+#[test]
+fn channel_len_cap_and_directional_types() {
+    assert_stdout(
+        include_str!("../parity-scripts/chan_len_cap_directional.go"),
+        "0 3\n2 3\n1 3\n0 0\n0 0\n4 4\n6\n1 7 0\n2\n1 5\ntrue\n",
+    );
+}
+
+/// A native stdlib function used as a value — bound, passed, stored in a map
+/// or slice — forwards to the call with its arity, variadic packing and
+/// `(value, error)` results intact. Expected output is `go run`'s (go1.27.1).
+#[test]
+fn stdlib_function_used_as_a_value() {
+    assert_stdout(
+        include_str!("../parity-scripts/stdlib_func_value.go"),
+        "bcd\n[a b c] 3\nhi\n8\n2\n\
+         ABC\nxyz\npad\n[1 2 3]\n1024 7\n42 <nil>\n\
+         strconv.Atoi: parsing \"x\": invalid syntax\nvia value 3\n007|z\n\
+         [apple fig pear]\ntrue false\ntrue true\na-b\n",
+    );
+}
+
+/// A pointer-receiver method value binds `&c`, so calls through it mutate
+/// `c`; a value-receiver one keeps its copy. Expected output is `go run`'s
+/// (go1.27.1).
+#[test]
+fn method_value_binds_pointer_receiver() {
+    assert_stdout(
+        include_str!("../parity-scripts/method_value_pointer_receiver.go"),
+        "2 0 2\n12\n6\n[{1} {3}]\n",
+    );
+}
+
+/// The sized integer limits, the float constants and the IEEE specials
+/// (`Inf`/`NaN`/`IsInf`/`IsNaN`/`Signbit`/`Copysign`). Expected output is
+/// `go run`'s (go1.27.1).
+#[test]
+fn math_limits_constants_and_ieee_specials() {
+    assert_stdout(
+        include_str!("../parity-scripts/math_consts_inf_nan.go"),
+        "127 -128 32767 -32768\n2147483647 -2147483648 255 65535 4294967295\n\
+         -2147483648 0\n1.7976931348623157e+308 5e-324\n\
+         3.4028234663852886e+38 1.401298464324817e-45\n\
+         1.618033988749895 1.6487212707001282 1.772453850905516 1.272019649514069\n\
+         0.6931471805599453 1.4426950408889634 2.302585092994046 0.4342944819032518\n\
+         +Inf -Inf NaN +Inf\ntrue false true false\ntrue false false true\n\
+         false true true\nfalse true true false\n-3 2.5 true\n1.618 +Inf     -Inf|\n-2\n",
+    );
+}
+
+/// `r.handlers["up"](x)` indexes a func-valued map field and calls the
+/// element; a struct variable is not an import, so the brackets are no type
+/// arguments. Expected output is `go run`'s (go1.27.1).
+#[test]
+fn func_in_a_container_field_is_called() {
+    assert_stdout(
+        include_str!("../parity-scripts/field_container_call.go"),
+        "HEY hey!\n50 20\nptr!\n",
+    );
+}
+
 #[test]
 fn integer_arithmetic_and_precedence() {
     // 2 + 3*4 == 14, printed by fmt.Println.
