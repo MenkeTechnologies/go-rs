@@ -1132,6 +1132,12 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
         .filter(|(t, _)| !t.is_empty())
         .collect();
 
+    let iface_sigs: HashMap<&str, &Vec<String>> = prog
+        .interfaces
+        .iter()
+        .map(|i| (i.name.as_str(), &i.methods))
+        .collect();
+
     let mut out: Vec<Func> = Vec::new();
     // Each round promotes one level of embedding, so a method reaches an outer
     // type through a chain of embedded fields as well as a single one.
@@ -1168,6 +1174,24 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
                     round.push(forwarder(&t.name, &inner, src));
                 }
             }
+            // An embedded *interface* (`struct { sort.Interface }`) promotes its
+            // method set the same way; the forwarder calls through the field,
+            // which dispatches on whatever value it holds.
+            for f in &t.fields {
+                let Some(sigs) = iface_sigs.get(base_type(&f.ty).as_str()) else {
+                    continue;
+                };
+                if f.name != base_type(&f.ty).rsplit('.').next().unwrap_or_default() {
+                    continue; // a named field, not an embedded one
+                }
+                for sig in *sigs {
+                    let src = iface_method_stub(sig);
+                    if have(&t.name, &src.name, &out) || have(&t.name, &src.name, &round) {
+                        continue;
+                    }
+                    round.push(forwarder(&t.name, &f.name, &src));
+                }
+            }
         }
         if round.is_empty() {
             break;
@@ -1175,6 +1199,37 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
         out.extend(round);
     }
     out
+}
+
+/// A bodiless method declaration standing for one interface method, decoded
+/// from its [`crate::ast::method_sig`] — the shape [`forwarder`] promotes. The
+/// encoding keeps no parameter types, so the parameters are untyped; the
+/// forwarder only passes them through.
+fn iface_method_stub(sig: &str) -> Func {
+    let (head, res) = sig.split_once(':').unwrap_or((sig, ""));
+    let (name, arity) = head.split_once('/').unwrap_or((head, "0"));
+    let results: Vec<String> = match res.is_empty() {
+        true => Vec::new(),
+        false => res.split(',').map(str::to_string).collect(),
+    };
+    Func {
+        name: name.to_string(),
+        receiver: Some(Param {
+            name: String::new(),
+            ty: String::new(),
+        }),
+        params: (0..arity.parse().unwrap_or(0))
+            .map(|i| Param {
+                name: format!("$mp{i}"),
+                ty: String::new(),
+            })
+            .collect(),
+        variadic: false,
+        result_names: vec![String::new(); results.len()],
+        results,
+        body: Vec::new(),
+        line: 0,
+    }
 }
 
 /// `func (r Outer) m(args…) … { [return] r.Inner.m(args…) }` — the body of one
@@ -3666,7 +3721,7 @@ impl Compiler {
                     {
                         self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
                         // `u8++` / `i8 += n` wrap at the variable's declared width.
-                        if let Some(ty) = self.decl_types.get(name).cloned() {
+                        if let Some(ty) = self.sized_int_ty(&Expr::Ident(name.clone())) {
                             self.emit_narrow(&ty, line);
                         }
                     }
@@ -3757,10 +3812,31 @@ impl Compiler {
                 self.expr(rhs)?;
                 match op {
                     AssignOp::Set => self.emit_value(value)?,
+                    // `*p op= v` is `*p = *p op v` with `p` evaluated once:
+                    // read the pointee through a copy of the pointer, then
+                    // apply the operator at the pointee's type, as `s.f op= v`
+                    // does above.
                     _ => {
-                        return Err(format!(
-                            "go-rs: compound assignment through a pointer is not supported (line {line})"
-                        ))
+                        self.b.emit(Op::Dup, line);
+                        self.b.emit(Op::CallBuiltin(host::GDEREF, 1), line);
+                        self.emit_panic_check(line); // nil dereference is recoverable
+                        self.expr(value)?;
+                        let f32ish = self.is_f32(target) || self.is_f32(value);
+                        let u64ish = self.is_u64(target);
+                        if !self.emit_f32_arith(assign_binop(op), f32ish, line)
+                            && !self.emit_u64_arith(assign_binop(op), u64ish, line)
+                        {
+                            self.emit_arith(
+                                assign_binop(op),
+                                NumType::Unknown,
+                                self.infer(value),
+                                is_nonzero_const(value),
+                                line,
+                            );
+                            if let Some(ty) = self.sized_int_ty(target) {
+                                self.emit_narrow(&ty, line);
+                            }
+                        }
                     }
                 }
                 self.b.emit(Op::CallBuiltin(host::GDEREF_SET, 2), line);
@@ -5681,7 +5757,12 @@ impl Compiler {
     /// the type of the other operand, so one unsigned operand fixes the whole
     /// expression, and a shift takes its type from the left operand alone.
     fn u64_ty(&self, e: &Expr) -> Option<String> {
-        let named = |t: &str| is_uint64_ty(t).then(|| t.to_string());
+        // A defined type over `uint64` (`type xorshift uint64`) computes as
+        // its base, so it answers with the underlying type.
+        let named = |t: &str| {
+            let u = self.underlying(t);
+            is_uint64_ty(&u).then_some(u)
+        };
         if let Some(t) = named(&base_type(&self.type_name(e))) {
             return Some(t);
         }
@@ -5701,7 +5782,7 @@ impl Compiler {
             }
             Expr::Call { func, .. } => match func.as_ref() {
                 // A conversion `uint64(x)` names its own type.
-                Expr::Ident(n) if is_uint64_ty(n) => Some(n.clone()),
+                Expr::Ident(n) if named(n).is_some() => named(n),
                 Expr::Ident(n) => self
                     .funcs
                     .get(n)
@@ -6013,11 +6094,12 @@ impl Compiler {
     /// its type from the left operand alone (the count has its own).
     fn sized_int_ty(&self, e: &Expr) -> Option<String> {
         match e {
-            Expr::Ident(n) => self
-                .decl_types
-                .get(n)
-                .filter(|t| int_width(t).is_some())
-                .cloned(),
+            Expr::Ident(n) => self.decl_types.get(n).and_then(|t| self.sized_under(t)),
+            // `*p += n` wraps at the pointee's width.
+            Expr::Unary {
+                op: UnOp::Deref,
+                rhs,
+            } => self.sized_under(&base_type(&self.type_name(rhs))),
             Expr::Unary {
                 op: UnOp::Neg | UnOp::BitNot,
                 rhs,
@@ -6032,22 +6114,29 @@ impl Compiler {
             }
             Expr::Call { func, .. } => match func.as_ref() {
                 // A conversion `int8(x)` names its own type.
-                Expr::Ident(n) if int_width(n).is_some() => Some(n.clone()),
+                Expr::Ident(n) if self.sized_under(n).is_some() => self.sized_under(n),
                 Expr::Ident(n) => self
                     .funcs
                     .get(n)
                     .map(|s| base_type(&s.result_ty))
-                    .filter(|t| int_width(t).is_some()),
+                    .and_then(|t| self.sized_under(&t)),
                 _ => None,
             },
             Expr::Selector { .. } | Expr::TypeAssert { .. } => {
                 let t = self.type_name(e);
-                (int_width(&t).is_some()).then_some(t)
+                self.sized_under(&t)
             }
             // A slice element takes its width from the slice's element type.
-            Expr::Index { recv, .. } => self.elem_ty_of(recv).filter(|t| int_width(t).is_some()),
+            Expr::Index { recv, .. } => self.elem_ty_of(recv).and_then(|t| self.sized_under(&t)),
             _ => None,
         }
+    }
+
+    /// The sized integer type `ty` computes as, following a defined type to its
+    /// base: `type B uint8` wraps at 8 bits like `uint8` does.
+    fn sized_under(&self, ty: &str) -> Option<String> {
+        let u = self.underlying(ty);
+        int_width(&u).map(|_| u)
     }
 
     /// The written element type of a slice-valued expression, when go-rs recorded
