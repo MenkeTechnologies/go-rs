@@ -1285,14 +1285,13 @@ fn forwarder(outer: &str, inner: &str, src: &Func) -> Func {
 fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Promotion is a source-level rewrite: the forwarders join the program's
     // own functions before anything else looks at the method set.
-    let promoted = promoted_methods(prog);
-    let prog = &if promoted.is_empty() {
-        prog.clone()
-    } else {
-        let mut p = prog.clone();
-        p.funcs.extend(promoted);
-        p
-    };
+    // Block scoping is one too: a shadowing declaration is renamed apart
+    // from the variable it shadows (`scope::resolve`), so the name-keyed
+    // tables below see one variable per name.
+    let mut p = prog.clone();
+    p.funcs.extend(promoted_methods(prog));
+    crate::scope::resolve(&mut p);
+    let prog = &p;
     let structs: HashSet<String> = prog.types.iter().map(|t| t.name.clone()).collect();
     let struct_fields: HashMap<String, Vec<(String, String)>> = prog
         .types

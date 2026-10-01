@@ -41,6 +41,9 @@ tokens
    │  parser.rs     — recursive-descent → Go AST
    ▼
 ast::Program
+   │  scope.rs      — rename block-shadowed locals apart (Go block scoping)
+   ▼
+ast::Program
    │  compiler.rs   — lower to fusevm ops (LoadInt, Add, Call, JumpIfFalse, …)
    ▼
 fusevm::Chunk
@@ -166,6 +169,10 @@ prints its message but not Go's goroutine stack trace.
 its value's type name as embedded — which is exactly how the parser records
 `struct { Base }`, but also matches a hand-written `Base Base` field, so that
 field would promote here where Go would reject the reference as undefined.
+Variables are block-scoped as in Go: a declaration that reuses an outer
+variable's name in an inner block (`for j := …` inside `for j := …`, an
+`if err := …` init, a `switch v := v.(type)` binding) is a new variable —
+`scope.rs` renames it apart before the name-keyed compiler sees it.
 A `type` declaration inside a function body is parsed but **hoisted** to the
 package rather than scoped to its block, so two blocks declaring different types
 under one name collide (the first parsed wins).

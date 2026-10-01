@@ -20,6 +20,7 @@ pub mod lsp;
 pub mod parser;
 pub mod pkg;
 pub mod rust_ffi;
+pub mod scope;
 pub mod stdlib_vendor;
 pub mod tiers;
 
