@@ -1380,13 +1380,13 @@ case 3:
         <article class="doc-entry" id="doc-package-sort-4">
           <h3><a class="doc-anchor" href="#doc-package-sort-4">#</a> <code>sort.Slice</code></h3>
           <pre><code class="lang-go">sort.Slice(x any, less func(i, j int) bool)</code></pre>
-          <p>Sorts `x` using the comparator. A host builtin cannot call a VM closure, so the compiler lowers this to `$sortSlice` — an in-language insertion sort the linker synthesizes into every program, used or not. It is O(n²) and stable.</p>
+          <p>Sorts `x` using the comparator, with Go's pattern-defeating quicksort: it is not stable, and equal elements end in the order Go leaves them in. A host builtin cannot call a VM closure, so this is Go's own `sort` source (`goroot/sort.go`) compiled into a program that imports `sort`.</p>
           <pre><code class="lang-go">sort.Slice(xs, func(i, j int) bool { return xs[i] &lt; xs[j] })</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-sort-5">
           <h3><a class="doc-anchor" href="#doc-package-sort-5">#</a> <code>sort.SliceStable</code></h3>
           <pre><code class="lang-go">sort.SliceStable(x any, less func(i, j int) bool)</code></pre>
-          <p>The same `$sortSlice` insertion sort as `sort.Slice`. Because that sort is already stable, the two functions are indistinguishable here.</p>
+          <p>Sorts `x` using the comparator, keeping equal elements in their original order — Go's insertion-sort blocks merged with SymMerge.</p>
           <pre><code class="lang-go">sort.SliceStable(xs, less)</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-sort-6">
@@ -1434,8 +1434,32 @@ case 3:
         <article class="doc-entry" id="doc-package-sort-13">
           <h3><a class="doc-anchor" href="#doc-package-sort-13">#</a> <code>sort.SliceIsSorted</code></h3>
           <pre><code class="lang-go">sort.SliceIsSorted(x any, less func(i, j int) bool) bool</code></pre>
-          <p>Whether the slice is already ordered by the comparator. Takes a VM closure, so it is lowered to `$sliceIsSorted` alongside `sort.Slice`.</p>
+          <p>Whether the slice is already ordered by the comparator. Takes a VM closure, so it is Go source compiled in alongside `sort.Slice`.</p>
           <pre><code class="lang-go">sort.SliceIsSorted(xs, func(i, j int) bool { return xs[i] &lt; xs[j] })</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-14">
+          <h3><a class="doc-anchor" href="#doc-package-sort-14">#</a> <code>sort.Sort</code></h3>
+          <pre><code class="lang-go">sort.Sort(data sort.Interface)</code></pre>
+          <p>Sorts `data` through its `Len` / `Less` / `Swap` methods with Go's pattern-defeating quicksort. Not stable: equal elements end in the order Go leaves them in.</p>
+          <pre><code class="lang-go">sort.Sort(byAge(people))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-15">
+          <h3><a class="doc-anchor" href="#doc-package-sort-15">#</a> <code>sort.Stable</code></h3>
+          <pre><code class="lang-go">sort.Stable(data sort.Interface)</code></pre>
+          <p>Sorts `data` through its methods, keeping equal elements in their original order.</p>
+          <pre><code class="lang-go">sort.Stable(byAge(people))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-16">
+          <h3><a class="doc-anchor" href="#doc-package-sort-16">#</a> <code>sort.Reverse</code></h3>
+          <pre><code class="lang-go">sort.Reverse(data sort.Interface) sort.Interface</code></pre>
+          <p>`data` with `Less` inverted — a struct embedding `data`, so `Len` and `Swap` are promoted from it.</p>
+          <pre><code class="lang-go">sort.Sort(sort.Reverse(sort.IntSlice(xs)))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-sort-17">
+          <h3><a class="doc-anchor" href="#doc-package-sort-17">#</a> <code>sort.IsSorted</code></h3>
+          <pre><code class="lang-go">sort.IsSorted(data sort.Interface) bool</code></pre>
+          <p>Whether `data` is already ordered by its `Less` method.</p>
+          <pre><code class="lang-go">sort.IsSorted(sort.StringSlice(names))</code></pre>
         </article>
       </section>
 

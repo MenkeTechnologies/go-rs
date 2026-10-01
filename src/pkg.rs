@@ -87,38 +87,53 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if main.imports.iter().any(|p| p == "os") {
         add_os_file(&mut main)?;
     }
-    add_sort_slice(&mut main);
+    if main.imports.iter().any(|p| p == "sort") {
+        add_sort_source(&mut main)?;
+    }
     add_sort_search(&mut main);
     add_stringify(&mut main);
     Ok(main)
 }
 
-/// Synthesize `$sortSlice(s, less)` — the in-language target of `sort.Slice` /
-/// `sort.SliceStable`, whose comparator is a VM closure a host builtin can't
-/// call. An insertion sort keyed on `less(j, j-1)` (stable; the swap works on
-/// go-rs's reference-typed slice, mutating the caller's slice in place).
-fn add_sort_slice(prog: &mut Program) {
-    let src = "package p\n\
-        func h(s any, less func(int, int) bool) {\n\
-        \tfor i := 1; i < len(s); i++ {\n\
-        \t\tfor j := i; j > 0 && less(j, j-1); j-- {\n\
-        \t\t\ts[j], s[j-1] = s[j-1], s[j]\n\
-        \t\t}\n\
-        \t}\n\
-        }\n";
-    if let Ok(mut p) = crate::parse(src) {
-        if let Some(mut f) = p.funcs.pop() {
-            f.name = "$sortSlice".to_string();
-            prog.funcs.push(f);
-        }
-    }
+/// The names package `sort` declares in Go source (`goroot/sort.go`) rather
+/// than as host builtins — each calls `Less` / `Swap` methods or a `less`
+/// closure, which a host builtin cannot, or is a type. They are synthesized
+/// and qualified under `sort`, and a program's `sort.<Name>` is rewritten to
+/// the qualified identifier (`Qualifier::source_half`).
+pub const SORT_SOURCE: &[&str] = &[
+    "Sort",
+    "Stable",
+    "IsSorted",
+    "Reverse",
+    "Slice",
+    "SliceStable",
+    "SliceIsSorted",
+    "Interface",
+    "IntSlice",
+    "Float64Slice",
+    "StringSlice",
+];
+
+/// Synthesize package `sort`'s Go half — `Interface`, the `IntSlice` family,
+/// and Go's own pdqsort / SymMerge (`goroot/sort.go`). It has to be Go's
+/// algorithm: the order an unstable sort leaves equal elements in is output.
+fn add_sort_source(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/sort.go"))?;
+    qualify(&mut pkg, "sort", true);
+    prog.types.append(&mut pkg.types);
+    prog.interfaces.append(&mut pkg.interfaces);
+    prog.defined.append(&mut pkg.defined);
+    prog.funcs.append(&mut pkg.funcs);
+    let inits = std::mem::take(&mut pkg.main);
+    prog.main.splice(0..0, inits);
+    Ok(())
 }
 
 /// Synthesize the rest of package `sort`: the binary searches and the
 /// "is it already sorted" predicates.
 ///
-/// Written in Go and parsed for the same reason `$sortSlice` is: `sort.Search`
-/// and `sort.SliceIsSorted` take a VM closure, which a host builtin cannot call.
+/// Written in Go and parsed for the same reason `goroot/sort.go` is: `sort.Search`
+/// takes a VM closure, which a host builtin cannot call.
 /// The four that take no closure ride along in the same form rather than
 /// becoming host builtins, so the whole package is described in one place and
 /// the search halves cannot drift apart.
@@ -127,7 +142,7 @@ fn add_sort_slice(prog: &mut Program) {
 /// `f(i)` is true, and `n` when there is none — which is what makes
 /// `SearchInts` answer `len(a)` for a value past the end rather than -1.
 fn add_sort_search(prog: &mut Program) {
-    let each: [(&str, &str); 8] = [
+    let each: [(&str, &str); 7] = [
         (
             "$sortSearch",
             "func h(n int, f func(int) bool) int {\n\
@@ -175,12 +190,6 @@ fn add_sort_search(prog: &mut Program) {
             "$float64sAreSorted",
             "func h(a []float64) bool {\n\tfor i := 1; i < len(a); i++ {\n\
              \t\tif a[i] < a[i-1] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n",
-        ),
-        (
-            "$sliceIsSorted",
-            "func h(s any, less func(int, int) bool) bool {\n\
-             \tfor i := len(s) - 1; i > 0; i-- {\n\
-             \t\tif less(i, i-1) {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n",
         ),
     ];
     for (name, body) in each {
@@ -670,11 +679,21 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
             aliases.insert(import_alias(p).to_string(), p.clone());
         }
     }
+    // alias → the names a native package declares in Go source instead
+    // (`sort.Sort`, `sort.IntSlice`): a reference to one of those is rewritten
+    // like a source package's, and every other name stays a host selector.
+    let mut source_half: HashMap<String, &'static [&'static str]> = HashMap::new();
+    for p in &prog.imports {
+        if p == "sort" {
+            source_half.insert(import_alias(p).to_string(), SORT_SOURCE);
+        }
+    }
 
     let q = Qualifier {
         path: path.to_string(),
         own,
         aliases,
+        source_half,
     };
 
     // Qualify declarations (only for imported packages) and rewrite references
@@ -730,6 +749,7 @@ struct Qualifier {
     path: String,
     own: HashSet<String>,
     aliases: HashMap<String, String>,
+    source_half: HashMap<String, &'static [&'static str]>,
 }
 
 impl Qualifier {
@@ -948,6 +968,14 @@ impl Qualifier {
                     if !bound.contains(a) {
                         if let Some(p) = self.aliases.get(a) {
                             *e = Expr::Ident(format!("{p}.{field}"));
+                            return;
+                        }
+                        if self
+                            .source_half
+                            .get(a)
+                            .is_some_and(|names| names.contains(&field.as_str()))
+                        {
+                            *e = Expr::Ident(format!("{a}.{field}"));
                             return;
                         }
                     }

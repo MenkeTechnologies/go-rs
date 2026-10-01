@@ -1517,8 +1517,9 @@ const CORPUS: &[Entry] = &[
         "The smallest `int`, equal to `math.MinInt64` on every target.",
         "best := math.MinInt",
     ),
-    // ── Package sort (host::stdlib ids 875-877, plus the `$sortSlice` /
-    // `$sortSearch` family the compiler lowers to; see `pkg::add_sort_search`) ──
+    // ── Package sort (host::stdlib ids 875-877; the `$sortSearch` family the
+    // compiler lowers to, see `pkg::add_sort_search`; and Go's own sort source,
+    // see `pkg::add_sort_source` / goroot/sort.go) ──
     e(
         "sort.Ints",
         "Package sort",
@@ -1544,14 +1545,14 @@ const CORPUS: &[Entry] = &[
         "sort.Slice",
         "Package sort",
         "sort.Slice(x any, less func(i, j int) bool)",
-        "Sorts `x` using the comparator. A host builtin cannot call a VM closure, so the compiler lowers this to `$sortSlice` — an in-language insertion sort the linker synthesizes into every program, used or not. It is O(n²) and stable.",
+        "Sorts `x` using the comparator, with Go's pattern-defeating quicksort: it is not stable, and equal elements end in the order Go leaves them in. A host builtin cannot call a VM closure, so this is Go's own `sort` source (`goroot/sort.go`) compiled into a program that imports `sort`.",
         "sort.Slice(xs, func(i, j int) bool { return xs[i] < xs[j] })",
     ),
     e(
         "sort.SliceStable",
         "Package sort",
         "sort.SliceStable(x any, less func(i, j int) bool)",
-        "The same `$sortSlice` insertion sort as `sort.Slice`. Because that sort is already stable, the two functions are indistinguishable here.",
+        "Sorts `x` using the comparator, keeping equal elements in their original order — Go's insertion-sort blocks merged with SymMerge.",
         "sort.SliceStable(xs, less)",
     ),
     e(
@@ -1607,8 +1608,36 @@ const CORPUS: &[Entry] = &[
         "sort.SliceIsSorted",
         "Package sort",
         "sort.SliceIsSorted(x any, less func(i, j int) bool) bool",
-        "Whether the slice is already ordered by the comparator. Takes a VM closure, so it is lowered to `$sliceIsSorted` alongside `sort.Slice`.",
+        "Whether the slice is already ordered by the comparator. Takes a VM closure, so it is Go source compiled in alongside `sort.Slice`.",
         "sort.SliceIsSorted(xs, func(i, j int) bool { return xs[i] < xs[j] })",
+    ),
+    e(
+        "sort.Sort",
+        "Package sort",
+        "sort.Sort(data sort.Interface)",
+        "Sorts `data` through its `Len` / `Less` / `Swap` methods with Go's pattern-defeating quicksort. Not stable: equal elements end in the order Go leaves them in.",
+        "sort.Sort(byAge(people))",
+    ),
+    e(
+        "sort.Stable",
+        "Package sort",
+        "sort.Stable(data sort.Interface)",
+        "Sorts `data` through its methods, keeping equal elements in their original order.",
+        "sort.Stable(byAge(people))",
+    ),
+    e(
+        "sort.Reverse",
+        "Package sort",
+        "sort.Reverse(data sort.Interface) sort.Interface",
+        "`data` with `Less` inverted — a struct embedding `data`, so `Len` and `Swap` are promoted from it.",
+        "sort.Sort(sort.Reverse(sort.IntSlice(xs)))",
+    ),
+    e(
+        "sort.IsSorted",
+        "Package sort",
+        "sort.IsSorted(data sort.Interface) bool",
+        "Whether `data` is already ordered by its `Less` method.",
+        "sort.IsSorted(sort.StringSlice(names))",
     ),
     // ── Package os (host::stdlib id 880) ──
     e(
