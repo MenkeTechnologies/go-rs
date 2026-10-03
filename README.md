@@ -147,8 +147,8 @@ Real Go, executed on fusevm:
 | Inline FFI     | `rust { pub extern "C" fn … }` blocks compile to a cached `cdylib` on first run and are callable by name from Go |
 
 Goroutines, channels, and `select` run on a **cooperative scheduler in the
-shared `fusevm` VM** (`fusevm::sched`, from the pinned `fusevm` 0.26.8): each
-goroutine is its own VM sharing the program and the single-threaded heap,
+shared `fusevm` VM** (`fusevm::sched`, from the pinned `fusevm` 0.26.9): each
+goroutine is its own VM sharing the program, the package-level variables and the single-threaded heap,
 yielding at channel operations. **Generics are handled by erasure** — type-parameter and
 type-argument brackets are consumed and dropped, and the dynamically-typed value
 model runs one erased body for every instantiation (the zero value of a

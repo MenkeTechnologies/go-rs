@@ -178,24 +178,6 @@ suspended goroutine still holds its VM). Closing it needs a fusevm release
 where the VM borrows or `Arc`-shares its chunk; the published pin is the
 contract.
 
-## A goroutine does not see package-level variables — waiting on a fusevm release
-
-```go
-var counter = 5
-func work(done chan bool) { counter = 100; done <- true }
-// main: counter = 7; go work(done); <-done; fmt.Println(counter)
-// go: 100    go-rs: 7 (and a goroutine reading `counter` reads nil)
-```
-
-A package-level variable is a fusevm global, and `fusevm::sched` gives each
-goroutine its own `VM` with its own, empty, `globals` — so a function running
-as a goroutine neither reads the value `main` stored nor writes one `main`
-sees. A global that some *closure* captures is unaffected: it lives in a heap
-cell (`Compiler::global_cells`), and the heap is shared by every goroutine,
-which is why `go func() { counter++ }()` is right. Closing it for the rest
-needs the scheduler to share one globals table across its VMs (or go-rs to put
-every global in a cell, which costs a dereference on every global access).
-
 ## Range-over-func: a labeled jump out of the body is rejected, and `defer` runs early
 
 ```go

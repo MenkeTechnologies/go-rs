@@ -401,9 +401,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fusevm"
-version = "0.26.8"
+version = "0.26.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9a28ee8f351cc6d6b86a41d0697b0b114c381f02297cf882f106a3effa31276"
+checksum = "52e9c630b03b4cd39bdec854806a9f6b93f24e29c9e0c7008a9d80b67c291d32"
 dependencies = [
  "base64",
  "bincode",
