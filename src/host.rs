@@ -303,13 +303,13 @@ pub const GDEREF_SET: u16 = 990;
 /// the element type's zero value (`elemTy` decides whether that copy recurses,
 /// as for [`GARRAY_COPY`]). Writes through a sub-slice's shared backing.
 pub const GCLEAR: u16 = 991;
-/// `[value]` → the value inside an interface box ([`HostObj::Named`]), or the
+/// `[value]` → the value inside an interface box (`HostObj::Named`), or the
 /// value itself. Emitted where a value leaves an interface for its concrete
 /// type: a successful `x.(T)`, a type-switch case naming one type, and the
 /// receiver a dynamically dispatched method is handed.
 pub const GUNNAME: u16 = 992;
 /// `[p]` → `*p` for a pointer to a non-struct value: the value a
-/// [`HostObj::Cell`] holds, or `p` itself (a struct, slice or map pointer is
+/// `HostObj::Cell` holds, or `p` itself (a struct, slice or map pointer is
 /// its pointee's own handle). A pointer-receiver method on a defined
 /// non-struct type is handed its receiver in such a cell.
 pub const GDEREF: u16 = 993;
