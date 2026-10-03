@@ -526,6 +526,27 @@ A constant is lowered as a variable, so at that point `big` is a run-time
 the compiler to know which names are constants — through block scoping and
 shadowing — which is the same pass the overflow diagnosis above wants.
 
+## Transcendental `math` functions differ from Go in the last bit
+
+```go
+for i := 0; i < 20000; i++ {
+	v := -700 + float64(float64(i)*0.0713)
+	fmt.Println(math.Pow(1.0001, v), math.Sin(v), math.Atan(v))
+}
+// go-rs differs from go 1.27.1 (darwin/arm64) in the last printed digit on
+// 19894 of the Pow lines, 5452 Sin, 5531 Atan, 7846 Hypot, 5044 Log10, ...
+```
+
+`Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Atan2`, `Sinh`, `Cosh`, `Tanh`,
+`Exp`, `Log`, `Log2`, `Log10`, `Pow`, `Cbrt` and `Hypot` are host builtins over
+Rust's `f64` methods, which call the platform's libm. Go computes them with its
+own algorithms (`math/sin.go`, `pow.go`, …), so the two agree only to within an
+ulp or so. `Sqrt`, `Floor`, `Ceil`, `Trunc`, `Abs`, `Mod` and `Copysign` are
+exact in both and agree. Closing it means porting Go's algorithms; for byte
+parity the port also has to fuse `x*y + z` into one rounding wherever Go's
+compiler does, which on arm64 (and not on amd64) is every such expression —
+the same reason a user's own `a*b + c` can differ from Go on arm64.
+
 ## Constant folding keeps a signed zero
 
 ```go

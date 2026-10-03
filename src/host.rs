@@ -4584,8 +4584,24 @@ fn star_arg(operands: &[Value], next: &mut usize) -> Option<i64> {
 /// `%+v` of `42` is `42`, not `+42`.
 fn render_v(v: &Value, spec: &Spec) -> String {
     let numeric = spec.prec.is_some() || spec.zero || spec.space;
-    if numeric && !spec.plus && !spec.sharp && is_int_operand(v) {
-        return pad_number(&scalar_verb(v, 'd', spec), 'd', spec);
+    // Under `%v` the `+` flag is `%+v`'s field-name flag, which `fmt` clears
+    // before formatting a number, so it never prints a sign.
+    let num_spec = Spec {
+        plus: false,
+        ..*spec
+    };
+    if numeric && !spec.sharp && is_int_operand(v) {
+        return pad_number(&scalar_verb(v, 'd', &num_spec), 'd', &num_spec);
+    }
+    // A float under `%v` is `%g` (Go's `fmtFloat(v, size, 'g', -1)`), and a
+    // written precision is the `%g` precision — significant digits — not the
+    // text truncation it is for a string: `%.4v` of 3.14159265 is `3.142`.
+    let unnamed = unname(v);
+    if spec.prec.is_some()
+        && !spec.sharp
+        && (matches!(unnamed, Value::Float(_)) || unbox_f32(&unnamed).is_some())
+    {
+        return render_verb(&unnamed, 'g', &num_spec, 0);
     }
     let mode = if spec.sharp {
         FmtMode::SharpV
@@ -4597,9 +4613,11 @@ fn render_v(v: &Value, spec: &Spec) -> String {
     // Go's `printValue` walks a composite and applies the width and the `0` flag
     // at each *leaf*, so `%10v` of a `[]int{1, 2}` is `[         1          2]`
     // rather than the list padded as a whole. Only plain `%v` walks: `%#v` and
-    // `%+v` name the composite as a whole, and with no width and no `0` flag the
-    // walk is indistinguishable from the one-shot rendering below.
-    if matches!(mode, FmtMode::V) && (spec.width.is_some() || spec.zero) {
+    // `%+v` name the composite as a whole, and with no width, precision or `0`
+    // flag the walk is indistinguishable from the one-shot rendering below.
+    if matches!(mode, FmtMode::V | FmtMode::PlusV)
+        && (spec.width.is_some() || spec.zero || spec.prec.is_some())
+    {
         if let Some(walked) = distribute_v(v, spec) {
             return walked;
         }
@@ -4646,7 +4664,14 @@ fn distribute_v(v: &Value, spec: &Spec) -> Option<String> {
         return Some(format!("map[{}]", body.join(" ")));
     }
     if let Some(fields) = struct_fields_of(v) {
-        let body: Vec<String> = fields.iter().map(|(_, f)| render_v(f, spec)).collect();
+        // `%+v` names each field.
+        let body: Vec<String> = fields
+            .iter()
+            .map(|(name, f)| match spec.plus {
+                true => format!("{name}:{}", render_v(f, spec)),
+                false => render_v(f, spec),
+            })
+            .collect();
         return Some(format!("{{{}}}", body.join(" ")));
     }
     match nil_composite_kind(v)? {
@@ -5239,6 +5264,11 @@ pub mod stdlib {
     pub const IS_NAN: u16 = 925;
     pub const SIGNBIT: u16 = 926;
     pub const COPYSIGN: u16 = 927;
+    // math.* IEEE bit patterns (`unsafe` casts in Go's own source).
+    pub const FLOAT64_BITS: u16 = 995;
+    pub const FLOAT64_FROM_BITS: u16 = 996;
+    pub const FLOAT32_BITS: u16 = 997;
+    pub const FLOAT32_FROM_BITS: u16 = 998;
     // strings.* / strconv.* (added wave).
     pub const CONTAINS_RUNE: u16 = 972;
     pub const CONTAINS_ANY: u16 = 973;
@@ -5340,6 +5370,10 @@ pub mod stdlib {
             ("math", "IsNaN") => IS_NAN,
             ("math", "Signbit") => SIGNBIT,
             ("math", "Copysign") => COPYSIGN,
+            ("math", "Float64bits") => FLOAT64_BITS,
+            ("math", "Float64frombits") => FLOAT64_FROM_BITS,
+            ("math", "Float32bits") => FLOAT32_BITS,
+            ("math", "Float32frombits") => FLOAT32_FROM_BITS,
             ("sort", "Ints") => SORT_INTS,
             ("sort", "Strings") => SORT_STRINGS,
             ("sort", "Float64s") => SORT_FLOAT64S,
@@ -5597,6 +5631,27 @@ pub mod stdlib {
             )
         });
         vm.register_builtin(COPYSIGN, |vm, a| math2(vm, a, f64::copysign));
+        // A `uint64` / `uint32` is held as its bit pattern in an `i64`.
+        vm.register_builtin(FLOAT64_BITS, |vm, a| {
+            let args = pop_args(vm, a);
+            let f = args.first().map(super::arg_float).unwrap_or(0.0);
+            Value::Int(f.to_bits() as i64)
+        });
+        vm.register_builtin(FLOAT64_FROM_BITS, |vm, a| {
+            let args = pop_args(vm, a);
+            let b = args.first().map(|v| v.to_int()).unwrap_or(0);
+            Value::Float(f64::from_bits(b as u64))
+        });
+        vm.register_builtin(FLOAT32_BITS, |vm, a| {
+            let args = pop_args(vm, a);
+            let f = args.first().map(super::arg_float).unwrap_or(0.0);
+            Value::Int(i64::from((f as f32).to_bits()))
+        });
+        vm.register_builtin(FLOAT32_FROM_BITS, |vm, a| {
+            let args = pop_args(vm, a);
+            let b = args.first().map(|v| v.to_int()).unwrap_or(0);
+            Value::Float(f64::from(f32::from_bits(b as u32)))
+        });
         // sort.*
         vm.register_builtin(SORT_INTS, |vm, a| {
             sort_slice(vm, a, |x, y| x.to_int().cmp(&y.to_int()))

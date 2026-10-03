@@ -95,6 +95,9 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if main.imports.iter().any(|p| p == "sort") {
         add_sort_source(&mut main)?;
     }
+    if main.imports.iter().any(|p| p == "math") {
+        add_math_source(&mut main)?;
+    }
     add_sort_search(&mut main);
     add_stringify(&mut main);
     Ok(main)
@@ -412,6 +415,38 @@ pub const STRINGS_SOURCE: &[&str] = &[
     "NewReplacer",
 ];
 
+/// The names package `math` declares in Go source (`goroot/math_source.go`)
+/// rather than as host builtins — Go's own portable bodies, which also decide
+/// the last bit of each result. Rewritten and qualified the way
+/// [`SORT_SOURCE`] is.
+pub const MATH_SOURCE: &[&str] = &[
+    "Modf",
+    "Frexp",
+    "Ldexp",
+    "Dim",
+    "Remainder",
+    "Log1p",
+    "Expm1",
+    "Gamma",
+    "Erf",
+    "Erfc",
+    "Nextafter",
+    "Nextafter32",
+    "RoundToEven",
+];
+
+/// Synthesize package `math`'s Go half ([`MATH_SOURCE`]) and qualify it under
+/// `math`. Its tables are package-level vars, spliced ahead of the program's
+/// own globals.
+fn add_math_source(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/math_source.go"))?;
+    qualify(&mut pkg, "math", true);
+    prog.funcs.append(&mut pkg.funcs);
+    let inits = std::mem::take(&mut pkg.main);
+    prog.main.splice(0..0, inits);
+    Ok(())
+}
+
 /// Synthesize package `strings`' Go half ([`STRINGS_SOURCE`]) and qualify it
 /// under `strings`.
 fn add_strings_source(prog: &mut Program) -> Result<(), String> {
@@ -722,6 +757,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         }
         if p == "strings" {
             source_half.insert(import_alias(p).to_string(), STRINGS_SOURCE);
+        }
+        if p == "math" {
+            source_half.insert(import_alias(p).to_string(), MATH_SOURCE);
         }
     }
 
@@ -1504,6 +1542,10 @@ fn stdlib_func_sig(pkg: &str, func: &str) -> Option<&'static str> {
         ) => "(x float64) float64",
         ("math", "Pow" | "Mod" | "Hypot" | "Max" | "Min" | "Atan2") => "(x, y float64) float64",
         ("math", "Copysign") => "(f, sign float64) float64",
+        ("math", "Float64bits") => "(f float64) uint64",
+        ("math", "Float64frombits") => "(b uint64) float64",
+        ("math", "Float32bits") => "(f float32) uint32",
+        ("math", "Float32frombits") => "(b uint32) float32",
         ("math", "Inf") => "(sign int) float64",
         ("math", "NaN") => "() float64",
         ("math", "IsInf") => "(f float64, sign int) bool",
