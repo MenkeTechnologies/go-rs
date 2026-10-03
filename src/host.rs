@@ -5254,6 +5254,8 @@ pub mod stdlib {
     pub const FORMAT_BOOL: u16 = 983;
     pub const FORMAT_FLOAT: u16 = 984;
     pub const QUOTE_RUNE: u16 = 985;
+    pub const PARSE_UINT: u16 = 988;
+    pub const FORMAT_UINT: u16 = 989;
     // sort.*
     pub const SORT_INTS: u16 = 875;
     pub const SORT_STRINGS: u16 = 876;
@@ -5301,6 +5303,8 @@ pub mod stdlib {
             ("strconv", "Itoa") => ITOA,
             ("strconv", "Atoi") => ATOI,
             ("strconv", "ParseInt") => PARSE_INT,
+            ("strconv", "ParseUint") => PARSE_UINT,
+            ("strconv", "FormatUint") => FORMAT_UINT,
             ("strconv", "ParseFloat") => PARSE_FLOAT,
             ("strconv", "FormatInt") => FORMAT_INT,
             ("strconv", "Quote") => QUOTE,
@@ -5352,6 +5356,7 @@ pub mod stdlib {
             (pkg, func),
             ("strconv", "Atoi")
                 | ("strconv", "ParseInt")
+                | ("strconv", "ParseUint")
                 | ("strconv", "ParseFloat")
                 | ("strconv", "ParseBool")
                 // The three printers return `(n int, err error)` too, so
@@ -5388,6 +5393,7 @@ pub mod stdlib {
             // `uint64` value is held. Go accepts the constant only where a
             // `uint64` / `uint` is wanted, and those print it unsigned.
             ("math", "MaxUint64") | ("math", "MaxUint") => Value::Int(u64::MAX as i64),
+            ("strconv", "IntSize") => Value::Int(64),
             ("math", "MaxFloat64") => Value::Float(f64::MAX),
             // The smallest subnormal, 0x1p-1074.
             ("math", "SmallestNonzeroFloat64") => Value::Float(f64::from_bits(1)),
@@ -5422,6 +5428,8 @@ pub mod stdlib {
         vm.register_builtin(JOIN, b_join);
         vm.register_builtin(ITOA, b_itoa);
         vm.register_builtin(ATOI, b_atoi);
+        vm.register_builtin(PARSE_UINT, b_parse_uint);
+        vm.register_builtin(FORMAT_UINT, b_format_uint);
         // extra strings.*
         vm.register_builtin(COUNT, b_count);
         vm.register_builtin(TRIM_PREFIX, |vm, a| {
@@ -5691,8 +5699,9 @@ pub mod stdlib {
     fn b_parse_int(vm: &mut VM, argc: u8) -> Value {
         let args = pop_args(vm, argc);
         let s = args.first().map(go_str).unwrap_or_default();
-        let base = args.get(1).map(|v| v.to_int()).unwrap_or(10).max(2) as u32;
-        parse_signed(&s, base, "ParseInt")
+        let base = args.get(1).map(|v| v.to_int()).unwrap_or(10);
+        let bit_size = args.get(2).map(|v| v.to_int()).unwrap_or(64);
+        parse_signed(&s, base, bit_size, "ParseInt")
     }
 
     /// `strconv.ParseFloat(s, bitSize) (float64, error)`. An overflowing literal
@@ -5716,6 +5725,20 @@ pub mod stdlib {
         let args = pop_args(vm, argc);
         let n = args.first().map(|v| v.to_int()).unwrap_or(0);
         let base = args.get(1).map(|v| v.to_int()).unwrap_or(10);
+        format_bits(vm, n < 0, n.unsigned_abs(), base)
+    }
+
+    /// `strconv.FormatUint(i uint64, base int) string` — the `uint64` held as
+    /// its bit pattern, formatted as the unsigned value it is.
+    fn b_format_uint(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+        let base = args.get(1).map(|v| v.to_int()).unwrap_or(10);
+        format_bits(vm, false, n as u64, base)
+    }
+
+    /// Go's `formatBits`: `mag` in `base`, with a leading `-` when `neg`.
+    fn format_bits(vm: &mut VM, neg: bool, mag: u64, base: i64) -> Value {
         // Go's `formatBits`: any base from 2 to 36, a negative number as a
         // `-` and its magnitude — not the two's-complement bits Rust's `{:x}`
         // writes for an `i64`.
@@ -5724,7 +5747,7 @@ pub mod stdlib {
             super::plain_panic(vm, "strconv: illegal AppendInt/FormatInt base".to_string());
             return Value::Undef;
         }
-        let (b, mut mag) = (base as u64, n.unsigned_abs());
+        let (b, mut mag) = (base as u64, mag);
         let mut out = Vec::new();
         loop {
             out.push(DIGITS[(mag % b) as usize]);
@@ -5733,7 +5756,7 @@ pub mod stdlib {
                 break;
             }
         }
-        if n < 0 {
+        if neg {
             out.push(b'-');
         }
         out.reverse();
@@ -6034,12 +6057,17 @@ pub mod stdlib {
     /// `Error()` and `Unwrap()` are synthesized as Go source by `crate::pkg`, so
     /// the message text, `errors.Is` and `errors.As` all come off the real type.
     fn num_error(func: &str, num: &str, reason: &'static str) -> Value {
+        num_error_with(func, num, sentinel(reason))
+    }
+
+    /// A `*strconv.NumError` wrapping `err`.
+    fn num_error_with(func: &str, num: &str, err: Value) -> Value {
         Value::Obj(heap_alloc(HostObj::Struct {
             type_name: NUM_ERROR.to_string(),
             fields: vec![
                 ("Func".to_string(), Value::str(func.to_string())),
                 ("Num".to_string(), Value::str(num.to_string())),
-                ("Err".to_string(), sentinel(reason)),
+                ("Err".to_string(), err),
             ],
             by_ref: true,
         }))
@@ -6052,28 +6080,204 @@ pub mod stdlib {
     const SYNTAX: &str = "invalid syntax";
     const RANGE: &str = "value out of range";
 
-    /// Parse a signed integer in `base` the way `strconv` does: no surrounding
-    /// whitespace is allowed, and an out-of-range value saturates *and* reports a
-    /// range error (Go returns the clamped value alongside it).
-    fn parse_signed(s: &str, base: u32, func: &str) -> Value {
-        match i64::from_str_radix(s, base) {
-            Ok(n) => parsed(Value::Int(n), None),
-            Err(e) => {
-                let (v, reason) = match e.kind() {
-                    std::num::IntErrorKind::PosOverflow => (i64::MAX, RANGE),
-                    std::num::IntErrorKind::NegOverflow => (i64::MIN, RANGE),
-                    _ => (0, SYNTAX),
-                };
-                parsed(Value::Int(v), Some(num_error(func, s, reason)))
-            }
+    /// Why Go's `strconv` integer parse failed — the `Err` its `*NumError`
+    /// wraps. `Base` and `BitSize` are the fresh `errors.New` values Go builds
+    /// for a bad argument; the other two are the shared sentinels.
+    enum AtoiErr {
+        Syntax,
+        Range,
+        Base(i64),
+        BitSize(i64),
+    }
+
+    impl AtoiErr {
+        fn into_error(self, func: &str, num: &str) -> Value {
+            let err = match self {
+                AtoiErr::Syntax => sentinel(SYNTAX),
+                AtoiErr::Range => sentinel(RANGE),
+                AtoiErr::Base(b) => super::make_error(format!("invalid base {b}")),
+                AtoiErr::BitSize(b) => super::make_error(format!("invalid bit size {b}")),
+            };
+            num_error_with(func, num, err)
         }
     }
 
-    /// `strconv.Atoi(s) (int, error)` — a base-10 signed integer.
+    /// Go's `underscoreOK`: underscores may only separate digits (or follow a
+    /// base prefix), never lead, trail or double up.
+    fn underscore_ok(s: &str) -> bool {
+        // `saw` is one of '^' (start / after a digit-less sign), '0' (a digit or
+        // base prefix) or '_' (an underscore), as in Go.
+        let b = s.as_bytes();
+        let mut saw = b'^';
+        let mut i = 0;
+        if !b.is_empty() && (b[0] == b'-' || b[0] == b'+') {
+            i = 1;
+        }
+        let mut hex = false;
+        if b.len() - i >= 2 && b[i] == b'0' {
+            let p = b[i + 1].to_ascii_lowercase();
+            if p == b'b' || p == b'o' || p == b'x' {
+                hex = p == b'x';
+                i += 2;
+                saw = b'0';
+            }
+        }
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_digit() || (hex && c.to_ascii_lowercase().is_ascii_hexdigit()) {
+                saw = b'0';
+            } else if c == b'_' {
+                if saw != b'0' {
+                    return false;
+                }
+                saw = b'_';
+            } else {
+                if saw == b'_' {
+                    return false;
+                }
+                saw = b'!';
+            }
+            i += 1;
+        }
+        saw != b'_'
+    }
+
+    /// Go's `strconv.ParseUint`: the value, or the value Go returns beside its
+    /// error (the type's maximum on a range error, else 0).
+    fn parse_uint(s0: &str, base: i64, bit_size: i64) -> Result<u64, (u64, AtoiErr)> {
+        if s0.is_empty() {
+            return Err((0, AtoiErr::Syntax));
+        }
+        let base0 = base == 0;
+        let mut s = s0.as_bytes();
+        let base: u64 = match base {
+            2..=36 => base as u64,
+            0 => {
+                if s[0] == b'0' {
+                    match s.get(1).map(u8::to_ascii_lowercase) {
+                        Some(b'b') if s.len() >= 3 => {
+                            s = &s[2..];
+                            2
+                        }
+                        Some(b'o') if s.len() >= 3 => {
+                            s = &s[2..];
+                            8
+                        }
+                        Some(b'x') if s.len() >= 3 => {
+                            s = &s[2..];
+                            16
+                        }
+                        _ => {
+                            s = &s[1..];
+                            8
+                        }
+                    }
+                } else {
+                    10
+                }
+            }
+            _ => return Err((0, AtoiErr::Base(base))),
+        };
+        let bit_size = match bit_size {
+            0 => 64,
+            1..=64 => bit_size as u32,
+            _ => return Err((0, AtoiErr::BitSize(bit_size))),
+        };
+        // Cutoff is the smallest number such that cutoff*base > maxUint64.
+        let cutoff = u64::MAX / base + 1;
+        let max_val = if bit_size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_size) - 1
+        };
+        let mut underscores = false;
+        let mut n: u64 = 0;
+        for &c in s {
+            let d = match c {
+                b'_' if base0 => {
+                    underscores = true;
+                    continue;
+                }
+                b'0'..=b'9' => c - b'0',
+                _ if c.to_ascii_lowercase().is_ascii_lowercase() => {
+                    c.to_ascii_lowercase() - b'a' + 10
+                }
+                _ => return Err((0, AtoiErr::Syntax)),
+            };
+            if u64::from(d) >= base {
+                return Err((0, AtoiErr::Syntax));
+            }
+            if n >= cutoff {
+                return Err((max_val, AtoiErr::Range));
+            }
+            n *= base;
+            let n1 = n.wrapping_add(u64::from(d));
+            if n1 < n || n1 > max_val {
+                return Err((max_val, AtoiErr::Range));
+            }
+            n = n1;
+        }
+        if underscores && !underscore_ok(s0) {
+            return Err((0, AtoiErr::Syntax));
+        }
+        Ok(n)
+    }
+
+    /// Go's `strconv.ParseInt`, built on [`parse_uint`] as Go builds it.
+    fn parse_int(s0: &str, base: i64, bit_size: i64) -> Result<i64, (i64, AtoiErr)> {
+        if s0.is_empty() {
+            return Err((0, AtoiErr::Syntax));
+        }
+        let (neg, s) = match s0.as_bytes()[0] {
+            b'+' => (false, &s0[1..]),
+            b'-' => (true, &s0[1..]),
+            _ => (false, s0),
+        };
+        let un = match parse_uint(s, base, bit_size) {
+            Ok(un) => un,
+            Err((un, AtoiErr::Range)) => un,
+            Err((_, e)) => return Err((0, e)),
+        };
+        let bit_size = if bit_size == 0 { 64 } else { bit_size as u32 };
+        let cutoff = 1u64 << (bit_size - 1);
+        if !neg && un >= cutoff {
+            return Err(((cutoff - 1) as i64, AtoiErr::Range));
+        }
+        if neg && un > cutoff {
+            return Err(((cutoff as i64).wrapping_neg(), AtoiErr::Range));
+        }
+        Ok(if neg {
+            (un as i64).wrapping_neg()
+        } else {
+            un as i64
+        })
+    }
+
+    /// `strconv.ParseInt` / `Atoi` as a builtin result: `(value, error)`.
+    fn parse_signed(s: &str, base: i64, bit_size: i64, func: &str) -> Value {
+        match parse_int(s, base, bit_size) {
+            Ok(n) => parsed(Value::Int(n), None),
+            Err((v, e)) => parsed(Value::Int(v), Some(e.into_error(func, s))),
+        }
+    }
+
+    /// `strconv.ParseUint(s, base, bitSize) (uint64, error)`.
+    fn b_parse_uint(vm: &mut VM, argc: u8) -> Value {
+        let args = pop_args(vm, argc);
+        let s = args.first().map(go_str).unwrap_or_default();
+        let base = args.get(1).map(|v| v.to_int()).unwrap_or(10);
+        let bit_size = args.get(2).map(|v| v.to_int()).unwrap_or(64);
+        match parse_uint(&s, base, bit_size) {
+            Ok(n) => parsed(Value::Int(n as i64), None),
+            Err((v, e)) => parsed(Value::Int(v as i64), Some(e.into_error("ParseUint", &s))),
+        }
+    }
+
+    /// `strconv.Atoi(s) (int, error)` — `ParseInt(s, 10, 0)` reported as `Atoi`.
     fn b_atoi(vm: &mut VM, argc: u8) -> Value {
         let args = pop_args(vm, argc);
         let s = args.first().map(go_str).unwrap_or_default();
-        parse_signed(&s, 10, "Atoi")
+        parse_signed(&s, 10, 0, "Atoi")
     }
 }
 

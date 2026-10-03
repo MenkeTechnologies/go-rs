@@ -84,6 +84,7 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if main.imports.iter().any(|p| p == "strings") {
         add_strings_builder(&mut main)?;
         add_strings_func(&mut main)?;
+        add_strings_source(&mut main)?;
     }
     // `os.Stdout` / `os.Stderr` the same way. Their initializers are
     // package-level vars, so they are spliced ahead of the program's own
@@ -349,7 +350,7 @@ fn uses_errorf(prog: &Program) -> bool {
 /// conversion that builds one, or names one of the sentinels such a value wraps.
 fn uses_strconv_error(prog: &Program) -> bool {
     /// The `strconv` conversions whose second result is a `*NumError`.
-    const PARSERS: &[&str] = &["Atoi", "ParseInt", "ParseFloat", "ParseBool"];
+    const PARSERS: &[&str] = &["Atoi", "ParseInt", "ParseUint", "ParseFloat", "ParseBool"];
     // Called or used as a value; the walk reaches a call's callee too.
     program_has_expr(prog, &|e| {
         PARSERS.iter().any(|f| is_selector(e, "strconv", f))
@@ -393,6 +394,31 @@ fn add_strings_func(prog: &mut Program) -> Result<(), String> {
             prog.funcs.push(f);
         }
     }
+    Ok(())
+}
+
+/// The names package `strings` declares in Go source (`goroot/strings_source.go`)
+/// rather than as host builtins: the functions with more than one result, the
+/// ones Go builds on its own helpers, and the `Replacer` type. Rewritten and
+/// qualified the way [`SORT_SOURCE`] is.
+pub const STRINGS_SOURCE: &[&str] = &[
+    "Cut",
+    "CutPrefix",
+    "CutSuffix",
+    "SplitAfter",
+    "SplitAfterN",
+    "LastIndexAny",
+    "Replacer",
+    "NewReplacer",
+];
+
+/// Synthesize package `strings`' Go half ([`STRINGS_SOURCE`]) and qualify it
+/// under `strings`.
+fn add_strings_source(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/strings_source.go"))?;
+    qualify(&mut pkg, "strings", true);
+    prog.types.append(&mut pkg.types);
+    prog.funcs.append(&mut pkg.funcs);
     Ok(())
 }
 
@@ -693,6 +719,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
     for p in &prog.imports {
         if p == "sort" {
             source_half.insert(import_alias(p).to_string(), SORT_SOURCE);
+        }
+        if p == "strings" {
+            source_half.insert(import_alias(p).to_string(), STRINGS_SOURCE);
         }
     }
 
@@ -1462,6 +1491,8 @@ fn stdlib_func_sig(pkg: &str, func: &str) -> Option<&'static str> {
         ("strconv", "Itoa") => "(i int) string",
         ("strconv", "Atoi") => "(s string) (int, error)",
         ("strconv", "ParseInt") => "(s string, base int, bitSize int) (int64, error)",
+        ("strconv", "ParseUint") => "(s string, base int, bitSize int) (uint64, error)",
+        ("strconv", "FormatUint") => "(i uint64, base int) string",
         ("strconv", "ParseFloat") => "(s string, bitSize int) (float64, error)",
         ("strconv", "FormatInt") => "(i int64, base int) string",
         ("strconv", "Quote") => "(s string) string",

@@ -178,6 +178,24 @@ suspended goroutine still holds its VM). Closing it needs a fusevm release
 where the VM borrows or `Arc`-shares its chunk; the published pin is the
 contract.
 
+## A comment mentioning a `rust {` block beside a non-ASCII block comment crashes — waiting on a fusevm release
+
+```go
+// see the rust { } section below
+/* café */
+func main() { fmt.Println("ok") }
+// go: ok    go-rs: panic in fusevm::rust_sugar (byte index is not a char boundary)
+```
+
+Inline Rust blocks are found by `fusevm::RustSugar::desugar`, which steps
+through a `/* … */` comment one byte at a time and slices the source at each
+step, so a multi-byte character inside a block comment panics. go-rs only
+hands it source that has the word `rust` followed by `{` (`rust_ffi::desugar`),
+which keeps every ordinary program — a comment saying "trust", Go's own `time`
+sources — away from it; a program that does write `rust {`, even inside a
+comment, and also has a non-ASCII block comment still reaches the panic.
+Closing it needs the scanner to advance by character.
+
 ## Range-over-func: a labeled jump out of the body is rejected, and `defer` runs early
 
 ```go

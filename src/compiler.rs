@@ -5608,6 +5608,11 @@ impl Compiler {
                 return sig.results.clone();
             }
         }
+        // A natively implemented stdlib function: its declared signature
+        // (`strconv.ParseUint` yields a `uint64`, not an untyped integer).
+        if let Some(Expr::FuncLit { results, .. }) = self.stdlib_func_lit(func) {
+            return results;
+        }
         func_sig(&self.underlying(&self.type_name(func)))
             .map(|s| s.results)
             .unwrap_or_default()
