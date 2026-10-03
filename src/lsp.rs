@@ -1562,7 +1562,7 @@ const CORPUS: &[Entry] = &[
     e(
         "math.MaxInt32",
         "Package math",
-        "math.MaxInt8 / MaxInt16 / MaxInt32, MinInt8 / MinInt16 / MinInt32, MaxUint8 / MaxUint16 / MaxUint32",
+        "math.MaxInt8 / MaxInt16 / MaxInt32, MinInt8 / MinInt16 / MinInt32, MaxUint8 / MaxUint16 / MaxUint32 / MaxUint64 / MaxUint",
         "The limits of the sized integer types, as untyped integer constants.",
         "var n int32 = math.MaxInt32",
     ),

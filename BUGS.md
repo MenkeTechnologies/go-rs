@@ -490,20 +490,23 @@ conversion silently truncates instead of failing the build. The same pass would
 catch `float32(1e20) * float32(1e20)` (constant overflow of `float32`) and
 `x / 0` on constants.
 
-The same missing pass makes a constant expression that *leaves* `int64` range
-mid-way wrong even when its result fits:
+The same missing pass leaves one corner of exact constant arithmetic open. A
+`const` declaration and a literal-only expression are folded exactly (in
+`i128`) whenever an `i64` step would wrap, so `const big = 1<<64 - 1`, `half =
+big >> 1`, `var e uint64 = 1<<64 - 1` and Go's own `math/bits` are right
+(`parity-scripts/const_exact_uint64.go`). What is not folded is an expression
+outside a `const` declaration that *names* a constant above `int64`:
 
 ```go
-var e uint64 = 1<<64 - 1
-fmt.Println(e)   // go: 18446744073709551615   go-rs: 0
+const big = 1<<64 - 1
+fmt.Println(uint64(big >> 4))            // go: 1152921504606846975   go-rs: 18446744073709551615
+fmt.Println(uint64(math.MaxUint64 >> 1)) // go: 9223372036854775807   go-rs: 18446744073709551615
 ```
 
-Go's constants are arbitrary-precision, so `1<<64` is exact and subtracting 1
-lands back inside `uint64`. go-rs folds constants in `i64`, where `1<<64` is
-already 0. Writing the value as the decimal literal `18446744073709551615`, or
-as `1 << 63`, is correct — only an intermediate that exceeds the width is not.
-Closing it needs the constant evaluator to work in a wider (or arbitrary
-precision) type, which is the same pass the overflow diagnosis above wants.
+A constant is lowered as a variable, so at that point `big` is a run-time
+`uint64` bit pattern with no static type to make `>>` logical. Folding it needs
+the compiler to know which names are constants — through block scoping and
+shadowing — which is the same pass the overflow diagnosis above wants.
 
 ## Constant folding keeps a signed zero
 
@@ -659,42 +662,6 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
 
-## A function type is erased, so a call through one mis-binds and mis-destructures
-
-```go
-func apply(f func(string, ...int) int) { fmt.Println(f("dyn", 4, 5, 6)) }
-apply(func(l string, ns ...int) int { fmt.Println(l, len(ns)); return len(ns) })
-// go:    dyn 3 / 3
-// go-rs: 5 0 / 0
-
-type pipe struct{ pair func(int) (int, int) }
-p := pipe{pair: func(n int) (int, int) { return n, n + 1 }}
-a, b := p.pair(4)   // go: 4 5   go-rs: [4 5] <nil>
-```
-
-One missing fact behind both. `Parser::type_name` erases a function type to the
-bare name `"func"`, so a func-typed *parameter*, *field* or *container element*
-carries no signature — neither the arity `Compiler::emit_call_operands` needs to
-pack a variadic call's trailing arguments (every written argument takes a stack
-slot of its own, so each parameter binds one slot off and the closure handle
-lands in the first), nor the result count `Compiler::call_result_count` needs to
-destructure a tuple. The operand count is fixed in the bytecode before the
-closure exists, so there is nothing to ask at run time either. Closing it means
-carrying a real function signature through the type system.
-
-A func value whose lambda *is* statically known is unaffected. `p := func(f
-string, a ...any)`, an immediately-invoked literal and `go` on either pack their
-trailing arguments (`Expr::FuncLit` carries the `variadic` flag the parser
-already computed and `LambdaInfo` records it); `dm := func(a, b int) (int, int)`
-and `dm := divmod` destructure their tuple from the same record. The gates are
-`parity-scripts/variadic_closure.go`, `parity-scripts/func_value_dispatch.go`
-and `parity-scripts/func_typed_field_call.go`.
-
-(An earlier version of this entry blamed `Op::CallDynamic` for the `p :=
-func(…)` form too. That was wrong: `p` is in `closure_vars`, so it lowered
-through `emit_closure_call` and a plain `Op::Call` — the packing was simply
-missing there.)
-
 ## Rebinding through a pointer to a slice, and reading through a pointer to a map
 
 ```go
@@ -750,6 +717,10 @@ This is a representation gap, not a formatting one: closing it means a byte
 string in the shared VM (`Value::Str` is fusevm's, used by every frontend), so
 it is not a change go-rs can make alone.
 
+Go's own `math/bits` meets it in `Reverse8` and `Reverse16`, which index a
+string constant of bytes (`rev8tab`) — `bits.Reverse8(1)` is `194` (the first
+byte of U+0080's encoding) where Go answers `128`.
+
 ## A `type` declaration inside a function body is not scoped to its block
 
 ```go
@@ -792,23 +763,19 @@ type), so the one format path has to accept `%w` and render it as `%v`. Keeping
 `Errorf` correct is worth more than rejecting a verb that is only ever written
 inside it. Separating them means giving `Errorf` its own formatter entry point.
 
-## `import "slices"` / `import "maps"` stop in the runtime packages below them
+## The zero value of a type parameter is `nil`
 
 ```go
-import "slices"   // go-rs: expected `LBrace`, found `RParen` on line 1027
+func first[T any](xs []T) T { var zero T; if len(xs) == 0 { return zero }; return xs[0] }
+fmt.Println(first([]int{}))          // go: 0        go-rs: <nil>
+next, stop := iter.Pull(seq)         // after the sequence ends:
+v, ok := next()                      // go: 0 false  go-rs: <nil> false
 ```
 
-The two packages themselves parse and link: a type parameter's composite
-literal (`append(S{}, s...)` in `slices.Clone`), a declaration without a body
-(`maps.clone`, implemented in the runtime), a parameter list of bare types
-(`iter`'s `newcoro(func(*coro)) *coro`), index-keyed slice literals and
-`//go:build` constraints all work. What stops the import is below them:
-`slices` and `maps` import `iter`, which imports `runtime` and
-`internal/race` → `internal/abi`. `internal/abi` converts `unsafe.Pointer`s to
-pointer-to-array types (`(*[1 << 16]Method)(p)`, the reported line — numbered
-in the package's concatenated source) and `runtime` is the Go runtime itself;
-neither is something go-rs can load from source. The range-over-func loops
-that consume `iter`'s `Seq` / `Seq2` are lowered (`parity-scripts/range_over_func.go`).
-
-Closing it needs `iter` supplied without its runtime half (the `Seq`/`Seq2`
-types, with `Pull`/`Pull2` built on go-rs's own goroutines).
+Generics are erased: one body runs for every instantiation, so inside it `T`
+names no type and `var zero T` has nothing to be the zero *of*. go-rs makes it
+`nil`, which arithmetic and string concatenation treat as the identity (so a
+generic sum or join is right) but which prints as `<nil>`. The vendored
+`iter.Pull` / `Pull2` return that zero once the sequence is over, the same way
+Go's do. Closing it needs the instantiation's type arguments at run time —
+monomorphizing, or passing the type arguments as hidden parameters.

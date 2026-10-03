@@ -14,6 +14,10 @@ pub const PACKAGES: &[(&str, &str)] = &[
     ("cmp", include_str!("../goroot/cmp.go")),
     ("io", include_str!("../goroot/io.go")),
     ("bytes", include_str!("../goroot/bytes.go")),
+    ("iter", include_str!("../goroot/iter.go")),
+    ("slices", include_str!("../goroot/slices.go")),
+    ("maps", include_str!("../goroot/maps.go")),
+    ("math/bits", include_str!("../goroot/bits.go")),
 ];
 
 /// The source of vendored package `path`, or `None` if it is not vendored.

@@ -461,3 +461,136 @@ pub fn array_len_of(ty: &str) -> Option<usize> {
     let close = rest.find(']')?;
     rest[..close].parse().ok()
 }
+
+/// A function type's signature, read back from the spelling the parser gives
+/// it: `func(int, ...string) (int, error)`. Parameter names are not part of the
+/// spelling, and a variadic parameter is spelled `...T` with `T` its element
+/// type, which is what `params` holds for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncSig {
+    pub params: Vec<String>,
+    pub variadic: bool,
+    pub results: Vec<String>,
+}
+
+/// Spell a function type the way Go's `%T` does: `func(int, ...string) int`,
+/// with a parenthesized result list for anything but exactly one result.
+pub fn func_type_spelling(params: &[String], variadic: bool, results: &[String]) -> String {
+    let n = params.len();
+    let ps: Vec<String> = params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match variadic && i + 1 == n {
+            true => format!("...{t}"),
+            false => t.clone(),
+        })
+        .collect();
+    let rs = match results.len() {
+        0 => String::new(),
+        1 => format!(" {}", results[0]),
+        _ => format!(" ({})", results.join(", ")),
+    };
+    format!("func({}){rs}", ps.join(", "))
+}
+
+/// Split a type list at its top-level `, ` separators — a comma nested in a
+/// bracket, parenthesis or brace belongs to the type it is in.
+fn split_type_list(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
+/// The signature of a function type spelled by [`func_type_spelling`], or
+/// `None` when `ty` is not one.
+pub fn func_sig(ty: &str) -> Option<FuncSig> {
+    let rest = ty.trim().strip_prefix("func(")?;
+    let mut depth = 1i32;
+    let close = rest.char_indices().find_map(|(i, c)| {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        (depth == 0).then_some(i)
+    })?;
+    let mut params = split_type_list(&rest[..close]);
+    let variadic = params.last().is_some_and(|p| p.starts_with("..."));
+    if variadic {
+        let last = params.pop().unwrap_or_default();
+        params.push(last.trim_start_matches("...").to_string());
+    }
+    let tail = rest[close + 1..].trim();
+    let results = match tail.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        Some(list) => split_type_list(list),
+        None if tail.is_empty() => Vec::new(),
+        None => vec![tail.to_string()],
+    };
+    Some(FuncSig {
+        params,
+        variadic,
+        results,
+    })
+}
+
+#[cfg(test)]
+mod func_sig_tests {
+    use super::*;
+
+    fn s(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn spelling_round_trips_through_func_sig() {
+        let cases: &[(&[&str], bool, &[&str], &str)] = &[
+            (&[], false, &[], "func()"),
+            (&["string", "int"], true, &["int"], "func(string, ...int) int"),
+            (&["int"], false, &["int", "error"], "func(int) (int, error)"),
+            (
+                &["map[string]func(int, int) bool", "[]struct{a int; b int}"],
+                false,
+                &["func() (V, bool)", "func()"],
+                "func(map[string]func(int, int) bool, []struct{a int; b int}) (func() (V, bool), func())",
+            ),
+        ];
+        for (params, variadic, results, spelled) in cases {
+            let text = func_type_spelling(&s(params), *variadic, &s(results));
+            assert_eq!(&text, spelled);
+            let sig = func_sig(&text).expect("a function type");
+            assert_eq!(sig.params, s(params), "{text}");
+            assert_eq!(sig.variadic, *variadic, "{text}");
+            assert_eq!(sig.results, s(results), "{text}");
+        }
+    }
+
+    #[test]
+    fn non_function_types_have_no_signature() {
+        for ty in [
+            "func",
+            "int",
+            "[]func()",
+            "map[string]func()",
+            "chan func()",
+            "",
+        ] {
+            assert_eq!(func_sig(ty), None, "{ty}");
+        }
+    }
+}

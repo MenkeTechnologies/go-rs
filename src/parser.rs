@@ -100,7 +100,7 @@ struct Parser {
     /// use may precede the declaration) plus the local ones in scope — so an
     /// array length written as a constant expression (`[MaxCase]rune`,
     /// `[N*2]int`) folds to the `[N]T` value type instead of decaying to `[]T`.
-    int_consts: HashMap<String, i64>,
+    int_consts: HashMap<String, i128>,
     /// The type parameters of the generic function being parsed whose
     /// constraint has a composite core type (`S ~[]E`, `M ~map[K]V`), as
     /// name → that core type. Generics are erased, so a composite literal of
@@ -526,7 +526,7 @@ impl Parser {
                 name,
                 init: Some(e),
                 ..
-            } => match self.const_int(e) {
+            } => match const_int_wide(e, &self.int_consts) {
                 Some(v) if self.int_consts.get(name) != Some(&v) => {
                     self.int_consts.insert(name.clone(), v);
                     true
@@ -537,6 +537,23 @@ impl Parser {
             // first that folds.
             Stmt::Block(ss) => ss.iter().filter(|s| self.record_int_consts(s)).count() > 0,
             _ => false,
+        }
+    }
+
+    /// Replace each initializer of a `const` statement whose run-time `i64`
+    /// evaluation would wrap with its exact value ([`exact_const_literal`]).
+    /// It runs after [`Parser::record_int_consts`], which has to see the
+    /// expression and not the literal: the literal of `1<<64 - 1` is the bit
+    /// pattern `-1`, and a later `big >> 1` must fold from the exact value.
+    fn fold_exact_consts(&self, s: &mut Stmt) {
+        match s {
+            Stmt::Var { init: Some(e), .. } => {
+                if let Some(lit) = exact_const_literal(e, &self.int_consts) {
+                    *e = lit;
+                }
+            }
+            Stmt::Block(ss) => ss.iter_mut().for_each(|s| self.fold_exact_consts(s)),
+            _ => {}
         }
     }
 
@@ -813,20 +830,6 @@ impl Parser {
         let name = format!("struct{{{inner}}}");
         self.anon_structs.entry(name.clone()).or_insert(fields);
         Ok(name)
-    }
-
-    /// Consume tokens through the closing `)` of an already-opened paren group.
-    fn skip_balanced_parens(&mut self) -> Result<(), String> {
-        let mut depth = 1;
-        while depth > 0 {
-            match self.advance() {
-                Tok::LParen => depth += 1,
-                Tok::RParen => depth -= 1,
-                Tok::Eof => return Err("go-rs: unterminated `(` in interface method".to_string()),
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     /// Consume a `[ … ]` bracket group (type parameters `[T any, U comparable]`
@@ -1281,21 +1284,26 @@ impl Parser {
                 Ok(name)
             }
             // `func(params) results` — a function type (for function-typed
-            // parameters/fields). Consumed structurally; go-rs treats every
-            // function value uniformly, so only the `func` tag is retained.
+            // parameters, fields, elements and results). Spelled with its whole
+            // signature, `func(string, ...int) (int, error)`, because a call
+            // through a value of the type needs it: the parameter types and the
+            // variadic flag to pack the operands, the result count to
+            // destructure a tuple (`func_sig` reads it back).
             Tok::Func => {
                 self.advance();
                 self.expect(&Tok::LParen)?;
-                self.skip_balanced_parens()?;
+                let (params, variadic) = self.params()?;
+                self.expect(&Tok::RParen)?;
                 // Optional results: a single type or a `( … )` list, ending
                 // before the next `,`/`)`/`{`/`;`.
-                if matches!(self.peek(), Tok::LParen) {
-                    self.advance();
-                    self.skip_balanced_parens()?;
-                } else if self.type_starts() {
-                    let _ = self.type_name()?;
-                }
-                Ok("func".to_string())
+                let results: Vec<String> =
+                    if matches!(self.peek(), Tok::LParen) || self.type_starts() {
+                        self.results()?.into_iter().map(|(_, ty)| ty).collect()
+                    } else {
+                        Vec::new()
+                    };
+                let tys: Vec<String> = params.into_iter().map(|p| p.ty).collect();
+                Ok(func_type_spelling(&tys, variadic, &results))
             }
             Tok::Ident(_) => {
                 let mut name = self.ident()?;
@@ -1366,8 +1374,9 @@ impl Parser {
         match self.peek() {
             Tok::Var => self.var_stmt(),
             Tok::Const => {
-                let s = self.const_stmt()?;
+                let mut s = self.const_stmt()?;
                 self.record_int_consts(&s);
+                self.fold_exact_consts(&mut s);
                 Ok(s)
             }
             // `type T …` in a function body. It declares no run-time work, so it
@@ -1574,6 +1583,7 @@ impl Parser {
             || ty.starts_with("chan ")
             || ty.starts_with("interface{")
             || matches!(ty, "func" | "error" | "any")
+            || ty.starts_with("func(")
             || self.iface_names.contains(ty)
         {
             return Expr::Ident("nil".to_string());
@@ -2262,6 +2272,12 @@ impl Parser {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
+            // A literal-only operation whose exact value an `i64` step would
+            // wrap (`1<<64 - 1`) is a constant expression: give it its exact
+            // value now, as Go does, instead of wrapping at run time.
+            if let Some(lit) = exact_const_literal(&lhs, &HashMap::new()) {
+                lhs = lit;
+            }
         }
         Ok(lhs)
     }
@@ -3039,7 +3055,7 @@ const INT_TYPE_NAMES: &[&str] = &[
 /// array sizes and index-keyed array-literal elements. Handles literals, named
 /// integer constants from `consts`, a conversion to an integer type
 /// (`int(N)`), and the unary/binary arithmetic that appears in array bounds.
-fn const_int_of(e: &Expr, consts: &HashMap<String, i64>) -> Option<i64> {
+fn const_int_of(e: &Expr, consts: &HashMap<String, i128>) -> Option<i64> {
     i64::try_from(const_int_wide(e, consts)?).ok()
 }
 
@@ -3047,28 +3063,83 @@ fn const_int_of(e: &Expr, consts: &HashMap<String, i64>) -> Option<i64> {
 /// exact, so an intermediate may leave `i64` and come back (`1 << 70 >> 68` is
 /// `4`); folding in `i128` keeps every such expression whose steps fit there,
 /// and one that overflows even that is not folded rather than wrapped.
-fn const_int_wide(e: &Expr, consts: &HashMap<String, i64>) -> Option<i128> {
-    match e {
+fn const_int_wide(e: &Expr, consts: &HashMap<String, i128>) -> Option<i128> {
+    const_int_exact(e, consts, &mut false)
+}
+
+/// The bit width of an unsigned integer type name, or `None` for any other.
+fn unsigned_width(t: &str) -> Option<u32> {
+    match t {
+        "uint8" | "byte" => Some(8),
+        "uint16" => Some(16),
+        "uint32" => Some(32),
+        "uint" | "uint64" | "uintptr" => Some(64),
+        _ => None,
+    }
+}
+
+/// [`const_int_wide`], also reporting through `left_i64` whether any step's
+/// value — an operand, an intermediate or the result — lies outside `i64`.
+/// That is exactly when evaluating the expression at run time in `i64`
+/// arithmetic would wrap where Go's exact constant arithmetic does not.
+fn const_int_exact(e: &Expr, consts: &HashMap<String, i128>, left_i64: &mut bool) -> Option<i128> {
+    let v = match e {
         Expr::Int(n) => Some(i128::from(*n)),
-        Expr::Ident(name) => consts.get(name).map(|&n| i128::from(n)),
+        Expr::Ident(name) => consts.get(name).copied(),
         Expr::Call {
             func,
             args,
             spread: false,
             ..
         } if args.len() == 1 => match func.as_ref() {
+            // `uint64(<negative literal>)` is how [`exact_const_literal`]
+            // writes a constant above `i64`: the literal is its bit pattern.
+            Expr::Ident(t)
+                if unsigned_width(t) == Some(64) && matches!(args[0], Expr::Int(n) if n < 0) =>
+            {
+                let Expr::Int(n) = args[0] else {
+                    unreachable!("matched above")
+                };
+                Some(i128::from(n as u64))
+            }
             Expr::Ident(t) if INT_TYPE_NAMES.contains(&t.as_str()) => {
-                const_int_wide(&args[0], consts)
+                let v = const_int_exact(&args[0], consts, left_i64)?;
+                // A constant converted to an unsigned type must be in its
+                // range; Go rejects `uint64(-1)`.
+                match unsigned_width(t) {
+                    Some(w) if v < 0 || v >> w != 0 => None,
+                    _ => Some(v),
+                }
             }
             _ => None,
         },
         Expr::Unary {
             op: crate::ast::UnOp::Neg,
             rhs,
-        } => const_int_wide(rhs, consts)?.checked_neg(),
+        } => const_int_exact(rhs, consts, left_i64)?.checked_neg(),
+        // `^x` is `-x - 1` on an untyped or signed constant, and flips only the
+        // type's own bits on an unsigned one: `^uint64(0)` is `1<<64 - 1`.
+        Expr::Unary {
+            op: crate::ast::UnOp::BitNot,
+            rhs,
+        } => {
+            let v = const_int_exact(rhs, consts, left_i64)?;
+            let width = match rhs.as_ref() {
+                Expr::Call { func, .. } => match func.as_ref() {
+                    Expr::Ident(t) => unsigned_width(t),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Some(match width {
+                Some(w) => v ^ ((1i128 << w) - 1),
+                None => !v,
+            })
+        }
         Expr::Binary { op, lhs, rhs } => {
             use crate::ast::BinOp;
-            let (a, b) = (const_int_wide(lhs, consts)?, const_int_wide(rhs, consts)?);
+            let a = const_int_exact(lhs, consts, left_i64)?;
+            let b = const_int_exact(rhs, consts, left_i64)?;
             match op {
                 BinOp::Add => a.checked_add(b),
                 BinOp::Sub => a.checked_sub(b),
@@ -3082,11 +3153,48 @@ fn const_int_wide(e: &Expr, consts: &HashMap<String, i64>) -> Option<i128> {
                 // Shifting every bit out leaves the sign, as it does for an
                 // exact constant.
                 BinOp::Shr => u32::try_from(b).ok().map(|s| a >> s.min(i128::BITS - 1)),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::AndNot => Some(a & !b),
                 _ => None,
             }
         }
         _ => None,
+    }?;
+    if i64::try_from(v).is_err() {
+        *left_i64 = true;
     }
+    Some(v)
+}
+
+/// The value a constant initializer has to be given as a literal, or `None`
+/// when evaluating it at run time is already exact.
+///
+/// A constant is lowered as a variable whose initializer runs in the VM's `i64`
+/// arithmetic, which wraps. That matches Go's exact constant arithmetic as long
+/// as every step stays in `i64`; when one does not — `1<<64 - 1`, `big >> 1`
+/// on `big = 1<<64 - 1` — the expression is folded instead. A result in the
+/// `uint64` range above `i64` is written `uint64(<bit pattern>)`: the bit
+/// pattern is how a `uint64` value is held, and the conversion around it both
+/// types it unsigned and lets [`const_int_exact`] read the exact value back
+/// (a negative operand is otherwise no `uint64` constant at all).
+fn exact_const_literal(e: &Expr, consts: &HashMap<String, i128>) -> Option<Expr> {
+    let mut left_i64 = false;
+    let v = const_int_exact(e, consts, &mut left_i64)?;
+    if !left_i64 {
+        return None;
+    }
+    if let Ok(n) = i64::try_from(v) {
+        return Some(Expr::Int(n));
+    }
+    let bits = u64::try_from(v).ok()? as i64;
+    Some(Expr::Call {
+        func: Box::new(Expr::Ident("uint64".to_string())),
+        args: vec![Expr::Int(bits)],
+        spread: false,
+        line: 0,
+    })
 }
 
 /// The zero-value expression for a Go element type (drives `make([]T, n)` fill).

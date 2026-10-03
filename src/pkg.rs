@@ -23,7 +23,11 @@ pub const NATIVE: &[&str] = &["fmt", "strings", "strconv", "math", "sort", "os"]
 /// switch dispatches on, which no Go source can name). Listed here so they are
 /// qualified like the package's own names — a user program's `runtimeTypeTag`
 /// then cannot capture the reference.
-const INTRINSICS: &[(&str, &str)] = &[("errors", "runtimeTypeTag"), ("os", "writeFd")];
+const INTRINSICS: &[(&str, &str)] = &[
+    ("errors", "runtimeTypeTag"),
+    ("os", "writeFd"),
+    ("slices", "sliceOverlap"),
+];
 
 /// Whether a type name is the parser's canonical name for an anonymous interface
 /// (`interface{Unwrap}`), which names a method set rather than a package's type.

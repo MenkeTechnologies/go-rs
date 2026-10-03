@@ -193,6 +193,9 @@ struct FuncSig {
     result: NumType,
     /// The Go type name of the first result (for struct/method type inference).
     result_ty: String,
+    /// Every declared result type, in order — what spells the function's type
+    /// when it is used as a value.
+    results: Vec<String>,
     /// Number of declared result values (for multi-value-return destructuring).
     nresults: usize,
     /// True if the last parameter is variadic (`args ...T`); the trailing call
@@ -1359,6 +1362,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                             .map(|t| numtype_of_ty(t))
                             .unwrap_or(NumType::Unknown),
                         result_ty: f.results.first().cloned().unwrap_or_default(),
+                        results: f.results.clone(),
                         nresults: f.results.len(),
                         variadic: f.variadic,
                     },
@@ -1911,9 +1915,20 @@ impl Compiler {
     /// a zero-argument closure that re-invokes the call over those snapshots. The
     /// closure runs at function return via [`Self::emit_defer_drain`].
     fn compile_defer(&mut self, call: &Expr, line: u32) -> Result<(), String> {
+        self.emit_snapshot_call(call, "defer", line)?;
+        self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 1), line);
+        self.b.emit(Op::Pop, line);
+        Ok(())
+    }
+
+    /// Push a zero-argument closure that makes `call` later: the callee's
+    /// receiver or func value and every argument are evaluated *now*, into
+    /// temporaries the closure captures, which is when Go evaluates them for
+    /// both `defer` and `go`. Returns the closure's lambda id.
+    fn emit_snapshot_call(&mut self, call: &Expr, stmt: &str, line: u32) -> Result<i64, String> {
         let Expr::Call { func, args, .. } = call else {
             return Err(format!(
-                "go-rs: `defer` requires a function call (line {line})"
+                "go-rs: `{stmt}` requires a function call (line {line})"
             ));
         };
         let n = self.temp_counter;
@@ -1985,10 +2000,7 @@ impl Compiler {
             spread: false,
             line,
         })];
-        self.emit_funclit(&[], &body, false, 0);
-        self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 1), line);
-        self.b.emit(Op::Pop, line);
-        Ok(())
+        Ok(self.emit_funclit(&[], &body, false, 0))
     }
 
     /// Emit a call to a closure whose value is already on the stack (as the
@@ -2744,12 +2756,19 @@ impl Compiler {
                     let tup = format!("$tup{n}");
                     self.expr(&values[0])?;
                     self.emit_set(&tup, *line);
+                    let result_tys = self.call_result_types(&values[0]);
                     for (i, name) in names.iter().enumerate() {
                         self.emit_get(&tup, *line);
                         self.b.emit(Op::LoadInt(i as i64), *line);
                         self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), *line);
-                        self.types.insert(name.clone(), NumType::Unknown);
-                        self.decl_types.insert(name.clone(), String::new());
+                        // Each name takes its result's declared type: a
+                        // `uint64` still prints unsigned, and a function-typed
+                        // result keeps the signature a call through the name
+                        // packs and destructures by (`next, stop :=
+                        // iter.Pull(seq)`).
+                        let ty = result_tys.get(i).cloned().unwrap_or_default();
+                        self.types.insert(name.clone(), numtype_of_ty(&ty));
+                        self.decl_types.insert(name.clone(), ty);
                         self.emit_declare(name, *line);
                     }
                 }
@@ -2993,10 +3012,14 @@ impl Compiler {
                         let idx = self.b.add_name(&format!("$lambda_{id}"));
                         self.b.emit(Op::Go(idx, argc as u8 + 1), *line);
                     }
+                    // Any other callee — a method call, a captured or field func
+                    // value, an indexed one, a package function: snapshot the
+                    // callee and arguments into a closure, as `defer` does, and
+                    // run that closure as the goroutine.
                     _ => {
-                        return Err(format!(
-                        "go-rs: `go` requires a top-level function or closure call (line {line})"
-                    ))
+                        let id = self.emit_snapshot_call(call, "go", *line)?;
+                        let idx = self.b.add_name(&format!("$lambda_{id}"));
+                        self.b.emit(Op::Go(idx, 1), *line);
                     }
                 }
             }
@@ -5031,6 +5054,12 @@ impl Compiler {
     /// off the object ([`host::go_type_name`]), so the two agree.
     fn go_type_display(&self, ty: &str) -> String {
         let ty = ty.trim();
+        if let Some(sig) = func_sig(ty) {
+            let show = |ts: &[String]| -> Vec<String> {
+                ts.iter().map(|t| self.go_type_display(t)).collect()
+            };
+            return func_type_spelling(&show(&sig.params), sig.variadic, &show(&sig.results));
+        }
         if let (Some(elem), Some(n)) = (array_elem_ty(ty), array_len_of(ty)) {
             return format!("[{n}]{}", self.go_type_display(elem));
         }
@@ -5420,7 +5449,7 @@ impl Compiler {
                     recv: Box::new(recv.clone()),
                     field: method.to_string(),
                 };
-                return self.call_value(&field, args, line);
+                return self.call_value(&field, args, spread, line);
             }
             return Err(format!(
                 "go-rs: no method `{method}` with {} argument(s) (line {line})",
@@ -5489,7 +5518,9 @@ impl Compiler {
                         .closure_vars
                         .get(name)
                         .and_then(|id| self.lambdas.get(*id as usize))
-                        .map(|l| l.nresults);
+                        .map(|l| l.nresults)
+                        // A variable of a function type: its signature says.
+                        .or_else(|| self.sig_nresults(func));
                 }
                 Expr::Selector { recv, field } => {
                     // A native package function that returns `(value, error)`.
@@ -5532,7 +5563,9 @@ impl Compiler {
                                 false => results.split(',').count(),
                             });
                         }
-                        return None;
+                        // A func-typed *field* `p.pair(4)`: its declared type's
+                        // signature.
+                        return self.sig_nresults(func);
                     }
                     // A *source*-linked package's function is merged into the
                     // program under its qualified name, so `io.WriteString`'s
@@ -5546,10 +5579,44 @@ impl Compiler {
                             .map(|sig| sig.nresults);
                     }
                 }
-                _ => {}
+                // Any other callee yielding a function value — `fs[i](x)`,
+                // `mk()(x)` — has the result count its static type spells.
+                _ => return self.sig_nresults(func),
             }
         }
         None
+    }
+
+    /// The one result type of a call through `func`, read off the signature
+    /// its static type spells; `None` unless it spells exactly one result.
+    fn sig_result_ty(&self, func: &Expr) -> Option<String> {
+        let sig = func_sig(&self.underlying(&self.type_name(func)))?;
+        match sig.results.as_slice() {
+            [one] => Some(base_type(one)),
+            _ => None,
+        }
+    }
+
+    /// Every result type of the call `e`, when its callee is a declared
+    /// function or a value whose static type spells a signature.
+    fn call_result_types(&self, e: &Expr) -> Vec<String> {
+        let Expr::Call { func, .. } = e else {
+            return Vec::new();
+        };
+        if let Expr::Ident(name) = func.as_ref() {
+            if let Some(sig) = self.funcs.get(name) {
+                return sig.results.clone();
+            }
+        }
+        func_sig(&self.underlying(&self.type_name(func)))
+            .map(|s| s.results)
+            .unwrap_or_default()
+    }
+
+    /// The result count of a call through `func`, read off the signature its
+    /// static type spells, or `None` when it spells none.
+    fn sig_nresults(&self, func: &Expr) -> Option<usize> {
+        func_sig(&self.underlying(&self.type_name(func))).map(|s| s.results.len())
     }
 
     /// Reject a multiple-value call used where one value is expected — Go's
@@ -5586,7 +5653,15 @@ impl Compiler {
     /// method dispatch and struct value-copy.
     fn type_name(&self, e: &Expr) -> String {
         match e {
-            Expr::Ident(n) => self.decl_types.get(n).cloned().unwrap_or_default(),
+            Expr::Ident(n) => match self.decl_types.get(n) {
+                Some(t) => t.clone(),
+                // A declared function used as a value has its signature's type.
+                None if self.is_func_value(n) => {
+                    let sig = &self.funcs[n];
+                    func_type_spelling(&sig.param_tys, sig.variadic, &sig.results)
+                }
+                None => String::new(),
+            },
             Expr::StructLit { type_name, .. } => type_name.clone(),
             // A type assertion `x.(T)` has static type T.
             Expr::TypeAssert { ty, .. } => base_type(ty),
@@ -5640,6 +5715,7 @@ impl Compiler {
                     .funcs
                     .get(name)
                     .map(|s| base_type(&s.result_ty))
+                    .or_else(|| self.sig_result_ty(func))
                     .unwrap_or_default(),
                 // A method call has the method's declared result type:
                 // `d.Next()` is a `Day`, which is what boxes it with its name
@@ -5654,9 +5730,51 @@ impl Compiler {
                             == Some(&1)
                     })
                     .map(|t| base_type(t))
+                    .or_else(|| self.sig_result_ty(func))
                     .unwrap_or_default(),
-                _ => String::new(),
+                _ => self.sig_result_ty(func).unwrap_or_default(),
             },
+            // An arithmetic or bitwise result has its operands' type — a shift
+            // its left operand's, any other operator the typed side's (an
+            // untyped constant takes the other operand's type). Without it a
+            // `rhat := un32 - q1*yn1` over `uint64`s declared an untyped
+            // `rhat`, and its later comparisons and divisions went signed.
+            Expr::Binary {
+                op: BinOp::Shl | BinOp::Shr,
+                lhs,
+                ..
+            } => self.type_name(lhs),
+            Expr::Binary {
+                op:
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::AndNot,
+                lhs,
+                rhs,
+            } => {
+                let l = self.type_name(lhs);
+                if l.is_empty() {
+                    self.type_name(rhs)
+                } else {
+                    l
+                }
+            }
+            // A function literal has the function type its signature spells.
+            Expr::FuncLit {
+                params,
+                results,
+                variadic,
+                ..
+            } => {
+                let tys: Vec<String> = params.iter().map(|p| p.ty.clone()).collect();
+                func_type_spelling(&tys, *variadic, results)
+            }
             // A slice literal names its own type, so a variable bound to one
             // records `[]T` and an element's declared type is recoverable.
             // A slice literal names its own reference type; an array literal
@@ -5938,6 +6056,14 @@ impl Compiler {
                 .contains(&(base.clone(), m.to_string()))
         });
         (elem.starts_with('*') || on_value).then_some(helper)
+    }
+
+    /// The function type a `fmt` operand is statically known to have, for
+    /// `%T`: a closure carries no signature at run time, so without the tag
+    /// every function value would print as `func()`.
+    fn func_box_spec(&self, e: &Expr) -> Option<String> {
+        let ty = self.type_name(e);
+        func_sig(&ty).is_some().then_some(ty)
     }
 
     /// Box the value just emitted for `e` as an interface value when its static
@@ -6756,6 +6882,7 @@ impl Compiler {
                         if let Some(ty) = self
                             .named_box_spec(a)
                             .or_else(|| self.sized_int_box_spec(a))
+                            .or_else(|| self.func_box_spec(a))
                         {
                             let t = self.b.add_constant(Value::str(ty));
                             self.b.emit(Op::LoadConst(t), line);
@@ -6974,6 +7101,14 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(host::GWRITE_FD, 2), line);
                 return Ok(());
             }
+            // The vendored `slices` package's one host intrinsic, standing in for
+            // the `unsafe` address comparison in `overlaps`.
+            if name == "slices.sliceOverlap" && args.len() == 2 {
+                self.expr(&args[0])?;
+                self.expr(&args[1])?;
+                self.b.emit(Op::CallBuiltin(host::GSLICE_OVERLAP, 2), line);
+                return Ok(());
+            }
             if name == "errors.runtimeTypeTag" && args.len() == 1 {
                 self.expr(&args[0])?;
                 self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), line);
@@ -7068,11 +7203,13 @@ impl Compiler {
                 self.emit_set(&ni, line);
                 // Push self (the closure), the args, then the name-index.
                 self.emit_get(&cv, line);
-                for a in args {
-                    self.emit_value(a)?;
-                }
+                let callee_ty = self.type_name(&Expr::Ident(name.clone()));
+                let argc = self.emit_value_call_operands(&callee_ty, args, spread, line)?;
                 self.emit_get(&ni, line);
-                self.b.emit(Op::CallDynamic(args.len() as u8 + 1), line);
+                self.b.emit(
+                    Op::CallDynamic(Self::call_arity(argc + 1, name, line)?),
+                    line,
+                );
                 self.emit_panic_check(line);
                 return Ok(());
             }
@@ -7131,13 +7268,19 @@ impl Compiler {
         // an element of a slice/map of funcs (`fns[i](x)`), a field holding a
         // closure, or the result of another call. Evaluate it and dispatch
         // dynamically through the closure's stored subroutine name-index.
-        self.call_value(func, args, line)
+        self.call_value(func, args, spread, line)
     }
 
     /// Call a function *value* produced by an arbitrary expression: stash it,
     /// read its subroutine name-index, then push `self`, the args, and the
     /// name-index and issue `Op::CallDynamic`.
-    fn call_value(&mut self, func: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
+    fn call_value(
+        &mut self,
+        func: &Expr,
+        args: &[Expr],
+        spread: bool,
+        line: u32,
+    ) -> Result<(), String> {
         let n = self.temp_counter;
         self.temp_counter += 1;
         let cv = format!("$cv{n}");
@@ -7149,13 +7292,45 @@ impl Compiler {
             .emit(Op::CallBuiltin(host::GCLOSURE_NAMEIDX, 1), line);
         self.emit_set(&ni, line);
         self.emit_get(&cv, line); // self (the closure)
-        for a in args {
-            self.emit_value(a)?;
-        }
+        let callee_ty = self.type_name(func);
+        let argc = self.emit_value_call_operands(&callee_ty, args, spread, line)?;
         self.emit_get(&ni, line);
-        self.b.emit(Op::CallDynamic(args.len() as u8 + 1), line);
+        self.b.emit(
+            Op::CallDynamic(Self::call_arity(argc + 1, "function value", line)?),
+            line,
+        );
         self.emit_panic_check(line);
         Ok(())
+    }
+
+    /// Push the operands of a call through a function *value*. When the
+    /// callee's static type spells a signature they are packed as a declared
+    /// function's are — the trailing arguments of a variadic one into its
+    /// slice, each fixed one converted to its parameter type — and otherwise
+    /// each argument takes one slot. Returns the operand count.
+    fn emit_value_call_operands(
+        &mut self,
+        callee_ty: &str,
+        args: &[Expr],
+        spread: bool,
+        line: u32,
+    ) -> Result<usize, String> {
+        match func_sig(&self.underlying(callee_ty)) {
+            Some(sig) if sig.variadic || sig.params.len() == args.len() => self.emit_call_operands(
+                &sig.params,
+                sig.variadic,
+                args,
+                spread,
+                "function value",
+                line,
+            ),
+            _ => {
+                for a in args {
+                    self.emit_value(a)?;
+                }
+                Ok(args.len())
+            }
+        }
     }
 
     // ── static type inference ──────────────────────────────────────────────

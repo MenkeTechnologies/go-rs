@@ -77,6 +77,10 @@ pub const GSTRUCT_BIND: u16 = 857;
 /// stdout, because those are the only two files a synthesized `*os.File` is
 /// ever built for.
 pub const GWRITE_FD: u16 = 858;
+/// `slices.sliceOverlap(a, b)` — whether two slices share a backing array and
+/// their element ranges intersect. The vendored `slices.overlaps` asks this in
+/// place of Go's `unsafe` address arithmetic, which go-rs has no model of.
+pub const GSLICE_OVERLAP: u16 = 987;
 /// The range keys of a value as a slice: `0..len` for a slice/string, the keys
 /// for a map. Lets `for … range` iterate slices and maps uniformly.
 pub const GRANGE_KEYS: u16 = 824;
@@ -421,6 +425,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
     vm.register_builtin(GSTRUCT_BIND, b_struct_bind);
     vm.register_builtin(GWRITE_FD, b_write_fd);
+    vm.register_builtin(GSLICE_OVERLAP, b_slice_overlap);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
     vm.register_builtin(GARRAY_TAG, b_array_tag);
@@ -2947,6 +2952,24 @@ fn b_struct_copy(vm: &mut VM, argc: u8) -> Value {
     struct_copy(args.first().cloned().unwrap_or(Value::Undef))
 }
 
+/// Two slices overlap when they view the same backing array and their
+/// `[offset, offset+len)` ranges intersect — what Go's `slices.overlaps`
+/// computes from element addresses. An empty slice overlaps nothing.
+fn b_slice_overlap(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let view = |v: Option<&Value>| match v {
+        Some(Value::Obj(id)) => slice_backing(*id),
+        _ => None,
+    };
+    let overlap = match (view(args.first()), view(args.get(1))) {
+        (Some((ba, oa, la)), Some((bb, ob, lb))) => {
+            la > 0 && lb > 0 && ba == bb && oa < ob + lb && ob < oa + la
+        }
+        _ => false,
+    };
+    Value::Bool(overlap)
+}
+
 fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
     use std::io::Write as _;
     let args = pop_args(vm, argc);
@@ -5361,6 +5384,10 @@ pub mod stdlib {
             ("math", "MaxUint8") => Value::Int(u8::MAX.into()),
             ("math", "MaxUint16") => Value::Int(u16::MAX.into()),
             ("math", "MaxUint32") => Value::Int(u32::MAX.into()),
+            // Above `i64`: the two's-complement bit pattern, which is how a
+            // `uint64` value is held. Go accepts the constant only where a
+            // `uint64` / `uint` is wanted, and those print it unsigned.
+            ("math", "MaxUint64") | ("math", "MaxUint") => Value::Int(u64::MAX as i64),
             ("math", "MaxFloat64") => Value::Float(f64::MAX),
             // The smallest subnormal, 0x1p-1074.
             ("math", "SmallestNonzeroFloat64") => Value::Float(f64::from_bits(1)),
