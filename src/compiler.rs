@@ -4058,7 +4058,12 @@ impl Compiler {
             // xs { v.N = 1 }` leaves `xs` untouched — the single most damaging
             // place aliasing showed up, because Go programs rely on it to mean
             // "read-only walk".
-            let elem = self.elem_type_of(&self.type_name(iter));
+            // Over a string the value is the rune decoded there, an `int32`.
+            let elem = if self.is_string_expr(iter) {
+                "int32".to_string()
+            } else {
+                self.elem_type_of(&self.type_name(iter))
+            };
             self.emit_copy_for(&elem);
             self.emit_set(v, 0);
             self.types.insert(v.clone(), NumType::Unknown);
@@ -4433,6 +4438,12 @@ impl Compiler {
             Some(base) if base != ty => self.underlying(base),
             _ => ty.to_string(),
         }
+    }
+
+    /// Whether `e` is statically a string — a literal, or anything whose type
+    /// is `string` or a defined type over it.
+    fn is_string_expr(&self, e: &Expr) -> bool {
+        self.underlying(&base_type(&self.type_name(e))) == "string"
     }
 
     /// Whether `ty` is a float type, following defined types to their base.
@@ -5658,6 +5669,10 @@ impl Compiler {
     /// method dispatch and struct value-copy.
     fn type_name(&self, e: &Expr) -> String {
         match e {
+            // A string literal is an untyped constant whose default type is
+            // `string`; a string has no other type to take, so naming it is what
+            // lets `s := "abc"` record that `s[i]` is a byte.
+            Expr::Str(_) => "string".to_string(),
             Expr::Ident(n) => match self.decl_types.get(n) {
                 Some(t) => t.clone(),
                 // A declared function used as a value has its signature's type.
@@ -5807,6 +5822,9 @@ impl Compiler {
             // `s[i]` / `m[k]` has the container's element type. Naming it is what
             // makes an indexed read of a struct element copy (Go value
             // semantics): `e := xs[0]; e.N = 1` must not write through to `xs[0]`.
+            // Indexing a string yields a byte, not a rune: `s[0] - 200` wraps at
+            // eight bits and `%T` names it `uint8`.
+            Expr::Index { recv, .. } if self.is_string_expr(recv) => "uint8".to_string(),
             Expr::Index { recv, .. } => self.elem_type_of(&self.underlying(&self.type_name(recv))),
             _ => String::new(),
         }
@@ -6498,6 +6516,8 @@ impl Compiler {
                 let t = self.type_name(e);
                 self.sized_under(&t)
             }
+            // A string element is a byte.
+            Expr::Index { recv, .. } if self.is_string_expr(recv) => Some("uint8".to_string()),
             // A slice element takes its width from the slice's element type.
             Expr::Index { recv, .. } => self.elem_ty_of(recv).and_then(|t| self.sized_under(&t)),
             _ => None,

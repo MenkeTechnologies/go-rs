@@ -15,6 +15,7 @@ pub mod cli;
 pub mod compiler;
 pub mod dap;
 pub mod host;
+mod isprint;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;

@@ -1136,19 +1136,61 @@ case 3:
           <pre><code class="lang-go">strconv.QuoteRune('\t')   // '\t'</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strconv-8">
-          <h3><a class="doc-anchor" href="#doc-package-strconv-8">#</a> <code>strconv.ParseBool</code></h3>
+          <h3><a class="doc-anchor" href="#doc-package-strconv-8">#</a> <code>strconv.QuoteToASCII</code></h3>
+          <pre><code class="lang-go">strconv.QuoteToASCII(s string) string</code></pre>
+          <p>The string as a double-quoted Go literal like `strconv.Quote`, with every non-ASCII rune escaped as `\uHHHH` or `\UHHHHHHHH`. `%+q` formats a string the same way.</p>
+          <pre><code class="lang-go">strconv.QuoteToASCII("☺")   // "\u263a"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-9">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-9">#</a> <code>strconv.QuoteRuneToASCII</code></h3>
+          <pre><code class="lang-go">strconv.QuoteRuneToASCII(r rune) string</code></pre>
+          <p>The rune as a single-quoted Go literal with a non-ASCII rune escaped, as `%+q` formats an integer.</p>
+          <pre><code class="lang-go">strconv.QuoteRuneToASCII('☺')   // '\u263a'</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-10">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-10">#</a> <code>strconv.QuoteToGraphic</code></h3>
+          <pre><code class="lang-go">strconv.QuoteToGraphic(s string) string</code></pre>
+          <p>The string as a double-quoted Go literal, writing every graphic rune — printable, or a Unicode space such as U+00A0 — literally.</p>
+          <pre><code class="lang-go">strconv.QuoteToGraphic("\u00a0")   // " " (written literally)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-11">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-11">#</a> <code>strconv.QuoteRuneToGraphic</code></h3>
+          <pre><code class="lang-go">strconv.QuoteRuneToGraphic(r rune) string</code></pre>
+          <p>The rune as a single-quoted Go literal, written literally when it is graphic.</p>
+          <pre><code class="lang-go">strconv.QuoteRuneToGraphic('\u2028')   // '\u2028'</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-12">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-12">#</a> <code>strconv.CanBackquote</code></h3>
+          <pre><code class="lang-go">strconv.CanBackquote(s string) bool</code></pre>
+          <p>Whether the string can be written as a raw (back-quoted) literal: one line, no control character other than tab, no backquote and no byte order mark. `%#q` back-quotes exactly when this holds.</p>
+          <pre><code class="lang-go">strconv.CanBackquote("a`b")   // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-13">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-13">#</a> <code>strconv.IsPrint</code></h3>
+          <pre><code class="lang-go">strconv.IsPrint(r rune) bool</code></pre>
+          <p>Whether the rune is printable — a letter, mark, number, punctuation, symbol or the ASCII space — decided by Go's own range tables, so an unassigned code point is not printable.</p>
+          <pre><code class="lang-go">strconv.IsPrint('\u00ad')   // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-14">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-14">#</a> <code>strconv.IsGraphic</code></h3>
+          <pre><code class="lang-go">strconv.IsGraphic(r rune) bool</code></pre>
+          <p>Whether the rune is printable or one of the Unicode space characters `IsPrint` leaves out.</p>
+          <pre><code class="lang-go">strconv.IsGraphic('\u00a0')   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strconv-15">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-15">#</a> <code>strconv.ParseBool</code></h3>
           <pre><code class="lang-go">strconv.ParseBool(s string) (bool, error)</code></pre>
           <p>The boolean `s` spells. Exactly ten spellings are accepted — `1 t T TRUE true True 0 f F FALSE false False` — and anything else is a `*strconv.NumError` wrapping `ErrSyntax`, with `false` as the value.</p>
           <pre><code class="lang-go">strconv.ParseBool("T")   // true, &lt;nil&gt;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strconv-9">
-          <h3><a class="doc-anchor" href="#doc-package-strconv-9">#</a> <code>strconv.FormatBool</code></h3>
+        <article class="doc-entry" id="doc-package-strconv-16">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-16">#</a> <code>strconv.FormatBool</code></h3>
           <pre><code class="lang-go">strconv.FormatBool(b bool) string</code></pre>
           <p>`"true"` or `"false"`.</p>
           <pre><code class="lang-go">strconv.FormatBool(1 == 1)   // "true"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-package-strconv-10">
-          <h3><a class="doc-anchor" href="#doc-package-strconv-10">#</a> <code>strconv.FormatFloat</code></h3>
+        <article class="doc-entry" id="doc-package-strconv-17">
+          <h3><a class="doc-anchor" href="#doc-package-strconv-17">#</a> <code>strconv.FormatFloat</code></h3>
           <pre><code class="lang-go">strconv.FormatFloat(f float64, fmt byte, prec, bitSize int) string</code></pre>
           <p>The float as text. `fmt` is one of `f` (no exponent), `e`/`E` (an exponent always), `g`/`G` (an exponent for large exponents, plain otherwise). `prec` is the digit count, or `-1` for the fewest digits that parse back to `f` exactly — at the width `bitSize` names, so `32` gives `float32`'s shorter answer. The `b`, `x` and `X` verbs (binary and hexadecimal exponents) are not implemented and fault rather than answering.</p>
           <pre><code class="lang-go">strconv.FormatFloat(0.1, 'f', -1, 32)   // "0.1"</code></pre>

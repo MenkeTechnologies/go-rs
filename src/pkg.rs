@@ -1533,7 +1533,10 @@ fn stdlib_func_sig(pkg: &str, func: &str) -> Option<&'static str> {
         ("strconv", "FormatUint") => "(i uint64, base int) string",
         ("strconv", "ParseFloat") => "(s string, bitSize int) (float64, error)",
         ("strconv", "FormatInt") => "(i int64, base int) string",
-        ("strconv", "Quote") => "(s string) string",
+        ("strconv", "Quote" | "QuoteToASCII" | "QuoteToGraphic") => "(s string) string",
+        ("strconv", "QuoteRuneToASCII" | "QuoteRuneToGraphic") => "(r rune) string",
+        ("strconv", "CanBackquote") => "(s string) bool",
+        ("strconv", "IsPrint" | "IsGraphic") => "(r rune) bool",
         (
             "math",
             "Abs" | "Sqrt" | "Floor" | "Ceil" | "Round" | "Trunc" | "Sin" | "Cos" | "Tan" | "Asin"

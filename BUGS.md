@@ -88,23 +88,6 @@ types is not, because tagging every map would put a box on the common path for
 a name that is almost always already right. A slice does not have this gap: its
 element type is stamped by `GELEM_TAG`.
 
-## An unassigned code point prints literally where Go escapes it
-
-```go
-fmt.Printf("%q\n", 0x378)   // go: '͸'   go-rs: '͸'
-```
-
-`strconv.Quote` writes a rune literally when `unicode.IsPrint` accepts it —
-every letter, mark, number, punctuation and symbol, plus the ASCII space.
-`go_is_print` (`src/host.rs`) decides three of the four non-printable classes
-exactly: the C0 and C1 controls are `char::is_control`, every separator but the
-ASCII space is `char::is_whitespace`, and the private-use areas are three fixed
-ranges. The fourth is `Cn`, the code points Unicode has not assigned, which is
-neither a fixed range nor derivable from anything Rust's standard library
-exposes — it needs the general-category tables, and those change with the
-Unicode version. Closing it means carrying a category table (or a generated
-`IsPrint` range list) in the frontend.
-
 ## A call passes at most 255 arguments
 
 ```go
@@ -488,12 +471,6 @@ What is still missing from that corner:
 - **`os.File` is only the two standard streams.** There is no `Open`, `Create`
   or `Read` — `writeFd` is the package's one intrinsic and only ever sees
   descriptors 1 and 2.
-
-`strconv.FormatFloat` is implemented for the `f`, `F`, `e`, `E`, `g` and `G`
-verbs at both `bitSize`s, including `prec == -1`. The two remaining verbs —
-`b` (binary exponent) and `x`/`X` (hexadecimal float) — fault at run time
-rather than answering, because the alternative is a decimal string presented as
-a hex-float one.
 
 ## Constant-overflow is not diagnosed
 

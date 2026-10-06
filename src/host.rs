@@ -2340,9 +2340,12 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
-/// `append(base, xs...)` — a fresh slice of `base`'s elements then every element
-/// of each spread slice argument. Collecting into a new backing matches Go's
-/// observable result (a caller reassigns the return value).
+/// `append(base, xs...)` — every element of each spread operand, appended to
+/// `base` exactly as [`b_append`] appends listed elements: in place when
+/// `base` has the capacity (so `append(s[:i], s[i+1:]...)` deletes from `s`'s
+/// own backing array, as Go's does), reallocating when it does not. The spread
+/// elements are collected before anything is written, which is Go's `memmove`
+/// answer when the two overlap.
 fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     // Argument 0 is the compiler's answer to "is the element type a Go *value*
@@ -2376,12 +2379,13 @@ fn b_append_spread(vm: &mut VM, argc: u8) -> Value {
             }
         }
     };
-    // Then the base slice (nil → empty), then the spread slices (normally
+    // Argument 1 is the base slice; the rest are the spread operands (normally
     // exactly one).
-    for a in args.iter().skip(1) {
+    for a in args.iter().skip(2) {
         extend_from(a);
     }
-    Value::Obj(heap_alloc(HostObj::slice(out)))
+    let base = args.get(1).cloned().unwrap_or(Value::Undef);
+    append_values(vm, base, out)
 }
 
 /// `[map, key]` → `[value, present]` for the comma-ok map lookup `v, ok := m[k]`.
@@ -2571,6 +2575,12 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
         return Value::Undef;
     }
     let recv = args.remove(0);
+    append_values(vm, recv, args)
+}
+
+/// Append `args` to the slice `recv` — the shared body of [`b_append`] and
+/// [`b_append_spread`].
+fn append_values(vm: &mut VM, recv: Value, args: Vec<Value>) -> Value {
     match recv {
         Value::Obj(id) => {
             // `append(*p, x)` hands over the pointer, not the slice it addresses.
@@ -2618,6 +2628,7 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                     Some(HostObj::Slice { elems: a, .. }) => a[offset..offset + len].to_vec(),
                     _ => Vec::new(),
                 });
+                out = moved_elems(out);
                 out.extend(args);
                 return grow_slice(out, cap);
             }
@@ -2635,8 +2646,9 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
                 }) => Some(Vec::new()),
                 _ => None,
             });
-            if let Some(mut out) = existing {
+            if let Some(out) = existing {
                 let old_cap = out.len();
+                let mut out = moved_elems(out);
                 out.extend(args);
                 return grow_slice(out, old_cap);
             }
@@ -2650,6 +2662,34 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
         }
         _ => Value::Obj(heap_alloc(HostObj::slice(args))),
     }
+}
+
+/// The elements of an outgrown backing array, as they land in the new one.
+///
+/// Go's `growslice` copies the old array, so a struct or array element of the
+/// grown slice is a value of its own: writing `ys[0].N` after `ys :=
+/// append(xs, v)` reallocated leaves `xs[0]` alone. A pointer, slice, map or
+/// scalar element is the same value either way. An array element is recognised
+/// by its `[N]T` stamp, a value struct by [`struct_bind`].
+fn moved_elems(elems: Vec<Value>) -> Vec<Value> {
+    elems
+        .into_iter()
+        .map(|e| {
+            let arr_ty = match &e {
+                Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+                    Some(HostObj::Slice {
+                        arr_ty: Some(t), ..
+                    }) => Some(t.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            match arr_ty {
+                Some(t) => value_copy(e, &t),
+                None => struct_bind(e),
+            }
+        })
+        .collect()
 }
 
 /// `delete(m, k)` — remove key `k` from map `m` (no-op if absent).
@@ -3401,72 +3441,93 @@ pub(crate) fn go_str_mode(v: &Value, mode: FmtMode) -> String {
 /// `%q` on a string: Go's `strconv.Quote` — double quotes, backslash escapes for
 /// the C escapes and `\`/`"`, and `\xNN`/`\uNNNN` for other non-printables.
 pub(crate) fn go_quote(s: &str) -> String {
+    go_quote_with(s, '"', false, false)
+}
+
+/// Go's `strconv.appendQuotedWith`: `s` between `quote`s, every rune written
+/// by [`append_escaped_rune`]. `ascii_only` is `QuoteToASCII` (and `%+q`),
+/// `graphic_only` is `QuoteToGraphic`.
+pub(crate) fn go_quote_with(s: &str, quote: char, ascii_only: bool, graphic_only: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            '\u{7}' => out.push_str("\\a"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\u{b}' => out.push_str("\\v"),
-            c if !go_is_print(c) => out.push_str(&escape_rune(c as u32)),
-            c => out.push(c),
-        }
+    out.push(quote);
+    for r in s.chars() {
+        append_escaped_rune(&mut out, r, quote, ascii_only, graphic_only);
     }
-    out.push('"');
+    out.push(quote);
     out
 }
 
-/// How `strconv.Quote` writes a rune it will not print literally: `\xNN` for a
-/// C0 control or `DEL`, `\uNNNN` inside the basic plane and `\UNNNNNNNN` above
-/// it. The named escapes (`\n`, `\t`, …) are matched before this is reached.
-fn escape_rune(c: u32) -> String {
-    match c {
-        0..=0x1f | 0x7f => format!("\\x{c:02x}"),
-        0..=0xffff => format!("\\u{c:04x}"),
-        _ => format!("\\U{c:08x}"),
+/// Go's `strconv.appendEscapedRune`: the rune itself when it may be written
+/// literally, else its named escape (`\n`), else `\xNN` for a C0 control or
+/// `DEL`, `\uNNNN` inside the basic plane and `\UNNNNNNNN` above it.
+fn append_escaped_rune(
+    out: &mut String,
+    r: char,
+    quote: char,
+    ascii_only: bool,
+    graphic_only: bool,
+) {
+    if r == quote || r == '\\' {
+        // always backslashed
+        out.push('\\');
+        out.push(r);
+        return;
+    }
+    let u = r as u32;
+    if ascii_only {
+        if r.is_ascii() && crate::isprint::is_print(u) {
+            out.push(r);
+            return;
+        }
+    } else if crate::isprint::is_print(u) || graphic_only && crate::isprint::is_in_graphic_list(u) {
+        out.push(r);
+        return;
+    }
+    match r {
+        '\u{7}' => out.push_str("\\a"),
+        '\u{8}' => out.push_str("\\b"),
+        '\u{c}' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{b}' => out.push_str("\\v"),
+        _ if u < 0x20 || u == 0x7f => out.push_str(&format!("\\x{u:02x}")),
+        _ if u < 0x10000 => out.push_str(&format!("\\u{u:04x}")),
+        _ => out.push_str(&format!("\\U{u:08x}")),
     }
 }
 
 /// Whether Go's `strconv` writes a rune literally inside a quoted string —
-/// `unicode.IsPrint`, which is every letter, mark, number, punctuation and
-/// symbol plus the ASCII space.
-///
-/// The three non-printable classes tested here are exact: `Cc` (the C0 and C1
-/// controls) is [`char::is_control`], every separator but the ASCII space is
-/// [`char::is_whitespace`], and the private-use areas are three fixed ranges.
-/// The fourth, `Cn` (code points Unicode has not assigned), needs the category
-/// tables Rust's standard library does not expose, so an unassigned rune still
-/// prints literally where Go escapes it — see BUGS.md.
+/// `strconv.IsPrint`, ported with its tables in `src/isprint.rs`.
 fn go_is_print(c: char) -> bool {
-    if c.is_control() {
-        return false;
-    }
-    if c == ' ' {
-        return true;
-    }
-    if c.is_whitespace() {
-        return false;
-    }
-    !matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+    crate::isprint::is_print(c as u32)
 }
 
 /// `%q` on an integer: Go quotes it as a rune literal (`'A'`, `'\n'`, `'世'`).
 pub(crate) fn go_quote_rune(n: i64) -> String {
-    let Some(c) = u32::try_from(n).ok().and_then(char::from_u32) else {
-        // Go renders an out-of-range code point as the replacement character.
-        return "'\u{fffd}'".to_string();
-    };
-    let inner = go_quote(&c.to_string());
-    // Reuse the string escaper, then swap the delimiters and fix `'`/`"`.
-    let body = &inner[1..inner.len() - 1];
-    let body = body.replace("\\\"", "\"").replace('\'', "\\'");
-    format!("'{body}'")
+    go_quote_rune_with(n, false, false)
+}
+
+/// Go's `strconv.appendQuotedRuneWith`: an integer that is no valid code point
+/// (negative, a surrogate, above `U+10FFFF`) is quoted as the replacement
+/// character.
+pub(crate) fn go_quote_rune_with(n: i64, ascii_only: bool, graphic_only: bool) -> String {
+    let r = u32::try_from(n)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or('\u{fffd}');
+    let mut out = String::from('\'');
+    append_escaped_rune(&mut out, r, '\'', ascii_only, graphic_only);
+    out.push('\'');
+    out
+}
+
+/// Go's `strconv.CanBackquote`: whether `s` can be written as a raw string
+/// literal — a single line with no control characters other than tab, no
+/// backquote, and no byte order mark.
+pub(crate) fn go_can_backquote(s: &str) -> bool {
+    !s.chars()
+        .any(|r| r == '\u{feff}' || (r < ' ' && r != '\t') || r == '`' || r == '\u{7f}')
 }
 
 /// `%T`: the value's Go type name. go-rs carries no static element type for a
@@ -3563,10 +3624,50 @@ fn elem_type_name(v: Option<&Value>) -> String {
 /// from an imported package is already `path.Name`, and Go shows the path's last
 /// segment (`unicode/utf8.T` is `utf8.T`); anything else is `package main`'s.
 pub(crate) fn package_qualified(name: &str) -> String {
+    if name.starts_with("struct{") {
+        return anon_struct_spelling(name);
+    }
     match name.rsplit_once('.') {
         Some((path, ty)) => format!("{}.{ty}", path.rsplit('/').next().unwrap_or(path)),
         None => format!("main.{name}"),
     }
+}
+
+/// How `%T` spells an anonymous struct type, which belongs to no package:
+/// the parser's `struct{A int; B []pt}` is Go's `struct { A int; B []main.pt }`,
+/// and the empty one is `struct {}`.
+fn anon_struct_spelling(name: &str) -> String {
+    let inner = name
+        .strip_prefix("struct{")
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or("");
+    if inner.is_empty() {
+        return "struct {}".to_string();
+    }
+    // Fields are `; `-separated at brace depth 0; a field's type may itself be
+    // an anonymous struct with fields of its own.
+    let mut fields = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => {
+                fields.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    fields.push(&inner[start..]);
+    let fields: Vec<String> = fields
+        .iter()
+        .map(|f| match f.trim().split_once(' ') {
+            Some((n, t)) => format!("{n} {}", go_type_spelling(t)),
+            None => go_type_spelling(f.trim()),
+        })
+        .collect();
+    format!("struct {{ {} }}", fields.join("; "))
 }
 
 pub(crate) fn go_type_spelling(ty: &str) -> String {
@@ -3577,6 +3678,8 @@ pub(crate) fn go_type_spelling(ty: &str) -> String {
             "" => {}
             "byte" => out.push_str("uint8"),
             "rune" => out.push_str("int32"),
+            // `any` is an alias too, for the empty interface.
+            "any" => out.push_str("interface {}"),
             w if is_predeclared_type(w) => out.push_str(w),
             w => {
                 out.push_str(&package_qualified(w));
@@ -3584,7 +3687,39 @@ pub(crate) fn go_type_spelling(ty: &str) -> String {
         }
         word.clear();
     };
-    for c in ty.chars() {
+    let mut chars = ty.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        // The empty interface is spelled with a space: `interface {}`.
+        if word == "interface" && ty[i..].starts_with("{}") {
+            out.push_str("interface {}");
+            word.clear();
+            chars.next();
+            continue;
+        }
+        // An anonymous struct type is spelled as a whole, braces and all.
+        if word == "struct" && c == '{' {
+            let mut depth = 0usize;
+            let mut end = ty.len();
+            for (j, d) in ty[i..].char_indices() {
+                match d {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push_str(&anon_struct_spelling(&format!("struct{}", &ty[i..end])));
+            word.clear();
+            while chars.peek().is_some_and(|&(k, _)| k < end) {
+                chars.next();
+            }
+            continue;
+        }
         // A qualified name (`pkg.T`, `a/b.T`) is one word; a leading `.` (`...T`)
         // is punctuation.
         if c.is_alphanumeric() || c == '_' || (!word.is_empty() && (c == '.' || c == '/')) {
@@ -3826,10 +3961,49 @@ pub(crate) fn bytes_of(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
+thread_local! {
+    /// How many composites [`obj_str_mode`] is currently inside. `%#v` names a
+    /// byte slice `[]byte` only as the operand itself — Go's `printArg` has a
+    /// `[]byte` case — and `[]uint8` (its reflected type) at any depth below.
+    static FMT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Holds one level of [`FMT_DEPTH`] for as long as it lives.
+struct FmtDepthGuard;
+
+impl FmtDepthGuard {
+    /// Enter a composite, returning the guard and the depth it was entered at
+    /// (0 for the operand itself).
+    fn enter() -> (Self, usize) {
+        let depth = FMT_DEPTH.with(|d| {
+            let n = d.get();
+            d.set(n + 1);
+            n
+        });
+        (FmtDepthGuard, depth)
+    }
+}
+
+impl Drop for FmtDepthGuard {
+    fn drop(&mut self) {
+        FMT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// The `%#v` name of a byte slice entered at `depth`.
+fn byte_slice_name(depth: usize) -> &'static str {
+    if depth == 0 {
+        "[]byte"
+    } else {
+        "[]uint8"
+    }
+}
+
 /// Format a heap object the way Go's `%v` does: `[e0 e1 …]` for a slice,
 /// `map[k0:v0 …]` (keys sorted, as Go's fmt does) for a map, `{f0 f1 …}` for a
 /// struct.
 fn obj_str_mode(id: u32, mode: FmtMode) -> String {
+    let (_guard, depth) = FmtDepthGuard::enter();
     // `%#v` uses Go source syntax: a typed composite literal, `, `-separated,
     // with every element itself in Go syntax. `%v`/`%+v` use the space-separated
     // display forms, differing only in whether struct fields are named.
@@ -3854,12 +4028,12 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     return format!("[{}]", elems(a));
                 }
                 // `%#v` of a byte slice writes Go source for one: the alias name
-                // `[]byte` (where `%T` prints `[]uint8`) and hex element
-                // literals.
+                // `[]byte` for the operand itself, `[]uint8` nested (see
+                // `FMT_DEPTH`), and hex element literals.
                 if elem_ty.as_deref().is_some_and(is_byte_elem) {
                     let bytes: Vec<String> =
                         a.iter().map(|e| format!("{:#04x}", e.to_int())).collect();
-                    return format!("[]byte{{{}}}", bytes.join(", "));
+                    return format!("{}{{{}}}", byte_slice_name(depth), bytes.join(", "));
                 }
                 format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
             }
@@ -3917,7 +4091,12 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             // Go prints a nil slice as `[]` and a nil map as `map[]` — the same
             // as an empty one — and `%#v` as the type followed by `(nil)`.
             Some(HostObj::Nil { kind, ty }) => match (mode, kind) {
-                (FmtMode::SharpV, _) => format!("{ty}(nil)"),
+                (FmtMode::SharpV, _) => match elem_ty_spelling(ty) {
+                    Some(e) if *kind == NilKind::Slice && is_byte_elem(&e) => {
+                        format!("{}(nil)", byte_slice_name(depth))
+                    }
+                    _ => format!("{}(nil)", go_type_spelling(ty)),
+                },
                 (_, NilKind::Slice) => "[]".to_string(),
                 (_, NilKind::Map) => "map[]".to_string(),
             },
@@ -4128,6 +4307,97 @@ fn format_e(mant: &str, exp: i32, e: char) -> String {
     } else {
         format!("{mant}{e}{sign}{mag}")
     }
+}
+
+/// `strconv.FormatFloat` under the binary-exponent formats `b`, `x` and `X`,
+/// ported from Go's `genericFtoa` / `fmtB` / `fmtX` (strconv/ftoa.go).
+///
+/// The value is decomposed at its own width — `bits32` reads the `float32`
+/// layout (23 mantissa bits, bias -127) — so `%x` of a `float32` shows its
+/// 24-bit significand. `b` ignores `prec`; `x`/`X` round the hex fraction to
+/// `prec` digits (`None` is the shortest exact form). The caller handles an
+/// infinity or NaN first, as `genericFtoa` does before reaching these.
+fn format_float_bx(f: f64, fmt: char, prec: Option<usize>, bits32: bool) -> String {
+    let (mantbits, expbits, bias, bits) = if bits32 {
+        (23u32, 8u32, -127i64, u64::from((f as f32).to_bits()))
+    } else {
+        (52, 11, -1023, f.to_bits())
+    };
+    let neg = bits >> (expbits + mantbits) != 0;
+    let mut exp = ((bits >> mantbits) & ((1 << expbits) - 1)) as i64;
+    let mut mant = bits & ((1u64 << mantbits) - 1);
+    if exp == 0 {
+        // denormalized
+        exp += 1;
+    } else {
+        mant |= 1u64 << mantbits;
+    }
+    exp += bias;
+    let sign = if neg { "-" } else { "" };
+    if fmt == 'b' {
+        // %b: -ddddddddp±ddd
+        let e = exp - i64::from(mantbits);
+        let esign = if e >= 0 { "+" } else { "" };
+        return format!("{sign}{mant}p{esign}{e}");
+    }
+    // %x: -0x1.yyyyyyyyp±ddd or -0x0p+0.
+    if mant == 0 {
+        exp = 0;
+    }
+    // Shift digits so leading 1 (if any) is at bit 1<<60.
+    mant <<= 60 - mantbits;
+    while mant != 0 && mant & (1 << 60) == 0 {
+        mant <<= 1;
+        exp -= 1;
+    }
+    // Round if requested.
+    if let Some(p) = prec.filter(|&p| p < 15) {
+        let shift = (p * 4) as u32;
+        let extra = (mant << shift) & ((1 << 60) - 1);
+        mant >>= 60 - shift;
+        if extra | (mant & 1) > 1 << 59 {
+            mant += 1;
+        }
+        mant <<= 60 - shift;
+        if mant & (1 << 61) != 0 {
+            // Wrapped around.
+            mant >>= 1;
+            exp += 1;
+        }
+    }
+    let hex = |d: u64| {
+        let c = char::from_digit((d & 15) as u32, 16).unwrap_or('0');
+        if fmt == 'X' {
+            c.to_ascii_uppercase()
+        } else {
+            c
+        }
+    };
+    let mut out = format!("{sign}0{fmt}{}", (mant >> 60) & 1);
+    // .fraction
+    mant <<= 4; // remove leading 0 or 1
+    match prec {
+        None if mant != 0 => {
+            out.push('.');
+            while mant != 0 {
+                out.push(hex(mant >> 60));
+                mant <<= 4;
+            }
+        }
+        Some(p) if p > 0 => {
+            out.push('.');
+            for _ in 0..p {
+                out.push(hex(mant >> 60));
+                mant <<= 4;
+            }
+        }
+        _ => {}
+    }
+    // p±dd — at least two exponent digits.
+    out.push(if fmt == 'X' { 'P' } else { 'p' });
+    out.push(if exp < 0 { '-' } else { '+' });
+    out.push_str(&format!("{:02}", exp.unsigned_abs()));
+    out
 }
 
 /// Go's `%e`/`%E` verb: `prec` digits after the mantissa's decimal point
@@ -4903,7 +5173,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
         // `%q` quotes a string with `strconv.Quote` and an integer as a rune
         // literal. `#` asks for a back-quoted string where one is possible.
         'q' => match v {
-            Value::Int(n) => go_quote_rune(*n),
+            Value::Int(n) => go_quote_rune_with(*n, spec.plus, false),
             _ => {
                 let mut s = go_str(v);
                 // Precision truncates the string before it is quoted, so `%.2q`
@@ -4913,10 +5183,12 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
                         s = s.chars().take(p).collect();
                     }
                 }
-                if spec.sharp && !s.contains('`') && !s.contains('\n') {
+                // `#` back-quotes when `strconv.CanBackquote` allows it; `+`
+                // escapes every non-ASCII rune (`strconv.QuoteToASCII`).
+                if spec.sharp && go_can_backquote(&s) {
                     format!("`{s}`")
                 } else {
-                    go_quote(&s)
+                    go_quote_with(&s, '"', spec.plus, false)
                 }
             }
         },
@@ -4964,6 +5236,19 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             };
             int_precision(sign, "", &digits, spec.prec)
         }
+        // A float under `%b`, `%x` or `%X` is `strconv.FormatFloat` with that
+        // format at the operand's width — a binary or hexadecimal exponent.
+        'b' | 'x' | 'X' if matches!(v, Value::Float(_)) || unbox_f32(v).is_some() => {
+            let x = arg_float(v);
+            let s = if x.is_nan() {
+                "NaN".to_string()
+            } else if x.is_infinite() {
+                if x < 0.0 { "-Inf" } else { "+Inf" }.to_string()
+            } else {
+                format_float_bx(x, verb, spec.prec, unbox_f32(v).is_some())
+            };
+            signed(s, spec)
+        }
         // `%x`/`%X` hex-encode a string bytewise.
         'x' | 'X' if matches!(v, Value::Str(_)) => hex_bytes(go_str(v).as_bytes(), verb, spec),
         // The base-N verbs. Go prints a *signed* operand as a sign and the
@@ -5010,10 +5295,26 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             .and_then(char::from_u32)
             .unwrap_or('\u{fffd}')
             .to_string(),
-        // `%U` is Go's Unicode format: `U+4E16`, at least four hex digits. It
-        // reads the operand's bits unsigned, so a negative integer shows all 64
-        // (`U+FFFFFFFFFFFFFFF7`) rather than clamping to zero.
-        'U' => format!("U+{:04X}", v.to_int() as u64),
+        // `%U` is Go's `fmt.fmtUnicode`: `U+4E16`, zero-padded to at least four
+        // hex digits or to a larger precision (`%.6U` is `U+004E16`). It reads
+        // the operand's bits unsigned, so a negative integer shows all 64
+        // (`U+FFFFFFFFFFFFFFF7`) rather than clamping to zero. `#` appends the
+        // character itself in quotes when it is a printable code point.
+        'U' => {
+            let u = v.to_int() as u64;
+            let prec = spec.prec.filter(|&p| p > 4).unwrap_or(4);
+            let mut s = format!("U+{u:0prec$X}");
+            if spec.sharp {
+                if let Some(c) = u32::try_from(u)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .filter(|&c| go_is_print(c))
+                {
+                    s.push_str(&format!(" '{c}'"));
+                }
+            }
+            s
+        }
         // `%s` on a byte slice is handled by the caller; here it is the value's
         // own text, truncated by any precision.
         's' => {
@@ -5286,6 +5587,14 @@ pub mod stdlib {
     pub const QUOTE_RUNE: u16 = 985;
     pub const PARSE_UINT: u16 = 988;
     pub const FORMAT_UINT: u16 = 989;
+    // strconv quoting variants and rune classes (`strconv.IsPrint` tables).
+    pub const QUOTE_TO_ASCII: u16 = 928;
+    pub const QUOTE_RUNE_TO_ASCII: u16 = 929;
+    pub const QUOTE_TO_GRAPHIC: u16 = 930;
+    pub const QUOTE_RUNE_TO_GRAPHIC: u16 = 931;
+    pub const CAN_BACKQUOTE: u16 = 932;
+    pub const IS_PRINT: u16 = 933;
+    pub const IS_GRAPHIC: u16 = 934;
     // sort.*
     pub const SORT_INTS: u16 = 875;
     pub const SORT_STRINGS: u16 = 876;
@@ -5338,6 +5647,13 @@ pub mod stdlib {
             ("strconv", "ParseFloat") => PARSE_FLOAT,
             ("strconv", "FormatInt") => FORMAT_INT,
             ("strconv", "Quote") => QUOTE,
+            ("strconv", "QuoteToASCII") => QUOTE_TO_ASCII,
+            ("strconv", "QuoteRuneToASCII") => QUOTE_RUNE_TO_ASCII,
+            ("strconv", "QuoteToGraphic") => QUOTE_TO_GRAPHIC,
+            ("strconv", "QuoteRuneToGraphic") => QUOTE_RUNE_TO_GRAPHIC,
+            ("strconv", "CanBackquote") => CAN_BACKQUOTE,
+            ("strconv", "IsPrint") => IS_PRINT,
+            ("strconv", "IsGraphic") => IS_GRAPHIC,
             ("math", "Abs") => ABS,
             ("math", "Sqrt") => SQRT,
             ("math", "Pow") => POW,
@@ -5567,6 +5883,39 @@ pub mod stdlib {
         // `strconv.Quote` is the same double-quoted Go literal `%q` produces —
         // escapes and all, which wrapping the raw string in quotes was not.
         vm.register_builtin(QUOTE, |vm, a| s1(vm, a, super::go_quote));
+        vm.register_builtin(QUOTE_TO_ASCII, |vm, a| {
+            s1(vm, a, |s| super::go_quote_with(s, '"', true, false))
+        });
+        vm.register_builtin(QUOTE_TO_GRAPHIC, |vm, a| {
+            s1(vm, a, |s| super::go_quote_with(s, '"', false, true))
+        });
+        vm.register_builtin(QUOTE_RUNE_TO_ASCII, |vm, a| {
+            let args = pop_args(vm, a);
+            let r = args.first().map(|v| v.to_int()).unwrap_or(0);
+            Value::str(super::go_quote_rune_with(r, true, false))
+        });
+        vm.register_builtin(QUOTE_RUNE_TO_GRAPHIC, |vm, a| {
+            let args = pop_args(vm, a);
+            let r = args.first().map(|v| v.to_int()).unwrap_or(0);
+            Value::str(super::go_quote_rune_with(r, false, true))
+        });
+        vm.register_builtin(CAN_BACKQUOTE, |vm, a| {
+            let args = pop_args(vm, a);
+            Value::Bool(super::go_can_backquote(
+                &args.first().map(go_str).unwrap_or_default(),
+            ))
+        });
+        // `IsPrint`/`IsGraphic` take a rune; a negative one is no code point.
+        vm.register_builtin(IS_PRINT, |vm, a| {
+            let args = pop_args(vm, a);
+            let r = args.first().map(|v| v.to_int()).unwrap_or(-1);
+            Value::Bool(u32::try_from(r).is_ok_and(crate::isprint::is_print))
+        });
+        vm.register_builtin(IS_GRAPHIC, |vm, a| {
+            let args = pop_args(vm, a);
+            let r = args.first().map(|v| v.to_int()).unwrap_or(-1);
+            Value::Bool(u32::try_from(r).is_ok_and(crate::isprint::is_graphic))
+        });
         vm.register_builtin(STRCONV_ERR, b_strconv_err);
         // math.*
         vm.register_builtin(ABS, |vm, a| math1(vm, a, f64::abs));
@@ -6012,16 +6361,8 @@ pub mod stdlib {
                 }
                 _ => super::format_float_g(f, prec, verb == 'G'),
             },
-            // Go also defines `b`, `x` and `X` (binary and hexadecimal
-            // exponents). Faulting is the honest answer: the alternative is a
-            // decimal string presented as a hex-float one.
-            'b' | 'x' | 'X' => {
-                super::ffi_fault(
-                    vm,
-                    format!("go-rs: strconv.FormatFloat: fmt '{verb}' is not implemented"),
-                );
-                return Value::Undef;
-            }
+            // The binary and hexadecimal exponent formats.
+            'b' | 'x' | 'X' => super::format_float_bx(f, verb, prec, narrowed),
             // Go's `ftoa` writes `%` and the byte for anything else.
             other => format!("%{other}"),
         };

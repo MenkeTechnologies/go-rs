@@ -258,6 +258,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     while i < bytes.len() && allowed.contains(bytes[i] as char) {
                         i += 1;
                     }
+                    // A hexadecimal floating-point literal: `0x1.8p1`, `0x.cp-2`,
+                    // `0x1p-1074` — hex mantissa digits, an optional `.`, and a
+                    // mandatory binary exponent.
+                    if radix == 16 && i < bytes.len() && matches!(bytes[i], b'.' | b'p' | b'P') {
+                        let (v, next) = scan_hex_float(src, bytes, ds, line)?;
+                        i = next;
+                        out.push(Token {
+                            kind: Tok::Float(v, None),
+                            line,
+                        });
+                        continue;
+                    }
                     let digits = src[ds..i].replace('_', "");
                     // A value above i64::MAX (a uint64 constant like
                     // 0x8080808080808080) is reinterpreted as the i64 with the
@@ -309,6 +321,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     .map_err(|_| format!("go-rs: bad float literal `{text}` on line {line}"))?;
                 out.push(Token {
                     kind: Tok::Float(v, exact_decimal(&clean)),
+                    line,
+                });
+            } else if clean.len() > 1 && clean.starts_with('0') {
+                // A leading `0` on an integer is Go's legacy octal prefix:
+                // `0755` is 493, and `09` is not a literal at all.
+                let v = i64::from_str_radix(&clean[1..], 8)
+                    .or_else(|_| u64::from_str_radix(&clean[1..], 8).map(|u| u as i64))
+                    .map_err(|_| {
+                        format!("go-rs: invalid digit in octal literal `{text}` on line {line}")
+                    })?;
+                out.push(Token {
+                    kind: Tok::Int(v),
                     line,
                 });
             } else {
@@ -564,6 +588,81 @@ fn unescape(c: char) -> char {
 /// Returns the resulting Unicode code point and the index past the sequence.
 /// Handles `\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\ooo` (octal), and the simple
 /// single-char escapes (`\n \t \r \0 \\ \' \"` …).
+/// Scan the rest of a hexadecimal floating-point literal whose mantissa digits
+/// start at `i` (just past `0x`), returning its value and the index after it.
+///
+/// The mantissa is accumulated into a `u64` until it holds 60 bits; a nonzero
+/// digit past that sets the low (sticky) bit, so converting it to `f64` rounds
+/// to nearest-even as an exact conversion would. The binary exponent is then
+/// applied by exact power-of-two scaling.
+fn scan_hex_float(
+    src: &str,
+    bytes: &[u8],
+    mut i: usize,
+    line: u32,
+) -> Result<(f64, usize), String> {
+    let start = i - 2;
+    let (mut mant, mut exp, mut sticky, mut after_dot, mut any) = (0u64, 0i64, false, false, false);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'.' && !after_dot {
+            after_dot = true;
+        } else if let Some(d) = (c as char).to_digit(16) {
+            any = true;
+            if mant < 1 << 60 {
+                mant = mant * 16 + u64::from(d);
+                if after_dot {
+                    exp -= 4;
+                }
+            } else {
+                sticky |= d != 0;
+                if !after_dot {
+                    exp += 4;
+                }
+            }
+        } else if c != b'_' {
+            break;
+        }
+        i += 1;
+    }
+    let bad = |end: usize| {
+        format!(
+            "go-rs: bad hexadecimal float literal `{}` on line {line}",
+            &src[start..end]
+        )
+    };
+    if !any || i >= bytes.len() || !matches!(bytes[i], b'p' | b'P') {
+        return Err(bad(i));
+    }
+    i += 1;
+    let neg = i < bytes.len() && bytes[i] == b'-';
+    if i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+        i += 1;
+    }
+    let ds = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let p: i64 = src[ds..i].replace('_', "").parse().map_err(|_| bad(i))?;
+    exp += if neg { -p } else { p };
+    if sticky {
+        mant |= 1;
+    }
+    let mut v = mant as f64;
+    // Scale in steps that stay inside f64's exponent range.
+    while exp > 0 && v.is_finite() && v != 0.0 {
+        let k = exp.min(1000);
+        v *= 2f64.powi(k as i32);
+        exp -= k;
+    }
+    while exp < 0 && v != 0.0 {
+        let k = (-exp).min(1000);
+        v /= 2f64.powi(k as i32);
+        exp += k;
+    }
+    Ok((v, i))
+}
+
 fn scan_escape(src: &str, bytes: &[u8], i: usize) -> (u32, usize) {
     /// The `n` digits at `at` read in `radix`, or U+FFFD when they are not
     /// there: a truncated escape at end of input, or one whose digits are a
