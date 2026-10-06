@@ -24,6 +24,7 @@ pub mod rust_ffi;
 pub mod scope;
 pub mod stdlib_vendor;
 pub mod tiers;
+mod unicase;
 
 pub use banner::version_banner;
 use fusevm::{Op, Scheduler, VMResult, Value, VM};

@@ -864,13 +864,13 @@ case 3:
         <article class="doc-entry" id="doc-package-strings-1">
           <h3><a class="doc-anchor" href="#doc-package-strings-1">#</a> <code>strings.ToUpper</code></h3>
           <pre><code class="lang-go">strings.ToUpper(s string) string</code></pre>
-          <p>The string with every character mapped to upper case, using full Unicode case mapping.</p>
+          <p>The string with every rune mapped to upper case by Go's simple, rune-for-rune Unicode mapping (`unicode.ToUpper`): `ß` stays `ß`.</p>
           <pre><code class="lang-go">strings.ToUpper("héllo")   // HÉLLO</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strings-2">
           <h3><a class="doc-anchor" href="#doc-package-strings-2">#</a> <code>strings.ToLower</code></h3>
           <pre><code class="lang-go">strings.ToLower(s string) string</code></pre>
-          <p>The string with every character mapped to lower case, using full Unicode case mapping.</p>
+          <p>The string with every rune mapped to lower case by Go's simple, rune-for-rune Unicode mapping (`unicode.ToLower`), with no context-dependent final sigma.</p>
           <pre><code class="lang-go">strings.ToLower("HÉLLO")   // héllo</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strings-3">
@@ -1080,13 +1080,19 @@ case 3:
         <article class="doc-entry" id="doc-package-strings-37">
           <h3><a class="doc-anchor" href="#doc-package-strings-37">#</a> <code>strings.Title</code></h3>
           <pre><code class="lang-go">strings.Title(s string) string</code></pre>
-          <p>Each space-separated word with its first character upper-cased. It splits on the ASCII space only, where Go's deprecated Title splits on every non-letter.</p>
-          <pre><code class="lang-go">strings.Title("hello wide world")   // Hello Wide World</code></pre>
+          <p>Every rune that follows a separator mapped to title case, as Go's deprecated `Title` does: a separator is any ASCII character but a letter, digit or `_`, and beyond ASCII a space.</p>
+          <pre><code class="lang-go">strings.Title("hello wide-world")   // Hello Wide-World</code></pre>
         </article>
         <article class="doc-entry" id="doc-package-strings-38">
-          <h3><a class="doc-anchor" href="#doc-package-strings-38">#</a> <code>strings.EqualFold</code></h3>
+          <h3><a class="doc-anchor" href="#doc-package-strings-38">#</a> <code>strings.ToTitle</code></h3>
+          <pre><code class="lang-go">strings.ToTitle(s string) string</code></pre>
+          <p>Every rune mapped to its Unicode title case (`unicode.ToTitle`), which differs from upper case for the digraphs: `ǆ` becomes `ǅ`.</p>
+          <pre><code class="lang-go">strings.ToTitle("ǆemal")   // ǅEMAL</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-strings-39">
+          <h3><a class="doc-anchor" href="#doc-package-strings-39">#</a> <code>strings.EqualFold</code></h3>
           <pre><code class="lang-go">strings.EqualFold(s, t string) bool</code></pre>
-          <p>Case-insensitive equality — but ASCII-only. Go performs full Unicode case folding, so `EqualFold("HÉ", "hé")` is true in Go and false here.</p>
+          <p>Equality under simple Unicode case folding, walking each rune's `unicode.SimpleFold` orbit: `EqualFold("HÉ", "hé")` and `EqualFold("ſ", "S")` are true; `ß` does not fold to `SS`.</p>
           <pre><code class="lang-go">strings.EqualFold("Go", "GO")   // true</code></pre>
         </article>
       </section>

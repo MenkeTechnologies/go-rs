@@ -1488,7 +1488,9 @@ fn stdlib_func_sig(pkg: &str, func: &str) -> Option<&'static str> {
         ("fmt", "Sprintf") => "(format string, a ...any) string",
         ("fmt", "Print" | "Println") => "(a ...any) (int, error)",
         ("fmt", "Printf") => "(format string, a ...any) (int, error)",
-        ("strings", "ToUpper" | "ToLower" | "TrimSpace" | "Title") => "(s string) string",
+        ("strings", "ToUpper" | "ToLower" | "ToTitle" | "TrimSpace" | "Title") => {
+            "(s string) string"
+        }
         ("strings", "Contains" | "HasPrefix" | "HasSuffix" | "EqualFold" | "ContainsAny") => {
             "(s, t string) bool"
         }

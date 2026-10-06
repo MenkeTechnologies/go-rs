@@ -774,9 +774,12 @@ fn b_imod(vm: &mut VM, argc: u8) -> Value {
 fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let recv = args.first().cloned().unwrap_or(Value::Undef);
-    let lo_raw = args.get(1).map(Value::to_int).unwrap_or(-1);
-    let hi_raw = args.get(2).map(Value::to_int).unwrap_or(-1);
-    let max_raw = args.get(3).map(Value::to_int).unwrap_or(-1);
+    // An omitted bound is `undef`; a written one is checked as written.
+    let bound = |i: usize| match args.get(i) {
+        None | Some(Value::Undef) => None,
+        Some(v) => Some(v.to_int()),
+    };
+    let (lo, hi, max) = (bound(1), bound(2), bound(3));
     match recv {
         // A sub-slice shares the parent's backing array (so element writes are
         // visible both ways), matching Go — collapse a view-of-a-view to the
@@ -787,16 +790,22 @@ fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
             };
             // Go bounds a re-slice by capacity, not length: `s[:cap(s)]` is
             // legal and exposes the backing array's spare room, so an element an
-            // append wrote past `len` is reachable through `s[0:len+1]`.
+            // append wrote past `len` is reachable through `s[0:len+1]`. An
+            // array's capacity is its length, and Go says "length" for it.
             let cap = slice_cap(id).unwrap_or(len) as i64;
-            let len = len as i64;
-            let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, cap) as usize;
-            let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, cap) as usize;
-            let hi = hi.max(lo);
-            // The three-index form `s[lo:hi:max]` gives the result capacity
-            // `max - lo`; omitted, it keeps the rest of the parent's capacity.
-            let mx = if max_raw < 0 { cap } else { max_raw }.clamp(0, cap) as usize;
-            let mx = mx.max(hi);
+            let is_array = HEAP.with(|h| {
+                matches!(
+                    h.borrow().get(id as usize),
+                    Some(HostObj::Slice {
+                        arr_ty: Some(_),
+                        ..
+                    })
+                )
+            });
+            let Some((lo, hi, mx)) = slice_bounds(vm, len as i64, cap, !is_array, lo, hi, max)
+            else {
+                return Value::Undef;
+            };
             Value::Obj(heap_alloc(HostObj::SliceView {
                 backing,
                 offset: base + lo,
@@ -808,12 +817,95 @@ fn b_slice_sub(vm: &mut VM, argc: u8) -> Value {
             // Byte-indexed substring, matching Go's string slicing.
             let bytes = s.as_bytes();
             let len = bytes.len() as i64;
-            let lo = if lo_raw < 0 { 0 } else { lo_raw }.clamp(0, len) as usize;
-            let hi = if hi_raw < 0 { len } else { hi_raw }.clamp(0, len) as usize;
-            let slice = bytes.get(lo..hi.max(lo)).unwrap_or(&[]);
-            Value::str(String::from_utf8_lossy(slice).into_owned())
+            let Some((lo, hi, _)) = slice_bounds(vm, len, len, false, lo, hi, max) else {
+                return Value::Undef;
+            };
+            Value::str(String::from_utf8_lossy(&bytes[lo..hi]).into_owned())
         }
         _ => Value::Undef,
+    }
+}
+
+/// Go's bounds checks for `x[lo:hi]` / `x[lo:hi:max]`, in the order and with
+/// the messages the compiler's `ssagen` emits them (checked high to low, so
+/// each is compared against a value already known to be in range). Returns
+/// `(lo, hi, max)` resolved against `len` / `cap`, or raises the runtime panic
+/// and returns `None`. `is_slice` picks "with capacity" over "with length".
+fn slice_bounds(
+    vm: &mut VM,
+    len: i64,
+    cap: i64,
+    is_slice: bool,
+    lo: Option<i64>,
+    hi: Option<i64>,
+    max: Option<i64>,
+) -> Option<(usize, usize, usize)> {
+    // `x` must lie in `0..=y`; otherwise the `runtime.boundsError` of `kind`.
+    let check = |vm: &mut VM, x: i64, y: i64, kind: BoundsKind| -> bool {
+        if (0..=y).contains(&x) {
+            return true;
+        }
+        runtime_panic(vm, bounds_error(kind, x, y, is_slice));
+        false
+    };
+    let i = lo.unwrap_or(0);
+    if let Some(k) = max {
+        let j = hi.unwrap_or(len);
+        if !(check(vm, k, cap, BoundsKind::Slice3A)
+            && check(vm, j, k, BoundsKind::Slice3B)
+            && check(vm, i, j, BoundsKind::Slice3C))
+        {
+            return None;
+        }
+        return Some((i as usize, j as usize, k as usize));
+    }
+    let j = hi.unwrap_or(len);
+    if !(check(vm, j, cap, BoundsKind::SliceA) && check(vm, i, j, BoundsKind::SliceB)) {
+        return None;
+    }
+    Some((i as usize, j as usize, cap as usize))
+}
+
+/// The `runtime.boundsError` kinds a slice expression raises.
+#[derive(Clone, Copy)]
+enum BoundsKind {
+    SliceA,
+    SliceB,
+    Slice3A,
+    Slice3B,
+    Slice3C,
+}
+
+/// The text of a `runtime.boundsError` (runtime/error.go): the
+/// `boundsErrorFmt` form, or the shorter `boundsNegErrorFmt` one, which drops
+/// `y`, when `x` is negative.
+fn bounds_error(kind: BoundsKind, x: i64, y: i64, is_slice: bool) -> String {
+    let a = if is_slice { "capacity" } else { "length" };
+    if x < 0 {
+        return match kind {
+            BoundsKind::SliceA => format!("slice bounds out of range [:{x}]"),
+            BoundsKind::SliceB => format!("slice bounds out of range [{x}:]"),
+            BoundsKind::Slice3A => format!("slice bounds out of range [::{x}]"),
+            BoundsKind::Slice3B => format!("slice bounds out of range [:{x}:]"),
+            BoundsKind::Slice3C => format!("slice bounds out of range [{x}::]"),
+        };
+    }
+    match kind {
+        BoundsKind::SliceA => format!("slice bounds out of range [:{x}] with {a} {y}"),
+        BoundsKind::SliceB => format!("slice bounds out of range [{x}:{y}]"),
+        BoundsKind::Slice3A => format!("slice bounds out of range [::{x}] with {a} {y}"),
+        BoundsKind::Slice3B => format!("slice bounds out of range [:{x}:{y}]"),
+        BoundsKind::Slice3C => format!("slice bounds out of range [{x}:{y}:]"),
+    }
+}
+
+/// The text of an index `runtime.boundsError`: `boundsIndex`, or its negative
+/// form, which omits the length.
+fn index_error(i: i64, len: usize) -> String {
+    if i < 0 {
+        format!("index out of range [{i}]")
+    } else {
+        format!("index out of range [{i}] with length {len}")
     }
 }
 
@@ -2131,17 +2223,22 @@ fn b_make(vm: &mut VM, argc: u8) -> Value {
         _ => {
             let n = args.get(1).map(|v| v.to_int()).unwrap_or(0);
             let zero = args.get(2).cloned().unwrap_or(Value::Int(0));
-            // `-1` is the compiler's marker for an omitted capacity.
-            let c = args.get(3).map(|v| v.to_int()).unwrap_or(-1);
+            // `undef` is the compiler's marker for an omitted capacity.
+            let c = match args.get(3) {
+                None | Some(Value::Undef) => n,
+                Some(v) => v.to_int(),
+            };
+            // Go's `makeslice` checks: a negative length is reported as such,
+            // and a capacity below the length (or negative) as the capacity.
             if n < 0 {
-                ffi_fault(vm, format!("go-rs: makeslice: len out of range ({n})"));
+                runtime_panic(vm, "makeslice: len out of range");
                 return Value::Undef;
             }
-            if c >= 0 && c < n {
-                ffi_fault(vm, format!("go-rs: makeslice: cap out of range ({c})"));
+            if c < n {
+                runtime_panic(vm, "makeslice: cap out of range");
                 return Value::Undef;
             }
-            let (len, cap) = (n as usize, if c < 0 { n as usize } else { c as usize });
+            let (len, cap) = (n as usize, c as usize);
             // Each element gets its *own* zero value. Cloning one `Value` would
             // share a struct (or array) zero's handle across every slot, so a
             // write to `s[0].f` would appear in every element. `value_copy` is
@@ -2290,7 +2387,7 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
             return match usize::try_from(i).ok().and_then(|i| s.as_bytes().get(i)) {
                 Some(b) => Value::Int(*b as i64),
                 None => {
-                    runtime_panic(vm, format!("index out of range [{i}] with length {len}"));
+                    runtime_panic(vm, index_error(i, len));
                     Value::Undef
                 }
             };
@@ -2306,7 +2403,7 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
         return match usize::try_from(i).ok().filter(|&i| i < len) {
             Some(i) => slice_get(id, i).unwrap_or(Value::Undef),
             None => {
-                runtime_panic(vm, format!("index out of range [{i}] with length {len}"));
+                runtime_panic(vm, index_error(i, len));
                 Value::Undef
             }
         };
@@ -2434,7 +2531,7 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
                 }
                 None::<String>
             }),
-            None => Some(format!("index out of range [{i}] with length {len}")),
+            None => Some(index_error(i, len)),
         };
         return match err {
             None => val,
@@ -5595,6 +5692,7 @@ pub mod stdlib {
     pub const CAN_BACKQUOTE: u16 = 932;
     pub const IS_PRINT: u16 = 933;
     pub const IS_GRAPHIC: u16 = 934;
+    pub const TO_TITLE: u16 = 935;
     // sort.*
     pub const SORT_INTS: u16 = 875;
     pub const SORT_STRINGS: u16 = 876;
@@ -5607,6 +5705,7 @@ pub mod stdlib {
         Some(match (pkg, func) {
             ("strings", "ToUpper") => TO_UPPER,
             ("strings", "ToLower") => TO_LOWER,
+            ("strings", "ToTitle") => TO_TITLE,
             ("strings", "Contains") => CONTAINS,
             ("strings", "HasPrefix") => HAS_PREFIX,
             ("strings", "HasSuffix") => HAS_SUFFIX,
@@ -5763,8 +5862,18 @@ pub mod stdlib {
     }
 
     pub fn install(vm: &mut VM) {
-        vm.register_builtin(TO_UPPER, |vm, a| s1(vm, a, |s| s.to_uppercase()));
-        vm.register_builtin(TO_LOWER, |vm, a| s1(vm, a, |s| s.to_lowercase()));
+        // Go maps case rune by rune with the simple mappings (`strings.Map`
+        // over `unicode.ToUpper`), never lengthening a string the way Rust's
+        // full mappings do (`ß` stays `ß`).
+        vm.register_builtin(TO_UPPER, |vm, a| {
+            s1(vm, a, |s| map_runes(s, crate::unicase::to_upper))
+        });
+        vm.register_builtin(TO_LOWER, |vm, a| {
+            s1(vm, a, |s| map_runes(s, crate::unicase::to_lower))
+        });
+        vm.register_builtin(TO_TITLE, |vm, a| {
+            s1(vm, a, |s| map_runes(s, crate::unicase::to_title))
+        });
         vm.register_builtin(TRIM_SPACE, |vm, a| s1(vm, a, |s| s.trim().to_string()));
         vm.register_builtin(CONTAINS, |vm, a| b2(vm, a, |s, p| s.contains(p)));
         vm.register_builtin(HAS_PREFIX, |vm, a| b2(vm, a, |s, p| s.starts_with(p)));
@@ -5794,9 +5903,7 @@ pub mod stdlib {
             })
         });
         vm.register_builtin(TITLE, |vm, a| s1(vm, a, title_case));
-        vm.register_builtin(EQUAL_FOLD, |vm, a| {
-            b2(vm, a, |s, t| s.eq_ignore_ascii_case(t))
-        });
+        vm.register_builtin(EQUAL_FOLD, |vm, a| b2(vm, a, equal_fold));
         vm.register_builtin(LAST_INDEX, b_last_index);
         // `strings.ContainsRune` / `IndexRune` take a `rune`, which reaches here
         // as the code point rather than a string.
@@ -6068,17 +6175,82 @@ pub mod stdlib {
         Value::Undef
     }
 
+    /// `strings.Map(f, s)` for a rune-to-rune mapping that never drops a rune.
+    fn map_runes(s: &str, f: fn(u32) -> u32) -> String {
+        map_runes_with(s, f)
+    }
+
+    /// `strings.Title`: every rune that follows a separator is mapped to title
+    /// case (`unicode.ToTitle`).
     fn title_case(s: &str) -> String {
-        s.split(' ')
-            .map(|w| {
-                let mut c = w.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().chain(c).collect::<String>(),
-                    None => String::new(),
+        let mut prev = ' ' as u32;
+        map_runes_with(s, |r| {
+            let out = if is_separator(prev) {
+                crate::unicase::to_title(r)
+            } else {
+                r
+            };
+            prev = r;
+            out
+        })
+    }
+
+    fn map_runes_with(s: &str, mut f: impl FnMut(u32) -> u32) -> String {
+        s.chars()
+            .map(|c| char::from_u32(f(c as u32)).unwrap_or('\u{fffd}'))
+            .collect()
+    }
+
+    /// `strings.isSeparator`: ASCII alphanumerics and underscore are not
+    /// separators; other ASCII is. Beyond ASCII, letters and digits are not,
+    /// and of the rest only spaces are.
+    fn is_separator(r: u32) -> bool {
+        if r <= 0x7F {
+            let c = r as u8;
+            return !(c.is_ascii_alphanumeric() || c == b'_');
+        }
+        if crate::unicase::is_letter(r) || crate::unicase::is_digit(r) {
+            return false;
+        }
+        crate::unicase::is_space(r)
+    }
+
+    /// `strings.EqualFold`: equal under simple Unicode case folding, walking
+    /// each rune's `unicode.SimpleFold` orbit.
+    fn equal_fold(s: &str, t: &str) -> bool {
+        let mut tc = t.chars();
+        for sc in s.chars() {
+            let Some(tch) = tc.next() else {
+                return false;
+            };
+            let (mut sr, mut tr) = (sc as u32, tch as u32);
+            if tr == sr {
+                continue;
+            }
+            // Make sr < tr to simplify what follows.
+            if tr < sr {
+                std::mem::swap(&mut tr, &mut sr);
+            }
+            // Fast check for ASCII.
+            if tr < 0x80 {
+                // ASCII only, sr/tr must be upper/lower case
+                if (u32::from(b'A')..=u32::from(b'Z')).contains(&sr) && tr == sr + 32 {
+                    continue;
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+                return false;
+            }
+            // General case. SimpleFold(x) returns the next equivalent rune > x
+            // or wraps around to smaller values.
+            let mut r = crate::unicase::simple_fold(sr);
+            while r != sr && r < tr {
+                r = crate::unicase::simple_fold(r);
+            }
+            if r == tr {
+                continue;
+            }
+            return false;
+        }
+        tc.next().is_none()
     }
 
     fn b_count(vm: &mut VM, argc: u8) -> Value {

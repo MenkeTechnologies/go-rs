@@ -4338,7 +4338,7 @@ impl Compiler {
             } else {
                 self.emit_zero(&elem, line);
             }
-            self.b.emit(Op::LoadInt(-1), line);
+            self.b.emit(Op::LoadUndef, line);
             let ec = self.b.add_constant(Value::str(elem));
             self.b.emit(Op::LoadConst(ec), line);
             self.b.emit(Op::CallBuiltin(host::GMAKE, 5), line);
@@ -4701,17 +4701,20 @@ impl Compiler {
                 max,
             } => {
                 // `recv[low:high:max]`: push recv, low, high, max — each omitted
-                // bound as `-1` (0 / len / cap respectively).
+                // bound as `undef` (0 / len / cap respectively), so a negative
+                // bound a program computed still reaches the bounds check.
                 self.expr(recv)?;
                 for bound in [low, high, max] {
                     match bound {
                         Some(e) => self.expr(e)?,
                         None => {
-                            self.b.emit(Op::LoadInt(-1), 0);
+                            self.b.emit(Op::LoadUndef, 0);
                         }
                     }
                 }
                 self.b.emit(Op::CallBuiltin(host::GSLICE_SUB, 4), 0);
+                // slice bounds out of range is recoverable
+                self.emit_panic_check(0);
             }
             Expr::SliceLit {
                 elem_ty,
@@ -4772,11 +4775,12 @@ impl Compiler {
                         }
                     }
                     self.expr(elem_zero)?;
-                    // `cap` defaults to `len`; `-1` tells the host "omitted".
+                    // `cap` defaults to `len`; `undef` tells the host "omitted",
+                    // so a negative capacity a program computed is still caught.
                     match cap {
                         Some(e) => self.expr(e)?,
                         None => {
-                            self.b.emit(Op::LoadInt(-1), 0);
+                            self.b.emit(Op::LoadUndef, 0);
                         }
                     }
                     // The element type, so replicating the one zero gives each
@@ -4785,6 +4789,8 @@ impl Compiler {
                     let ec = self.b.add_constant(Value::str(elem_ty.clone()));
                     self.b.emit(Op::LoadConst(ec), 0);
                     self.b.emit(Op::CallBuiltin(host::GMAKE, 5), 0);
+                    // makeslice: len/cap out of range is recoverable
+                    self.emit_panic_check(0);
                 }
             }
             Expr::MakeChan { cap, .. } => {
