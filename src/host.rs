@@ -490,6 +490,16 @@ pub fn install(vm: &mut VM) {
     stdlib::install(vm);
 }
 
+/// `os.Args` as `go run` hands them over: the program's name, then the
+/// arguments after the source file. Unset — a binary `go build` produced — the
+/// process's own arguments are the program's.
+static PROGRAM_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record `os.Args` for the program about to run.
+pub fn set_program_args(args: Vec<String>) {
+    let _ = PROGRAM_ARGS.set(args);
+}
+
 thread_local! {
     /// Every concrete type's method set, keyed by the tag [`type_tag_of`]
     /// produces. Populated by [`GREG_METHODS`] in the program prologue; the
@@ -1081,7 +1091,9 @@ fn b_defer_unpark(_vm: &mut VM, _argc: u8) -> Value {
 /// stack trace Go prints below that line is not reproduced.)
 fn b_panic_finish(_vm: &mut VM, _argc: u8) -> Value {
     if let Some(v) = PANIC.with(|p| p.borrow_mut().take()) {
-        eprintln!("panic: {}", go_str(&v));
+        // A run-time fault's error prints its message, as Go prints `Error()`.
+        let msg = runtime_error_message(&v).unwrap_or_else(|| go_str(&v));
+        eprintln!("panic: {msg}");
         std::process::exit(2);
     }
     Value::Undef
@@ -3395,7 +3407,8 @@ fn runtime_panic(vm: &mut VM, msg: impl Into<String>) {
 fn plain_panic(vm: &mut VM, full: String) {
     if PANIC_MODE.with(|m| *m.borrow()) {
         // Recoverable: record it and let the compiler's unwind checks run.
-        PANIC.with(|p| *p.borrow_mut() = Some(Value::str(full)));
+        let v = runtime_error_value(&full).unwrap_or_else(|| Value::str(full));
+        PANIC.with(|p| *p.borrow_mut() = Some(v));
     } else {
         // Unrecovered: print like Go's first line and exit 2. Halt the VM too so
         // no further ops run before the process exits (stdout is flushed first).
@@ -3405,6 +3418,45 @@ fn plain_panic(vm: &mut VM, full: String) {
         vm.request_halt();
         std::process::exit(2);
     }
+}
+
+/// The message of a value [`runtime_error_value`] built, or `None`.
+fn runtime_error_message(v: &Value) -> Option<String> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Struct {
+            type_name, fields, ..
+        }) if type_name.starts_with("runtime.") => fields.first().map(|(_, s)| go_str(s)),
+        _ => None,
+    })
+}
+
+/// The `runtime` error a fault with message `full` panics with in Go, when the
+/// program linked those types (`pkg::add_runtime_error_types`, gated on its
+/// calling `recover`): `None` leaves the message a plain string, which is also
+/// what a library panic such as `strconv`'s bad-base message is in Go.
+fn runtime_error_value(full: &str) -> Option<Value> {
+    let (ty, by_ref) = if full.starts_with("runtime error: index out of range")
+        || full.starts_with("runtime error: slice bounds out of range")
+    {
+        ("runtime.boundsError", false)
+    } else if full.starts_with("runtime error: ") {
+        ("runtime.errorString", false)
+    } else if full == "assignment to entry in nil map" {
+        ("runtime.plainError", false)
+    } else if full.starts_with("interface conversion: ") {
+        ("runtime.TypeAssertionError", true)
+    } else {
+        return None;
+    };
+    if !METHOD_SETS.with(|m| m.borrow().contains_key(ty)) {
+        return None;
+    }
+    Some(Value::Obj(heap_alloc(HostObj::Struct {
+        type_name: ty.to_string(),
+        fields: vec![("s".to_string(), Value::str(full.to_string()))],
+        by_ref,
+    })))
 }
 
 /// `GSET_PANIC_MODE`: enable recoverable runtime faults (the program uses
@@ -5788,6 +5840,8 @@ pub mod stdlib {
     pub const SORT_FLOAT64S: u16 = 877;
     // os.*
     pub const GETENV: u16 = 880;
+    pub const OS_EXIT: u16 = 936;
+    pub const OS_ARGS: u16 = 937;
 
     /// Resolve `pkg.func` to a stdlib builtin id, or `None` if unknown.
     pub fn resolve(pkg: &str, func: &str) -> Option<u16> {
@@ -5882,6 +5936,7 @@ pub mod stdlib {
             ("sort", "Strings") => SORT_STRINGS,
             ("sort", "Float64s") => SORT_FLOAT64S,
             ("os", "Getenv") => GETENV,
+            ("os", "Exit") => OS_EXIT,
             _ => return None,
         })
     }
@@ -6216,6 +6271,26 @@ pub mod stdlib {
             let args = pop_args(vm, a);
             let k = args.first().map(go_str).unwrap_or_default();
             Value::str(std::env::var(&k).unwrap_or_default())
+        });
+        // `os.Args`: the program name, then its arguments.
+        vm.register_builtin(OS_ARGS, |vm, a| {
+            pop_args(vm, a);
+            let args = super::PROGRAM_ARGS
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::env::args().collect());
+            Value::Obj(heap_alloc(HostObj::slice(
+                args.into_iter().map(Value::str).collect(),
+            )))
+        });
+        // `os.Exit(code)`: end the process now with `code` — no deferred call
+        // runs, as in Go. Output already written is flushed first.
+        vm.register_builtin(OS_EXIT, |vm, a| {
+            use std::io::Write as _;
+            let code = pop_args(vm, a).first().map(|v| v.to_int()).unwrap_or(0);
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(code as i32)
         });
     }
 

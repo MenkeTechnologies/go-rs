@@ -101,10 +101,21 @@ fn run_file_cmd(cli: &gors::cli::Cli) -> ExitCode {
                 Err(e) => fail(&e),
             }
         }
-        _ => match gors::run_str(&src) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail(&e),
-        },
+        _ => {
+            // `os.Args[0]` is the program's name — what `go run` names the
+            // binary it builds, the file's stem — and the rest follow the file.
+            let name = std::path::Path::new(&file)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut args = vec![name];
+            args.extend(cli.argv.iter().cloned());
+            gors::host::set_program_args(args);
+            match gors::run_str(&src) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
     }
 }
 

@@ -82,6 +82,9 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if strconv_errors {
         add_num_error_type(&mut main);
     }
+    if uses_recover(&main) {
+        add_runtime_error_types(&mut main);
+    }
     // `strings.Builder` is a *type* in a package whose functions are host
     // builtins, so it cannot arrive through the source-package path; it is
     // synthesized and qualified instead. Gated on the import, because a program
@@ -609,6 +612,45 @@ fn add_num_error_type(prog: &mut Program) {
             r.ty = format!("*{ty}");
         }
     }
+    prog.types.append(&mut p.types);
+    prog.funcs.append(&mut p.funcs);
+}
+
+/// Whether the program calls `recover` — the one way it can hold the value a
+/// run-time fault panics with.
+fn uses_recover(prog: &Program) -> bool {
+    program_has_expr(prog, &|e| {
+        matches!(e, Expr::Call { func, .. } if matches!(func.as_ref(), Expr::Ident(n) if n == "recover"))
+    })
+}
+
+/// Synthesize the `runtime` error types a run-time fault panics with, so the
+/// value `recover()` returns is an `error` (`r.(error)` holds) whose `%v` is
+/// its message and whose `%T` is Go's: `runtime.boundsError` for an index or
+/// slice bound, `runtime.errorString` for a nil dereference or a division by
+/// zero, `runtime.plainError` for a write to a nil map, and
+/// `*runtime.TypeAssertionError` for a failed assertion (runtime/error.go).
+///
+/// Go's `errorString` and `plainError` are `string` types and `boundsError`
+/// keeps its operands to format later; each is a one-field struct holding the
+/// finished message here, which only `%#v` could tell apart. The host builds
+/// the values (`host::runtime_error_value`).
+fn add_runtime_error_types(prog: &mut Program) {
+    let src = "package runtime\n\
+        type boundsError struct{ s string }\n\
+        func (e boundsError) Error() string { return e.s }\n\
+        func (e boundsError) RuntimeError() {}\n\
+        type errorString struct{ s string }\n\
+        func (e errorString) Error() string { return e.s }\n\
+        func (e errorString) RuntimeError() {}\n\
+        type plainError struct{ s string }\n\
+        func (e plainError) Error() string { return e.s }\n\
+        func (e plainError) RuntimeError() {}\n\
+        type TypeAssertionError struct{ s string }\n\
+        func (e *TypeAssertionError) Error() string { return e.s }\n\
+        func (*TypeAssertionError) RuntimeError() {}\n";
+    let Ok(mut p) = crate::parse(src) else { return };
+    qualify(&mut p, "runtime", true);
     prog.types.append(&mut p.types);
     prog.funcs.append(&mut p.funcs);
 }

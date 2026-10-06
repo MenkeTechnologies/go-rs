@@ -4666,6 +4666,11 @@ impl Compiler {
                             return Ok(());
                         }
                     }
+                    if pkg == "os" && field == "Args" && !self.scope_has(pkg) {
+                        self.b
+                            .emit(Op::CallBuiltin(host::stdlib::OS_ARGS, 0), 0);
+                        return Ok(());
+                    }
                     if pkg == "strconv" && matches!(field.as_str(), "ErrSyntax" | "ErrRange") {
                         let c = self.b.add_constant(Value::str(field.clone()));
                         self.b.emit(Op::LoadConst(c), 0);
