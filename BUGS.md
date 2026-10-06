@@ -45,8 +45,8 @@ struct field or map value is formatted by the host, which cannot call a
 method. A top-level operand — including a method result of the defined type and an
 element of a defined slice of it — and a `[]T` / `[N]T` / `[]any` (or a defined
 type over one) are rendered through the method. The same erasure keeps `float32` / `uint64` widths out of an `any`,
-and a `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, for the
-reason in the pointer entry below.
+and a `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, because
+`&x` on a scalar has no address (the entry below).
 
 ## A nil pointer in an interface compares equal to nil
 
@@ -341,26 +341,19 @@ variable, field or element the method was called on
 call, so a method that keeps `s` beyond it sees none of the caller's later
 writes.
 
-## A pointer to a struct prints without `&`
+## A pointer nested inside a printed value prints as the value
 
 ```go
 p := point{1, "a"}
-fmt.Println(&p)             // go: &{1 a}          go-rs: {1 a}
 fmt.Println(outer{p: &p})   // go: {0xc000010030}  go-rs: {{1 a}}
 ```
 
-A *heap-allocated* pointer is now distinguishable at run time — `&T{…}` and
-`new(T)` mark their handle `by_ref` (`HostObj::Struct`, `src/host.rs`), which is
-what makes `==` compare them by identity. Two things still block the printing
-half:
-
-- `&x` on an existing variable is a no-op on the shared handle, so it cannot be
-  marked without also marking `x`, which would wrongly make `x == y` compare by
-  identity for the plain struct value. It needs a real pointer wrapper object
-  (with the deref plumbing that implies), not a flag.
-- A pointer *nested* inside a printed value is a hex address in Go, which is
-  nondeterministic and not reproducible at all; the depth-0 `&{…}` form is the
-  only part worth matching.
+A pointer *operand* is right: `&T{…}` / `new(T)` (a `by_ref` handle) and `&x`
+(a `HostObj::Ptr`) print as `&{1 a}` / `&[1 2]` / `&map[k:1]` under every verb,
+and `%T` names them `*main.T` (`parity-scripts/pointer_operand_printing.go`).
+One level down Go prints the pointer's hex address instead, which no two runs
+reproduce, so go-rs keeps printing the value there rather than inventing an
+address.
 
 ## `append` capacity misses Go's malloc size-class rounding
 

@@ -4552,7 +4552,11 @@ impl Compiler {
                 // pointer sees the same struct the original variable holds.
                 if matches!(op, UnOp::Addr | UnOp::Deref) {
                     self.expr(rhs)?;
-                    if matches!(op, UnOp::Deref) && self.is_cell_ptr(rhs) {
+                    // `*p` reads through a captured scalar's cell, and through an
+                    // `&x` pointer object to `x`'s handle — which every reader
+                    // follows anyway, but `fmt` and `%T` must see the value, not
+                    // the pointer, to print `[1 2]` rather than `&[1 2]`.
+                    if matches!(op, UnOp::Deref) {
                         self.b.emit(Op::CallBuiltin(host::GDEREF, 1), 0);
                     }
                     // `&T{…}` (and `new(T)`, which parses to it) allocates: the
@@ -5035,7 +5039,7 @@ impl Compiler {
                 op: UnOp::Deref,
                 ..
             }
-        ) && self.structs.contains(&ty)
+        ) && self.structs.contains(&base_type(&ty))
         {
             self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
             return Ok(());
@@ -6875,6 +6879,11 @@ impl Compiler {
                             )?;
                         } else {
                             self.expr(a)?;
+                            // `*p` hands `fmt` the struct value, not the pointer:
+                            // `{30}`, never `&{30}`.
+                            if matches!(a, Expr::Unary { op: UnOp::Deref, .. }) {
+                                self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), line);
+                            }
                         }
                         // `fmt` renders a float at its own width's precision, so
                         // a statically-`float32` operand carries that width in.

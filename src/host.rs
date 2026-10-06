@@ -3252,7 +3252,16 @@ fn b_clear(vm: &mut VM, argc: u8) -> Value {
 fn b_array_copy(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let elem_ty = args.get(1).map(go_str).unwrap_or_default();
-    array_copy(args.first().cloned().unwrap_or(Value::Undef), &elem_ty)
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    // The compiler's static type of `&a` is `a`'s own, so a `*[N]T` reaches
+    // a bind site typed as the array; the pointer object says what it is, and
+    // Go copies nothing through a pointer.
+    let is_ptr = matches!(&v, Value::Obj(id)
+        if HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Ptr { .. }))));
+    if is_ptr {
+        return v;
+    }
+    array_copy(v, &elem_ty)
 }
 
 /// One value copy for a value of written type `ty`: an array copy when `ty` is
@@ -3641,9 +3650,19 @@ pub(crate) fn go_type_name(v: &Value) -> String {
         Value::Float(_) => "float64".to_string(),
         Value::Str(_) => "string".to_string(),
         Value::Undef => "<nil>".to_string(),
-        Value::Obj(id) => HEAP.with(|h| {
+        // `&T{…}` / `new(T)` (a `by_ref` handle) and `&x` (a `Ptr`) are Go
+        // pointers, so their type is the pointee's behind a `*`.
+        Value::Obj(id) if ptr_identity(v).is_some() => format!("*{}", obj_type_name(follow(*id))),
+        Value::Obj(id) => obj_type_name(follow(*id)),
+        _ => "interface {}".to_string(),
+    }
+}
+
+/// `%T` of the heap object `id` itself, with no pointer in front of it.
+fn obj_type_name(id: u32) -> String {
+    HEAP.with(|h| {
             let h = h.borrow();
-            match h.get(follow(*id) as usize) {
+            match h.get(id as usize) {
                 // A `fmt`-tagged slice names its written element type, which is
                 // the only way `[]uint8` and `[]int32` are distinguishable from
                 // `[]int` — their elements are all plain integers.
@@ -3698,9 +3717,7 @@ pub(crate) fn go_type_name(v: &Value) -> String {
                     .unwrap_or_else(|| "<nil>".to_string()),
                 None => "<nil>".to_string(),
             }
-        }),
-        _ => "interface {}".to_string(),
-    }
+    })
 }
 
 fn elem_type_name(v: Option<&Value>) -> String {
@@ -3723,6 +3740,15 @@ fn elem_type_name(v: Option<&Value>) -> String {
 pub(crate) fn package_qualified(name: &str) -> String {
     if name.starts_with("struct{") {
         return anon_struct_spelling(name);
+    }
+    // The error types the linker synthesizes for `fmt.Errorf` and the host's
+    // `errors.New`-shaped values are Go's `errors.errorString` and
+    // `fmt.wrapError(s)` (`pkg::add_errorf_type`).
+    match name {
+        "$errorString" => return "errors.errorString".to_string(),
+        "$wrapError" => return "fmt.wrapError".to_string(),
+        "$wrapErrors" => return "fmt.wrapErrors".to_string(),
+        _ => {}
     }
     match name.rsplit_once('.') {
         Some((path, ty)) => format!("{}.{ty}", path.rsplit('/').next().unwrap_or(path)),
@@ -3918,6 +3944,22 @@ fn b_named_box(vm: &mut VM, argc: u8) -> Value {
         return inner;
     }
     let ty = args.get(1).map(go_str).unwrap_or_default();
+    // `&g` of a defined composite is a pointer to the named value, so the name
+    // goes behind the pointer: `%T` is `*main.Grid` and `%v` is `&[1 2]`.
+    let target = match &inner {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Ptr { .. }) => Some(Value::Obj(follow(*id))),
+            _ => None,
+        }),
+        _ => None,
+    };
+    if let Some(target) = target {
+        if is_named(&target) {
+            return inner;
+        }
+        let named = heap_alloc(HostObj::Named { ty, inner: target });
+        return Value::Obj(heap_alloc(HostObj::Ptr { target: named }));
+    }
     Value::Obj(heap_alloc(HostObj::Named { ty, inner }))
 }
 
@@ -3935,13 +3977,16 @@ fn b_chan_handle(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
-/// [`GDEREF`] — read through a pointer to a non-struct value.
+/// [`GDEREF`] — `*p`: read through a pointer to a non-struct value, or step
+/// from an `&x` pointer object to the variable's own handle, so the result is
+/// the value `x` rather than a pointer to it.
 fn b_deref(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let p = args.into_iter().next().unwrap_or(Value::Undef);
     let Value::Obj(id) = p else { return p };
     HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Cell(v)) => v.clone(),
+        Some(HostObj::Ptr { target }) => Value::Obj(*target),
         _ => p.clone(),
     })
 }
@@ -4112,8 +4157,12 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             .collect::<Vec<_>>()
             .join(sep)
     };
+    // Go's `printValue` writes a pointer *operand* to an array, slice, struct
+    // or map as `&` and the value it points at; nested one level down it is a
+    // hex address, which is not reproducible, so only depth 0 takes the form.
+    let amp = depth == 0 && pointer_to_composite(&Value::Obj(id));
     let id = follow(id);
-    HEAP.with(|h| {
+    let body = HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
             // Unreachable: `follow` resolved any pointer above.
@@ -4238,6 +4287,38 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             }
             None => "<nil>".to_string(),
         }
+    });
+    if amp {
+        format!("&{body}")
+    } else {
+        body
+    }
+}
+
+/// Whether `v` is a pointer to an array, slice, struct or map — the operand
+/// Go's `printValue` writes as `&` and the value pointed at.
+fn pointer_to_composite(v: &Value) -> bool {
+    match v {
+        Value::Obj(id) => ptr_identity(v).is_some() && points_at_composite(follow(*id)),
+        _ => false,
+    }
+}
+
+/// Whether the heap object `id` is one Go's `printValue` writes behind `&`
+/// when a pointer to it is the operand: an array, slice, struct or map.
+fn points_at_composite(id: u32) -> bool {
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(
+            HostObj::Struct { .. }
+            | HostObj::Slice { .. }
+            | HostObj::SliceView { .. }
+            | HostObj::Map(_)
+            | HostObj::Nil { .. },
+        ) => true,
+        Some(HostObj::Named { inner, .. }) => {
+            slice_elems(inner).is_some() || map_pairs(inner).is_some()
+        }
+        _ => false,
     })
 }
 
@@ -5093,15 +5174,19 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
     // do not come through this path, print the name.
     let unnamed = unname(v);
     let v = &unnamed;
+    // A pointer operand to a composite is `&` and the composite, as under `%v`.
+    let amp = if depth == 0 && pointer_to_composite(v) { "&" } else { "" };
+    let unnamed = unname(v);
+    let v = &unnamed;
     if matches!(verb, 's' | 'q' | 'x' | 'X') {
         if let Some(b) = slice_bytes(v) {
             // Hex reads the bytes themselves: a byte that is not UTF-8 on its
             // own (`171`) must not pass through a lossy string first.
             if matches!(verb, 'x' | 'X') {
-                return pad_text(&hex_bytes(&b, verb, spec), spec);
+                return format!("{amp}{}", pad_text(&hex_bytes(&b, verb, spec), spec));
             }
             let text = Value::str(String::from_utf8_lossy(&b).into_owned());
-            return pad_text(&scalar_verb(&text, verb, spec), spec);
+            return format!("{amp}{}", pad_text(&scalar_verb(&text, verb, spec), spec));
         }
     }
     if let Some(es) = slice_elems(v) {
@@ -5109,7 +5194,7 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
             .iter()
             .map(|e| render_verb(e, verb, spec, depth + 1))
             .collect();
-        return format!("[{}]", body.join(" "));
+        return format!("{amp}[{}]", body.join(" "));
     }
     if let Some(pairs) = map_pairs(v) {
         // `fmt` orders map output by the *key values*, then renders each key and
@@ -5130,21 +5215,21 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
             .collect();
         rows.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
         let body: Vec<String> = rows.into_iter().map(|(_, r)| r).collect();
-        return format!("map[{}]", body.join(" "));
+        return format!("{amp}map[{}]", body.join(" "));
     }
     if let Some(fields) = struct_fields_of(v) {
         let body: Vec<String> = fields
             .iter()
             .map(|(_, f)| render_verb(f, verb, spec, depth + 1))
             .collect();
-        return format!("{{{}}}", body.join(" "));
+        return format!("{amp}{{{}}}", body.join(" "));
     }
     // An empty composite still has the shape of one: a nil slice under a
     // non-string verb is `[]`, a nil map `map[]`.
     if let Some(kind) = nil_composite_kind(v) {
         return match kind {
-            NilKind::Slice => "[]".to_string(),
-            NilKind::Map => "map[]".to_string(),
+            NilKind::Slice => format!("{amp}[]"),
+            NilKind::Map => format!("{amp}map[]"),
         };
     }
     if let Some(bad) = bad_verb(v, verb, spec, depth) {
