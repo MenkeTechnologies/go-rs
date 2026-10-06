@@ -66,6 +66,11 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     }
     init_globals.extend(std::mem::take(&mut main.main));
     main.main = init_globals;
+    // `strconv`'s Go half reaches `ErrSyntax`, so it is linked before the
+    // check below that decides whether the error types are needed.
+    if uses_strconv_source(&main) {
+        add_strconv_source(&mut main)?;
+    }
     // `fmt.Errorf` and the `strconv` conversions build real error values —
     // synthesize their types before `$stringify` so the helper picks up each
     // `Error()` method. The `strconv` sentinels are `errors.New`-shaped, so
@@ -447,6 +452,45 @@ fn add_math_source(prog: &mut Program) -> Result<(), String> {
     Ok(())
 }
 
+/// The names package `strconv` declares in Go source
+/// (`goroot/strconv_source.go`) rather than as host builtins: the unquoting
+/// functions, which return several results, and the `Append*` family.
+/// Rewritten and qualified the way [`SORT_SOURCE`] is.
+pub const STRCONV_SOURCE: &[&str] = &[
+    "Unquote",
+    "UnquoteChar",
+    "QuotedPrefix",
+    "AppendBool",
+    "AppendInt",
+    "AppendUint",
+    "AppendFloat",
+    "AppendQuote",
+    "AppendQuoteToASCII",
+    "AppendQuoteToGraphic",
+    "AppendQuoteRune",
+    "AppendQuoteRuneToASCII",
+    "AppendQuoteRuneToGraphic",
+];
+
+/// Whether the program names one of [`STRCONV_SOURCE`] — called or used as a
+/// value. Only then is the Go half linked. `main` is already qualified here, so
+/// the reference is the identifier `strconv.<Name>` rather than a selector.
+fn uses_strconv_source(prog: &Program) -> bool {
+    program_has_expr(prog, &|e| {
+        matches!(e, Expr::Ident(n)
+            if n.strip_prefix("strconv.").is_some_and(|f| STRCONV_SOURCE.contains(&f)))
+    })
+}
+
+/// Synthesize package `strconv`'s Go half ([`STRCONV_SOURCE`]) and qualify
+/// it under `strconv`.
+fn add_strconv_source(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/strconv_source.go"))?;
+    qualify(&mut pkg, "strconv", true);
+    prog.funcs.append(&mut pkg.funcs);
+    Ok(())
+}
+
 /// Synthesize package `strings`' Go half ([`STRINGS_SOURCE`]) and qualify it
 /// under `strings`.
 fn add_strings_source(prog: &mut Program) -> Result<(), String> {
@@ -760,6 +804,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         }
         if p == "math" {
             source_half.insert(import_alias(p).to_string(), MATH_SOURCE);
+        }
+        if p == "strconv" {
+            source_half.insert(import_alias(p).to_string(), STRCONV_SOURCE);
         }
     }
 

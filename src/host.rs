@@ -5069,6 +5069,7 @@ fn is_verb(c: char) -> bool {
             | 'x'
             | 'X'
             | 'o'
+            | 'O'
             | 'b'
             | 'c'
             | 'U'
@@ -5151,7 +5152,7 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
     }
     let body = scalar_verb(v, verb, spec);
     match verb {
-        'd' | 'o' | 'b' | 'x' | 'X' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+        'd' | 'o' | 'O' | 'b' | 'x' | 'X' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
             pad_number(&body, verb, spec)
         }
         // `fmt.fmtUnicode` clears the `0` flag itself before padding, so `%U` is
@@ -5353,7 +5354,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
         // — and only an unsigned one reads all 64 bits. `#` writes the base
         // prefix after the sign: `-0x9`, `-0b1001`, and a leading `0` for octal
         // where the digits do not already start with one.
-        'x' | 'X' | 'o' | 'b' => {
+        'x' | 'X' | 'o' | 'O' | 'b' => {
             let (neg, mag) = match arg_uint(v) {
                 Some(u) => (false, u),
                 None => {
@@ -5364,7 +5365,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             let mut digits = match verb {
                 'x' => format!("{mag:x}"),
                 'X' => format!("{mag:X}"),
-                'o' => format!("{mag:o}"),
+                'o' | 'O' => format!("{mag:o}"),
                 _ => format!("{mag:b}"),
             };
             let prefix = match (spec.sharp, verb) {
@@ -5383,6 +5384,9 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
                     ""
                 }
             };
+            // `%O` always writes `0o`, outside the precision and after any
+            // leading `0` that `#` added (Go's `fmtInteger`: `%#O` of 8 is `0o010`).
+            let prefix = if verb == 'O' { "0o" } else { prefix };
             int_precision(sign_of(neg, spec), prefix, &digits, spec.prec)
         }
         // A code point outside Unicode — a negative or too-large integer — is
@@ -5460,7 +5464,7 @@ fn bad_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> Option<String> 
         });
     }
     let bad = match verb {
-        'd' | 'o' | 'c' | 'U' => matches!(v, Value::Str(_) | Value::Bool(_) | Value::Float(_)),
+        'd' | 'o' | 'O' | 'c' | 'U' => matches!(v, Value::Str(_) | Value::Bool(_) | Value::Float(_)),
         'b' => matches!(v, Value::Str(_) | Value::Bool(_)),
         'x' | 'X' => matches!(v, Value::Bool(_)),
         'f' | 'F' | 'e' | 'E' | 'g' | 'G' => matches!(v, Value::Str(_) | Value::Bool(_)),
@@ -5562,7 +5566,7 @@ fn pad_number(body: &str, verb: char, spec: &Spec) -> String {
     // Go drops the `0` flag there and pads the rest of the width with spaces:
     // `%05.2d` of `3` is `   03`, not `00003`. A float keeps both, because its
     // precision counts fraction digits rather than leading ones.
-    let zero = spec.zero && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'b'));
+    let zero = spec.zero && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'O' | 'b'));
     if !zero {
         return format!("{}{body}", " ".repeat(fill));
     }
@@ -5577,7 +5581,7 @@ fn pad_number(body: &str, verb: char, spec: &Spec) -> String {
     // seven digits plus the sign make the eight. (Octal's prefix is a `0`,
     // which the fill supplies on its own.)
     let (prefix, digits) = match rest.get(..2) {
-        Some(p @ ("0x" | "0X" | "0b")) => (p, &rest[2..]),
+        Some(p @ ("0x" | "0X" | "0b" | "0o")) => (p, &rest[2..]),
         _ => ("", rest),
     };
     format!("{sign}{prefix}{}{digits}", "0".repeat(fill + prefix.len()))
