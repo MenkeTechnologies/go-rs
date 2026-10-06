@@ -8,11 +8,18 @@
 // and give meaning to. The full package is built on `sync`, `errors` and a
 // dozen adapter types whose behaviour is only observable through a real file
 // descriptor; what a Go program actually names when it writes portable code is
-// the two one-method interfaces below and the helper over them.
+// the two one-method interfaces below, the helper over them, and the
+// `ErrShortWrite` a buffered writer reports.
 //
 // They carry no implementation of their own — an interface is a method set, and
 // go-rs already dispatches one — so the whole package is the contract.
 package io
+
+import "errors"
+
+// ErrShortWrite means that a write accepted fewer bytes than requested
+// but failed to return an explicit error.
+var ErrShortWrite = errors.New("short write")
 
 // Writer is the interface that wraps the basic Write method.
 //

@@ -461,6 +461,9 @@ What is still missing from that corner:
 - **`bytes.Buffer`'s read half** — `Read`, `ReadString`, `Next`, `UnreadByte`
   and the read offset they share. The write half is what a program reaches for
   when it wants somewhere to write, and is what is vendored.
+- **`bufio` is only its `Writer`.** `Reader` and `Scanner` read from an
+  `io.Reader`, which go-rs's `io` does not have, and there is no `os.Stdin`
+  to scan.
 - **`os.File` is only the two standard streams.** There is no `Open`, `Create`
   or `Read` — `writeFd` is the package's one intrinsic and only ever sees
   descriptors 1 and 2.

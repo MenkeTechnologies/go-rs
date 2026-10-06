@@ -13,6 +13,7 @@ pub const PACKAGES: &[(&str, &str)] = &[
     ("unicode/utf16", include_str!("../goroot/utf16.go")),
     ("cmp", include_str!("../goroot/cmp.go")),
     ("io", include_str!("../goroot/io.go")),
+    ("bufio", include_str!("../goroot/bufio.go")),
     ("bytes", include_str!("../goroot/bytes.go")),
     ("iter", include_str!("../goroot/iter.go")),
     ("slices", include_str!("../goroot/slices.go")),
