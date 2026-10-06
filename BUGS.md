@@ -671,39 +671,32 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
 
-## Rebinding through a pointer to a slice, and reading through a pointer to a map
+## Rebinding through a pointer to a slice
 
 ```go
 var s []int
 p := &s
 *p = append(*p, 1)          // go-rs: cannot assign through a pointer to a
                             //        non-composite value
-m := map[string]int{"a": 1}
-mp := &m
-fmt.Println(len(*mp))       // go: 1   go-rs: 0
-fmt.Println((*mp)["a"])     // go-rs: invalid index target
-var e []int
-fmt.Println(*(&e) == nil)   // go: true   go-rs: false
 ```
 
-*Reading* through a `*[]T` is fixed — `len`, `cap`, indexing (read and write),
-`range` and `append`'s operand all follow the `HostObj::Ptr` to the slice
-(`parity-scripts/pointer_to_slice.go`). Three things around it do not:
-
-- **`*p = <slice>`.** `b_deref_set` overwrites the *pointee in place*, which is
-  right for a struct and wrong for a slice: a slice rebind has to change the
-  header the variable holds, and go-rs models a slice as one object, so an
-  in-place overwrite would also be seen through a `t := s` taken earlier, which
-  Go leaves alone. Making it right needs `&s` to address the variable's storage
-  rather than the slice object — the same change the scalar `&x` entry above
-  wants. The accumulator idiom
-  `func add(out *[]int, v int) { *out = append(*out, v) }` is what reaches it.
-- **A pointer to a map.** `len`, indexing and `range` read the `Ptr` rather than
-  the map. Maps are reached through several accessors rather than the two the
-  slice reads share, so the same `follow` is more than a two-line change; `*mp`
-  on its own (printing, assigning) is right.
-- **`*p == nil`.** The comparison sees the pointer, not the pointee, so a
-  dereferenced nil slice is not `nil`.
+*Reading* through a `*[]T` or a `*map[K]V` is fixed — `*p` follows the
+`HostObj::Ptr` to the slice or map, so `len`, `cap`, indexing (read and write),
+`range`, `delete`, `append`'s operand and `*p == nil` all see the value
+(`parity-scripts/pointer_to_slice.go`,
+`parity-scripts/pointer_to_map_and_nil_deref.go`). Writing a new slice through
+the pointer does not: `b_deref_set` overwrites the *pointee in place*, which is
+right for a struct and wrong for a slice: a slice rebind has to change the
+header the variable holds, and go-rs models a slice as one object, so an
+in-place overwrite would also be seen through a `t := s` taken earlier, which
+Go leaves alone. Making it right needs `&s` to address the variable's storage
+rather than the slice object — the same change the scalar `&x` entry above
+wants. The accumulator idiom
+`func add(out *[]int, v int) { *out = append(*out, v) }` is what reaches it,
+and so is every `container/heap` `Push` / `Pop`, whose pointer receiver on a
+slice type is called through the `heap.Interface`: a direct `h.Push(x)` hands
+the method a cell for the receiver, but a call through an interface has no
+variable to hand back.
 
 ## A string cannot hold invalid UTF-8
 
@@ -788,3 +781,30 @@ generic sum or join is right) but which prints as `<nil>`. The vendored
 `iter.Pull` / `Pull2` return that zero once the sequence is over, the same way
 Go's do. Closing it needs the instantiation's type arguments at run time —
 monomorphizing, or passing the type arguments as hidden parameters.
+
+## `%T` of an instantiated generic type omits its type arguments
+
+```go
+type Pair[K comparable, V any] struct{ Key K; Val V }
+fmt.Printf("%T\n", Pair[string, int]{"a", 1})   // go: main.Pair[string,int]
+                                                // go-rs: main.Pair
+```
+
+Type parameters are erased: one `Pair` struct type serves every
+instantiation, and its run-time name is what method dispatch, type switches
+and the struct copy plan are keyed by. Naming the instantiation means carrying
+the type arguments on the value — known at a composite literal outside a
+generic body, but only as type parameters inside one — and stripping them
+wherever the erased name is the key.
+
+## A rune literal is an untyped integer
+
+```go
+r := 'a'
+fmt.Printf("%T\n", r)   // go: int32   go-rs: int
+```
+
+The lexer folds a rune literal to its integer value, so nothing downstream
+knows it was a rune: a variable it initializes is typed `int`. A rune that
+gets its type from a declaration (`var r rune = 'a'`, a `[]rune` element, a
+`range` over a string) is `int32` as in Go.
