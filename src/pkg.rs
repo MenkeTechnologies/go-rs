@@ -619,9 +619,10 @@ fn add_num_error_type(prog: &mut Program) {
 /// Whether the program calls `recover` — the one way it can hold the value a
 /// run-time fault panics with.
 fn uses_recover(prog: &Program) -> bool {
-    program_has_expr(prog, &|e| {
-        matches!(e, Expr::Call { func, .. } if matches!(func.as_ref(), Expr::Ident(n) if n == "recover"))
-    })
+    program_has_expr(
+        prog,
+        &|e| matches!(e, Expr::Call { func, .. } if matches!(func.as_ref(), Expr::Ident(n) if n == "recover")),
+    )
 }
 
 /// Synthesize the `runtime` error types a run-time fault panics with, so the

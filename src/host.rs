@@ -3713,62 +3713,62 @@ pub(crate) fn go_type_name(v: &Value) -> String {
 /// `%T` of the heap object `id` itself, with no pointer in front of it.
 fn obj_type_name(id: u32) -> String {
     HEAP.with(|h| {
-            let h = h.borrow();
-            match h.get(id as usize) {
-                // A `fmt`-tagged slice names its written element type, which is
-                // the only way `[]uint8` and `[]int32` are distinguishable from
-                // `[]int` — their elements are all plain integers.
-                Some(HostObj::Slice {
-                    elems: a,
-                    arr_ty: None,
-                    elem_ty,
-                }) => match elem_ty {
-                    Some(t) => format!("[]{}", go_type_spelling(t)),
-                    None => format!("[]{}", elem_type_name(a.first())),
-                },
-                Some(HostObj::Slice {
-                    arr_ty: Some(ty), ..
-                }) => ty.clone(),
-                Some(HostObj::SliceView {
-                    backing, offset, ..
-                }) => {
-                    let e = match h.get(*backing as usize) {
-                        Some(HostObj::Slice { elems: a, .. }) => a.get(*offset).cloned(),
-                        _ => None,
-                    };
-                    format!("[]{}", elem_type_name(e.as_ref()))
-                }
-                Some(HostObj::Map(m)) => format!(
-                    "map[{}]{}",
-                    elem_type_name(m.first().map(|(k, _)| k)),
-                    elem_type_name(m.first().map(|(_, v)| v))
-                ),
-                // A user-declared struct is qualified by its package, and go-rs
-                // only ever compiles `package main`.
-                Some(HostObj::Struct { type_name, .. }) => package_qualified(type_name),
-                Some(HostObj::Closure { .. }) => "func()".to_string(),
-                Some(HostObj::Cell(v)) => go_type_name(v),
-                // A defined type is named, not described: `main.Weekday`, never
-                // the `int` it is represented as.
-                Some(HostObj::Named { ty, .. }) => go_type_spelling(ty),
-                // A typed nil records the type it was written as, so unlike a
-                // populated slice or map it needs no guess from its contents.
-                Some(HostObj::Nil { ty, .. }) => go_type_spelling(ty),
-                Some(HostObj::F32(_)) => "float32".to_string(),
-                Some(HostObj::U64 { ty, .. }) => ty.clone(),
-                // Every receive site maps the sentinel away, so it is only
-                // reachable if one was missed; name it after what it stands for.
-                Some(HostObj::ChanClosed) => "<nil>".to_string(),
-                // Unreachable: `follow` resolved any pointer above.
-                Some(HostObj::Ptr { .. }) => "<nil>".to_string(),
-                // A spread marker is expanded by `pop_args` before any builtin sees it;
-                // naming it at all means one leaked, so name it after what it holds.
-                Some(HostObj::Spread(xs)) => xs
-                    .first()
-                    .map(go_type_name)
-                    .unwrap_or_else(|| "<nil>".to_string()),
-                None => "<nil>".to_string(),
+        let h = h.borrow();
+        match h.get(id as usize) {
+            // A `fmt`-tagged slice names its written element type, which is
+            // the only way `[]uint8` and `[]int32` are distinguishable from
+            // `[]int` — their elements are all plain integers.
+            Some(HostObj::Slice {
+                elems: a,
+                arr_ty: None,
+                elem_ty,
+            }) => match elem_ty {
+                Some(t) => format!("[]{}", go_type_spelling(t)),
+                None => format!("[]{}", elem_type_name(a.first())),
+            },
+            Some(HostObj::Slice {
+                arr_ty: Some(ty), ..
+            }) => ty.clone(),
+            Some(HostObj::SliceView {
+                backing, offset, ..
+            }) => {
+                let e = match h.get(*backing as usize) {
+                    Some(HostObj::Slice { elems: a, .. }) => a.get(*offset).cloned(),
+                    _ => None,
+                };
+                format!("[]{}", elem_type_name(e.as_ref()))
             }
+            Some(HostObj::Map(m)) => format!(
+                "map[{}]{}",
+                elem_type_name(m.first().map(|(k, _)| k)),
+                elem_type_name(m.first().map(|(_, v)| v))
+            ),
+            // A user-declared struct is qualified by its package, and go-rs
+            // only ever compiles `package main`.
+            Some(HostObj::Struct { type_name, .. }) => package_qualified(type_name),
+            Some(HostObj::Closure { .. }) => "func()".to_string(),
+            Some(HostObj::Cell(v)) => go_type_name(v),
+            // A defined type is named, not described: `main.Weekday`, never
+            // the `int` it is represented as.
+            Some(HostObj::Named { ty, .. }) => go_type_spelling(ty),
+            // A typed nil records the type it was written as, so unlike a
+            // populated slice or map it needs no guess from its contents.
+            Some(HostObj::Nil { ty, .. }) => go_type_spelling(ty),
+            Some(HostObj::F32(_)) => "float32".to_string(),
+            Some(HostObj::U64 { ty, .. }) => ty.clone(),
+            // Every receive site maps the sentinel away, so it is only
+            // reachable if one was missed; name it after what it stands for.
+            Some(HostObj::ChanClosed) => "<nil>".to_string(),
+            // Unreachable: `follow` resolved any pointer above.
+            Some(HostObj::Ptr { .. }) => "<nil>".to_string(),
+            // A spread marker is expanded by `pop_args` before any builtin sees it;
+            // naming it at all means one leaked, so name it after what it holds.
+            Some(HostObj::Spread(xs)) => xs
+                .first()
+                .map(go_type_name)
+                .unwrap_or_else(|| "<nil>".to_string()),
+            None => "<nil>".to_string(),
+        }
     })
 }
 
@@ -5227,7 +5227,11 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
     let unnamed = unname(v);
     let v = &unnamed;
     // A pointer operand to a composite is `&` and the composite, as under `%v`.
-    let amp = if depth == 0 && pointer_to_composite(v) { "&" } else { "" };
+    let amp = if depth == 0 && pointer_to_composite(v) {
+        "&"
+    } else {
+        ""
+    };
     let unnamed = unname(v);
     let v = &unnamed;
     if matches!(verb, 's' | 'q' | 'x' | 'X') {
@@ -5601,7 +5605,9 @@ fn bad_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> Option<String> 
         });
     }
     let bad = match verb {
-        'd' | 'o' | 'O' | 'c' | 'U' => matches!(v, Value::Str(_) | Value::Bool(_) | Value::Float(_)),
+        'd' | 'o' | 'O' | 'c' | 'U' => {
+            matches!(v, Value::Str(_) | Value::Bool(_) | Value::Float(_))
+        }
         'b' => matches!(v, Value::Str(_) | Value::Bool(_)),
         'x' | 'X' => matches!(v, Value::Bool(_)),
         'f' | 'F' | 'e' | 'E' | 'g' | 'G' => matches!(v, Value::Str(_) | Value::Bool(_)),
@@ -5703,7 +5709,8 @@ fn pad_number(body: &str, verb: char, spec: &Spec) -> String {
     // Go drops the `0` flag there and pads the rest of the width with spaces:
     // `%05.2d` of `3` is `   03`, not `00003`. A float keeps both, because its
     // precision counts fraction digits rather than leading ones.
-    let zero = spec.zero && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'O' | 'b'));
+    let zero =
+        spec.zero && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'O' | 'b'));
     if !zero {
         return format!("{}{body}", " ".repeat(fill));
     }

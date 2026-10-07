@@ -4667,8 +4667,7 @@ impl Compiler {
                         }
                     }
                     if pkg == "os" && field == "Args" && !self.scope_has(pkg) {
-                        self.b
-                            .emit(Op::CallBuiltin(host::stdlib::OS_ARGS, 0), 0);
+                        self.b.emit(Op::CallBuiltin(host::stdlib::OS_ARGS, 0), 0);
                         return Ok(());
                     }
                     if pkg == "strconv" && matches!(field.as_str(), "ErrSyntax" | "ErrRange") {
@@ -6886,7 +6885,13 @@ impl Compiler {
                             self.expr(a)?;
                             // `*p` hands `fmt` the struct value, not the pointer:
                             // `{30}`, never `&{30}`.
-                            if matches!(a, Expr::Unary { op: UnOp::Deref, .. }) {
+                            if matches!(
+                                a,
+                                Expr::Unary {
+                                    op: UnOp::Deref,
+                                    ..
+                                }
+                            ) {
                                 self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), line);
                             }
                         }
