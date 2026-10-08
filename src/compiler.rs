@@ -340,6 +340,9 @@ struct Compiler {
     /// types, so it cannot tell `*T` from `T`; `errors.As` needs to, because
     /// the target's type is the dynamic type it looks for in the chain.
     ptr_struct_vars: HashSet<String>,
+    /// Set while the panic epilogue is emitted: its return, after the deferred
+    /// calls ran, ends a goroutine fatally if the panic is still live.
+    unwinding: bool,
     /// Methods whose last parameter is variadic (`func (s *S) Add(xs ...int)`),
     /// whose trailing arguments a call packs into a slice.
     variadic_methods: HashSet<(String, String)>,
@@ -1532,6 +1535,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         methods,
         value_recv_methods,
         ptr_struct_vars: HashSet::new(),
+        unwinding: false,
         variadic_methods,
         method_nresults,
         method_result_ty,
@@ -1855,6 +1859,7 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 1), line);
             self.b.emit(Op::Pop, line);
         }
+        self.emit_goroutine_panic_exit(line);
         self.b.emit(Op::ReturnValue, line);
     }
 
@@ -1869,6 +1874,7 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 1), line);
             self.b.emit(Op::Pop, line);
         }
+        self.emit_goroutine_panic_exit(line);
         let names = self.named_results.clone();
         if names.len() >= 2 {
             let _ = self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, names.len(), line, |c, i| {
@@ -1901,8 +1907,10 @@ impl Compiler {
         // `recover()` may have assigned them). An unnamed-result function returns
         // the result types' zero values so a recovered call still has the right
         // shape.
+        self.unwinding = true;
         if !self.named_results.is_empty() {
             self.emit_named_return(line);
+            self.unwinding = false;
             return;
         }
         if results.len() >= 2 {
@@ -1917,6 +1925,18 @@ impl Compiler {
             self.b.emit(Op::LoadUndef, line);
         }
         self.emit_return(line);
+        self.unwinding = false;
+    }
+
+    /// On the panic epilogue's return path, once the deferred calls have run:
+    /// a panic still live in a goroutine's entry function is fatal
+    /// ([`host::GPANIC_GOROUTINE_EXIT`]). Every other return emits nothing.
+    fn emit_goroutine_panic_exit(&mut self, line: u32) {
+        if self.unwinding {
+            self.b
+                .emit(Op::CallBuiltin(host::GPANIC_GOROUTINE_EXIT, 0), line);
+            self.b.emit(Op::Pop, line);
+        }
     }
 
     /// After a user-function call, if a panic is now propagating, jump to the

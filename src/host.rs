@@ -319,6 +319,11 @@ pub const GDEREF: u16 = 993;
 /// itself, or `-1` — a handle the scheduler never issues, so both answer `0` —
 /// for a nil channel, whose `Undef` would otherwise read as channel `0`.
 pub const GCHAN_HANDLE: u16 = 994;
+/// A function's panic epilogue, after its deferred calls ran: if this frame is
+/// a goroutine's entry and the panic is still live, it is fatal — print it and
+/// exit, as [`GPANIC_FINISH`] does for `main`. Nothing above a goroutine's
+/// entry frame can recover it.
+pub const GPANIC_GOROUTINE_EXIT: u16 = 999;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -458,6 +463,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GPANIC_ACTIVE, b_panic_active);
     vm.register_builtin(GRECOVER, b_recover);
     vm.register_builtin(GPANIC_FINISH, b_panic_finish);
+    vm.register_builtin(GPANIC_GOROUTINE_EXIT, b_panic_goroutine_exit);
     vm.register_builtin(GCELL_NEW, b_cell_new);
     vm.register_builtin(GCELL_GET, b_cell_get);
     vm.register_builtin(GCELL_SET, b_cell_set);
@@ -1107,6 +1113,17 @@ fn b_panic_finish(_vm: &mut VM, _argc: u8) -> Value {
         let msg = runtime_error_message(&v).unwrap_or_else(|| go_str(&v));
         eprintln!("panic: {msg}");
         std::process::exit(2);
+    }
+    Value::Undef
+}
+
+/// [`GPANIC_GOROUTINE_EXIT`]. The scheduler positions a goroutine on a frame
+/// whose return address is one past the program's last op — returning from it
+/// ends the goroutine's run — so that address is what marks the entry frame.
+fn b_panic_goroutine_exit(vm: &mut VM, argc: u8) -> Value {
+    let ops = vm.chunk.ops.len();
+    if vm.frames.last().is_some_and(|f| f.return_ip == ops) {
+        return b_panic_finish(vm, argc);
     }
     Value::Undef
 }

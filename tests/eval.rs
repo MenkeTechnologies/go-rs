@@ -1450,6 +1450,40 @@ fn unrecovered_runtime_panic_aborts() {
 }
 
 #[test]
+fn unrecovered_goroutine_panic_is_fatal() {
+    // A panic that unwinds out of a goroutine's function ends the program with
+    // Go's exit status 2 and `panic:` line, even though `main` is blocked on a
+    // channel the goroutine never sends on — not a deadlock report. Both the
+    // spawn forms (a declared function, a literal) and an unwind through a
+    // nested call are covered.
+    for body in [
+        "go func() {\n\t\tpanic(\"boom\")\n\t}()",
+        "go work()",
+        "go func() {\n\t\tdefer fmt.Println(\"deferred ran\")\n\t\twork()\n\t}()",
+    ] {
+        let src = format!(
+            "package main\nimport \"fmt\"\nfunc work() {{\n\tpanic(\"boom\")\n}}\nfunc main() {{\n\tdone := make(chan bool)\n\tfmt.Println(\"start\")\n\t{body}\n\t<-done\n\tfmt.Println(\"unreachable\")\n}}\n"
+        );
+        let mut f = tempfile::Builder::new().suffix(".go").tempfile().unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_go"))
+            .arg("run")
+            .arg(f.path())
+            .output()
+            .expect("spawn go binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{body}: stderr {stderr:?}");
+        assert!(
+            stderr.starts_with("panic: boom"),
+            "{body}: stderr {stderr:?}"
+        );
+        assert!(!stdout.contains("unreachable"), "{body}: stdout {stdout:?}");
+        assert!(stdout.starts_with("start\n"), "{body}: stdout {stdout:?}");
+    }
+}
+
+#[test]
 fn multi_value_spread_into_call() {
     // `f(g())` where g returns multiple values passes them as f's arguments.
     let src = "\
