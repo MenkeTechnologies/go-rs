@@ -335,6 +335,14 @@ pub const GPANIC_GOROUTINE_EXIT: u16 = 999;
 /// replaced — how `$stringify` hands `fmt` a struct whose exported fields print
 /// through their `String()` / `Error()`.
 pub const GSTRUCT_WITH: u16 = 938;
+/// `[m]` → a slice of map `m`'s keys, in its pair order (empty for a nil map).
+pub const GMAP_KEYS: u16 = 941;
+/// `[m]` → a slice of map `m`'s values, in its pair order.
+pub const GMAP_VALS: u16 = 942;
+/// `[m, keys, vals]` → the display copy `fmt` prints for a map whose keys or
+/// values print through `String()` / `Error()`: `keys` / `vals` are the
+/// rendered [`GMAP_KEYS`] / [`GMAP_VALS`] — see [`HostObj::MapShown`].
+pub const GMAP_SHOWN: u16 = 943;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -478,6 +486,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GPANIC_FATAL_VALUE, b_panic_fatal_value);
     vm.register_builtin(GPANIC_GOROUTINE_EXIT, b_panic_goroutine_exit);
     vm.register_builtin(GSTRUCT_WITH, b_struct_with);
+    vm.register_builtin(GMAP_KEYS, b_map_keys);
+    vm.register_builtin(GMAP_VALS, b_map_vals);
+    vm.register_builtin(GMAP_SHOWN, b_map_shown);
     vm.register_builtin(GCELL_NEW, b_cell_new);
     vm.register_builtin(GCELL_GET, b_cell_get);
     vm.register_builtin(GCELL_SET, b_cell_set);
@@ -1514,6 +1525,15 @@ pub(crate) enum HostObj {
     /// `%T` and `%#v` print. [`b_named_box`] applies it; the formatter unwraps
     /// it everywhere else, and it never reaches the program.
     Named { ty: String, inner: Value },
+    /// A map at a `fmt` argument position whose keys or values print through
+    /// `String()` / `Error()` ([`GMAP_SHOWN`]): each pair's original key, which
+    /// `fmt` sorts by (`internal/fmtsort` orders the keys, not their text), beside
+    /// the rendered key and value. `ty` is the map's own `%T`. Like
+    /// [`HostObj::Named`] it is a display copy the program never holds.
+    MapShown {
+        pairs: Vec<(Value, Value, Value)>,
+        ty: String,
+    },
 }
 
 impl HostObj {
@@ -2956,6 +2976,37 @@ pub(crate) fn make_error(msg: String) -> Value {
     }))
 }
 
+/// [`GMAP_KEYS`].
+fn b_map_keys(vm: &mut VM, argc: u8) -> Value {
+    let m = pop_args(vm, argc).into_iter().next().unwrap_or(Value::Undef);
+    let keys = map_pairs(&m).unwrap_or_default().into_iter().map(|(k, _)| k);
+    Value::Obj(heap_alloc(HostObj::slice(keys.collect())))
+}
+
+/// [`GMAP_VALS`].
+fn b_map_vals(vm: &mut VM, argc: u8) -> Value {
+    let m = pop_args(vm, argc).into_iter().next().unwrap_or(Value::Undef);
+    let vals = map_pairs(&m).unwrap_or_default().into_iter().map(|(_, v)| v);
+    Value::Obj(heap_alloc(HostObj::slice(vals.collect())))
+}
+
+/// [`GMAP_SHOWN`]. A nil map is handed back as it is: it prints `map[]`
+/// whatever its types' methods, and only the nil object knows its `%#v`.
+fn b_map_shown(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc).into_iter();
+    let m = args.next().unwrap_or(Value::Undef);
+    let keys = args.next().and_then(|k| slice_elems(&k)).unwrap_or_default();
+    let vals = args.next().and_then(|v| slice_elems(&v)).unwrap_or_default();
+    let Some(pairs) = map_pairs(&m) else { return m };
+    let pairs = pairs
+        .into_iter()
+        .zip(keys.into_iter().zip(vals))
+        .map(|((k, _), (sk, sv))| (k, sk, sv))
+        .collect();
+    let ty = go_type_name(&m);
+    Value::Obj(heap_alloc(HostObj::MapShown { pairs, ty }))
+}
+
 /// [`GSTRUCT_WITH`]. The copy is for `fmt` alone — the program never holds it —
 /// and a pointer operand yields a pointer copy, so it still prints behind `&`.
 fn b_struct_with(vm: &mut VM, argc: u8) -> Value {
@@ -3918,6 +3969,7 @@ fn obj_type_name(id: u32) -> String {
             // A defined type is named, not described: `main.Weekday`, never
             // the `int` it is represented as.
             Some(HostObj::Named { ty, .. }) => go_type_spelling(ty),
+            Some(HostObj::MapShown { ty, .. }) => ty.clone(),
             // A typed nil records the type it was written as, so unlike a
             // populated slice or map it needs no guess from its contents.
             Some(HostObj::Nil { ty, .. }) => go_type_spelling(ty),
@@ -4432,24 +4484,16 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                 }
             }
             Some(HostObj::Map(m)) => {
-                // `fmt` sorts map keys so map output is deterministic. Sorting
-                // the rendered `k:v` strings is only right when the keys order
-                // the same as their text, so sort on the key values themselves.
-                let mut pairs: Vec<(String, String)> = m
-                    .iter()
-                    .map(|(k, v)| (go_str_mode(k, mode), go_str_mode(v, mode)))
-                    .collect();
-                pairs.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
-                let body = pairs
-                    .into_iter()
-                    .map(|(k, v)| format!("{k}:{v}"))
-                    .collect::<Vec<_>>()
-                    .join(sep);
+                let pairs = m.iter().map(|(k, v)| (k.clone(), k.clone(), v.clone()));
+                let body = map_body(pairs.collect(), mode, sep);
                 if sharp {
                     format!("{}{{{}}}", go_type_name(&Value::Obj(id)), body)
                 } else {
                     format!("map[{body}]")
                 }
+            }
+            Some(HostObj::MapShown { pairs, .. }) => {
+                format!("map[{}]", map_body(pairs.clone(), mode, sep))
             }
             // A `float32` prints its own width's shortest decimal.
             Some(HostObj::F32(f)) => format_float32(*f),
@@ -4557,6 +4601,23 @@ fn points_at_composite(id: u32) -> bool {
 /// Order two rendered map keys the way `fmt` orders the underlying values:
 /// numerically when both parse as numbers, lexicographically otherwise. Plain
 /// string sorting would put `10` before `9`.
+/// The `k:v` pairs of a printed map, joined by `sep`. `fmt` sorts map keys so
+/// map output is deterministic, on the key values rather than their text — so
+/// each pair is `(sort key, shown key, shown value)`, which differ only for a
+/// [`HostObj::MapShown`] key rendered through its `String()`.
+fn map_body(pairs: Vec<(Value, Value, Value)>, mode: FmtMode, sep: &str) -> String {
+    let mut pairs: Vec<(String, String, String)> = pairs
+        .iter()
+        .map(|(k, sk, sv)| (go_str_mode(k, FmtMode::V), go_str_mode(sk, mode), go_str_mode(sv, mode)))
+        .collect();
+    pairs.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
+    pairs
+        .into_iter()
+        .map(|(_, k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
 fn map_key_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<f64>(), b.parse::<f64>()) {
         (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),

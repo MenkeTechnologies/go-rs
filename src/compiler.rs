@@ -6309,21 +6309,31 @@ impl Compiler {
     /// `String()` / `Error()` method, or through such a field, or `None`.
     fn stringify_all_helper(&self, e: &Expr) -> Option<String> {
         let ty = self.underlying(&self.type_name(e));
-        let elem = ty
-            .strip_prefix("[]")
-            .or_else(|| array_elem_ty(&ty))?
-            .to_string();
+        let elem = ty.strip_prefix("[]").or_else(|| array_elem_ty(&ty))?;
+        self.stringify_elems_helper(elem)
+    }
+
+    /// For a `fmt` operand of static type `map[K]V` where `K` or `V` prints
+    /// through a method: the `$stringifyAll_T` helper rendering its keys and
+    /// the one rendering its values, `None` for a side printed plainly.
+    fn stringify_map_helpers(&self, e: &Expr) -> Option<(Option<String>, Option<String>)> {
+        let ty = self.underlying(&self.type_name(e));
+        let (k, v) = map_split(&ty)?;
+        let helpers = (self.stringify_elems_helper(k), self.stringify_elems_helper(v));
+        (helpers.0.is_some() || helpers.1.is_some()).then_some(helpers)
+    }
+
+    /// The `$stringifyAll_T` helper that renders `[]elem` through `String()` /
+    /// `Error()`, or `None` when an `elem` value prints plainly.
+    fn stringify_elems_helper(&self, elem: &str) -> Option<String> {
         // Elements of an interface type carry their own dynamic types, and one
         // helper serves every such slice.
-        if self.is_iface_ty(&elem) {
+        if self.is_iface_ty(elem) {
             let helper = "$stringifyAll_any".to_string();
             return self.funcs.contains_key(&helper).then_some(helper);
         }
-        let base = base_type(&elem);
+        let base = base_type(elem);
         let helper = format!("$stringifyAll_{base}");
-        if !self.funcs.contains_key(&helper) {
-            return None;
-        }
         if !self.funcs.contains_key(&helper) {
             return None;
         }
@@ -6342,6 +6352,37 @@ impl Compiler {
             || on_value
             || !(has("String") || has("Error"));
         applies.then_some(helper)
+    }
+
+    /// `fmt`'s display copy of map `m` ([`host::GMAP_SHOWN`]): its keys and
+    /// values, each side sent through its `$stringifyAll_T` helper when it has
+    /// one, beside the map itself.
+    fn emit_map_shown(
+        &mut self,
+        m: &Expr,
+        keys: Option<String>,
+        vals: Option<String>,
+        line: u32,
+    ) -> Result<(), String> {
+        let tmp = format!("$mshow{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.expr(m)?;
+        self.types.insert(tmp.clone(), NumType::Unknown);
+        self.emit_set(&tmp, line);
+        self.emit_get(&tmp, line);
+        for (side, helper) in [(host::GMAP_KEYS, keys), (host::GMAP_VALS, vals)] {
+            self.emit_get(&tmp, line);
+            self.b.emit(Op::CallBuiltin(side, 1), line);
+            if let Some(helper) = helper {
+                let part = format!("$mpart{}", self.temp_counter);
+                self.temp_counter += 1;
+                self.types.insert(part.clone(), NumType::Unknown);
+                self.emit_set(&part, line);
+                self.call(&Expr::Ident(helper), &[Expr::Ident(part)], false, line)?;
+            }
+        }
+        self.b.emit(Op::CallBuiltin(host::GMAP_SHOWN, 3), line);
+        Ok(())
     }
 
     /// The function type a `fmt` operand is statically known to have, for
@@ -7191,6 +7232,14 @@ impl Compiler {
                         };
                         // A `[]T` / `[N]T` whose element type prints through a
                         // method is rendered element by element.
+                        // A `map[K]V` whose keys or values print through a
+                        // method: both sides rendered, the keys kept for sorting.
+                        if has_stringify && calls_methods {
+                            if let Some((keys, vals)) = self.stringify_map_helpers(a) {
+                                self.emit_map_shown(a, keys, vals, line)?;
+                                continue;
+                            }
+                        }
                         if has_stringify && calls_methods {
                             if let Some(helper) = self.stringify_all_helper(a) {
                                 self.call(
