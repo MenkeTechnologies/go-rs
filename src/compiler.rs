@@ -5656,11 +5656,6 @@ impl Compiler {
         Ok(true)
     }
 
-    /// Lower a method call `recv.method(args)`. The receiver's static type names
-    /// the method set; the receiver is passed as the first (deepest) argument.
-    /// A *pointer*-receiver method gets the caller's own struct handle, so a
-    /// field it writes is observed by the caller; a value-receiver one gets a
-    /// copy ([`Self::emit_recv_copy`]) and cannot write through.
     /// Refuse `x.name` when it is ambiguous on `x`'s struct type, as Go's
     /// compiler does (`ambiguous selector x.name`).
     fn check_selector(&self, recv: &Expr, name: &str, line: u32) -> Result<(), String> {
@@ -5677,6 +5672,11 @@ impl Compiler {
         ))
     }
 
+    /// Lower a method call `recv.method(args)`. The receiver's static type names
+    /// the method set; the receiver is passed as the first (deepest) argument.
+    /// A *pointer*-receiver method gets the caller's own struct handle, so a
+    /// field it writes is observed by the caller; a value-receiver one gets a
+    /// copy ([`Self::emit_recv_copy`]) and cannot write through.
     fn method_call(
         &mut self,
         recv: &Expr,
