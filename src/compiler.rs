@@ -5479,6 +5479,28 @@ impl Compiler {
         }
     }
 
+    /// The receiver type a method expression names — `T` in `T.m`, `*T` in
+    /// `(*T).m` — or `None` when `recv` is a value. A variable shadowing a
+    /// type name is still a variable.
+    fn method_expr_type(&self, recv: &Expr) -> Option<String> {
+        let names_type = |n: &String| {
+            (self.structs.contains(n) || self.defined_types.contains_key(n))
+                && !self.decl_types.contains_key(n)
+                && !self.scope_has(n)
+        };
+        match recv {
+            Expr::Ident(n) if names_type(n) => Some(n.clone()),
+            Expr::Unary {
+                op: UnOp::Deref,
+                rhs,
+            } => match rhs.as_ref() {
+                Expr::Ident(n) if names_type(n) => Some(format!("*{n}")),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Emit the closure a *method value* or *method expression* denotes, and
     /// answer whether the selector was one. `false` leaves an ordinary field
     /// read to the caller.
@@ -5497,18 +5519,14 @@ impl Compiler {
     /// work and the call dispatches exactly as a written one would — including
     /// dynamically, when the receiver's type is an interface.
     fn method_value(&mut self, recv: &Expr, field: &str) -> Result<bool, String> {
-        // `sq.Area` — the receiver names a *type*, not a value. A variable
-        // shadowing a type name is still a variable.
-        let is_type = matches!(recv, Expr::Ident(n)
-            if self.structs.contains(n) && !self.decl_types.contains_key(n));
-        let ty = match (is_type, recv) {
-            (true, Expr::Ident(n)) => n.clone(),
-            _ => self.type_name(recv),
-        };
+        // `sq.Area` / `(*sq).Area` — the receiver names a *type*, not a value.
+        let expr_ty = self.method_expr_type(recv);
+        let is_type = expr_ty.is_some();
+        let ty = expr_ty.unwrap_or_else(|| self.type_name(recv));
         if ty.is_empty() {
             return Ok(false);
         }
-        let key = (ty.clone(), field.to_string());
+        let key = (base_type(&ty), field.to_string());
         // A concrete type declares the method; an interface only names it, and
         // its method set carries the shape (`Get/0:int`).
         let (arity, ptys, results) = match self.methods.get(&key) {
@@ -5575,6 +5593,11 @@ impl Compiler {
                     self.methods.contains_key(&key) && !self.value_recv_methods.contains(&key);
                 if ptr_recv {
                     self.expr(recv)?;
+                } else if self.structs.contains(&key.0) {
+                    // A value receiver is copied even when `recv` is a
+                    // pointer: `f := p.Get` binds `*p` as it is now.
+                    self.expr(recv)?;
+                    self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
                 } else {
                     self.emit_value(recv)?;
                 }
@@ -7447,6 +7470,25 @@ impl Compiler {
                     // base) unwinds to a `recover` like any other.
                     self.emit_panic_check(line);
                     return Ok(());
+                }
+            }
+            // A method expression called in place: `T.m(x, args…)` and
+            // `(*T).m(p, args…)` are `x.m(args…)` / `p.m(args…)`.
+            if let Some(ty) = self.method_expr_type(recv) {
+                if let Some((first, rest)) = args.split_first() {
+                    // The receiver argument takes the receiver's type, which
+                    // an untyped constant (`Celsius.F(100)`) only has once
+                    // converted to it.
+                    let first = match self.defined_types.contains_key(&ty) {
+                        true => Expr::Call {
+                            func: Box::new(Expr::Ident(ty)),
+                            args: vec![first.clone()],
+                            spread: false,
+                            line,
+                        },
+                        false => first.clone(),
+                    };
+                    return self.method_call(&first, field, rest, spread, line);
                 }
             }
             // Otherwise a method call `recv.method(args)`.
