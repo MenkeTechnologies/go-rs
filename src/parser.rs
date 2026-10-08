@@ -2949,6 +2949,15 @@ impl Parser {
             self.expect(&Tok::RParen)?;
             return Ok(Expr::MakeChan { cap, elem_ty });
         }
+        // `make(T, …)` for a defined slice or map type makes its base and
+        // converts it to `T`, the way `T{…}` is parsed — so the result has
+        // `T`'s methods rather than being made as a slice whatever `T` is.
+        let line = self.line();
+        let written = ty.clone();
+        let mut ty = ty;
+        while let Some(base) = self.defined.get(&ty).filter(|b| **b != ty) {
+            ty = base.clone();
+        }
         let is_map = ty.starts_with("map[");
         let mut len = None;
         let mut cap = None;
@@ -2964,7 +2973,7 @@ impl Parser {
         // the only place that type survives, and what lets a `m[k]` element be
         // typed at a use site.
         let elem_ty = ty.strip_prefix("[]").unwrap_or("");
-        Ok(Expr::Make {
+        let make = Expr::Make {
             is_map,
             len,
             cap,
@@ -2977,6 +2986,15 @@ impl Parser {
             // `zero_value_expr` — without it `make([]T, n)` fills with integers
             // and the first `s[i].f = v` panics on a nil dereference.
             elem_zero: Box::new(self.zero_value_expr(elem_ty)),
+        };
+        if written == ty {
+            return Ok(make);
+        }
+        Ok(Expr::Call {
+            func: Box::new(Expr::Ident(written)),
+            args: vec![make],
+            spread: false,
+            line,
         })
     }
 }
