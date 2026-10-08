@@ -79,7 +79,7 @@ struct Parser {
     /// Anonymous struct types encountered (`struct{…}` in a type or literal
     /// position), keyed by a canonical name synthesized from their fields, so an
     /// identical shape shares one type. Merged into the program's declared types.
-    anon_structs: HashMap<String, Vec<Param>>,
+    anon_structs: HashMap<String, (Vec<Param>, Vec<String>)>,
     /// Anonymous interface types with a method set (`interface{ Unwrap() error }`
     /// in a type-assertion or type-switch position), keyed by the canonical name
     /// [`iface_name`] builds, so an identical method set shares one type. Merged
@@ -488,8 +488,12 @@ impl Parser {
         interfaces.append(&mut self.local_interfaces);
         // Register anonymous struct types (`struct{…}` used as a type or literal)
         // so the compiler can zero-fill and field-access them.
-        for (name, fields) in std::mem::take(&mut self.anon_structs) {
-            types.push(StructDecl { name, fields });
+        for (name, (fields, embedded)) in std::mem::take(&mut self.anon_structs) {
+            types.push(StructDecl {
+                name,
+                fields,
+                embedded,
+            });
         }
         // Register anonymous interface types (`interface{ Unwrap() error }` in a
         // type-assertion or type-switch position) so the compiler can test a
@@ -668,8 +672,12 @@ impl Parser {
             }
             _ => {
                 self.expect(&Tok::Struct)?;
-                let fields = self.struct_field_list()?;
-                Ok(Some(TypeDecl::Struct(StructDecl { name, fields })))
+                let (fields, embedded) = self.struct_field_list()?;
+                Ok(Some(TypeDecl::Struct(StructDecl {
+                    name,
+                    fields,
+                    embedded,
+                })))
             }
         }
     }
@@ -748,12 +756,14 @@ impl Parser {
         Ok(self.results()?.into_iter().map(|(_, ty)| ty).collect())
     }
 
-    /// Parse a `{ field-decls }` struct body into its fields. The `struct`
-    /// keyword is already consumed; the opening `{` is the current token.
-    fn struct_field_list(&mut self) -> Result<Vec<Param>, String> {
+    /// Parse a `{ field-decls }` struct body into its fields and the names of
+    /// the embedded ones. The `struct` keyword is already consumed; the opening
+    /// `{` is the current token.
+    fn struct_field_list(&mut self) -> Result<(Vec<Param>, Vec<String>), String> {
         self.expect(&Tok::LBrace)?;
         self.skip_semis();
         let mut fields = Vec::new();
+        let mut embedded = Vec::new();
         while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
             // An embedded field is a bare type with no name: `struct { Base }`.
             // Its field name is the type's own name (the last component of a
@@ -761,6 +771,7 @@ impl Parser {
             if let Some(ty) = self.embedded_field()? {
                 let bare = ty.trim_start_matches('*');
                 let name = bare.rsplit('.').next().unwrap_or(bare).to_string();
+                embedded.push(name.clone());
                 fields.push(Param { name, ty });
                 self.skip_semis();
                 continue;
@@ -780,7 +791,7 @@ impl Parser {
             self.skip_semis();
         }
         self.expect(&Tok::RBrace)?;
-        Ok(fields)
+        Ok((fields, embedded))
     }
 
     /// An embedded field at the current position — `Base`, `pkg.Base`, or
@@ -825,14 +836,16 @@ impl Parser {
     /// and return that name. Identical shapes share one type.
     fn anon_struct_type(&mut self) -> Result<String, String> {
         self.expect(&Tok::Struct)?;
-        let fields = self.struct_field_list()?;
+        let (fields, embedded) = self.struct_field_list()?;
         let inner = fields
             .iter()
             .map(|f| format!("{} {}", f.name, f.ty))
             .collect::<Vec<_>>()
             .join("; ");
         let name = format!("struct{{{inner}}}");
-        self.anon_structs.entry(name.clone()).or_insert(fields);
+        self.anon_structs
+            .entry(name.clone())
+            .or_insert((fields, embedded));
         Ok(name)
     }
 

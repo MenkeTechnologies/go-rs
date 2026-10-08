@@ -36,6 +36,17 @@ pub struct Program {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<Param>,
+    /// The fields declared without a name (`struct { Base; *pkg.Ptr }`), whose
+    /// name is their type's — the ones that promote fields and methods. A named
+    /// field whose name happens to be its type's (`Kind Kind`) is not one.
+    pub embedded: Vec<String>,
+}
+
+impl StructDecl {
+    /// Whether field `name` is an embedded field.
+    pub fn is_embedded(&self, name: &str) -> bool {
+        self.embedded.iter().any(|e| e == name)
+    }
 }
 
 /// A `type I interface { m(...) ...; … }` declaration — its method-set names.

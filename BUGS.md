@@ -24,14 +24,14 @@ A gap listed here is deliberately **not** represented by a corpus file, because
 the corpus is a green byte-parity gate. Close the gap and add the corpus file in
 the same change.
 
-## A defined type reached only through a type parameter or a nested value prints bare
+## A defined type reached only through a type parameter or a map prints bare
 
 ```go
 type Weekday int
 func (d Weekday) String() string { return "Wed" }
 func show[T any](v T) { fmt.Println(v) }
-show(Weekday(3))                      // go: Wed      go-rs: 3
-fmt.Println(struct{ D Weekday }{3})   // go: {Wed}    go-rs: {3}
+show(Weekday(3))                         // go: Wed         go-rs: 3
+fmt.Println(map[string]Weekday{"a": 1})  // go: map[a:Wed]  go-rs: map[a:1]
 ```
 
 A defined non-struct value is boxed with its type name
@@ -41,10 +41,12 @@ interface — and unwrapped where it leaves one for a concrete type. That is
 what dispatch, type switches, assertions, `==` and `%T` read, so a `Weekday` in
 an `any` behaves as Go's does. Two conversions are not seen: a generic
 parameter is erased to its constraint rather than typed as an interface, and a
-struct field or map value is formatted by the host, which cannot call a
-method. A top-level operand — including a method result of the defined type and an
-element of a defined slice of it — and a `[]T` / `[N]T` / `[]any` (or a defined
-type over one) are rendered through the method. The same erasure keeps `float32` / `uint64` widths out of an `any`,
+map key or value is formatted by the host, which cannot call a method. A
+top-level operand — including a method result of the defined type and an
+element of a defined slice of it — a `[]T` / `[N]T` / `[]any` (or a defined
+type over one), and an exported struct field (`$stringify`'s `$withFields`
+display copy, `parity-scripts/stringer_struct_fields.go`) are rendered through
+the method. The same erasure keeps `float32` / `uint64` widths out of an `any`,
 and a `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, because
 `&x` on a scalar has no address (the entry below).
 

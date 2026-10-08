@@ -1129,16 +1129,12 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
         .iter()
         .map(|t| (t.name.as_str(), t.fields.iter().collect()))
         .collect();
-    // A field is embedded when its name is its type's own name.
+    // The embedded fields of `ty`, by name — which is their type's name.
     let embedded = |ty: &str| -> Vec<String> {
-        field_types
-            .get(ty)
-            .map(|fs| {
-                fs.iter()
-                    .filter(|p| p.name == base_type(&p.ty).rsplit('.').next().unwrap_or_default())
-                    .map(|p| p.name.clone())
-                    .collect()
-            })
+        prog.types
+            .iter()
+            .find(|t| t.name == ty)
+            .map(|t| t.embedded.clone())
             .unwrap_or_default()
     };
     let declared: HashSet<(&str, &str)> = prog
@@ -1207,7 +1203,7 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
                 let Some(sigs) = iface_sigs.get(base_type(&f.ty).as_str()) else {
                     continue;
                 };
-                if f.name != base_type(&f.ty).rsplit('.').next().unwrap_or_default() {
+                if !t.is_embedded(&f.name) {
                     continue; // a named field, not an embedded one
                 }
                 for sig in *sigs {
@@ -1416,12 +1412,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     for _ in 0..prog.types.len() {
         let mut grew = false;
         for t in &prog.types {
-            // An embedded field is the one whose name is its own type.
-            for f in t
-                .fields
-                .iter()
-                .filter(|f| f.name == base_type(&f.ty).rsplit('.').next().unwrap_or_default())
-            {
+            for f in t.fields.iter().filter(|f| t.is_embedded(&f.name)) {
                 let inner = base_type(&f.ty);
                 let inner_all = all_methods.get(&inner).cloned().unwrap_or_default();
                 let to_value = match f.ty.starts_with('*') {
@@ -3476,7 +3467,9 @@ impl Compiler {
                 if self.iface_of(&bound_ty).is_none() && !self.runtime_tag(&bound_ty).is_empty() {
                     self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
                 }
-                self.decl_types.insert(name.clone(), bound_ty);
+                // Like every declared type here, a pointer is recorded by its
+                // base, which is what field and method lookups key on.
+                self.decl_types.insert(name.clone(), base_type(&bound_ty));
                 self.emit_declare(name, line);
             }
             for s in &case.body {
@@ -6175,9 +6168,7 @@ impl Compiler {
 
     /// The synthesized `$stringifyAll_T` for a `fmt` operand whose static type
     /// is a slice or array of a type `T` that `fmt` prints through its
-    /// `String()` / `Error()` method, or `None`. A value element uses the
-    /// method only when it is declared on the value receiver, which is Go's
-    /// method-set rule; a pointer element reaches either kind.
+    /// `String()` / `Error()` method, or through such a field, or `None`.
     fn stringify_all_helper(&self, e: &Expr) -> Option<String> {
         let ty = self.underlying(&self.type_name(e));
         let elem = ty
@@ -6195,11 +6186,24 @@ impl Compiler {
         if !self.funcs.contains_key(&helper) {
             return None;
         }
+        if !self.funcs.contains_key(&helper) {
+            return None;
+        }
+        // The helper sends each element through `$stringify`, whose struct
+        // cases follow Go's method sets exactly. Any other type has one tag
+        // for a value and a pointer (`&x` on a scalar is the value), so a
+        // value element of it uses a method only when the value receiver
+        // declares one.
+        let has = |m: &str| self.methods.contains_key(&(base.clone(), m.to_string()));
         let on_value = ["String", "Error"].iter().any(|m| {
             self.value_recv_methods
                 .contains(&(base.clone(), m.to_string()))
         });
-        (elem.starts_with('*') || on_value).then_some(helper)
+        let applies = self.structs.contains(&base)
+            || elem.starts_with('*')
+            || on_value
+            || !(has("String") || has("Error"));
+        applies.then_some(helper)
     }
 
     /// The function type a `fmt` operand is statically known to have, for
@@ -7264,6 +7268,15 @@ impl Compiler {
                 self.expr(&args[0])?;
                 self.expr(&args[1])?;
                 self.b.emit(Op::CallBuiltin(host::GSLICE_OVERLAP, 2), line);
+                return Ok(());
+            }
+            // `$stringify`'s display copy of a struct (`pkg::add_stringify`).
+            if name == "$withFields" {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.b
+                    .emit(Op::CallBuiltin(host::GSTRUCT_WITH, args.len() as u8), line);
                 return Ok(());
             }
             if name == "errors.runtimeTypeTag" && args.len() == 1 {

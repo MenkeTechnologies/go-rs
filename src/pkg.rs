@@ -564,6 +564,7 @@ fn add_errorf_type(prog: &mut Program) {
         prog.types.push(StructDecl {
             name: ty.to_string(),
             fields,
+            embedded: Vec::new(),
         });
         prog.funcs.push(getter(ty, "Error", "s", "string"));
         if let (Some((field, _)), Some(ret)) = (extra, unwrap_ret) {
@@ -660,6 +661,13 @@ fn add_runtime_error_types(prog: &mut Program) {
 /// zero-argument `Error()`/`String()` method that calls it — so `fmt` prints
 /// error and `Stringer` values via their method (Go's fmt interface handling).
 /// The compiler wraps each `fmt.Print*`/`Sprint*` argument with a call to it.
+///
+/// Go's `fmt` applies the same rule to the exported fields of a struct it
+/// prints (`printValue` calls `handleMethods` on any field it can take an
+/// interface of), so a struct with such a field gets a case too: it returns a
+/// display copy whose method-bearing fields are already rendered
+/// (`$withFields`). An unexported field is printed as its plain value, as Go
+/// cannot call a method through it.
 fn add_stringify(prog: &mut Program) {
     // Every type that has `String()` / `Error()` — declared, or promoted from
     // an embedded field — with whether a *value* of it has the method (Go's
@@ -694,83 +702,113 @@ fn add_stringify(prog: &mut Program) {
     if reach.is_empty() {
         return;
     }
-    let mut types: Vec<(String, &str)> = reach.iter().map(|(t, _, m)| (t.clone(), *m)).collect();
-    types.sort(); // deterministic case order
-                  // `fmt` prints a slice or array element through its method too — `[]Color`
-                  // prints `[G B]` — and an element is not an operand the per-argument
-                  // helper sees. For each program type (a package's own are left alone) a
-                  // `$stringifyAll_T(xs []T) []any` renders the elements through the method,
-                  // and the compiler routes a `[]T` / `[N]T` operand through it.
-                  // A `[]any` holds its elements already boxed with their dynamic types, so
-                  // its one helper sends each through `$stringify` itself. Go source cannot
-                  // name `$stringify`, so the call is written against a placeholder and
-                  // renamed in the parsed loop body.
-    let src = "package p\nfunc h(xs []any) []any {\n\tout := make([]any, len(xs))\n\tfor i := 0; i < len(xs); i++ {\n\t\tout[i] = placeholder(xs[i])\n\t}\n\treturn out\n}\n";
-    if let Ok(mut p) = crate::parse(src) {
-        if let Some(mut f) = p.funcs.pop() {
-            for s in &mut f.body {
-                if let Stmt::For { body, .. } = s {
-                    for s in body {
-                        if let Stmt::Assign {
-                            value: Expr::Call { func, .. },
-                            ..
-                        } = s
-                        {
-                            **func = Expr::Ident("$stringify".to_string());
-                        }
+    let shown = ShownTypes::new(prog, &reach);
+
+    // `fmt` prints a slice or array element through its method too — `[]Color`
+    // prints `[G B]` — and an element is not an operand the per-argument
+    // helper sees. For each program type (a package's own are left alone) a
+    // `$stringifyAll_T(xs []T) []any` sends the elements through `$stringify`,
+    // and the compiler routes a `[]T` / `[N]T` operand through it; `[]any`
+    // gets one too. Go source cannot name `$stringify`, so the call is written
+    // against a placeholder and renamed in the parsed loop body.
+    let mut all_types: Vec<String> = shown.any_method.iter().cloned().collect();
+    all_types.extend(shown.rebuilt.iter().cloned());
+    all_types.retain(|t| !t.contains('.'));
+    all_types.sort();
+    all_types.dedup();
+    for (elem, name) in std::iter::once(("any".to_string(), "any".to_string()))
+        .chain(all_types.iter().map(|t| (t.clone(), t.clone())))
+    {
+        let src = format!(
+            "package p\nfunc h(xs []{elem}) []any {{\n\tout := make([]any, len(xs))\n\tfor i := 0; i < len(xs); i++ {{\n\t\tout[i] = placeholder(xs[i])\n\t}}\n\treturn out\n}}\n"
+        );
+        let Ok(mut p) = crate::parse(&src) else {
+            continue;
+        };
+        let Some(mut f) = p.funcs.pop() else { continue };
+        for s in &mut f.body {
+            if let Stmt::For { body, .. } = s {
+                for s in body {
+                    if let Stmt::Assign {
+                        value: Expr::Call { func, .. },
+                        ..
+                    } = s
+                    {
+                        **func = Expr::Ident("$stringify".to_string());
                     }
                 }
             }
-            f.name = "$stringifyAll_any".to_string();
-            prog.funcs.push(f);
         }
+        f.name = format!("$stringifyAll_{name}");
+        prog.funcs.push(f);
     }
-    for (ty, method) in &types {
-        if ty.contains('.') {
-            continue;
-        }
-        let src = format!(
-            "package p\nfunc h(xs []{ty}) []any {{\n\tout := make([]any, len(xs))\n\tfor i := 0; i < len(xs); i++ {{\n\t\tout[i] = xs[i].{method}()\n\t}}\n\treturn out\n}}\n"
-        );
-        if let Ok(mut p) = crate::parse(&src) {
-            if let Some(mut f) = p.funcs.pop() {
-                f.name = format!("$stringifyAll_{ty}");
-                prog.funcs.push(f);
-            }
-        }
-    }
+
     // A struct value and a pointer to one are distinct dynamic types: the value
     // has only its value-receiver methods, the pointer has them all. So a
     // struct's `T` case calls the method its value has, if any, and its `*T`
     // case the one the pointer has. Any other type has one tag for both.
-    let structs: HashSet<&str> = prog.types.iter().map(|t| t.name.as_str()).collect();
-    let mut arms: Vec<(String, &str)> = Vec::new();
-    for (ty, on_value, on_ptr) in reach {
-        if !structs.contains(ty.as_str()) {
-            arms.push((ty, on_ptr));
+    let call = |func: Expr, args: Vec<Expr>| Expr::Call {
+        func: Box::new(func),
+        args,
+        spread: false,
+        line: 0,
+    };
+    let method_call = |method: &str| {
+        call(
+            Expr::Selector {
+                recv: Box::new(Expr::Ident("$t".to_string())),
+                field: method.to_string(),
+            },
+            vec![],
+        )
+    };
+    let mut arms: Vec<(String, Expr)> = Vec::new();
+    for (ty, on_value, on_ptr) in &reach {
+        if !shown.structs.contains(ty.as_str()) {
+            arms.push((ty.clone(), method_call(on_ptr)));
             continue;
         }
         if let Some(m) = on_value {
-            arms.push((ty.clone(), m));
+            arms.push((ty.clone(), method_call(m)));
         }
-        arms.push((format!("*{ty}"), on_ptr));
+        arms.push((format!("*{ty}"), method_call(on_ptr)));
+    }
+    // A struct that prints some field through a method: `$withFields($t,
+    // "F", rendered, …)` copies it with those fields replaced. The pointer
+    // gets the same case unless it has a method of its own.
+    let mut rebuilt: Vec<&String> = shown.rebuilt.iter().collect();
+    rebuilt.sort();
+    for ty in rebuilt {
+        let Some(decl) = prog.types.iter().find(|t| &t.name == ty) else {
+            continue;
+        };
+        let mut args = vec![Expr::Ident("$t".to_string())];
+        for f in &decl.fields {
+            let Some(each) = shown.field_rendering(&f.name, &f.ty) else {
+                continue;
+            };
+            let field = Expr::Selector {
+                recv: Box::new(Expr::Ident("$t".to_string())),
+                field: f.name.clone(),
+            };
+            let helper = match each {
+                Some(elem) => format!("$stringifyAll_{elem}"),
+                None => "$stringify".to_string(),
+            };
+            args.push(Expr::Str(f.name.clone()));
+            args.push(call(Expr::Ident(helper), vec![field]));
+        }
+        let rebuild = call(Expr::Ident("$withFields".to_string()), args);
+        arms.push((ty.clone(), rebuild.clone()));
+        if !shown.any_method.contains(ty) {
+            arms.push((format!("*{ty}"), rebuild));
+        }
     }
     let cases: Vec<TypeSwitchCase> = arms
         .into_iter()
-        .map(|(ty, method)| TypeSwitchCase {
+        .map(|(ty, value)| TypeSwitchCase {
             types: vec![ty],
-            body: vec![Stmt::Return(
-                vec![Expr::Call {
-                    func: Box::new(Expr::Selector {
-                        recv: Box::new(Expr::Ident("$t".to_string())),
-                        field: method.to_string(),
-                    }),
-                    args: vec![],
-                    spread: false,
-                    line: 0,
-                }],
-                0,
-            )],
+            body: vec![Stmt::Return(vec![value], 0)],
         })
         .collect();
     prog.funcs.push(Func {
@@ -798,6 +836,90 @@ fn add_stringify(prog: &mut Program) {
     });
 }
 
+/// Which types `fmt` prints through a method, as `add_stringify` sees them.
+struct ShownTypes {
+    /// Every struct type name.
+    structs: HashSet<String>,
+    /// Types a *value* of which has `String()` / `Error()`.
+    on_value: HashSet<String>,
+    /// Types whose value or pointer has one.
+    any_method: HashSet<String>,
+    /// Interface types, whose dynamic value decides at run time.
+    interfaces: HashSet<String>,
+    /// Structs without a method of their own on the value that print some
+    /// exported field through one — directly, or through a nested struct.
+    rebuilt: HashSet<String>,
+}
+
+impl ShownTypes {
+    fn new(prog: &Program, reach: &[(String, Option<&str>, &str)]) -> ShownTypes {
+        let mut interfaces: HashSet<String> =
+            prog.interfaces.iter().map(|i| i.name.clone()).collect();
+        interfaces.extend(["any", "error", "fmt.Stringer"].map(str::to_string));
+        let mut shown = ShownTypes {
+            structs: prog.types.iter().map(|t| t.name.clone()).collect(),
+            on_value: reach
+                .iter()
+                .filter(|(_, v, _)| v.is_some())
+                .map(|(t, _, _)| t.clone())
+                .collect(),
+            any_method: reach.iter().map(|(t, _, _)| t.clone()).collect(),
+            interfaces,
+            rebuilt: HashSet::new(),
+        };
+        loop {
+            let grew: Vec<String> = prog
+                .types
+                .iter()
+                .filter(|t| !shown.on_value.contains(&t.name) && !shown.rebuilt.contains(&t.name))
+                .filter(|t| {
+                    t.fields
+                        .iter()
+                        .any(|f| shown.field_rendering(&f.name, &f.ty).is_some())
+                })
+                .map(|t| t.name.clone())
+                .collect();
+            if grew.is_empty() {
+                return shown;
+            }
+            shown.rebuilt.extend(grew);
+        }
+    }
+
+    /// How `fmt` renders field `name` of written type `fty` when that differs
+    /// from the plain value: `Some(None)` through `$stringify`,
+    /// `Some(Some(elem))` element-wise through `$stringifyAll_elem`, `None`
+    /// plainly — an unexported field, or one whose type has no method.
+    fn field_rendering(&self, name: &str, fty: &str) -> Option<Option<String>> {
+        if !name.starts_with(|c: char| c.is_uppercase()) {
+            return None;
+        }
+        let shows = |t: &str| match t.strip_prefix('*') {
+            Some(inner) => self.any_method.contains(inner),
+            None => {
+                self.on_value.contains(t)
+                    || self.rebuilt.contains(t)
+                    || self.interfaces.contains(t)
+                    || t.starts_with("interface{")
+            }
+        };
+        // `[]E` and `[N]E` both split at the first `]`.
+        match fty.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            Some((_, elem)) => {
+                let base = elem.trim_start_matches('*');
+                // Interface elements carry their dynamic types, so the one
+                // `[]any` helper serves them; a package's own types have none.
+                let helper = match self.interfaces.contains(base) {
+                    true => "any",
+                    false => base,
+                };
+                (shows(elem) && !helper.contains('.')).then(|| Some(helper.to_string()))
+            }
+            None => shows(fty).then_some(None),
+        }
+    }
+}
+
 /// Whether type `ty` has a zero-argument `method` — `Some(on_value)` with
 /// whether a value of `ty` has it, `None` when neither `ty` nor `*ty` does. A
 /// declared method is on the value unless its receiver is a pointer; otherwise
@@ -816,10 +938,10 @@ fn method_reach(prog: &Program, ty: &str, method: &str, depth: usize) -> Option<
     }
     let t = prog.types.iter().find(|t| t.name == ty)?;
     t.fields.iter().find_map(|f| {
-        let inner = f.ty.trim_start_matches('*');
-        if f.name != inner.rsplit('.').next().unwrap_or(inner) {
+        if !t.is_embedded(&f.name) {
             return None; // a named field, not an embedded one
         }
+        let inner = f.ty.trim_start_matches('*');
         let on_value = method_reach(prog, inner, method, depth + 1)?;
         Some(f.ty.starts_with('*') || on_value)
     })

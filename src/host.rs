@@ -324,6 +324,10 @@ pub const GCHAN_HANDLE: u16 = 994;
 /// exit, as [`GPANIC_FINISH`] does for `main`. Nothing above a goroutine's
 /// entry frame can recover it.
 pub const GPANIC_GOROUTINE_EXIT: u16 = 999;
+/// `[s, name0, v0, …]` → a display copy of struct `s` with the named fields
+/// replaced — how `$stringify` hands `fmt` a struct whose exported fields print
+/// through their `String()` / `Error()`.
+pub const GSTRUCT_WITH: u16 = 938;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
 /// tests a value against an interface's method set.
@@ -464,6 +468,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GRECOVER, b_recover);
     vm.register_builtin(GPANIC_FINISH, b_panic_finish);
     vm.register_builtin(GPANIC_GOROUTINE_EXIT, b_panic_goroutine_exit);
+    vm.register_builtin(GSTRUCT_WITH, b_struct_with);
     vm.register_builtin(GCELL_NEW, b_cell_new);
     vm.register_builtin(GCELL_GET, b_cell_get);
     vm.register_builtin(GCELL_SET, b_cell_set);
@@ -2908,6 +2913,34 @@ pub(crate) fn make_error(msg: String) -> Value {
         type_name: "$errorString".to_string(),
         fields: vec![("s".to_string(), Value::str(msg))],
         by_ref: true,
+    }))
+}
+
+/// [`GSTRUCT_WITH`]. The copy is for `fmt` alone — the program never holds it —
+/// and a pointer operand yields a pointer copy, so it still prints behind `&`.
+fn b_struct_with(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc).into_iter();
+    let s = args.next().unwrap_or(Value::Undef);
+    let Value::Obj(id) = &s else { return s };
+    let snapshot = HEAP.with(|h| match h.borrow().get(follow(*id) as usize) {
+        Some(HostObj::Struct {
+            type_name, fields, ..
+        }) => Some((type_name.clone(), fields.clone())),
+        _ => None,
+    });
+    let Some((type_name, mut fields)) = snapshot else {
+        return s;
+    };
+    while let (Some(name), Some(v)) = (args.next(), args.next()) {
+        let name = go_str(&name);
+        if let Some(slot) = fields.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = v;
+        }
+    }
+    Value::Obj(heap_alloc(HostObj::Struct {
+        type_name,
+        fields,
+        by_ref: ptr_identity(&s).is_some(),
     }))
 }
 
