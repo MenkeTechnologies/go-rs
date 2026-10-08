@@ -2525,6 +2525,18 @@ impl Parser {
             let ty = self.anon_struct_type()?;
             return self.struct_literal(ty);
         }
+        // `interface{ … }(x)` — a conversion to an inline interface type. The
+        // type is named the way `type_name` registers it, so the call resolves
+        // as the identity conversion `any(x)` / `Named(x)` already does; the
+        // empty method set is the predeclared `any`.
+        if matches!(self.peek(), Tok::Interface) {
+            let ty = self.type_name()?;
+            return Ok(Expr::Ident(if ty == "interface{}" {
+                "any".to_string()
+            } else {
+                ty
+            }));
+        }
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
             Tok::Float(f, dec) => Ok(Expr::Float(f, dec)),
