@@ -461,6 +461,12 @@ What is still missing from that corner:
 - **`bytes.Buffer`'s read half** — `Read`, `ReadString`, `Next`, `UnreadByte`
   and the read offset they share. The write half is what a program reaches for
   when it wants somewhere to write, and is what is vendored.
+- **`bytes`'s `*Func` trimmers and the rarer functions** — `TrimFunc`,
+  `TrimLeftFunc`, `TrimRightFunc`, `LastIndexFunc`, `FieldsFunc`,
+  `LastIndexAny`, `CutLast`, `Title`, `ToValidUTF8`, the `*Special` case
+  mappings and the `iter` sequences (`Lines`, `SplitSeq`, …) are not vendored;
+  a call is a compile error. The common package functions are
+  (`parity-scripts/bytes_package_funcs.go`).
 - **`bufio` is only its `Writer`.** `Reader` and `Scanner` read from an
   `io.Reader`, which go-rs's `io` does not have, and there is no `os.Stdin`
   to scan.
