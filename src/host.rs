@@ -723,6 +723,11 @@ fn conv_string(v: &Value) -> Value {
                 v.clone()
             }
         }
+        // An untyped `nil` passed for a `[]byte` / `[]rune` parameter arrives
+        // as `Undef` rather than a typed nil slice, and `string` of a nil slice
+        // is `""`. `string(nil)` itself does not compile, so a nil slice is the
+        // only `Undef` a conversion to string can see.
+        Value::Undef => Value::str(""),
         _ => Value::str(go_str(v)),
     }
 }
