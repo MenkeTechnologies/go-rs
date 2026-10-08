@@ -3624,14 +3624,20 @@ fn ambiguous_promoted_selector_is_a_compile_error() {
     // A field at that depth makes a method of the same name ambiguous too.
     for (decl, sel) in [
         ("type C struct {\n\tA\n\tB\n}", "c.Hello()"),
-        ("type F struct{ Hello int }\ntype C struct {\n\tA\n\tF\n}", "c.Hello"),
+        (
+            "type F struct{ Hello int }\ntype C struct {\n\tA\n\tF\n}",
+            "c.Hello",
+        ),
     ] {
         let src = format!(
             "package main\nimport \"fmt\"\ntype A struct{{}}\nfunc (A) Hello() string {{ return \"A\" }}\ntype B struct{{}}\nfunc (B) Hello() string {{ return \"B\" }}\n{decl}\nfunc main() {{\n\tvar c C\n\tfmt.Println({sel})\n}}\n"
         );
         let (out, ok) = run_capturing_stderr(&src);
         assert!(!ok, "{decl}: accepted, output {out:?}");
-        assert!(out.contains("ambiguous selector c.Hello"), "{decl}: {out:?}");
+        assert!(
+            out.contains("ambiguous selector c.Hello"),
+            "{decl}: {out:?}"
+        );
     }
 }
 

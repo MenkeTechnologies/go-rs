@@ -1230,6 +1230,7 @@ impl Qualifier {
                             chan,
                             bind,
                             ok_bind,
+                            ..
                         } => {
                             self.expr(chan, bound);
                             for b in [bind, ok_bind].into_iter().flatten() {

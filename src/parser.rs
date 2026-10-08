@@ -2069,6 +2069,7 @@ impl Parser {
                 bind: None,
                 ok_bind: None,
                 chan: self.expr()?,
+                define: false,
             });
         }
         let first = self.expr()?;
@@ -2084,6 +2085,7 @@ impl Parser {
                     self.peek()
                 ));
             }
+            let define = matches!(self.peek(), Tok::Define);
             self.advance();
             self.expect(&Tok::Arrow)?;
             let chan = self.expr()?;
@@ -2095,11 +2097,13 @@ impl Parser {
                 bind: name(first),
                 ok_bind: name(second),
                 chan,
+                define,
             });
         }
         match self.peek() {
             // `v := <-ch` / `v = <-ch` (receive with bind).
             Tok::Define | Tok::Assign => {
+                let define = matches!(self.peek(), Tok::Define);
                 self.advance();
                 self.expect(&Tok::Arrow)?;
                 let chan = self.expr()?;
@@ -2111,6 +2115,7 @@ impl Parser {
                     bind,
                     ok_bind: None,
                     chan,
+                    define,
                 })
             }
             // `ch <- val` (send).

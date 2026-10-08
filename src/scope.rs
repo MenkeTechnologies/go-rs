@@ -232,10 +232,15 @@ impl Resolver {
                             bind,
                             ok_bind,
                             chan,
+                            define,
                         } => {
                             self.expr(chan);
                             for n in [bind, ok_bind].into_iter().flatten() {
-                                self.declare(n);
+                                if *define {
+                                    self.declare(n);
+                                } else {
+                                    self.reference(n);
+                                }
                             }
                         }
                         SelectComm::Send { chan, val } => {

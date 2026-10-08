@@ -71,10 +71,7 @@ impl Program {
                     f.name == name && f.receiver.as_ref().is_some_and(|r| base(&r.ty) == *t)
                 });
                 let in_iface = self.interfaces.iter().any(|i| {
-                    i.name == *t
-                        && i.methods
-                            .iter()
-                            .any(|m| m.split('/').next() == Some(name))
+                    i.name == *t && i.methods.iter().any(|m| m.split('/').next() == Some(name))
                 });
                 let decl = self.types.iter().find(|s| s.name == *t);
                 let field = decl.is_some_and(|s| s.fields.iter().any(|f| f.name == name));
@@ -341,6 +338,8 @@ pub enum SelectComm {
         /// and drained, which is a *ready* case rather than a blocked one.
         ok_bind: Option<String>,
         chan: Expr,
+        /// `:=` rather than `=`: the case declares `bind` / `ok_bind`.
+        define: bool,
     },
     /// `case ch <- val:` — send.
     Send { chan: Expr, val: Expr },

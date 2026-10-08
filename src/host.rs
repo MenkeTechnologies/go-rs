@@ -2978,15 +2978,27 @@ pub(crate) fn make_error(msg: String) -> Value {
 
 /// [`GMAP_KEYS`].
 fn b_map_keys(vm: &mut VM, argc: u8) -> Value {
-    let m = pop_args(vm, argc).into_iter().next().unwrap_or(Value::Undef);
-    let keys = map_pairs(&m).unwrap_or_default().into_iter().map(|(k, _)| k);
+    let m = pop_args(vm, argc)
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Undef);
+    let keys = map_pairs(&m)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, _)| k);
     Value::Obj(heap_alloc(HostObj::slice(keys.collect())))
 }
 
 /// [`GMAP_VALS`].
 fn b_map_vals(vm: &mut VM, argc: u8) -> Value {
-    let m = pop_args(vm, argc).into_iter().next().unwrap_or(Value::Undef);
-    let vals = map_pairs(&m).unwrap_or_default().into_iter().map(|(_, v)| v);
+    let m = pop_args(vm, argc)
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Undef);
+    let vals = map_pairs(&m)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, v)| v);
     Value::Obj(heap_alloc(HostObj::slice(vals.collect())))
 }
 
@@ -2995,8 +3007,14 @@ fn b_map_vals(vm: &mut VM, argc: u8) -> Value {
 fn b_map_shown(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_args(vm, argc).into_iter();
     let m = args.next().unwrap_or(Value::Undef);
-    let keys = args.next().and_then(|k| slice_elems(&k)).unwrap_or_default();
-    let vals = args.next().and_then(|v| slice_elems(&v)).unwrap_or_default();
+    let keys = args
+        .next()
+        .and_then(|k| slice_elems(&k))
+        .unwrap_or_default();
+    let vals = args
+        .next()
+        .and_then(|v| slice_elems(&v))
+        .unwrap_or_default();
     let Some(pairs) = map_pairs(&m) else { return m };
     let pairs = pairs
         .into_iter()
@@ -4608,7 +4626,13 @@ fn points_at_composite(id: u32) -> bool {
 fn map_body(pairs: Vec<(Value, Value, Value)>, mode: FmtMode, sep: &str) -> String {
     let mut pairs: Vec<(String, String, String)> = pairs
         .iter()
-        .map(|(k, sk, sv)| (go_str_mode(k, FmtMode::V), go_str_mode(sk, mode), go_str_mode(sv, mode)))
+        .map(|(k, sk, sv)| {
+            (
+                go_str_mode(k, FmtMode::V),
+                go_str_mode(sk, mode),
+                go_str_mode(sv, mode),
+            )
+        })
         .collect();
     pairs.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
     pairs

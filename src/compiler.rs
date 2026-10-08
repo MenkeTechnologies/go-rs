@@ -825,6 +825,7 @@ pub(crate) fn free_stmt(s: &Stmt, bound: &mut HashSet<String>, out: &mut HashSet
                         bind,
                         ok_bind,
                         chan,
+                        ..
                     } => {
                         fe(chan, bound, out);
                         for b in [bind, ok_bind].into_iter().flatten() {
@@ -1529,7 +1530,11 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         .filter(|f| f.receiver.is_some())
         .map(|f| f.name.as_str())
         .collect();
-    member_names.extend(prog.types.iter().flat_map(|t| t.fields.iter().map(|f| f.name.as_str())));
+    member_names.extend(
+        prog.types
+            .iter()
+            .flat_map(|t| t.fields.iter().map(|f| f.name.as_str())),
+    );
     member_names.extend(
         prog.interfaces
             .iter()
@@ -1558,7 +1563,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             line,
         } = s
         {
-            let is_const = prog.untyped_consts.iter().any(|(n, l)| n == name && l == line);
+            let is_const = prog
+                .untyped_consts
+                .iter()
+                .any(|(n, l)| n == name && l == line);
             if is_const && declared(name) == 1 {
                 if let Some(v) = fold_untyped_int(e, &|n| const_ints.get(n).copied()) {
                     const_ints.insert(name.clone(), v);
@@ -2538,6 +2546,7 @@ impl Compiler {
                             bind,
                             ok_bind,
                             chan,
+                            ..
                         } => {
                             self.fv_expr(chan, bound, caps);
                             for v in [bind, ok_bind].into_iter().flatten() {
@@ -3171,11 +3180,12 @@ impl Compiler {
             Stmt::ForRange {
                 key,
                 val,
+                define,
                 iter,
                 body,
                 label,
                 ..
-            } => self.compile_for_range(key, val, iter, body, label)?,
+            } => self.compile_for_range(key, val, *define, iter, body, label)?,
             Stmt::Go { call, line } => {
                 let Expr::Call {
                     func, args, spread, ..
@@ -3743,6 +3753,7 @@ impl Compiler {
                 bind,
                 ok_bind,
                 chan,
+                define,
             } = &c.comm
             {
                 let elem = self.chan_elem_ty(chan);
@@ -3752,7 +3763,7 @@ impl Compiler {
                 if let Some(o) = ok_bind {
                     self.emit_get(&sv, line);
                     self.b.emit(Op::CallBuiltin(host::GCHAN_OK, 1), line);
-                    self.emit_set(o, line);
+                    self.emit_bind(o, *define);
                     self.types.insert(o.clone(), NumType::Bool);
                 }
                 if let Some(v) = bind {
@@ -3762,7 +3773,7 @@ impl Compiler {
                     self.emit_get(&sv, line);
                     self.emit_elem_zero(&elem, line)?;
                     self.b.emit(Op::CallBuiltin(host::GCHAN_VAL, 2), line);
-                    self.emit_set(v, line);
+                    self.emit_bind(v, *define);
                     self.types.insert(v.clone(), NumType::Unknown);
                     self.decl_types.insert(v.clone(), elem);
                 }
@@ -4167,6 +4178,17 @@ impl Compiler {
         Ok(())
     }
 
+    /// Bind a range variable to the value on the stack: a fresh declaration
+    /// for `:=`, so a function's `for _, x := range` never writes a package
+    /// variable `x` (or `main`'s, which share the global scope here); an
+    /// assignment for `=`.
+    fn emit_bind(&mut self, name: &str, define: bool) {
+        match define {
+            true => self.emit_declare(name, 0),
+            false => self.emit_set(name, 0),
+        }
+    }
+
     /// Lower `for [k[, v]] := range iter { body }` over a slice, map, or string.
     /// Iterates a host-computed key slice (`GRANGE_KEYS`) uniformly: `k` binds
     /// each key (index for a slice/string, key for a map); `v` binds `iter[k]`.
@@ -4174,6 +4196,7 @@ impl Compiler {
         &mut self,
         key: &Option<String>,
         val: &Option<String>,
+        define: bool,
         iter: &Expr,
         body: &[Stmt],
         label: &Option<String>,
@@ -4182,7 +4205,7 @@ impl Compiler {
         // channel is closed and drained. Nothing about the generic path applies,
         // so it gets its own loop.
         if self.type_name(iter).starts_with("chan ") {
-            return self.compile_for_range_chan(key, iter, body, label);
+            return self.compile_for_range_chan(key, define, iter, body, label);
         }
 
         let n = self.temp_counter;
@@ -4260,7 +4283,7 @@ impl Compiler {
                 self.emit_get(&i, 0);
                 self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), 0);
             }
-            self.emit_set(k, 0);
+            self.emit_bind(k, define);
             self.types.insert(k.clone(), NumType::Unknown);
         }
         // val := GRANGE_VAL($it, key)  — the loop value for the current key. This
@@ -4287,7 +4310,7 @@ impl Compiler {
                 self.elem_type_of(&self.type_name(iter))
             };
             self.emit_copy_for(&elem);
-            self.emit_set(v, 0);
+            self.emit_bind(v, define);
             self.types.insert(v.clone(), NumType::Unknown);
             // Only when the element type is actually known: recording an empty
             // one would clobber whatever an outer declaration of this name left
@@ -4335,6 +4358,7 @@ impl Compiler {
     fn compile_for_range_chan(
         &mut self,
         val: &Option<String>,
+        define: bool,
         chan: &Expr,
         body: &[Stmt],
         label: &Option<String>,
@@ -4365,7 +4389,7 @@ impl Compiler {
         self.loops.last_mut().expect("loop scope").breaks.push(jf);
         if let Some(v) = val {
             self.emit_get(&raw, 0);
-            self.emit_set(v, 0);
+            self.emit_bind(v, define);
             self.types.insert(v.clone(), numtype_of_ty(&elem));
             self.decl_types.insert(v.clone(), elem);
         }
@@ -5648,7 +5672,9 @@ impl Compiler {
             Expr::Ident(n) => n.as_str(),
             _ => "x",
         };
-        Err(format!("go-rs: ambiguous selector {x}.{name} (line {line})"))
+        Err(format!(
+            "go-rs: ambiguous selector {x}.{name} (line {line})"
+        ))
     }
 
     fn method_call(
@@ -6387,7 +6413,10 @@ impl Compiler {
     fn stringify_map_helpers(&self, e: &Expr) -> Option<(Option<String>, Option<String>)> {
         let ty = self.underlying(&self.type_name(e));
         let (k, v) = map_split(&ty)?;
-        let helpers = (self.stringify_elems_helper(k), self.stringify_elems_helper(v));
+        let helpers = (
+            self.stringify_elems_helper(k),
+            self.stringify_elems_helper(v),
+        );
         (helpers.0.is_some() || helpers.1.is_some()).then_some(helpers)
     }
 
@@ -7060,9 +7089,11 @@ impl Compiler {
                 line,
                 ..
             } => (vec![(Some(ty), e)], *line),
-            Stmt::Short { names, values, line } if names.len() == values.len() => {
-                (values.iter().map(|v| (None, v)).collect(), *line)
-            }
+            Stmt::Short {
+                names,
+                values,
+                line,
+            } if names.len() == values.len() => (values.iter().map(|v| (None, v)).collect(), *line),
             _ => return Ok(()),
         };
         for (ty, e) in decls {
