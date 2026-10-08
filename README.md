@@ -313,6 +313,13 @@ compile-time-constant float expression (`1.950 * 10.187`, `0.1 + 0.2`) with exac
 rational arithmetic and rounds to `f64` once, matching Go's arbitrary-precision
 constant semantics (a very long decimal or a non-terminating division whose exact
 terms leave the `f64`-exact range falls back to runtime `f64`).
+Integer constants are **range-checked** as Go's compiler checks them: an untyped
+integer constant converted to an integer type (`int8(300)`), given to a typed
+declaration (`var x int8 = 200`) or to `x := …` (type `int`) must fit, and an
+integer division by a constant zero is rejected — each a compile error rather
+than a wrapped value or a run-time panic. A converted constant is emitted as its
+exact value, so `int64(big >> 8)` with `const big = 1 << 70` is right. The cases
+left unchecked are listed in [BUGS.md](BUGS.md).
 
 **Bundled packages.** The standard-library packages vendored into the binary
 (`errors`, `sync`, `unicode/utf16`, `cmp`, `io`, `bufio` (its `Writer`), `bytes`,

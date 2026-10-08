@@ -46,6 +46,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         local_interfaces: Vec::new(),
         defined: HashMap::new(),
         int_consts: HashMap::new(),
+        untyped_consts: Vec::new(),
         type_param_cores: HashMap::new(),
         pkg_names: HashSet::new(),
     };
@@ -101,6 +102,8 @@ struct Parser {
     /// array length written as a constant expression (`[MaxCase]rune`,
     /// `[N*2]int`) folds to the `[N]T` value type instead of decaying to `[]T`.
     int_consts: HashMap<String, i128>,
+    /// [`Program::untyped_consts`], collected as `const` statements parse.
+    untyped_consts: Vec<(String, u32)>,
     /// The type parameters of the generic function being parsed whose
     /// constraint has a composite core type (`S ~[]E`, `M ~map[K]V`), as
     /// name → that core type. Generics are erased, so a composite literal of
@@ -462,7 +465,8 @@ impl Parser {
                         }
                     }
                 }
-                Tok::Var | Tok::Const => globals.push(self.stmt()?),
+                Tok::Var => globals.push(self.stmt()?),
+                Tok::Const => globals.push(self.stmt()?),
                 other => {
                     return Err(format!(
                         "go-rs: expected `func` or `type` at top level, found `{other}` on line {}",
@@ -512,6 +516,7 @@ impl Parser {
             main,
             funcs,
             defined,
+            untyped_consts: std::mem::take(&mut self.untyped_consts),
         })
     }
 
@@ -1392,6 +1397,7 @@ impl Parser {
             Tok::Var => self.var_stmt(),
             Tok::Const => {
                 let mut s = self.const_stmt()?;
+                collect_untyped_consts(&s, &mut self.untyped_consts);
                 self.record_int_consts(&s);
                 self.fold_exact_consts(&mut s);
                 Ok(s)
@@ -3354,4 +3360,19 @@ fn split_map_type(ty: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// The names a `const` statement declares without a type, with its line, into
+/// [`Program::untyped_consts`].
+fn collect_untyped_consts(s: &Stmt, out: &mut Vec<(String, u32)>) {
+    match s {
+        Stmt::Var {
+            name,
+            ty: None,
+            line,
+            ..
+        } => out.push((name.clone(), *line)),
+        Stmt::Block(ss) => ss.iter().for_each(|s| collect_untyped_consts(s, out)),
+        _ => {}
+    }
 }

@@ -479,25 +479,34 @@ What is still missing from that corner:
   or `Read` — `writeFd` is the package's one intrinsic and only ever sees
   descriptors 1 and 2.
 
-## Constant-overflow is not diagnosed
+## Constant-overflow is diagnosed only where the constant's type is certain
 
 ```go
-fmt.Println(int8(300))
-// go:    compile error — constant 300 overflows int8
-// go-rs: 44
+var x = 1 << 63   // go: compile error — overflows int    go-rs: -9223372036854775808
 ```
 
-go-rs has no constant-range checking pass, so an out-of-range constant
-conversion silently truncates instead of failing the build. The same pass would
-catch `float32(1e20) * float32(1e20)` (constant overflow of `float32`) and
-`x / 0` on constants.
+The checked cases (`tests/eval.rs`
+`constant_overflow_and_division_by_zero_are_compile_errors`) are a conversion
+`T(c)` of an untyped integer constant to an integer type, a typed `var` /
+`const` declaration with such an initializer, `x := c` (which gives `x` type
+`int`), and an integer division or remainder by a constant zero. `c` is a
+literal-only expression or names package-level untyped constants (or `main`'s
+top-level ones), folded exactly in `i128`; a converted constant is emitted as
+that exact value, so `int64(big >> 8)` with `const big = 1 << 70` is right
+(`parity-scripts/constant_range_boundaries.go`). Three things leave a case
+unchecked rather than risk rejecting a valid program:
 
-The same missing pass leaves one corner of exact constant arithmetic open. A
-`const` declaration and a literal-only expression are folded exactly (in
-`i128`) whenever an `i64` step would wrap, so `const big = 1<<64 - 1`, `half =
-big >> 1`, `var e uint64 = 1<<64 - 1` and Go's own `math/bits` are right
-(`parity-scripts/const_exact_uint64.go`). What is not folded is an expression
-outside a `const` declaration that *names* a constant above `int64`:
+- `var x = c` lowers to the same statement as `const x = c`, and an untyped
+  constant may exceed `int`.
+- A literal above `int64` is held as its `uint64` bit pattern, both by the
+  lexer (`18446744073709551615`) and by the parser's exact folding (`1<<64 - 1`
+  becomes `uint64(-1)`), and the pattern alone does not say whether the value
+  was typed — so a constant built from one is not folded.
+- A constant declared inside a function other than `main` is a local, and
+  locals are not folded.
+
+The same missing knowledge leaves one corner of exact constant arithmetic open:
+an expression outside a conversion that *names* a constant above `int64`:
 
 ```go
 const big = 1<<64 - 1
@@ -505,10 +514,8 @@ fmt.Println(uint64(big >> 4))            // go: 1152921504606846975   go-rs: 184
 fmt.Println(uint64(math.MaxUint64 >> 1)) // go: 9223372036854775807   go-rs: 18446744073709551615
 ```
 
-A constant is lowered as a variable, so at that point `big` is a run-time
-`uint64` bit pattern with no static type to make `>>` logical. Folding it needs
-the compiler to know which names are constants — through block scoping and
-shadowing — which is the same pass the overflow diagnosis above wants.
+`big` is held as `uint64(-1)` (above), so at run time it is a `uint64` bit
+pattern with no static type to make `>>` logical.
 
 ## Transcendental `math` functions differ from Go in the last bit
 

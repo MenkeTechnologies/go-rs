@@ -29,6 +29,11 @@ pub struct Program {
     /// it is transparent to every operation; the name is carried only where Go
     /// makes it observable — `%T`, `%#v` and method dispatch.
     pub defined: Vec<(String, String)>,
+    /// Every `const` this file declares without a type (`const big = 1 << 70`),
+    /// as `(name, line)`. A constant is lowered as a `Stmt::Var`, so this is
+    /// what tells the compiler that declaration is an untyped constant it may
+    /// fold and range-check.
+    pub untyped_consts: Vec<(String, u32)>,
 }
 
 /// What selector `x.name` denotes on a struct type, by Go's rule: the

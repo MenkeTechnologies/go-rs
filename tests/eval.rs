@@ -3634,3 +3634,28 @@ fn ambiguous_promoted_selector_is_a_compile_error() {
         assert!(out.contains("ambiguous selector c.Hello"), "{decl}: {out:?}");
     }
 }
+
+#[test]
+fn constant_overflow_and_division_by_zero_are_compile_errors() {
+    // Each is rejected by `go build` (go 1.27): a constant out of range of the
+    // integer type it converts or is assigned to — `int` for `:=` — and an
+    // integer division by a constant zero. Nothing runs, so nothing prints.
+    for body in [
+        "fmt.Println(int8(300))",
+        "fmt.Println(uint8(-1))",
+        "fmt.Println(int32(1 << 31))",
+        "var x int8 = 200\n\tfmt.Println(x)",
+        "var u uint = -1\n\tfmt.Println(u)",
+        "const c int8 = 1000\n\tfmt.Println(c)",
+        "x := 1 << 70\n\tfmt.Println(x)",
+        "const big = 1 << 70\n\tvar y int = big\n\tfmt.Println(y)",
+        "const k = 1 << 40\n\tfmt.Println(int32(k))",
+        "x := 5\n\tfmt.Println(x / 0)",
+        "x := 7\n\tfmt.Println(x % 0)",
+    ] {
+        let src = format!("package main\nimport \"fmt\"\nfunc main() {{\n\tfmt.Println(\"start\")\n\t{body}\n}}\n");
+        let (out, ok) = run_capturing_stderr(&src);
+        assert!(!ok, "{body}: accepted, output {out:?}");
+        assert!(!out.contains("start"), "{body}: ran, output {out:?}");
+    }
+}

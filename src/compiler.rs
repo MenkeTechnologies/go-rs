@@ -392,6 +392,9 @@ struct Compiler {
     /// methods at the shallowest depth ([`crate::ast::Selected::Ambiguous`]).
     /// Selecting one is a compile error, as in Go.
     ambiguous_selectors: HashSet<(String, String)>,
+    /// The package-level untyped integer constants, by name, with their exact
+    /// values — what [`Self::untyped_int_const`] folds a name to.
+    const_ints: HashMap<String, i128>,
     /// `&x` arguments, with `x` a slice or map, of the user calls being
     /// emitted: the variable and the temporary holding its pointer. Once the
     /// call returns `x` is reloaded through the pointer ([`Self::emit_arg`]).
@@ -1532,6 +1535,38 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .iter()
             .flat_map(|i| i.methods.iter().filter_map(|m| m.split('/').next())),
     );
+    // The untyped integer constants at package level, folded exactly in
+    // declaration order. A name declared twice at `main`'s top level (which is
+    // the global scope in go-rs) is a variable there too, and is left out.
+    let mut top: Vec<&Stmt> = Vec::new();
+    flatten_blocks(&prog.main, &mut top);
+    let declared = |name: &str| {
+        top.iter()
+            .filter(|s| match s {
+                Stmt::Var { name: n, .. } => n == name,
+                Stmt::Short { names, .. } => names.iter().any(|n| n == name),
+                _ => false,
+            })
+            .count()
+    };
+    let mut const_ints: HashMap<String, i128> = HashMap::new();
+    for s in &top {
+        if let Stmt::Var {
+            name,
+            ty: None,
+            init: Some(e),
+            line,
+        } = s
+        {
+            let is_const = prog.untyped_consts.iter().any(|(n, l)| n == name && l == line);
+            if is_const && declared(name) == 1 {
+                if let Some(v) = fold_untyped_int(e, &|n| const_ints.get(n).copied()) {
+                    const_ints.insert(name.clone(), v);
+                }
+            }
+        }
+    }
+
     let ambiguous_selectors: HashSet<(String, String)> = prog
         .types
         .iter()
@@ -1596,6 +1631,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         closure_vars: HashMap::new(),
         cell_ptrs: HashSet::new(),
         ambiguous_selectors,
+        const_ints,
         addr_writebacks: Vec::new(),
         ptr_aliases: HashMap::new(),
         call_depth: 0,
@@ -2800,6 +2836,7 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::DBG_LINE, 0), line);
             self.b.emit(Op::Pop, line);
         }
+        self.check_const_decl(s)?;
         self.track_ptr_alias(s);
         match s {
             Stmt::Var {
@@ -6180,6 +6217,14 @@ impl Compiler {
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        // Go rejects an integer division by a constant zero at compile time;
+        // a float one is `±Inf` / `NaN` at run time.
+        if matches!(op, BinOp::Div | BinOp::Mod)
+            && self.untyped_int_const(rhs) == Some(0)
+            && (self.infer(lhs) == NumType::Int || self.untyped_int_const(lhs).is_some())
+        {
+            return Err("go-rs: invalid operation: division by zero".to_string());
+        }
         // Short-circuit logical operators.
         match op {
             BinOp::And => {
@@ -6971,6 +7016,46 @@ impl Compiler {
         self.assign(target, AssignOp::Set, &Expr::Ident(back), line)
     }
 
+    /// [`fold_untyped_int`] with a name resolving to a package-level untyped
+    /// constant only where no local or captured variable shadows it.
+    fn untyped_int_const(&self, e: &Expr) -> Option<i128> {
+        fold_untyped_int(e, &|n| {
+            let local = self.scope_has(n) || self.active_captures.contains_key(n);
+            (!local).then(|| self.const_ints.get(n).copied()).flatten()
+        })
+    }
+
+    /// Go's constant-overflow check on a declaration: a constant initializer
+    /// must fit the declared integer type, and one given to `x := …` takes
+    /// `int`, so it must fit `int64`. (`var x = …` is left alone: a `const`
+    /// lowers to the same statement, and an untyped constant may exceed `int`.)
+    fn check_const_decl(&self, s: &Stmt) -> Result<(), String> {
+        let (decls, line): (Vec<(Option<&String>, &Expr)>, u32) = match s {
+            Stmt::Var {
+                ty: Some(ty),
+                init: Some(e),
+                line,
+                ..
+            } => (vec![(Some(ty), e)], *line),
+            Stmt::Short { names, values, line } if names.len() == values.len() => {
+                (values.iter().map(|v| (None, v)).collect(), *line)
+            }
+            _ => return Ok(()),
+        };
+        for (ty, e) in decls {
+            let ty = ty.map_or("int".to_string(), |t| self.underlying(t));
+            let (Some((lo, hi)), Some(v)) = (int_type_range(&ty), self.untyped_int_const(e)) else {
+                continue;
+            };
+            if v < lo || v > hi {
+                return Err(format!(
+                    "go-rs: cannot use {v} (untyped int constant) as {ty} value (overflows) (line {line})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Keep [`Self::ptr_aliases`] current: a declaration or plain assignment of
     /// `p` forgets what `p` addressed, and records `x` when the value is `&x`.
     fn track_ptr_alias(&mut self, s: &Stmt) {
@@ -7388,7 +7473,21 @@ impl Compiler {
             // A type conversion `T(x)` — a builtin numeric/string/bool type name
             // applied to a single value.
             if args.len() == 1 && is_conversion_type(name) {
-                self.expr(&args[0])?;
+                if let (Some((lo, hi)), Some(v)) =
+                    (int_type_range(name), self.untyped_int_const(&args[0]))
+                {
+                    if v < lo || v > hi {
+                        return Err(format!(
+                            "go-rs: constant {v} overflows {name} (line {line})"
+                        ));
+                    }
+                    // The exact value, not the operand evaluated in `i64`: a
+                    // constant above `int64` (`uint64(big >> 4)`) would wrap
+                    // on the way. An unsigned 64-bit value is its bit pattern.
+                    self.b.emit(Op::LoadInt(v as u64 as i64), line);
+                } else {
+                    self.expr(&args[0])?;
+                }
                 // `float64(u)` on an unsigned 64-bit operand widens the
                 // *unsigned* value: `float64(uint64(1)<<63)` is 9.22e+18, where
                 // reading the same bits as an `i64` would give -9.22e+18.
@@ -7885,6 +7984,80 @@ fn iface_display(ty: &str) -> String {
     } else {
         host::package_qualified(&name)
     }
+}
+
+/// `stmts` with every `Stmt::Block` replaced by its statements, recursively —
+/// a `const ( … )` group is one block.
+fn flatten_blocks<'s>(stmts: &'s [Stmt], out: &mut Vec<&'s Stmt>) {
+    for s in stmts {
+        match s {
+            Stmt::Block(ss) => flatten_blocks(ss, out),
+            s => out.push(s),
+        }
+    }
+}
+
+/// The exact value of an untyped integer constant expression: integer
+/// literals, the untyped constants `name` resolves, and the arithmetic on
+/// them, folded in `i128` as Go folds constants exactly. `None` for anything
+/// else — a variable, a call, a conversion (which gives the result a type), a
+/// step past `i128`, or a division by zero (reported on its own).
+fn fold_untyped_int(e: &Expr, name: &dyn Fn(&str) -> Option<i128>) -> Option<i128> {
+    match e {
+        // A source literal is never negative (`-5` is a negation), so a
+        // negative one is the bit pattern of a literal above `i64` — the
+        // lexer's `18446744073709551615`, the parser's `uint64(-1)` — whose
+        // type the pattern alone does not tell.
+        Expr::Int(n) => (*n >= 0).then(|| i128::from(*n)),
+        Expr::Ident(n) => name(n),
+        Expr::Unary { op: UnOp::Neg, rhs } => fold_untyped_int(rhs, name)?.checked_neg(),
+        Expr::Unary {
+            op: UnOp::BitNot,
+            rhs,
+        } => Some(!fold_untyped_int(rhs, name)?),
+        Expr::Binary { op, lhs, rhs } => {
+            let a = fold_untyped_int(lhs, name)?;
+            let b = fold_untyped_int(rhs, name)?;
+            match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div => a.checked_div(b),
+                BinOp::Mod => a.checked_rem(b),
+                BinOp::Shl => u32::try_from(b)
+                    .ok()
+                    .and_then(|s| a.checked_shl(s))
+                    .filter(|r| r >> b == a),
+                BinOp::Shr => u32::try_from(b).ok().map(|s| a >> s.min(i128::BITS - 1)),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::AndNot => Some(a & !b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The range of values integer type `ty` holds, for a constant converted or
+/// assigned to it. `None` for any other type.
+fn int_type_range(ty: &str) -> Option<(i128, i128)> {
+    let (bits, signed) = match ty {
+        "int8" => (8, true),
+        "int16" => (16, true),
+        "int32" | "rune" => (32, true),
+        "int" | "int64" => (64, true),
+        "uint8" | "byte" => (8, false),
+        "uint16" => (16, false),
+        "uint32" => (32, false),
+        "uint" | "uint64" | "uintptr" => (64, false),
+        _ => return None,
+    };
+    Some(match signed {
+        true => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        false => (0, (1i128 << bits) - 1),
+    })
 }
 
 /// Fold a compile-time-constant float expression to a single `f64`, evaluated
