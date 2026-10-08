@@ -3313,6 +3313,38 @@ fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
     if in_cell {
         return val;
     }
+    // A pointer to a slice or map: assigning through it gives the variable a
+    // new header, which must not reach a `t := s` copied from it earlier — so
+    // the pointer is retargeted at the new value instead of overwriting the
+    // old one, and the caller that passed `&s` reloads `s` through it.
+    if let Value::Obj(new) = val {
+        let retargeted = HEAP.with(|h| {
+            let mut h = h.borrow_mut();
+            let mut ptr = id;
+            while let Some(HostObj::Ptr { target }) = h.get(ptr as usize) {
+                match h.get(*target as usize) {
+                    Some(HostObj::Ptr { .. }) => ptr = *target,
+                    Some(
+                        HostObj::Slice { .. }
+                        | HostObj::SliceView { .. }
+                        | HostObj::Map(_)
+                        | HostObj::Nil { .. },
+                    ) => break,
+                    _ => return false,
+                }
+            }
+            match h.get_mut(ptr as usize) {
+                Some(HostObj::Ptr { target }) => {
+                    *target = new;
+                    true
+                }
+                _ => false,
+            }
+        });
+        if retargeted {
+            return val;
+        }
+    }
     // The *pointee* is overwritten rather than rebound, which is what makes the
     // write visible through every other pointer to it and through the variable
     // itself. The source is copied first: `*p = q` must not alias `q`'s fields.

@@ -682,32 +682,32 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
 
-## Rebinding through a pointer to a slice
+## Rebinding through a pointer to a slice that escapes the function
 
 ```go
+type W struct{ out *[]int }
 var s []int
-p := &s
-*p = append(*p, 1)          // go-rs: cannot assign through a pointer to a
-                            //        non-composite value
+w := W{&s}
+*w.out = append(*w.out, 1)   // go: s == [1]   go-rs: s == []
 ```
 
-*Reading* through a `*[]T` or a `*map[K]V` is fixed — `*p` follows the
-`HostObj::Ptr` to the slice or map, so `len`, `cap`, indexing (read and write),
-`range`, `delete`, `append`'s operand and `*p == nil` all see the value
-(`parity-scripts/pointer_to_slice.go`,
-`parity-scripts/pointer_to_map_and_nil_deref.go`). Writing a new slice through
-the pointer does not: `b_deref_set` overwrites the *pointee in place*, which is
-right for a struct and wrong for a slice: a slice rebind has to change the
-header the variable holds, and go-rs models a slice as one object, so an
-in-place overwrite would also be seen through a `t := s` taken earlier, which
-Go leaves alone. Making it right needs `&s` to address the variable's storage
-rather than the slice object — the same change the scalar `&x` entry above
-wants. The accumulator idiom
-`func add(out *[]int, v int) { *out = append(*out, v) }` is what reaches it,
-and so is every `container/heap` `Push` / `Pop`, whose pointer receiver on a
-slice type is called through the `heap.Interface`: a direct `h.Push(x)` hands
-the method a cell for the receiver, but a call through an interface has no
-variable to hand back.
+`*p = v` through a pointer to a slice or map retargets the pointer object
+(`b_deref_set`) instead of overwriting the slice in place, so a `t := s` taken
+earlier keeps its old header as Go's does. The variable `p` addresses is then
+reloaded through `p` where the compiler can see which variable that is: after a
+call handed `&s` (or `&b.f`, `&xs[i]`) as an argument — the accumulator idiom
+`func add(out *[]int, v int) { *out = append(*out, v) }` — and after a `*p = v`
+or a call handed `p` when `p := &s` is a local of the same function
+(`parity-scripts/pointer_to_slice_rebind.go`). A pointer that leaves those
+sight lines — stored in a struct field or a map, captured by a closure, handed
+to a `go` / `defer` call — still writes only the pointer, and `s` keeps its old
+value. So does a second pointer to the same variable: `p1, p2 := &s, &s` and
+`*p1 = …` leaves `*p2` on the old slice. Closing these needs `&s` to address
+the variable's storage rather than the slice object — the same change the
+scalar `&x` entry above wants. Every `container/heap` `Push` / `Pop` reaches
+it, whose pointer receiver on a slice type is called through the
+`heap.Interface`: a direct `h.Push(x)` hands the method a cell for the
+receiver, but a call through an interface has no variable to hand back.
 
 ## A string cannot hold invalid UTF-8
 

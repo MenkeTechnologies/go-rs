@@ -388,6 +388,17 @@ struct Compiler {
     /// non-struct `T`. Such a pointer is a heap cell holding the value (see
     /// [`host::GDEREF`]), so `*p` reads through the cell.
     cell_ptrs: HashSet<String>,
+    /// `&x` arguments, with `x` a slice or map, of the user calls being
+    /// emitted: the variable and the temporary holding its pointer. Once the
+    /// call returns `x` is reloaded through the pointer ([`Self::emit_arg`]).
+    addr_writebacks: Vec<(Expr, String)>,
+    /// Locals of the current function declared as `p := &x` with `x` a slice
+    /// or map — the variable each one addresses. A `*p = v` and a call handed
+    /// `p` reload `x` through it afterwards, as a call handed `&x` does.
+    ptr_aliases: HashMap<String, Expr>,
+    /// How many [`Self::call`]s are being emitted — the ones that drain
+    /// `addr_writebacks`. A `go` / `defer` call records nothing.
+    call_depth: usize,
     /// While compiling a lambda body: its captured variables (name → index into
     /// the closure's captures). `emit_get` reads these from the closure (slot 0).
     active_captures: HashMap<String, u16>,
@@ -1543,6 +1554,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambdas: Vec::new(),
         closure_vars: HashMap::new(),
         cell_ptrs: HashSet::new(),
+        addr_writebacks: Vec::new(),
+        ptr_aliases: HashMap::new(),
+        call_depth: 0,
         active_captures: HashMap::new(),
         debug,
         has_ffi,
@@ -1651,6 +1665,7 @@ impl Compiler {
         // `apply(f func(int) int, v int)` answered with `main`'s `f` rather than
         // the closure it was handed.
         self.closure_vars.clear();
+        self.ptr_aliases.clear();
         self.cell_ptrs = f
             .receiver
             .iter()
@@ -2231,6 +2246,7 @@ impl Compiler {
         // function was compiled before it is not its own. A captured closure is
         // still called — through `active_captures` and `Op::CallDynamic`.
         self.closure_vars.clear();
+        self.ptr_aliases.clear();
         // Re-seed the captured names with the types the enclosing scope had, so
         // a captured channel, `float32` or `uint64` keeps lowering by its type.
         for (name, ty) in captures.iter().zip(&capture_types) {
@@ -2741,6 +2757,7 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::DBG_LINE, 0), line);
             self.b.emit(Op::Pop, line);
         }
+        self.track_ptr_alias(s);
         match s {
             Stmt::Var {
                 name,
@@ -2912,7 +2929,21 @@ impl Compiler {
                 op,
                 value,
                 line,
-            } => self.assign(target, *op, value, *line)?,
+            } => {
+                self.assign(target, *op, value, *line)?;
+                // `*p = v` with `p := &s`: `s` is reloaded through `p`.
+                if let Expr::Unary {
+                    op: UnOp::Deref,
+                    rhs,
+                } = target
+                {
+                    if let Expr::Ident(p) = rhs.as_ref() {
+                        if let Some(var) = self.ptr_aliases.get(p).cloned() {
+                            self.emit_reload(&var, p, *line)?;
+                        }
+                    }
+                }
+            }
             Stmt::AssignMulti {
                 targets,
                 values,
@@ -4570,6 +4601,29 @@ impl Compiler {
     /// is a float — enough for arithmetic, which reads the static type, and not
     /// enough for `%T` or for a map key, which read the value.
     fn emit_arg(&mut self, a: &Expr, param_ty: Option<&String>) -> Result<(), String> {
+        // `f(&s)` with `s` a slice or map: the callee may rebind it
+        // (`*p = append(*p, v)`), which retargets the pointer object
+        // ([`host::GDEREF_SET`]) — go-rs has no address for `s` itself. The
+        // pointer is kept in a temporary and `s` reloaded through it once the
+        // call returns ([`Self::call`]). A local `p := &s` handed on is the
+        // same pointer, already in a variable.
+        if self.call_depth > 0 {
+            if let Some(target) = self.rebindable_addr(a).cloned() {
+                let ptr = format!("$aptr{}", self.temp_counter);
+                self.temp_counter += 1;
+                self.expr(a)?;
+                self.b.emit(Op::Dup, 0);
+                self.types.insert(ptr.clone(), NumType::Unknown);
+                self.emit_set(&ptr, 0);
+                self.addr_writebacks.push((target, ptr));
+                return Ok(());
+            }
+            if let Expr::Ident(p) = a {
+                if let Some(target) = self.ptr_aliases.get(p).cloned() {
+                    self.addr_writebacks.push((target, p.clone()));
+                }
+            }
+        }
         match param_ty {
             Some(t) if self.is_float_ty(t) => {
                 let t = self.underlying(&base_type(t));
@@ -6791,6 +6845,85 @@ impl Compiler {
     }
 
     fn call(&mut self, func: &Expr, args: &[Expr], spread: bool, line: u32) -> Result<(), String> {
+        let mark = self.addr_writebacks.len();
+        self.call_depth += 1;
+        let r = self.call_inner(func, args, spread, line);
+        self.call_depth -= 1;
+        let pending = self.addr_writebacks.split_off(mark);
+        r?;
+        for (target, ptr) in pending {
+            self.emit_reload(&target, &ptr, line)?;
+        }
+        Ok(())
+    }
+
+    /// `target = *ptr` — reload a slice or map variable through a pointer to
+    /// it that a callee or a `*p = v` may have retargeted.
+    fn emit_reload(&mut self, target: &Expr, ptr: &str, line: u32) -> Result<(), String> {
+        let back = format!("$reload{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.emit_get(ptr, line);
+        self.b.emit(Op::CallBuiltin(host::GDEREF, 1), line);
+        self.types.insert(back.clone(), NumType::Unknown);
+        let ty = self.type_name(target);
+        self.decl_types.insert(back.clone(), ty);
+        self.emit_set(&back, line);
+        self.assign(target, AssignOp::Set, &Expr::Ident(back), line)
+    }
+
+    /// Keep [`Self::ptr_aliases`] current: a declaration or plain assignment of
+    /// `p` forgets what `p` addressed, and records `x` when the value is `&x`.
+    fn track_ptr_alias(&mut self, s: &Stmt) {
+        let (name, value) = match s {
+            Stmt::Short { names, values, .. } => {
+                for n in names {
+                    self.ptr_aliases.remove(n);
+                }
+                match (names.as_slice(), values.as_slice()) {
+                    ([n], [v]) => (n, Some(v)),
+                    _ => return,
+                }
+            }
+            Stmt::Var { name, init, .. } => (name, init.as_ref()),
+            Stmt::Assign {
+                target: Expr::Ident(name),
+                op,
+                value,
+                ..
+            } => (name, (*op == AssignOp::Set).then_some(value)),
+            _ => return,
+        };
+        self.ptr_aliases.remove(name);
+        if let Some(x) = value.and_then(|v| self.rebindable_addr(v)).cloned() {
+            self.ptr_aliases.insert(name.clone(), x);
+        }
+    }
+
+    /// `x` when `e` is `&x` with `x` a slice or map variable, field or element
+    /// — a pointer whose pointee may be rebound through it.
+    fn rebindable_addr<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
+        let Expr::Unary {
+            op: UnOp::Addr,
+            rhs,
+        } = e
+        else {
+            return None;
+        };
+        let ty = self.underlying(&self.type_name(rhs));
+        let lvalue = matches!(
+            **rhs,
+            Expr::Ident(_) | Expr::Selector { .. } | Expr::Index { .. }
+        );
+        (lvalue && (ty.starts_with("[]") || ty.starts_with("map["))).then_some(&**rhs)
+    }
+
+    fn call_inner(
+        &mut self,
+        func: &Expr,
+        args: &[Expr],
+        spread: bool,
+        line: u32,
+    ) -> Result<(), String> {
         // Multi-value spread: `f(g())` where `g` returns N>1 values passes them
         // as N arguments. Evaluate `g` into a tuple, extract each element into a
         // temporary, and recurse with those temporaries as the arguments.
@@ -6813,7 +6946,7 @@ impl Compiler {
                         self.emit_set(&t, line);
                         expanded.push(Expr::Ident(t));
                     }
-                    return self.call(func, &expanded, false, line);
+                    return self.call_inner(func, &expanded, false, line);
                 }
             }
         }
