@@ -661,22 +661,40 @@ fn add_runtime_error_types(prog: &mut Program) {
 /// error and `Stringer` values via their method (Go's fmt interface handling).
 /// The compiler wraps each `fmt.Print*`/`Sprint*` argument with a call to it.
 fn add_stringify(prog: &mut Program) {
-    // type → the method fmt should call (Error preferred over String).
-    let mut chosen: HashMap<String, &str> = HashMap::new();
-    for method in ["String", "Error"] {
-        for f in &prog.funcs {
-            if let Some(r) = &f.receiver {
-                if f.name == method && f.params.is_empty() {
-                    let ty = r.ty.trim_start_matches('*').to_string();
-                    chosen.insert(ty, method); // Error's later pass wins
-                }
-            }
-        }
+    // Every type that has `String()` / `Error()` — declared, or promoted from
+    // an embedded field — with whether a *value* of it has the method (Go's
+    // method-set rule: a pointer-receiver method belongs to `*T` only).
+    let mut candidates: Vec<String> = prog.types.iter().map(|t| t.name.clone()).collect();
+    candidates.extend(
+        prog.funcs
+            .iter()
+            .filter_map(|f| f.receiver.as_ref())
+            .map(|r| r.ty.trim_start_matches('*').to_string()),
+    );
+    candidates.sort();
+    candidates.dedup();
+    // type → (the method a value calls, the method a pointer calls); `Error`
+    // is preferred over `String`, as `fmt` checks `error` first.
+    let mut reach: Vec<(String, Option<&str>, &str)> = Vec::new();
+    for ty in candidates {
+        let error = method_reach(prog, &ty, "Error", 0);
+        let string = method_reach(prog, &ty, "String", 0);
+        let on_value = match (error, string) {
+            (Some(true), _) => Some("Error"),
+            (_, Some(true)) => Some("String"),
+            _ => None,
+        };
+        let on_ptr = match (error, string) {
+            (Some(_), _) => "Error",
+            (_, Some(_)) => "String",
+            _ => continue,
+        };
+        reach.push((ty, on_value, on_ptr));
     }
-    if chosen.is_empty() {
+    if reach.is_empty() {
         return;
     }
-    let mut types: Vec<_> = chosen.into_iter().collect();
+    let mut types: Vec<(String, &str)> = reach.iter().map(|(t, _, m)| (t.clone(), *m)).collect();
     types.sort(); // deterministic case order
                   // `fmt` prints a slice or array element through its method too — `[]Color`
                   // prints `[G B]` — and an element is not an operand the per-argument
@@ -726,24 +744,16 @@ fn add_stringify(prog: &mut Program) {
     // struct's `T` case calls the method its value has, if any, and its `*T`
     // case the one the pointer has. Any other type has one tag for both.
     let structs: HashSet<&str> = prog.types.iter().map(|t| t.name.as_str()).collect();
-    let on_value = |ty: &str, method: &str| {
-        prog.funcs.iter().any(|f| {
-            f.name == method
-                && f.params.is_empty()
-                && f.receiver.as_ref().is_some_and(|r| r.ty == ty)
-        })
-    };
     let mut arms: Vec<(String, &str)> = Vec::new();
-    for (ty, method) in types {
+    for (ty, on_value, on_ptr) in reach {
         if !structs.contains(ty.as_str()) {
-            arms.push((ty, method));
+            arms.push((ty, on_ptr));
             continue;
         }
-        let value_method = ["Error", "String"].into_iter().find(|m| on_value(&ty, m));
-        if let Some(m) = value_method {
+        if let Some(m) = on_value {
             arms.push((ty.clone(), m));
         }
-        arms.push((format!("*{ty}"), method));
+        arms.push((format!("*{ty}"), on_ptr));
     }
     let cases: Vec<TypeSwitchCase> = arms
         .into_iter()
@@ -786,6 +796,33 @@ fn add_stringify(prog: &mut Program) {
         ],
         line: 0,
     });
+}
+
+/// Whether type `ty` has a zero-argument `method` — `Some(on_value)` with
+/// whether a value of `ty` has it, `None` when neither `ty` nor `*ty` does. A
+/// declared method is on the value unless its receiver is a pointer; otherwise
+/// the first embedded field that supplies it promotes it — an embedded `*T`
+/// onto the value too, an embedded `T` only as `T`'s value has it. (Two fields
+/// supplying it at one depth is ambiguous in Go, which the first-found rule
+/// does not model; see BUGS.md.)
+fn method_reach(prog: &Program, ty: &str, method: &str, depth: usize) -> Option<bool> {
+    let declared = prog.funcs.iter().find_map(|f| {
+        let r = f.receiver.as_ref()?;
+        (f.name == method && f.params.is_empty() && r.ty.trim_start_matches('*') == ty)
+            .then(|| !r.ty.starts_with('*'))
+    });
+    if declared.is_some() || depth > 8 {
+        return declared;
+    }
+    let t = prog.types.iter().find(|t| t.name == ty)?;
+    t.fields.iter().find_map(|f| {
+        let inner = f.ty.trim_start_matches('*');
+        if f.name != inner.rsplit('.').next().unwrap_or(inner) {
+            return None; // a named field, not an embedded one
+        }
+        let on_value = method_reach(prog, inner, method, depth + 1)?;
+        Some(f.ty.starts_with('*') || on_value)
+    })
 }
 
 /// Load `path` and its (source) imports depth-first, qualifying each package's
