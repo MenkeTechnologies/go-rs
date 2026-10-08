@@ -1961,7 +1961,8 @@ impl Compiler {
         self.b.emit(Op::LoadInt(in_goroutine as i64), line);
         self.b.emit(Op::CallBuiltin(host::GPANIC_FATAL, 1), line);
         let skip = self.b.emit(Op::JumpIfFalse(0), line);
-        self.b.emit(Op::CallBuiltin(host::GPANIC_FATAL_VALUE, 0), line);
+        self.b
+            .emit(Op::CallBuiltin(host::GPANIC_FATAL_VALUE, 0), line);
         let idx = self.b.add_name("$stringify");
         self.b.emit(Op::Call(idx, 1), line);
         self.b.emit(Op::CallBuiltin(host::GPANIC_FINISH, 1), line);
