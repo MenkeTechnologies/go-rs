@@ -4066,6 +4066,19 @@ fn b_elem_tag(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let v = args.first().cloned().unwrap_or(Value::Undef);
     let ty = args.get(1).map(go_str).unwrap_or_default();
+    // A `*[]T` / `*map[K]V` operand is tagged through its pointee, and the copy
+    // is pointed at again so `fmt` still writes the `&`.
+    if let Value::Obj(id) = &v {
+        let is_ptr =
+            HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Ptr { .. })));
+        if is_ptr {
+            let tagged = tag_elem_ty(&Value::Obj(follow(*id)), &ty);
+            return match tagged {
+                Value::Obj(t) => Value::Obj(heap_alloc(HostObj::Ptr { target: t })),
+                other => other,
+            };
+        }
+    }
     tag_elem_ty(&v, &ty)
 }
 
@@ -5226,13 +5239,13 @@ fn render_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> String {
     // do not come through this path, print the name.
     let unnamed = unname(v);
     let v = &unnamed;
-    // A pointer operand to a composite is `&` and the composite, as under `%v`.
-    let amp = if depth == 0 && pointer_to_composite(v) {
-        "&"
-    } else {
-        ""
+    // A pointer operand to a composite is `&` and the composite, as under `%v`:
+    // Go's `printValue` writes the `&` and renders the pointee with the verb.
+    let (amp, pointee) = match v {
+        Value::Obj(id) if depth == 0 && pointer_to_composite(v) => ("&", Value::Obj(follow(*id))),
+        _ => ("", v.clone()),
     };
-    let unnamed = unname(v);
+    let unnamed = unname(&pointee);
     let v = &unnamed;
     if matches!(verb, 's' | 'q' | 'x' | 'X') {
         if let Some(b) = slice_bytes(v) {
