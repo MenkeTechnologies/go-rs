@@ -721,7 +721,31 @@ fn add_stringify(prog: &mut Program) {
             }
         }
     }
-    let cases: Vec<TypeSwitchCase> = types
+    // A struct value and a pointer to one are distinct dynamic types: the value
+    // has only its value-receiver methods, the pointer has them all. So a
+    // struct's `T` case calls the method its value has, if any, and its `*T`
+    // case the one the pointer has. Any other type has one tag for both.
+    let structs: HashSet<&str> = prog.types.iter().map(|t| t.name.as_str()).collect();
+    let on_value = |ty: &str, method: &str| {
+        prog.funcs.iter().any(|f| {
+            f.name == method
+                && f.params.is_empty()
+                && f.receiver.as_ref().is_some_and(|r| r.ty == ty)
+        })
+    };
+    let mut arms: Vec<(String, &str)> = Vec::new();
+    for (ty, method) in types {
+        if !structs.contains(ty.as_str()) {
+            arms.push((ty, method));
+            continue;
+        }
+        let value_method = ["Error", "String"].into_iter().find(|m| on_value(&ty, m));
+        if let Some(m) = value_method {
+            arms.push((ty.clone(), m));
+        }
+        arms.push((format!("*{ty}"), method));
+    }
+    let cases: Vec<TypeSwitchCase> = arms
         .into_iter()
         .map(|(ty, method)| TypeSwitchCase {
             types: vec![ty],

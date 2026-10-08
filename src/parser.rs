@@ -759,7 +759,8 @@ impl Parser {
             // Its field name is the type's own name (the last component of a
             // qualified one), which is what promotion later reads through.
             if let Some(ty) = self.embedded_field()? {
-                let name = ty.rsplit('.').next().unwrap_or(&ty).to_string();
+                let bare = ty.trim_start_matches('*');
+                let name = bare.rsplit('.').next().unwrap_or(bare).to_string();
                 fields.push(Param { name, ty });
                 self.skip_semis();
                 continue;
@@ -783,7 +784,8 @@ impl Parser {
     }
 
     /// An embedded field at the current position — `Base`, `pkg.Base`, or
-    /// `*Base` with no field name — consumed and returned as its type text.
+    /// `*Base` with no field name — consumed and returned as its type text
+    /// (an embedded pointer with its `*`).
     /// Returns `None` (consuming nothing) if this is an ordinary named field.
     fn embedded_field(&mut self) -> Result<Option<String>, String> {
         // `*T` can only be an embedded pointer here; a named field would have
@@ -813,7 +815,9 @@ impl Parser {
         if matches!(self.peek(), Tok::Str(_)) {
             self.advance();
         }
-        Ok(Some(ty))
+        // An embedded pointer keeps its `*`: its zero value is nil, and it
+        // promotes the pointer-receiver methods into the value's method set.
+        Ok(Some(if star { format!("*{ty}") } else { ty }))
     }
 
     /// Parse an anonymous `struct{ … }` type (the `struct` keyword is the current

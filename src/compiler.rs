@@ -336,6 +336,10 @@ struct Compiler {
     /// `(type, method)` for every method declared with a value receiver — the
     /// receiver is copied at the call, so the method's writes stay local.
     value_recv_methods: HashSet<(String, String)>,
+    /// Variables declared `var v *T` for a struct `T`. `decl_types` keeps base
+    /// types, so it cannot tell `*T` from `T`; `errors.As` needs to, because
+    /// the target's type is the dynamic type it looks for in the chain.
+    ptr_struct_vars: HashSet<String>,
     /// Methods whose last parameter is variadic (`func (s *S) Add(xs ...int)`),
     /// whose trailing arguments a call packs into a slice.
     variadic_methods: HashSet<(String, String)>,
@@ -1379,39 +1383,75 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Each concrete type's method set, and each method-bearing interface's — the
     // two halves of Go's interface satisfaction rule, resolved at run time
     // against the table the prologue registers.
-    let mut type_methods: std::collections::BTreeMap<String, Vec<String>> =
+    //
+    // Go's method-set rule: a type's set holds its value-receiver methods, and
+    // the pointer type's holds those plus the pointer-receiver ones. A struct
+    // value and a pointer to one carry different runtime tags (`T` / `*T`), so
+    // each gets its own set. A pointer to any other type is not addressable
+    // apart from its value in go-rs (`&x` on a scalar is the value), so a
+    // non-struct type registers the full set under its one tag.
+    let mut value_methods: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut all_methods: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for f in &prog.funcs {
         if let Some(r) = &f.receiver {
-            type_methods
-                .entry(base_type(&r.ty))
-                .or_default()
-                .push(method_sig(&f.name, f.params.len(), &f.results));
+            let sig = method_sig(&f.name, f.params.len(), &f.results);
+            if !r.ty.starts_with('*') {
+                value_methods
+                    .entry(base_type(&r.ty))
+                    .or_default()
+                    .push(sig.clone());
+            }
+            all_methods.entry(base_type(&r.ty)).or_default().push(sig);
         }
     }
     // Go promotes an embedded type's methods into the embedding struct's method
-    // set, so a struct satisfies an interface its embedded field implements.
+    // set, so a struct satisfies an interface its embedded field implements:
+    // an embedded `T` adds `T`'s set to the value set and `*T`'s to the pointer
+    // set, and an embedded `*T` adds `*T`'s set to both.
     for _ in 0..prog.types.len() {
         let mut grew = false;
         for t in &prog.types {
             // An embedded field is the one whose name is its own type.
-            let promoted: Vec<String> = t
+            for f in t
                 .fields
                 .iter()
                 .filter(|f| f.name == base_type(&f.ty).rsplit('.').next().unwrap_or_default())
-                .filter_map(|f| type_methods.get(&base_type(&f.ty)).cloned())
-                .flatten()
-                .collect();
-            let own = type_methods.entry(t.name.clone()).or_default();
-            for m in promoted {
-                if !own.contains(&m) {
-                    own.push(m);
-                    grew = true;
+            {
+                let inner = base_type(&f.ty);
+                let inner_all = all_methods.get(&inner).cloned().unwrap_or_default();
+                let to_value = match f.ty.starts_with('*') {
+                    true => inner_all.clone(),
+                    false => value_methods.get(&inner).cloned().unwrap_or_default(),
+                };
+                for (set, promoted) in [
+                    (&mut value_methods, to_value),
+                    (&mut all_methods, inner_all),
+                ] {
+                    let own = set.entry(t.name.clone()).or_default();
+                    for m in promoted {
+                        if !own.contains(&m) {
+                            own.push(m);
+                            grew = true;
+                        }
+                    }
                 }
             }
         }
         if !grew {
             break;
+        }
+    }
+    let mut type_methods: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (ty, ms) in all_methods {
+        if structs.contains(&ty) {
+            let value = value_methods.get(&ty).cloned().unwrap_or_default();
+            type_methods.insert(ty.clone(), value);
+            type_methods.insert(format!("*{ty}"), ms);
+        } else {
+            type_methods.insert(ty, ms);
         }
     }
     for ms in type_methods.values_mut() {
@@ -1491,6 +1531,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         struct_fields,
         methods,
         value_recv_methods,
+        ptr_struct_vars: HashSet::new(),
         variadic_methods,
         method_nresults,
         method_result_ty,
@@ -2734,6 +2775,14 @@ impl Compiler {
                 }
                 self.types.insert(name.clone(), nt);
                 self.decl_types.insert(name.clone(), decl_ty);
+                match ty.as_deref() {
+                    Some(t) if t.starts_with('*') && self.structs.contains(&base_type(t)) => {
+                        self.ptr_struct_vars.insert(name.clone());
+                    }
+                    _ => {
+                        self.ptr_struct_vars.remove(name);
+                    }
+                }
                 self.emit_declare(name, *line);
             }
             Stmt::Short {
@@ -3404,7 +3453,7 @@ impl Compiler {
                     _ => String::new(),
                 };
                 // Bound at one concrete type, the value leaves its box.
-                if self.iface_of(&bound_ty).is_none() && !type_to_tag(&bound_ty).is_empty() {
+                if self.iface_of(&bound_ty).is_none() && !self.runtime_tag(&bound_ty).is_empty() {
                     self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
                 }
                 self.decl_types.insert(name.clone(), bound_ty);
@@ -3446,6 +3495,19 @@ impl Compiler {
         self.iface_methods.get(&base_type(ty))
     }
 
+    /// The runtime tag a value of written type `ty` carries ([`host::GTYPETAG`]):
+    /// [`type_to_tag`], except that a pointer to a struct keeps its `*` — a
+    /// struct value and a pointer to one are distinct dynamic types, which a
+    /// type switch, an assertion and the method-set lookup all tell apart.
+    fn runtime_tag(&self, ty: &str) -> String {
+        let base = base_type(ty);
+        if ty.starts_with('*') && self.structs.contains(&base) {
+            format!("*{base}")
+        } else {
+            type_to_tag(ty)
+        }
+    }
+
     /// Emit a test of whether the value in `val_tmp` (whose runtime type tag is
     /// in `tag_tmp`) has type `ty`, leaving a bool on the stack. Returns `false`
     /// — emitting nothing — when `ty` is the empty interface, which every value
@@ -3464,7 +3526,7 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(host::GIFACE_OK, 2), line);
             return true;
         }
-        let tag = type_to_tag(ty);
+        let tag = self.runtime_tag(ty);
         if tag.is_empty() {
             return false;
         }
@@ -3616,7 +3678,7 @@ impl Compiler {
                 let to_zero = self.b.emit(Op::JumpIfFalse(0), line);
                 self.emit_get(&raw, line);
                 // Asserted to a concrete type, the value leaves its box.
-                if self.iface_of(ty).is_none() && !type_to_tag(ty).is_empty() {
+                if self.iface_of(ty).is_none() && !self.runtime_tag(ty).is_empty() {
                     self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
                 }
                 let done = self.b.emit(Op::Jump(0), line);
@@ -4646,7 +4708,7 @@ impl Compiler {
                         self.b.emit(Op::CallBuiltin(host::GASSERT_IFACE, 3), 0);
                     }
                     None => {
-                        let c = self.b.add_constant(Value::str(type_to_tag(ty)));
+                        let c = self.b.add_constant(Value::str(self.runtime_tag(ty)));
                         self.b.emit(Op::LoadConst(c), 0);
                         self.b.emit(Op::CallBuiltin(host::GASSERT, 2), 0);
                     }
@@ -5912,6 +5974,20 @@ impl Compiler {
             ));
         };
         let ty = self.type_name(target);
+        // The dynamic type to look for is the target's own type, and for a
+        // struct that is `*T` or `T`. A `var v *T` target says which; failing
+        // that, a struct whose `Error` has a pointer receiver can only be
+        // matched as `*T`, since `T` does not implement `error`.
+        let base = base_type(&ty);
+        let declared_ptr = matches!(&**target, Expr::Ident(n) if self.ptr_struct_vars.contains(n));
+        let only_ptr_errs = self.structs.contains(&base)
+            && !self
+                .value_recv_methods
+                .contains(&(base.clone(), "Error".to_string()));
+        let tag = match declared_ptr || only_ptr_errs {
+            true => format!("*{base}"),
+            false => self.runtime_tag(&ty),
+        };
         if ty.is_empty() {
             return Err(format!(
                 "go-rs: errors.As: cannot determine the target's type (line {line})"
@@ -5923,7 +5999,7 @@ impl Compiler {
         let ok = format!("$asok{n}");
         self.call(
             &Expr::Ident("errors.asTag".to_string()),
-            &[err.clone(), Expr::Str(type_to_tag(&ty))],
+            &[err.clone(), Expr::Str(tag)],
             false,
             line,
         )?;
@@ -7672,7 +7748,8 @@ fn operand_verbs(format: &str) -> Vec<(bool, char)> {
 }
 
 /// Normalize a written type to the runtime tag [`host::GTYPETAG`] produces:
-/// pointers/named types → the base name, `[]T` → `[]`, `map[..]` → `map`,
+/// pointers/named types → the base name (a pointer to a struct keeps its `*`;
+/// see [`Compiler::runtime_tag`]), `[]T` → `[]`, `map[..]` → `map`,
 /// `func…` → `func`, and interface types (`any`, `interface{…}`, `error`) → `""`
 /// (which matches any value).
 fn type_to_tag(ty: &str) -> String {

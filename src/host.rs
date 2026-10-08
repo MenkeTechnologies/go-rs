@@ -611,6 +611,11 @@ fn type_tag_of(v: &Value) -> String {
         Value::Str(_) => "string".to_string(),
         Value::Bool(_) => "bool".to_string(),
         Value::Obj(id) => HEAP.with(|h| match h.borrow().get(follow(*id) as usize) {
+            // A pointer to a struct (`&T{…}`, `new(T)`, `&x`) is a different
+            // dynamic type from the struct value, with its own method set.
+            Some(HostObj::Struct { type_name, .. }) if ptr_identity(v).is_some() => {
+                format!("*{type_name}")
+            }
             Some(HostObj::Struct { type_name, .. }) => type_name.clone(),
             Some(HostObj::Slice { .. }) | Some(HostObj::SliceView { .. }) => "[]".to_string(),
             Some(HostObj::Map(_)) => "map".to_string(),

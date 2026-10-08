@@ -817,3 +817,33 @@ The lexer folds a rune literal to its integer value, so nothing downstream
 knows it was a rune: a variable it initializes is typed `int`. A rune that
 gets its type from a declaration (`var r rune = 'a'`, a `[]rune` element, a
 `range` over a string) is `int32` as in Go.
+
+## A `String` / `Error` promoted from an embedded field is not used by `fmt`
+
+```go
+type S struct{ A int }
+func (s *S) String() string { return "S!" }
+type P struct{ *S }
+fmt.Println(P{&S{9}})                 // go: S!     go-rs: {{9}}
+type Q struct{ S }
+fmt.Println(&Q{})                     // go: S!     go-rs: &{{0}}
+```
+
+The promoted method exists — `P{…}.String()` calls it, and `P` satisfies
+`fmt.Stringer` in an assertion or type switch. What misses it is `fmt`:
+`$stringify` (`pkg::add_stringify`) is built at link time from the methods a
+type *declares*, and the forwarders that promote a method are synthesized
+later, by the compiler (`promoted_methods`).
+
+## Two methods promoted from the same depth are not ambiguous
+
+```go
+type A struct{}; func (A) String() string { return "a" }
+type B struct{}; func (B) String() string { return "b" }
+type O struct{ A; B }
+var o any = O{}
+_, ok := o.(fmt.Stringer)   // go: false (O.String is ambiguous)   go-rs: true
+```
+
+Go drops a selector that two embedded fields supply at the same depth, so `O`
+has no `String` at all. The promotion pass takes the first one it finds.
