@@ -158,7 +158,9 @@ a variable captured by a nested closure is boxed in a shared heap cell, so a
 closure's writes are seen by the enclosing scope and by sibling closures (loop
 variables keep Go 1.22 per-iteration value semantics and are not boxed).
 **`defer`/`panic`/`recover`** run
-on a host-side defer stack drained before every return: `defer` snapshots the
+on host-side defer frames drained before every return — one per invocation,
+addressed through a hidden local so interleaved goroutines each drain their
+own: `defer` snapshots the
 call's arguments (and, for a method, its receiver by reference) and pushes a
 closure; a `panic` jumps to the function's defer drain and, if unrecovered,
 propagates up the call chain (a compile-time check after each call, active only
