@@ -22,6 +22,11 @@ use std::collections::{HashMap, HashSet};
 
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
+/// The hidden local holding a function invocation's defer-frame handle
+/// ([`host::GDEFER_ENTER`]). A local rather than host state, so goroutines that
+/// interleave on the one thread each drain their own deferred calls.
+const DEFER_FRAME: &str = "$defers";
+
 /// The static numeric category of a value — drives `/` truncation and the
 /// choice between numeric and string comparison ops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1549,7 +1554,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     c.fn_has_defer = body_has_defer(&prog.main);
     if c.fn_has_defer {
         c.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), 0);
-        c.b.emit(Op::Pop, 0);
+        c.emit_declare(DEFER_FRAME, 0);
     }
     for s in &prog.main {
         c.stmt(s)?;
@@ -1565,7 +1570,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
     if c.fn_has_defer {
         c.emit_defer_drain();
-        c.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 0), 0);
+        c.emit_get(DEFER_FRAME, 0);
+        c.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 1), 0);
         c.b.emit(Op::Pop, 0);
         c.fn_has_defer = false;
     }
@@ -1699,7 +1705,7 @@ impl Compiler {
         self.panic_jumps.clear();
         if self.fn_has_defer {
             self.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), f.line);
-            self.b.emit(Op::Pop, f.line);
+            self.emit_declare(DEFER_FRAME, f.line);
         }
 
         for s in &f.body {
@@ -1804,7 +1810,8 @@ impl Compiler {
     fn emit_return(&mut self, line: u32) {
         if self.fn_has_defer {
             self.emit_defer_drain();
-            self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 0), line);
+            self.emit_get(DEFER_FRAME, line);
+            self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 1), line);
             self.b.emit(Op::Pop, line);
         }
         self.b.emit(Op::ReturnValue, line);
@@ -1817,7 +1824,8 @@ impl Compiler {
     fn emit_named_return(&mut self, line: u32) {
         if self.fn_has_defer {
             self.emit_defer_drain();
-            self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 0), line);
+            self.emit_get(DEFER_FRAME, line);
+            self.b.emit(Op::CallBuiltin(host::GDEFER_LEAVE, 1), line);
             self.b.emit(Op::Pop, line);
         }
         let names = self.named_results.clone();
@@ -1887,9 +1895,11 @@ impl Compiler {
     /// `defer` time), so it is invoked as `c(self=c)` via `Op::CallDynamic`.
     fn emit_defer_drain(&mut self) {
         let start = self.b.current_pos();
-        self.b.emit(Op::CallBuiltin(host::GDEFER_LEN, 0), 0);
+        self.emit_get(DEFER_FRAME, 0);
+        self.b.emit(Op::CallBuiltin(host::GDEFER_LEN, 1), 0);
         let done = self.b.emit(Op::JumpIfFalse(0), 0);
-        self.b.emit(Op::CallBuiltin(host::GDEFER_POP, 0), 0);
+        self.emit_get(DEFER_FRAME, 0);
+        self.b.emit(Op::CallBuiltin(host::GDEFER_POP, 1), 0);
         self.emit_set("$dcpop", 0);
         // Park any propagating panic across the call: a deferred function runs
         // normally in Go, so the post-call unwind checks inside it must not see
@@ -1916,7 +1926,8 @@ impl Compiler {
     /// closure runs at function return via [`Self::emit_defer_drain`].
     fn compile_defer(&mut self, call: &Expr, line: u32) -> Result<(), String> {
         self.emit_snapshot_call(call, "defer", line)?;
-        self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 1), line);
+        self.emit_get(DEFER_FRAME, line);
+        self.b.emit(Op::CallBuiltin(host::GDEFER_PUSH, 2), line);
         self.b.emit(Op::Pop, line);
         Ok(())
     }
@@ -2194,7 +2205,7 @@ impl Compiler {
         let saved_panic_jumps = std::mem::take(&mut self.panic_jumps);
         if self.fn_has_defer {
             self.b.emit(Op::CallBuiltin(host::GDEFER_ENTER, 0), 0);
-            self.b.emit(Op::Pop, 0);
+            self.emit_declare(DEFER_FRAME, 0);
         }
 
         for s in &body {

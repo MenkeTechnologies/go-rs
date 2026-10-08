@@ -96,16 +96,18 @@ pub const GCLOSURE_NEW: u16 = 828;
 pub const GCLOSURE_GET: u16 = 829;
 /// Read a closure's target subroutine name-index (for `Op::CallDynamic`).
 pub const GCLOSURE_NAMEIDX: u16 = 819;
-/// Push a new (empty) defer frame — one per invocation of a function that has
-/// `defer` statements. (IDs 830–880 belong to the `stdlib` submodule.)
+/// → `Int` handle of a new (empty) defer frame — one per invocation of a
+/// function that has `defer` statements. The function keeps the handle in a
+/// local, so each goroutine's frames are its own. (IDs 830–880 belong to the
+/// `stdlib` submodule.)
 pub const GDEFER_ENTER: u16 = 881;
-/// `[closure]` → push a deferred closure onto the current defer frame.
+/// `[closure, frame]` → push a deferred closure onto defer frame `frame`.
 pub const GDEFER_PUSH: u16 = 882;
-/// → `Int` count of deferred closures in the current frame (drives the drain).
+/// `[frame]` → `Int` count of deferred closures in `frame` (drives the drain).
 pub const GDEFER_LEN: u16 = 883;
-/// → pop and return the most-recently-deferred closure of the current frame.
+/// `[frame]` → pop and return the most-recently-deferred closure of `frame`.
 pub const GDEFER_POP: u16 = 884;
-/// Pop the (drained) defer frame.
+/// `[frame]` → release the (drained) defer frame.
 pub const GDEFER_LEAVE: u16 = 885;
 /// `[value]` → record a panic; execution unwinds to the current function's
 /// defer drain (a deferred `recover()` may cancel it).
@@ -1104,45 +1106,68 @@ fn b_panic_finish(_vm: &mut VM, _argc: u8) -> Value {
     Value::Undef
 }
 
-/// Push a fresh defer frame at the start of a function that has `defer`s.
+/// Open a fresh defer frame at the start of a function that has `defer`s and
+/// return its handle, which the function keeps in a local for the calls below.
 fn b_defer_enter(_vm: &mut VM, _argc: u8) -> Value {
-    DEFERS.with(|d| d.borrow_mut().push(Vec::new()));
-    Value::Undef
+    let reused = DEFER_FREE.with(|f| f.borrow_mut().pop());
+    let handle = DEFERS.with(|d| {
+        let mut d = d.borrow_mut();
+        match reused {
+            Some(i) => i,
+            None => {
+                d.push(Vec::new());
+                d.len() - 1
+            }
+        }
+    });
+    Value::Int(handle as i64)
 }
 
-/// `[closure]` → record a deferred closure in the current frame (LIFO order).
+/// The defer-frame handle a call passed as its last argument.
+fn defer_handle(args: &[Value]) -> usize {
+    args.last().map_or(0, Value::to_int) as usize
+}
+
+/// `[closure, frame]` → record a deferred closure in `frame` (LIFO order).
 fn b_defer_push(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
+    let frame = defer_handle(&args);
     if let Some(c) = args.into_iter().next() {
         DEFERS.with(|d| {
-            if let Some(frame) = d.borrow_mut().last_mut() {
-                frame.push(c);
+            if let Some(f) = d.borrow_mut().get_mut(frame) {
+                f.push(c);
             }
         });
     }
     Value::Undef
 }
 
-/// → the number of deferred closures still to run in the current frame.
-fn b_defer_len(_vm: &mut VM, _argc: u8) -> Value {
-    Value::Int(DEFERS.with(|d| d.borrow().last().map(|f| f.len()).unwrap_or(0)) as i64)
+/// `[frame]` → the number of deferred closures still to run in `frame`.
+fn b_defer_len(vm: &mut VM, argc: u8) -> Value {
+    let frame = defer_handle(&pop_args(vm, argc));
+    Value::Int(DEFERS.with(|d| d.borrow().get(frame).map_or(0, Vec::len)) as i64)
 }
 
-/// → pop the most-recently-deferred closure of the current frame (LIFO).
-fn b_defer_pop(_vm: &mut VM, _argc: u8) -> Value {
+/// `[frame]` → pop the most-recently-deferred closure of `frame` (LIFO).
+fn b_defer_pop(vm: &mut VM, argc: u8) -> Value {
+    let frame = defer_handle(&pop_args(vm, argc));
     DEFERS.with(|d| {
         d.borrow_mut()
-            .last_mut()
-            .and_then(|f| f.pop())
+            .get_mut(frame)
+            .and_then(Vec::pop)
             .unwrap_or(Value::Undef)
     })
 }
 
-/// Drop the drained defer frame on function exit.
-fn b_defer_leave(_vm: &mut VM, _argc: u8) -> Value {
+/// `[frame]` → release the drained defer frame on function exit.
+fn b_defer_leave(vm: &mut VM, argc: u8) -> Value {
+    let frame = defer_handle(&pop_args(vm, argc));
     DEFERS.with(|d| {
-        d.borrow_mut().pop();
+        if let Some(f) = d.borrow_mut().get_mut(frame) {
+            f.clear();
+        }
     });
+    DEFER_FREE.with(|f| f.borrow_mut().push(frame));
     Value::Undef
 }
 
@@ -1736,10 +1761,19 @@ thread_local! {
     /// program so handles never leak across runs.
     static HEAP: RefCell<Vec<HostObj>> = const { RefCell::new(Vec::new()) };
 
-    /// A stack of defer frames, one per in-flight function invocation that has
-    /// `defer` statements. Each frame holds its deferred closures in push order;
-    /// the drain loop pops them LIFO before the function returns.
+    /// The defer frames of every in-flight function invocation that has `defer`
+    /// statements, addressed by the handle [`GDEFER_ENTER`] returned. Each frame
+    /// holds its deferred closures in push order; the drain loop pops them LIFO
+    /// before the function returns.
+    ///
+    /// It is a slab rather than a stack because goroutines interleave: they
+    /// share this thread, so a goroutine can enter a function while another is
+    /// still inside one, and the top of a stack would be the wrong goroutine's
+    /// frame. A released slot is reused through [`DEFER_FREE`].
     static DEFERS: RefCell<Vec<Vec<Value>>> = const { RefCell::new(Vec::new()) };
+
+    /// Released [`DEFERS`] slots, ready for the next [`GDEFER_ENTER`].
+    static DEFER_FREE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 
     /// The value of an in-flight `panic`, or `None`. Set by `panic()`, cleared by
     /// `recover()`; the compiler unwinds through defer drains while it is `Some`.
@@ -1786,6 +1820,7 @@ pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
     METHOD_SETS.with(|m| m.borrow_mut().clear());
     DEFERS.with(|d| d.borrow_mut().clear());
+    DEFER_FREE.with(|f| f.borrow_mut().clear());
     PANIC.with(|p| *p.borrow_mut() = None);
     PARKED.with(|p| p.borrow_mut().clear());
     CHAN_CLOSED.with(|c| *c.borrow_mut() = None);
