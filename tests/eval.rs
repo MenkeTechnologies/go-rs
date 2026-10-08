@@ -1484,6 +1484,40 @@ fn unrecovered_goroutine_panic_is_fatal() {
 }
 
 #[test]
+fn unrecovered_panic_prints_error_and_string_methods() {
+    // Go's `printpanicval` prints an `error` panic value through `Error()` and a
+    // `Stringer` through `String()` (`runtime.preprintpanics`) — in `main` and
+    // in a goroutine's entry frame. Expected first lines from `go run` (1.27).
+    let decls = "type E struct{ s string }\nfunc (e E) Error() string { return \"E:\" + e.s }\ntype P struct{ s string }\nfunc (p *P) Error() string { return \"P:\" + p.s }\ntype S struct{}\nfunc (S) String() string { return \"str\" }\n";
+    for (body, want) in [
+        ("panic(errors.New(\"boom\"))", "panic: boom\n"),
+        ("panic(fmt.Errorf(\"wrapped %d\", 3))", "panic: wrapped 3\n"),
+        ("panic(E{\"x\"})", "panic: E:x\n"),
+        ("panic(S{})", "panic: str\n"),
+        ("panic(\"plain\")", "panic: plain\n"),
+        (
+            "done := make(chan bool)\n\tgo func() {\n\t\tdefer close(done)\n\t\tpanic(&P{\"g\"})\n\t}()\n\t<-done",
+            "panic: P:g\n",
+        ),
+    ] {
+        let src = format!(
+            "package main\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n{decls}func main() {{\n\tvar _ = errors.New\n\tfmt.Println(\"start\")\n\t{body}\n}}\n"
+        );
+        let mut f = tempfile::Builder::new().suffix(".go").tempfile().unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_go"))
+            .arg("run")
+            .arg(f.path())
+            .output()
+            .expect("spawn go binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{body}: stderr {stderr:?}");
+        assert!(stderr.starts_with(want), "{body}: stderr {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "start\n", "{body}");
+    }
+}
+
+#[test]
 fn multi_value_spread_into_call() {
     // `f(g())` where g returns multiple values passes them as f's arguments.
     let src = "\

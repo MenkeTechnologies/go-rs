@@ -118,6 +118,13 @@ pub const GPANIC_ACTIVE: u16 = 887;
 pub const GRECOVER: u16 = 888;
 /// If a panic is still propagating at program end, print it and exit non-zero.
 pub const GPANIC_FINISH: u16 = 889;
+/// `[in_goroutine]` → `Bool`: whether a panic still live at this return is
+/// fatal — any live panic at the end of `main`, or one reaching a goroutine's
+/// entry frame. When it is, the value moves to the fatal slot, so the
+/// `Error()` / `String()` call that renders it runs with no panic in flight.
+pub const GPANIC_FATAL: u16 = 939;
+/// → the value [`GPANIC_FATAL`] moved to the fatal slot.
+pub const GPANIC_FATAL_VALUE: u16 = 940;
 /// Park the in-flight panic for the duration of one deferred call. Emitted by
 /// the drain loop immediately before invoking a deferred closure.
 ///
@@ -467,6 +474,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GPANIC_ACTIVE, b_panic_active);
     vm.register_builtin(GRECOVER, b_recover);
     vm.register_builtin(GPANIC_FINISH, b_panic_finish);
+    vm.register_builtin(GPANIC_FATAL, b_panic_fatal);
+    vm.register_builtin(GPANIC_FATAL_VALUE, b_panic_fatal_value);
     vm.register_builtin(GPANIC_GOROUTINE_EXIT, b_panic_goroutine_exit);
     vm.register_builtin(GSTRUCT_WITH, b_struct_with);
     vm.register_builtin(GCELL_NEW, b_cell_new);
@@ -1112,14 +1121,43 @@ fn b_defer_unpark(_vm: &mut VM, _argc: u8) -> Value {
 /// At program end, a still-propagating panic is fatal: print it like Go's first
 /// line (`panic: <value>`) on stderr and exit with status 2. (The goroutine
 /// stack trace Go prints below that line is not reproduced.)
-fn b_panic_finish(_vm: &mut VM, _argc: u8) -> Value {
-    if let Some(v) = PANIC.with(|p| p.borrow_mut().take()) {
+///
+/// With one argument it is the value [`GPANIC_FATAL`] moved aside, already
+/// rendered by `$stringify` — Go's `printpanicval` prints an `error` through
+/// `Error()` and a `Stringer` through `String()` (`runtime.preprintpanics`).
+fn b_panic_finish(vm: &mut VM, argc: u8) -> Value {
+    let rendered = pop_args(vm, argc).into_iter().next();
+    let live = match rendered {
+        Some(_) => FATAL.with(|f| f.borrow_mut().take()),
+        None => PANIC.with(|p| p.borrow_mut().take()),
+    };
+    if let Some(v) = live {
         // A run-time fault's error prints its message, as Go prints `Error()`.
-        let msg = runtime_error_message(&v).unwrap_or_else(|| go_str(&v));
+        let shown = rendered.unwrap_or_else(|| v.clone());
+        let msg = runtime_error_message(&v).unwrap_or_else(|| go_str(&shown));
         eprintln!("panic: {msg}");
         std::process::exit(2);
     }
     Value::Undef
+}
+
+/// [`GPANIC_FATAL`].
+fn b_panic_fatal(vm: &mut VM, argc: u8) -> Value {
+    let in_goroutine = pop_args(vm, argc).first().is_some_and(|v| v.is_truthy());
+    let ops = vm.chunk.ops.len();
+    if in_goroutine && !vm.frames.last().is_some_and(|f| f.return_ip == ops) {
+        return Value::bool(false);
+    }
+    let Some(v) = PANIC.with(|p| p.borrow_mut().take()) else {
+        return Value::bool(false);
+    };
+    FATAL.with(|f| *f.borrow_mut() = Some(v));
+    Value::bool(true)
+}
+
+/// [`GPANIC_FATAL_VALUE`].
+fn b_panic_fatal_value(_vm: &mut VM, _argc: u8) -> Value {
+    FATAL.with(|f| f.borrow().clone()).unwrap_or(Value::Undef)
 }
 
 /// [`GPANIC_GOROUTINE_EXIT`]. The scheduler positions a goroutine on a frame
@@ -1805,6 +1843,8 @@ thread_local! {
     /// The value of an in-flight `panic`, or `None`. Set by `panic()`, cleared by
     /// `recover()`; the compiler unwinds through defer drains while it is `Some`.
     static PANIC: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// A fatal panic's value while `$stringify` renders it ([`GPANIC_FATAL`]).
+    static FATAL: RefCell<Option<Value>> = const { RefCell::new(None) };
 
     /// One entry per deferred call currently running, innermost last. A drain
     /// loop parks the propagating panic here before each deferred call and

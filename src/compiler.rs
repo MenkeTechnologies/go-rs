@@ -1613,8 +1613,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
     // A panic that reached `main` unrecovered is fatal (prints + exits non-zero).
     if c.uses_panic {
-        c.b.emit(Op::CallBuiltin(host::GPANIC_FINISH, 0), 0);
-        c.b.emit(Op::Pop, 0);
+        c.emit_fatal_panic(false, 0);
     }
 
     // ── subroutine bodies, emitted after main and jumped over ──
@@ -1924,10 +1923,36 @@ impl Compiler {
     /// ([`host::GPANIC_GOROUTINE_EXIT`]). Every other return emits nothing.
     fn emit_goroutine_panic_exit(&mut self, line: u32) {
         if self.unwinding {
-            self.b
-                .emit(Op::CallBuiltin(host::GPANIC_GOROUTINE_EXIT, 0), line);
-            self.b.emit(Op::Pop, line);
+            self.emit_fatal_panic(true, line);
         }
+    }
+
+    /// A panic still live here is fatal ([`host::GPANIC_FINISH`]). Go prints
+    /// an `error` through `Error()` and a `Stringer` through `String()`, so
+    /// when the program has such a type the value is moved aside
+    /// ([`host::GPANIC_FATAL`]) and rendered by `$stringify` first. That call
+    /// is a plain `Call` with no unwind check: the panic is no longer in
+    /// flight, and there is no epilogue left to unwind to.
+    fn emit_fatal_panic(&mut self, in_goroutine: bool, line: u32) {
+        if !self.funcs.contains_key("$stringify") {
+            let finish = match in_goroutine {
+                true => host::GPANIC_GOROUTINE_EXIT,
+                false => host::GPANIC_FINISH,
+            };
+            self.b.emit(Op::CallBuiltin(finish, 0), line);
+            self.b.emit(Op::Pop, line);
+            return;
+        }
+        self.b.emit(Op::LoadInt(in_goroutine as i64), line);
+        self.b.emit(Op::CallBuiltin(host::GPANIC_FATAL, 1), line);
+        let skip = self.b.emit(Op::JumpIfFalse(0), line);
+        self.b.emit(Op::CallBuiltin(host::GPANIC_FATAL_VALUE, 0), line);
+        let idx = self.b.add_name("$stringify");
+        self.b.emit(Op::Call(idx, 1), line);
+        self.b.emit(Op::CallBuiltin(host::GPANIC_FINISH, 1), line);
+        self.b.emit(Op::Pop, line);
+        let end = self.b.current_pos();
+        self.b.patch_jump(skip, end);
     }
 
     /// After a user-function call, if a panic is now propagating, jump to the
