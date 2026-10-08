@@ -388,6 +388,10 @@ struct Compiler {
     /// non-struct `T`. Such a pointer is a heap cell holding the value (see
     /// [`host::GDEREF`]), so `*p` reads through the cell.
     cell_ptrs: HashSet<String>,
+    /// `(struct type, name)` pairs whose selector is ambiguous — two fields or
+    /// methods at the shallowest depth ([`crate::ast::Selected::Ambiguous`]).
+    /// Selecting one is a compile error, as in Go.
+    ambiguous_selectors: HashSet<(String, String)>,
     /// `&x` arguments, with `x` a slice or map, of the user calls being
     /// emitted: the variable and the temporary holding its pointer. Once the
     /// call returns `x` is reloaded through the pointer ([`Self::emit_arg`]).
@@ -1204,6 +1208,9 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
                     if have(&t.name, &src.name, &out) || have(&t.name, &src.name, &round) {
                         continue; // the outer type overrides it
                     }
+                    if !prog.promotes_method(&t.name, &src.name) {
+                        continue; // ambiguous, or shadowed by a field
+                    }
                     round.push(forwarder(&t.name, &inner, src));
                 }
             }
@@ -1220,6 +1227,9 @@ fn promoted_methods(prog: &Program) -> Vec<Func> {
                 for sig in *sigs {
                     let src = iface_method_stub(sig);
                     if have(&t.name, &src.name, &out) || have(&t.name, &src.name, &round) {
+                        continue;
+                    }
+                    if !prog.promotes_method(&t.name, &src.name) {
                         continue;
                     }
                     round.push(forwarder(&t.name, &f.name, &src));
@@ -1419,7 +1429,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Go promotes an embedded type's methods into the embedding struct's method
     // set, so a struct satisfies an interface its embedded field implements:
     // an embedded `T` adds `T`'s set to the value set and `*T`'s to the pointer
-    // set, and an embedded `*T` adds `*T`'s set to both.
+    // set, and an embedded `*T` adds `*T`'s set to both. A method Go does not
+    // promote — ambiguous, or shadowed by a field — is left out. (`prog` already
+    // holds the forwarders `promoted_methods` made, so a promoted method
+    // resolves at depth 0 here.)
     for _ in 0..prog.types.len() {
         let mut grew = false;
         for t in &prog.types {
@@ -1436,7 +1449,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 ] {
                     let own = set.entry(t.name.clone()).or_default();
                     for m in promoted {
-                        if !own.contains(&m) {
+                        if !own.contains(&m)
+                            && matches!(
+                                prog.lookup_selector(&t.name, m.split('/').next().unwrap_or("")),
+                                crate::ast::Selected::Method { .. }
+                            )
+                        {
                             own.push(m);
                             grew = true;
                         }
@@ -1500,6 +1518,29 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // ahead of `main`'s own body). Functions read these as globals.
     let globals = collect_globals(&prog.main);
 
+    // Only a struct with embedded fields can make a selector ambiguous, and
+    // only a name some type declares as a field or method can be one.
+    let mut member_names: HashSet<&str> = prog
+        .funcs
+        .iter()
+        .filter(|f| f.receiver.is_some())
+        .map(|f| f.name.as_str())
+        .collect();
+    member_names.extend(prog.types.iter().flat_map(|t| t.fields.iter().map(|f| f.name.as_str())));
+    member_names.extend(
+        prog.interfaces
+            .iter()
+            .flat_map(|i| i.methods.iter().filter_map(|m| m.split('/').next())),
+    );
+    let ambiguous_selectors: HashSet<(String, String)> = prog
+        .types
+        .iter()
+        .filter(|t| !t.embedded.is_empty())
+        .flat_map(|t| member_names.iter().map(move |n| (t, *n)))
+        .filter(|(t, n)| prog.lookup_selector(&t.name, n) == crate::ast::Selected::Ambiguous)
+        .map(|(t, n)| (t.name.clone(), n.to_string()))
+        .collect();
+
     // Tell the runtime which fields a struct value-copy must recurse into: those
     // declared as a struct type by value. A `*T` field keeps its raw `*` here, so
     // it is not in the plan and stays aliased — Go copies a pointer, not what it
@@ -1554,6 +1595,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambdas: Vec::new(),
         closure_vars: HashMap::new(),
         cell_ptrs: HashSet::new(),
+        ambiguous_selectors,
         addr_writebacks: Vec::new(),
         ptr_aliases: HashMap::new(),
         call_depth: 0,
@@ -4811,6 +4853,7 @@ impl Compiler {
             // A bare selector `x.f` is a package constant (`math.Pi`) or a
             // struct field read.
             Expr::Selector { recv, field } => {
+                self.check_selector(recv, field, 0)?;
                 if let Expr::Ident(pkg) = recv.as_ref() {
                     if let Some(v) = host::stdlib::resolve_const(pkg, field) {
                         let c = self.b.add_constant(v);
@@ -5534,6 +5577,20 @@ impl Compiler {
     /// A *pointer*-receiver method gets the caller's own struct handle, so a
     /// field it writes is observed by the caller; a value-receiver one gets a
     /// copy ([`Self::emit_recv_copy`]) and cannot write through.
+    /// Refuse `x.name` when it is ambiguous on `x`'s struct type, as Go's
+    /// compiler does (`ambiguous selector x.name`).
+    fn check_selector(&self, recv: &Expr, name: &str, line: u32) -> Result<(), String> {
+        let ty = base_type(&self.type_name(recv));
+        if !self.ambiguous_selectors.contains(&(ty, name.to_string())) {
+            return Ok(());
+        }
+        let x = match recv {
+            Expr::Ident(n) => n.as_str(),
+            _ => "x",
+        };
+        Err(format!("go-rs: ambiguous selector {x}.{name} (line {line})"))
+    }
+
     fn method_call(
         &mut self,
         recv: &Expr,
@@ -5542,6 +5599,7 @@ impl Compiler {
         spread: bool,
         line: u32,
     ) -> Result<(), String> {
+        self.check_selector(recv, method, line)?;
         let ty = self.type_name(recv);
 
         // Static dispatch: the receiver's concrete struct type is known and

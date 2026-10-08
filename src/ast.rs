@@ -31,6 +31,85 @@ pub struct Program {
     pub defined: Vec<(String, String)>,
 }
 
+/// What selector `x.name` denotes on a struct type, by Go's rule: the
+/// shallowest depth holding any field or method named `name` decides, and it
+/// must hold exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selected {
+    /// No field or method of that name at any depth.
+    Nothing,
+    /// A field, declared or promoted.
+    Field,
+    /// A method, found `depth` embedded fields down (0: declared on the type).
+    Method { depth: usize },
+    /// Two or more at the shallowest depth — a compile error to select.
+    Ambiguous,
+}
+
+impl Program {
+    /// Resolve selector `name` on struct type `ty` ([`Selected`]). Two at the
+    /// shallowest depth (`struct { A; B }` where both have `String`) make it
+    /// ambiguous, and a field there shadows any method deeper down. A type
+    /// reached twice at one depth counts twice, and one already searched at a
+    /// shallower depth is not searched again (`go/types`
+    /// `lookupFieldOrMethod`).
+    pub fn lookup_selector(&self, ty: &str, name: &str) -> Selected {
+        let base = |t: &str| t.trim_start_matches('*').to_string();
+        let mut level: Vec<(String, usize)> = vec![(base(ty), 1)];
+        let mut seen: Vec<String> = Vec::new();
+        for depth in 0..16 {
+            let mut found = 0;
+            let mut method = false;
+            let mut next: Vec<(String, usize)> = Vec::new();
+            for (t, mult) in &level {
+                let declared = self.funcs.iter().any(|f| {
+                    f.name == name && f.receiver.as_ref().is_some_and(|r| base(&r.ty) == *t)
+                });
+                let in_iface = self.interfaces.iter().any(|i| {
+                    i.name == *t
+                        && i.methods
+                            .iter()
+                            .any(|m| m.split('/').next() == Some(name))
+                });
+                let decl = self.types.iter().find(|s| s.name == *t);
+                let field = decl.is_some_and(|s| s.fields.iter().any(|f| f.name == name));
+                if declared || in_iface || field {
+                    found += mult;
+                    method = !field;
+                }
+                for f in decl.iter().flat_map(|s| &s.fields) {
+                    if decl.is_some_and(|s| s.is_embedded(&f.name)) {
+                        let inner = base(&f.ty);
+                        match next.iter_mut().find(|(n, _)| *n == inner) {
+                            Some((_, m)) => *m += mult,
+                            None => next.push((inner, *mult)),
+                        }
+                    }
+                }
+            }
+            match (found, method) {
+                (0, _) => {}
+                (1, true) => return Selected::Method { depth },
+                (1, false) => return Selected::Field,
+                _ => return Selected::Ambiguous,
+            }
+            seen.extend(level.into_iter().map(|(t, _)| t));
+            next.retain(|(t, _)| !seen.contains(t));
+            if next.is_empty() {
+                return Selected::Nothing;
+            }
+            level = next;
+        }
+        Selected::Nothing
+    }
+
+    /// Whether `name` on struct type `ty` is a method promoted through an
+    /// embedded field — not declared on `ty`, not ambiguous, not shadowed.
+    pub fn promotes_method(&self, ty: &str, name: &str) -> bool {
+        matches!(self.lookup_selector(ty, name), Selected::Method { depth } if depth > 0)
+    }
+}
+
 /// A `type T struct { field T; … }` declaration.
 #[derive(Debug, Clone)]
 pub struct StructDecl {

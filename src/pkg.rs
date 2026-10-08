@@ -924,9 +924,9 @@ impl ShownTypes {
 /// whether a value of `ty` has it, `None` when neither `ty` nor `*ty` does. A
 /// declared method is on the value unless its receiver is a pointer; otherwise
 /// the first embedded field that supplies it promotes it — an embedded `*T`
-/// onto the value too, an embedded `T` only as `T`'s value has it. (Two fields
-/// supplying it at one depth is ambiguous in Go, which the first-found rule
-/// does not model; see BUGS.md.)
+/// onto the value too, an embedded `T` only as `T`'s value has it — when Go
+/// promotes it at all: two fields supplying it at one depth, or a field of
+/// that name shallower, leave the type without it ([`Program::promotes_method`]).
 fn method_reach(prog: &Program, ty: &str, method: &str, depth: usize) -> Option<bool> {
     let declared = prog.funcs.iter().find_map(|f| {
         let r = f.receiver.as_ref()?;
@@ -935,6 +935,9 @@ fn method_reach(prog: &Program, ty: &str, method: &str, depth: usize) -> Option<
     });
     if declared.is_some() || depth > 8 {
         return declared;
+    }
+    if !prog.promotes_method(ty, method) {
+        return None;
     }
     let t = prog.types.iter().find(|t| t.name == ty)?;
     t.fields.iter().find_map(|f| {

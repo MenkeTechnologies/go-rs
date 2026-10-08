@@ -820,15 +820,3 @@ knows it was a rune: a variable it initializes is typed `int`. A rune that
 gets its type from a declaration (`var r rune = 'a'`, a `[]rune` element, a
 `range` over a string) is `int32` as in Go.
 
-## Two methods promoted from the same depth are not ambiguous
-
-```go
-type A struct{}; func (A) String() string { return "a" }
-type B struct{}; func (B) String() string { return "b" }
-type O struct{ A; B }
-var o any = O{}
-_, ok := o.(fmt.Stringer)   // go: false (O.String is ambiguous)   go-rs: true
-```
-
-Go drops a selector that two embedded fields supply at the same depth, so `O`
-has no `String` at all. The promotion pass takes the first one it finds.

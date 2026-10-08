@@ -3616,3 +3616,21 @@ fn function_without_body_in_main_is_rejected() {
 fn redeclared_constant_does_not_hang_the_parser() {
     let _ = gors::parse("package main\n\nconst X = 1\nconst X = 2\n\nfunc main() {}\n");
 }
+
+#[test]
+fn ambiguous_promoted_selector_is_a_compile_error() {
+    // Two embedded fields supplying `Hello` at the same depth: Go rejects the
+    // selector (`ambiguous selector c.Hello`) instead of taking the first.
+    // A field at that depth makes a method of the same name ambiguous too.
+    for (decl, sel) in [
+        ("type C struct {\n\tA\n\tB\n}", "c.Hello()"),
+        ("type F struct{ Hello int }\ntype C struct {\n\tA\n\tF\n}", "c.Hello"),
+    ] {
+        let src = format!(
+            "package main\nimport \"fmt\"\ntype A struct{{}}\nfunc (A) Hello() string {{ return \"A\" }}\ntype B struct{{}}\nfunc (B) Hello() string {{ return \"B\" }}\n{decl}\nfunc main() {{\n\tvar c C\n\tfmt.Println({sel})\n}}\n"
+        );
+        let (out, ok) = run_capturing_stderr(&src);
+        assert!(!ok, "{decl}: accepted, output {out:?}");
+        assert!(out.contains("ambiguous selector c.Hello"), "{decl}: {out:?}");
+    }
+}
