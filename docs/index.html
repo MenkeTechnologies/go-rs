@@ -139,17 +139,17 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>GO-RS REFERENCE</h2>
-      <p class="tutorial-subtitle">A Go frontend written in Rust. Source is lexed (with Go's automatic semicolon insertion) and parsed to an AST, lowered to <code>fusevm</code> bytecode, and executed on the same language-agnostic VM + three-tier Cranelift JIT that hosts <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisprs</code>, and <code>rubylang</code>. No bespoke VM, no goroutine runtime, no gc, no <code>go</code> toolchain. <strong>In active development.</strong></p>
+      <p class="tutorial-subtitle">A Go frontend written in Rust. Source is lexed (with Go's automatic semicolon insertion) and parsed to an AST, lowered to <code>fusevm</code> bytecode, and executed on the same language-agnostic VM + three-tier Cranelift JIT that hosts every fusevm language host. No bespoke VM, no goroutine runtime, no gc, no <code>go</code> toolchain. <strong>In active development.</strong></p>
 
       <section class="tutorial-section">
         <h2>What it is</h2>
         <p><code>go-rs</code> runs Go programs as ordinary compiled bytecode: it lexes and parses the source, lowers it to <code>fusevm</code> instructions, and lets the shared engine execute and JIT-compile them. There is no bespoke VM or tree-walker — arithmetic and comparisons lower to native fusevm ops so the Cranelift JIT can trace hot loops, while Go-specific behaviour (the <code>string</code> <code>+</code> concatenation overload and lexicographic string ordering, Go's <code>%v</code> value formatting where a whole <code>float64</code> prints as <code>3</code>) is served by the host numeric hook and print builtins.</p>
-        <p>It is another language hosted on <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a>, the shared bytecode VM and Cranelift JIT behind <code>zshrs</code> (the shell), <code>stryke</code> (the language), <code>awkrs</code> (AWK), <code>elisprs</code> (Emacs Lisp), and <code>rubylang</code> (Ruby). go-rs carries no VM or JIT of its own — the <code>go</code> toolchain compiles Go to a native binary with a goroutine runtime and garbage collector; go-rs runs Go on fusevm.</p>
+        <p>It is another language hosted on <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a>, the shared bytecode VM and Cranelift JIT behind every fusevm language host. go-rs carries no VM or JIT of its own — the <code>go</code> toolchain compiles Go to a native binary with a goroutine runtime and garbage collector; go-rs runs Go on fusevm.</p>
       </section>
 
       <section class="tutorial-section">
         <h2>Architecture</h2>
-        <p>The pipeline mirrors how <code>zshrs</code> hosts zsh and <code>rubylang</code> hosts Ruby:</p>
+        <p>The pipeline mirrors every other fusevm language host:</p>
         <pre>Go source  →  lexer (+ ASI)  →  parser (AST)  →  lower to fusevm bytecode  →  fusevm VM + Cranelift JIT
                                                     │
                                           host: string + concat, Go value formatting, fmt builtins</pre>
@@ -224,7 +224,7 @@ func main() {
       <section class="tutorial-section">
         <h2>Why go-rs</h2>
         <div class="cat-grid">
-          <div class="cat-card"><h4>Compiled, not walked</h4><p>go-rs lowers Go to fusevm bytecode and JITs hot paths through Cranelift — the same architecture that makes zshrs and stryke fast.</p></div>
+          <div class="cat-card"><h4>Compiled, not walked</h4><p>go-rs lowers Go to fusevm bytecode and JITs hot paths through Cranelift — the same architecture every fusevm language host uses.</p></div>
           <div class="cat-card"><h4>No go toolchain dependency</h4><p>No <code>go build</code>, no module cache, no runtime install: a single <code>go</code> binary lexes, parses, lowers, and runs.</p></div>
           <div class="cat-card"><h4>One shared engine</h4><p>Bug fixes and JIT improvements in fusevm benefit every fusevm language host at once.</p></div>
           <div class="cat-card"><h4>Editor-ready</h4><p>LSP and DAP ship in the same binary, so completion, diagnostics, and a stepping debugger work from any editor that speaks the protocols.</p></div>
@@ -271,7 +271,7 @@ cargo test</pre>
           <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a> (keywords, declaration types, console IO)</li>
           <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/go-rs">github.com/MenkeTechnologies/go-rs</a></li>
           <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/go-rs/issues">github.com/MenkeTechnologies/go-rs/issues</a></li>
-          <li><strong>The shared VM</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> (also behind <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisprs</code>, <code>rubylang</code>)</li>
+          <li><strong>The shared VM</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> (behind every fusevm language host)</li>
         </ul>
       </section>
     </main>
