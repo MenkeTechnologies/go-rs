@@ -278,11 +278,17 @@ the string spelling of one, an untyped `nil`, and a nil slice or map compared
 both directly (true) and through an interface (false). The matched pairs are
 printed alongside the mismatched ones, so neither a blanket `true` nor a blanket
 `false` passes. The fixed-width shape runs its arithmetic both directly and
-inside a capturing closure, which are separate code paths. It diffs both
+inside a capturing closure, which are separate code paths. Further shapes cover **named results on a function literal** (a bare
+`return`, and a deferred closure rewriting a result after it was set),
+`strconv.ParseFloat` over Go's whole float-literal grammar (hex floats, `_`
+separators, the signed and unsigned specials, malformed text, at both bit
+sizes), `%#v` of byte arrays and slices, promotion through an embedded
+*pointer* at two depths, Unicode identifiers, and a loop variable beside a later
+top-level variable of the same name. It diffs both
 interpreters byte-for-byte (stdout + exit status).
 
 `--only N` pins every generated block to statement shape `N`, so one shape's
-divergence rate is measurable instead of diluted across the other 38, and
+divergence rate is measurable instead of diluted across the other shapes, and
 `--ours PATH` runs a go-rs binary built from another commit — together they are
 how a newly added shape is shown to actually exercise what it claims to.
 

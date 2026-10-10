@@ -1397,8 +1397,14 @@ impl Qualifier {
                 }
             }
             Expr::Recv { chan } => self.expr(chan, bound),
-            Expr::FuncLit { params, body, .. } => {
+            Expr::FuncLit {
+                params,
+                result_names,
+                body,
+                ..
+            } => {
                 let mut inner = bound.clone();
+                inner.extend(result_names.iter().cloned());
                 for p in params {
                     p.ty = self.qual_type(&p.ty);
                     inner.insert(p.name.clone());
@@ -1837,6 +1843,7 @@ fn stdlib_func_sig(pkg: &str, func: &str) -> Option<&'static str> {
         ("sort", "Strings") => "(x []string)",
         ("sort", "Float64s") => "(x []float64)",
         ("os", "Getenv") => "(key string) string",
+        ("os", "Exit") => "(code int)",
         _ => return None,
     })
 }
@@ -1873,6 +1880,7 @@ pub fn stdlib_func_value(pkg: &str, func: &str) -> Option<Expr> {
     Some(Expr::FuncLit {
         params: f.params,
         results: f.results,
+        result_names: f.result_names,
         body: f.body,
         variadic: f.variadic,
     })

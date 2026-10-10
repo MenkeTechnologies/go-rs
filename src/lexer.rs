@@ -222,16 +222,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
         }
 
-        // identifiers & keywords
-        if c.is_ascii_alphabetic() || c == '_' {
+        // identifiers & keywords. Go identifiers are Unicode letters and digits,
+        // so the scan walks `char`s (`π`, `héllo`), not bytes.
+        let starts_ident = |ch: char| ch.is_alphabetic() || ch == '_';
+        if src.is_char_boundary(i) && src[i..].chars().next().is_some_and(starts_ident) {
             let start = i;
-            while i < bytes.len() {
-                let ch = bytes[i] as char;
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    i += 1;
-                } else {
+            for ch in src[i..].chars() {
+                if !(ch.is_alphanumeric() || ch == '_') {
                     break;
                 }
+                i += ch.len_utf8();
             }
             out.push(Token {
                 kind: keyword_or_ident(&src[start..i]),

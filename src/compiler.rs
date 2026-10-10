@@ -218,6 +218,12 @@ struct LambdaInfo {
     /// How many results the literal declares, so a call through it destructures
     /// a multi-value return the way a declared function's does.
     nresults: usize,
+    /// The declared result types.
+    results: Vec<String>,
+    /// Result names aligned with `results` (`""` when unnamed). A literal that
+    /// names its results binds them as zero-initialized locals, as a declared
+    /// function does.
+    result_names: Vec<String>,
     /// Free variables captured from the enclosing scope, in capture order.
     captures: Vec<String>,
     /// Aligned with `captures`: whether each was captured by reference (a shared
@@ -632,8 +638,14 @@ fn collect_loop_vars(s: &Stmt, out: &mut HashSet<String>) {
 fn collect_captured(s: &Stmt, out: &mut HashSet<String>) {
     fn ex(e: &Expr, out: &mut HashSet<String>) {
         match e {
-            Expr::FuncLit { params, body, .. } => {
+            Expr::FuncLit {
+                params,
+                result_names,
+                body,
+                ..
+            } => {
                 let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+                bound.extend(result_names.iter().cloned());
                 for s in body {
                     free_stmt(s, &mut bound, out);
                 }
@@ -935,9 +947,15 @@ fn free_expr(e: &Expr, bound: &HashSet<String>, out: &mut HashSet<String>) {
         Expr::Recv { chan } => free_expr(chan, bound, out),
         // A nested function literal: its free names (minus its own params) are
         // free in the enclosing one too.
-        Expr::FuncLit { params, body, .. } => {
+        Expr::FuncLit {
+            params,
+            result_names,
+            body,
+            ..
+        } => {
             let mut inner = bound.clone();
             inner.extend(params.iter().map(|p| p.name.clone()));
+            inner.extend(result_names.iter().cloned());
             for s in body {
                 free_stmt(s, &mut inner, out);
             }
@@ -1874,7 +1892,8 @@ impl Compiler {
         params: &[Param],
         body: &[Stmt],
         variadic: bool,
-        nresults: usize,
+        results: &[String],
+        result_names: &[String],
     ) -> i64 {
         let captures = self.free_vars(params, body);
         let id = self.lambdas.len() as i64;
@@ -1904,7 +1923,9 @@ impl Compiler {
             params: params.to_vec(),
             body: body.to_vec(),
             variadic,
-            nresults,
+            nresults: results.len(),
+            results: results.to_vec(),
+            result_names: result_names.to_vec(),
             captures,
             cell_captures,
             capture_types,
@@ -2190,7 +2211,7 @@ impl Compiler {
             spread: false,
             line,
         })];
-        Ok(self.emit_funclit(&[], &body, false, 0))
+        Ok(self.emit_funclit(&[], &body, false, &[], &[]))
     }
 
     /// Emit a call to a closure whose value is already on the stack (as the
@@ -2251,7 +2272,8 @@ impl Compiler {
             0 => vec![Stmt::ExprStmt(call)],
             _ => vec![Stmt::Return(vec![call], 0)],
         };
-        Ok(self.emit_funclit(&params, &body, variadic, nresults))
+        let unknown = vec![String::new(); nresults];
+        Ok(self.emit_funclit(&params, &body, variadic, &unknown, &unknown))
     }
 
     /// A collected lambda's parameter types and whether the last one is variadic.
@@ -2320,6 +2342,8 @@ impl Compiler {
         let captures = self.lambdas[id].captures.clone();
         let cell_captures = self.lambdas[id].cell_captures.clone();
         let capture_types = self.lambdas[id].capture_types.clone();
+        let results = self.lambdas[id].results.clone();
+        let result_names = self.lambdas[id].result_names.clone();
 
         let entry = self.b.current_pos();
         let name_idx = self.b.add_name(&format!("$lambda_{id}"));
@@ -2370,9 +2394,25 @@ impl Compiler {
             .filter(|(_, &cell)| cell)
             .map(|(n, _)| n.clone())
             .collect();
+        // Named results are locals the body may read, assign and (through a
+        // deferred closure) capture, so they join the capture analysis.
+        self.named_results = if result_names.iter().any(|n| !n.is_empty()) {
+            result_names.clone()
+        } else {
+            Vec::new()
+        };
+        let mut analysis_params = params.clone();
+        for (name, ty) in result_names.iter().zip(&results) {
+            if !name.is_empty() {
+                analysis_params.push(Param {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                });
+            }
+        }
         // This lambda's own params/locals captured by a further-nested closure.
         let saved_boxed = std::mem::take(&mut self.boxed);
-        self.boxed = boxed_vars(&params, &body);
+        self.boxed = boxed_vars(&analysis_params, &body);
         self.scope = Some(scope);
 
         // Prologue: bind the closure + params (closure deepest, at slot 0).
@@ -2380,6 +2420,21 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i), 0);
         }
         self.box_params(&params);
+
+        // Bind the named results to their zero values (boxed when captured).
+        for (name, ty) in result_names.iter().zip(&results) {
+            if name.is_empty() {
+                continue;
+            }
+            if self.structs.contains(&base_type(ty)) {
+                self.struct_lit(&base_type(ty), &[])?;
+            } else {
+                self.emit_zero(ty, 0);
+            }
+            self.types.insert(name.clone(), numtype_of_ty(ty));
+            self.decl_types.insert(name.clone(), base_type(ty));
+            self.emit_declare(name, 0);
+        }
 
         self.fn_has_defer = body_has_defer(&body);
         let saved_panic_jumps = std::mem::take(&mut self.panic_jumps);
@@ -2392,10 +2447,15 @@ impl Compiler {
             self.stmt(s)?;
         }
         self.resolve_gotos()?;
-        self.b.emit(Op::LoadUndef, 0);
-        self.emit_return(0);
-        self.emit_panic_epilogue(&[], 0);
+        if self.named_results.is_empty() {
+            self.b.emit(Op::LoadUndef, 0);
+            self.emit_return(0);
+        } else {
+            self.emit_named_return(0);
+        }
+        self.emit_panic_epilogue(&results, 0);
 
+        self.named_results = Vec::new();
         self.panic_jumps = saved_panic_jumps;
         self.boxed = saved_boxed;
         self.fn_has_defer = false;
@@ -2702,11 +2762,17 @@ impl Compiler {
             Expr::Recv { chan } => self.fv_expr(chan, bound, caps),
             // A nested function literal: its own params are bound; its remaining
             // free vars that name our scope become our captures too (chaining).
-            Expr::FuncLit { params, body, .. } => {
+            Expr::FuncLit {
+                params,
+                result_names,
+                body,
+                ..
+            } => {
                 let mut inner = bound.clone();
                 for p in params {
                     inner.insert(p.name.clone());
                 }
+                inner.extend(result_names.iter().cloned());
                 for s in body {
                     self.fv_stmt(s, &mut inner, caps);
                 }
@@ -3221,8 +3287,9 @@ impl Compiler {
                         body,
                         variadic,
                         results,
+                        result_names,
                     } => {
-                        let id = self.emit_funclit(params, body, *variadic, results.len());
+                        let id = self.emit_funclit(params, body, *variadic, results, result_names);
                         let (ptys, var) = self.lambda_sig(id);
                         let argc =
                             self.emit_call_operands(&ptys, var, args, *spread, "closure", *line)?;
@@ -4503,6 +4570,7 @@ impl Compiler {
             args: vec![Expr::FuncLit {
                 params,
                 results: vec!["bool".to_string()],
+                result_names: vec![String::new()],
                 body: yield_body,
                 variadic: false,
             }],
@@ -5086,8 +5154,9 @@ impl Compiler {
                 body,
                 variadic,
                 results,
+                result_names,
             } => {
-                self.emit_funclit(params, body, *variadic, results.len());
+                self.emit_funclit(params, body, *variadic, results, result_names);
             }
         }
         Ok(())
@@ -5193,8 +5262,9 @@ impl Compiler {
                 body,
                 variadic,
                 results,
+                result_names,
             } => {
-                let id = self.emit_funclit(params, body, *variadic, results.len());
+                let id = self.emit_funclit(params, body, *variadic, results, result_names);
                 self.closure_vars.insert(name.to_string(), id);
             }
             Expr::Ident(src) if self.closure_vars.contains_key(src) => {
@@ -5646,6 +5716,7 @@ impl Compiler {
         };
         self.expr(&Expr::FuncLit {
             params,
+            result_names: vec![String::new(); results.len()],
             results,
             body,
             // The synthesis reads an arity out of the method tables, not a
@@ -7195,9 +7266,10 @@ impl Compiler {
             body,
             variadic,
             results,
+            result_names,
         } = func
         {
-            let id = self.emit_funclit(params, body, *variadic, results.len());
+            let id = self.emit_funclit(params, body, *variadic, results, result_names);
             self.emit_closure_call(id, args, spread, line)?;
             return Ok(());
         }

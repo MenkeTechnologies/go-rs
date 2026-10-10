@@ -2628,13 +2628,13 @@ impl Parser {
                 self.expect(&Tok::LParen)?;
                 let (params, variadic) = self.params()?;
                 self.expect(&Tok::RParen)?;
-                // Closures keep only result types (named results on a func literal
-                // are uncommon; the name is dropped).
-                let results = self.results()?.into_iter().map(|(_, t)| t).collect();
+                let (result_names, results): (Vec<String>, Vec<String>) =
+                    self.results()?.into_iter().unzip();
                 let body = self.block()?;
                 Ok(Expr::FuncLit {
                     params,
                     results,
+                    result_names,
                     body,
                     variadic,
                 })

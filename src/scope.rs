@@ -27,7 +27,7 @@
 //! renamed — only a re-declaration in a block nested inside it is.
 
 use crate::ast::{Expr, Func, Program, SelectComm, Stmt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Rename every shadowing local declaration in `prog` (see the module docs).
 pub fn resolve(prog: &mut Program) {
@@ -38,7 +38,25 @@ pub fn resolve(prog: &mut Program) {
     let mut r = Resolver::default();
     r.push();
     r.top_is_global = true;
+    r.global_names = top_level_names(&prog.main);
     r.stmts(&mut prog.main);
+}
+
+/// The names `main`'s own top level declares. They are globals here, so a
+/// same-named variable in a nested block - even one written *before* the
+/// top-level declaration - is a different variable and must be renamed apart.
+fn top_level_names(body: &[Stmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for s in body {
+        match s {
+            Stmt::Var { name, .. } => {
+                names.insert(name.clone());
+            }
+            Stmt::Short { names: ns, .. } => names.extend(ns.iter().cloned()),
+            _ => {}
+        }
+    }
+    names
 }
 
 fn resolve_func(f: &mut Func) {
@@ -65,6 +83,8 @@ struct Resolver {
     /// Whether `scopes[0]` is the global scope (`main`'s top level), whose
     /// declarations are never renamed.
     top_is_global: bool,
+    /// With `top_is_global`: the names declared at `main`'s top level.
+    global_names: HashSet<String>,
 }
 
 impl Resolver {
@@ -102,7 +122,9 @@ impl Resolver {
             return;
         }
         let at_global_top = self.top_is_global && depth == 1;
-        let shadows = !at_global_top && self.lookup(name).is_some();
+        let shadows = !at_global_top
+            && (self.lookup(name).is_some()
+                || (self.top_is_global && self.global_names.contains(name.as_str())));
         let source = name.clone();
         if shadows {
             self.next += 1;
@@ -368,10 +390,18 @@ impl Resolver {
             Expr::Recv { chan } => self.expr(chan),
             // A function literal sees the enclosing function's variables; its
             // parameters are its outermost scope.
-            Expr::FuncLit { params, body, .. } => {
+            Expr::FuncLit {
+                params,
+                result_names,
+                body,
+                ..
+            } => {
                 self.push();
                 for p in params.iter_mut() {
                     self.declare(&mut p.name);
+                }
+                for n in result_names.iter_mut().filter(|n| !n.is_empty()) {
+                    self.declare(n);
                 }
                 self.stmts(body);
                 self.pop();

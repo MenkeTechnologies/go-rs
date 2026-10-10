@@ -3211,6 +3211,14 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
     })
 }
 
+/// Follow [`HostObj::Ptr`] links from `id` within `heap` to the object they end at.
+fn deref_in(heap: &[HostObj], mut id: u32) -> u32 {
+    while let Some(HostObj::Ptr { target }) = heap.get(id as usize) {
+        id = *target;
+    }
+    id
+}
+
 /// Find the struct that declares `name` through `root`'s embedded fields, and
 /// return its heap id. An embedded field is one whose field name equals the
 /// type name of the struct it holds — exactly how the parser records
@@ -3228,6 +3236,8 @@ fn embedded_field_owner(heap: &[HostObj], root: u32, name: &str) -> Option<u32> 
             };
             for (fname, fval) in fields {
                 let Value::Obj(inner) = fval else { continue };
+                // An embedded `*T` holds a pointer object; look through it.
+                let inner = &deref_in(heap, *inner);
                 let Some(HostObj::Struct {
                     type_name,
                     fields: inner_fields,
@@ -4470,7 +4480,10 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             // Unreachable: `follow` resolved any pointer above.
             Some(HostObj::Ptr { .. }) => String::new(),
             Some(HostObj::Slice {
-                elems: a, elem_ty, ..
+                elems: a,
+                arr_ty,
+                elem_ty,
+                ..
             }) => {
                 if !sharp {
                     return format!("[{}]", elems(a));
@@ -4478,10 +4491,20 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                 // `%#v` of a byte slice writes Go source for one: the alias name
                 // `[]byte` for the operand itself, `[]uint8` nested (see
                 // `FMT_DEPTH`), and hex element literals.
-                if elem_ty.as_deref().is_some_and(is_byte_elem) {
+                // An array of bytes is the same literal under its array type
+                // name; either way each element is `%#x` with no padding.
+                let array_of_bytes = arr_ty
+                    .as_deref()
+                    .and_then(|t| t.split_once(']'))
+                    .is_some_and(|(_, e)| is_byte_elem(e));
+                if array_of_bytes || elem_ty.as_deref().is_some_and(is_byte_elem) {
                     let bytes: Vec<String> =
-                        a.iter().map(|e| format!("{:#04x}", e.to_int())).collect();
-                    return format!("{}{{{}}}", byte_slice_name(depth), bytes.join(", "));
+                        a.iter().map(|e| format!("{:#x}", e.to_int())).collect();
+                    let name = match arr_ty {
+                        Some(t) => go_type_spelling(t),
+                        None => byte_slice_name(depth).to_string(),
+                    };
+                    return format!("{name}{{{}}}", bytes.join(", "));
                 }
                 format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
             }
@@ -4668,10 +4691,7 @@ pub(crate) fn format_float(f: f64) -> String {
     if !(-4..6).contains(&exp) {
         format_e(&mant, exp, 'e')
     } else {
-        // Inside the plain-decimal window Rust's `{}` is the same shortest
-        // round-tripping decimal Go computes, and never switches to exponent
-        // notation itself.
-        format!("{f}")
+        plain_form(&mant, exp)
     }
 }
 
@@ -4782,13 +4802,30 @@ fn plain_form(mant: &str, exp: i32) -> String {
 
 /// Split a finite `f64` into its shortest round-tripping decimal mantissa
 /// (`"-1.2345"`, sign included) and decimal exponent, via Rust's `{:e}` — which
-/// already emits the shortest such representation.
+/// emits the shortest such representation, though it breaks an exact tie
+/// between two shortest candidates away from zero where Go takes the even
+/// digit (`26481.0/262144.0` is `0.10101699829101562` in Go). Rounding the
+/// value to that many digits instead is exact, and ties to even.
 fn shortest_sci(f: f64) -> (String, i32) {
     let s = format!("{f:e}");
-    match s.split_once('e') {
-        Some((m, e)) => (m.to_string(), e.parse().unwrap_or(0)),
-        None => (s, 0),
+    let Some((m, e)) = s.split_once('e') else {
+        return (s, 0);
+    };
+    let digits = m.chars().filter(char::is_ascii_digit).count();
+    let odd_last = m
+        .chars()
+        .last()
+        .and_then(|c| c.to_digit(10))
+        .is_some_and(|d| d % 2 == 1);
+    if odd_last && digits > 1 {
+        let even = format!("{:.*e}", digits - 1, f);
+        if let Some((em, ee)) = even.split_once('e') {
+            if even.parse::<f64>() == Ok(f) {
+                return (em.to_string(), ee.parse().unwrap_or(0));
+            }
+        }
     }
+    (m.to_string(), e.parse().unwrap_or(0))
 }
 
 /// Assemble Go's `%e` rendering from a mantissa and exponent: the exponent
@@ -6718,19 +6755,93 @@ pub mod stdlib {
 
     /// `strconv.ParseFloat(s, bitSize) (float64, error)`. An overflowing literal
     /// yields ±Inf *and* a range error, as Go's does; a written `Inf` does not.
+    /// A `bitSize` of 32 rounds to `float32` first and returns that value
+    /// widened, so `0.1` comes back as `0.10000000149011612`.
     fn b_parse_float(vm: &mut VM, argc: u8) -> Value {
         let args = pop_args(vm, argc);
         let s = args.first().map(go_str).unwrap_or_default();
-        match s.parse::<f64>() {
-            Ok(f)
-                if f.is_infinite()
-                    && !s.trim_start_matches(['+', '-']).eq_ignore_ascii_case("inf") =>
-            {
-                parsed(Value::Float(f), Some(num_error("ParseFloat", &s, RANGE)))
-            }
-            Ok(f) => parsed(Value::Float(f), None),
-            Err(_) => parsed(Value::Float(0.0), Some(num_error("ParseFloat", &s, SYNTAX))),
+        let bit_size = args.get(1).map_or(64, |v| v.to_int());
+        let Some(f) = parse_go_float(&s) else {
+            return parsed(Value::Float(0.0), Some(num_error("ParseFloat", &s, SYNTAX)));
+        };
+        let spelled_inf = s
+            .trim_start_matches(['+', '-'])
+            .to_ascii_lowercase()
+            .starts_with("inf");
+        let f = if bit_size == 32 { f as f32 as f64 } else { f };
+        if f.is_infinite() && !spelled_inf {
+            return parsed(Value::Float(f), Some(num_error("ParseFloat", &s, RANGE)));
         }
+        parsed(Value::Float(f), None)
+    }
+
+    /// Go's float literal grammar for `strconv.ParseFloat`: an optional sign,
+    /// then `inf`/`infinity`/`nan` in any case, a decimal float, or a hex float
+    /// (`0x1.8p1`, whose `p` exponent is mandatory); `_` may separate digits
+    /// where `underscore_ok` allows. Rust's own `f64::parse` covers the
+    /// decimal and special spellings once underscores are stripped.
+    fn parse_go_float(s: &str) -> Option<f64> {
+        let cleaned: String = if s.contains('_') {
+            if !underscore_ok(s) {
+                return None;
+            }
+            s.chars().filter(|&c| c != '_').collect()
+        } else {
+            s.to_string()
+        };
+        let (neg, body) = match cleaned.as_bytes().first() {
+            Some(b'-') => (true, &cleaned[1..]),
+            Some(b'+') => (false, &cleaned[1..]),
+            _ => (false, cleaned.as_str()),
+        };
+        // Go has no signed NaN.
+        if body.len() != cleaned.len() && body.eq_ignore_ascii_case("nan") {
+            return None;
+        }
+        let magnitude = match body.get(..2) {
+            Some(p) if p.eq_ignore_ascii_case("0x") => parse_hex_float(&body[2..])?,
+            _ => body.parse::<f64>().ok()?,
+        };
+        Some(if neg { -magnitude } else { magnitude })
+    }
+
+    /// The magnitude of a hex float body (the text after `0x`): hex mantissa
+    /// digits with an optional point, then the mandatory `p` binary exponent.
+    fn parse_hex_float(s: &str) -> Option<f64> {
+        let b = s.as_bytes();
+        let (mut mant, mut sticky, mut exp2) = (0u64, false, 0i64);
+        let (mut digits, mut seen_dot, mut i) = (0, false, 0);
+        while i < b.len() {
+            match b[i] {
+                b'.' if !seen_dot => seen_dot = true,
+                c if c.is_ascii_hexdigit() => {
+                    let d = (c as char).to_digit(16)? as u64;
+                    digits += 1;
+                    if mant >> 60 == 0 {
+                        mant = mant << 4 | d;
+                        exp2 -= 4 * i64::from(seen_dot);
+                    } else {
+                        // Past 64 bits: keep only whether anything nonzero was dropped.
+                        sticky |= d != 0;
+                        exp2 += 4 * i64::from(!seen_dot);
+                    }
+                }
+                _ => break,
+            }
+            i += 1;
+        }
+        if digits == 0 || !matches!(b.get(i), Some(b'p' | b'P')) {
+            return None;
+        }
+        let exp = s[i + 1..].parse::<i32>().ok()?;
+        let mut f = (mant | u64::from(sticky)) as f64;
+        let mut e = exp2 + i64::from(exp);
+        while e != 0 && f != 0.0 && f.is_finite() {
+            let step = e.clamp(-1000, 1000);
+            f *= 2f64.powi(step as i32);
+            e -= step;
+        }
+        Some(f)
     }
 
     fn b_format_int(vm: &mut VM, argc: u8) -> Value {
@@ -6896,28 +7007,24 @@ pub mod stdlib {
     }
 
     /// `strconv.FormatFloat(f, 'f', -1, bits)`: the shortest decimal that parses
-    /// back to `f` at that width, always in fixed notation. Rust's `Display` for
-    /// a float is exactly that — shortest round-trip, and never an exponent, so
-    /// `1e21` writes its 22 digits out as Go's `'f'` does.
+    /// back to `f` at that width, always in fixed notation: the shortest digits
+    /// (ties to even, as Go breaks them) written out with no exponent, so `1e21`
+    /// is its 22 digits as Go's `'f'` does.
     fn shortest_fixed(f: f64, narrowed: bool) -> String {
-        if narrowed {
-            format!("{}", f as f32)
+        let (mant, exp) = if narrowed {
+            super::shortest_sci_32(f as f32)
         } else {
-            format!("{f}")
-        }
+            super::shortest_sci(f)
+        };
+        super::plain_form(&mant, exp)
     }
 
     /// `strconv.FormatFloat(f, 'e', -1, 32)`: the `%e` form of a `float32`'s
-    /// shortest round-trip decimal. Rust's `{:e}` for an `f32` produces exactly
-    /// those digits — only the exponent spelling differs from Go's signed
-    /// two-digit form, which [`super::format_e`] writes.
+    /// shortest round-trip decimal, with Go's signed two-digit exponent
+    /// ([`super::format_e`]).
     fn shortest_sci32(f: f32, upper: bool) -> String {
-        let s = format!("{f:e}");
-        let e = if upper { 'E' } else { 'e' };
-        match s.split_once('e') {
-            Some((mant, exp)) => super::format_e(mant, exp.parse().unwrap_or(0), e),
-            None => s,
-        }
+        let (mant, exp) = super::shortest_sci_32(f);
+        super::format_e(&mant, exp, if upper { 'E' } else { 'e' })
     }
 
     /// `strconv.FormatFloat(f, fmt, prec, bitSize)`.

@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 39;
+const SHAPES: u64 = 45;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -894,12 +894,142 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
             format!("\tfmt.Println({x}&{y}, {x}|{y}, {x}^{y}, {x}<<2, {x}>>1, {x}&^{y})\n")
         }
         // generic function instantiated at int and float64.
-        _ => {
+        24 => {
             uses.generic = true;
             let (x, y) = (rng.int(-9, 30), rng.int(-9, 30));
             let (a, b) = (rng.int(0, 12), rng.int(0, 12));
             format!("\tfmt.Println(imax({x}, {y}), imax({a}.5, {b}.5))\n")
         }
+        // ── named results on a function literal ───────────────────────────
+        // A closure's `(r int, s string)` binds zero-valued locals that a bare
+        // `return` yields and a deferred closure may rewrite after the return
+        // value was set, exactly as on a declared function.
+        39 => {
+            let (m, k, a) = (rng.int(1, 9), rng.int(1, 9), rng.int(-5, 20));
+            let w = rng.pick(WORDS);
+            let tail = match rng.below(3) {
+                0 => "\t\treturn".to_string(),
+                1 => format!("\t\treturn r + {k}, s + \"!\""),
+                _ => format!("\t\tif a > {k} {{\n\t\t\treturn\n\t\t}}\n\t\treturn -r, s"),
+            };
+            format!(
+                "\tnr{n} := func(a int) (r int, s string) {{\n\
+                 \t\tdefer func() {{ r += {k} }}()\n\
+                 \t\tr = a * {m}\n\t\ts = \"{w}\"\n{tail}\n\t}}\n\
+                 \tr{n}, s{n} := nr{n}({a})\n\tfmt.Println(r{n}, s{n})\n\
+                 \tfmt.Println(func() (z int) {{ z = {a}; return }}())\n"
+            )
+        }
+        // ── strconv.ParseFloat over Go's float-literal grammar ────────────
+        // Decimal, hex (`0x1.8p1`, exponent mandatory), `_` separators, the
+        // signed and unsigned specials, and malformed text — at both widths.
+        40 => {
+            uses.strconv = true;
+            let lit = match rng.below(5) {
+                0 => format!(
+                    "{}{}.{}e{}",
+                    rng.pick(&["", "-", "+"]),
+                    rng.int(0, 999),
+                    rng.int(0, 999),
+                    rng.int(-12, 40)
+                ),
+                1 => format!(
+                    "{}0x{:x}.{:x}p{}",
+                    rng.pick(&["", "-", "+"]),
+                    rng.int(0, 255),
+                    rng.int(0, 255),
+                    rng.int(-20, 20)
+                ),
+                2 => format!(
+                    "{}_{:03}.{}",
+                    rng.int(1, 99),
+                    rng.int(0, 999),
+                    rng.int(0, 9)
+                ),
+                3 => rng
+                    .pick(&[
+                        "inf",
+                        "-Inf",
+                        "+INFINITY",
+                        "nan",
+                        "NaN",
+                        "-nan",
+                        "+nan",
+                        "infinit",
+                        "1e400",
+                        "-1e400",
+                        "1e-400",
+                        "3.4e39",
+                        "0x1p-2",
+                        "0x.8p0",
+                        "0x_1p0",
+                    ])
+                    .to_string(),
+                _ => rng
+                    .pick(&[
+                        "1e", "0x1", "1__0", "_1", "1_", ".", "e5", "0x.p1", "", "1 ", "0b1",
+                    ])
+                    .to_string(),
+            };
+            format!(
+                "\tf64_{n}, e64_{n} := strconv.ParseFloat(\"{lit}\", 64)\n\
+                 \tf32_{n}, e32_{n} := strconv.ParseFloat(\"{lit}\", 32)\n\
+                 \tfmt.Println(f64_{n}, e64_{n}, f32_{n}, e32_{n})\n"
+            )
+        }
+        // ── %#v / %v of byte arrays and slices ────────────────────────────
+        // Go writes each byte element `%#x` with no padding (`0x1`), and an
+        // array under its array type, a slice as `[]byte` at depth 0 only.
+        41 => {
+            let (a, b, c) = (rng.int(0, 255), rng.int(0, 255), rng.int(0, 15));
+            format!(
+                "\tba{n} := [3]byte{{{a}, {b}, {c}}}\n\
+                 \tbs{n} := []byte{{{c}, {a}}}\n\
+                 \tfmt.Printf(\"%#v %#v %v %v\\n\", ba{n}, bs{n}, ba{n}, bs{n})\n\
+                 \tfmt.Printf(\"%#v %#v\\n\", struct{{ A [2]byte }}{{[2]byte{{{b}, {c}}}}}, [][]byte{{bs{n}}})\n"
+            )
+        }
+        // ── promotion through an embedded pointer ─────────────────────────
+        // Fields and methods of `*Inner` reached from the outer value, read
+        // and written, at one and two embedding depths.
+        42 => {
+            uses.embed = true;
+            let (x, y, d) = (rng.int(0, 50), rng.int(0, 50), rng.int(1, 9));
+            format!(
+                "\tin{n} := &embInner{{depth: {x}}}\n\
+                 \tmid{n} := embMid{{embInner: in{n}, tag: \"m\"}}\n\
+                 \tout{n} := embOuter{{&mid{n}, {y}}}\n\
+                 \tout{n}.depth += {d}\n\
+                 \tout{n}.tag = \"t\"\n\
+                 \tout{n}.bump({d})\n\
+                 \tfmt.Println(in{n}.depth, mid{n}.depth, out{n}.depth, out{n}.tag, out{n}.n, out{n}.read())\n"
+            )
+        }
+        // ── Unicode identifiers ───────────────────────────────────────────
+        43 => {
+            let (a, b) = (rng.int(1, 30), rng.int(1, 30));
+            format!(
+                "\tπ{n} := {a}\n\tsum日本{n} := π{n} + {b}\n\tvar héllo{n} = \"wörld\"\n\
+                 \tfmt.Println(π{n}, sum日本{n}, héllo{n}, len(héllo{n}))\n\
+                 \tfunc(ñ int) {{\n\t\tfmt.Println(ñ * π{n})\n\t}}({b})\n"
+            )
+        }
+        // ── loop variable vs a later same-named top-level variable ────────
+        // `lv` below is the loop's own variable; the `lv :=` after the loop is
+        // a different one, so closures and defers made in the loop keep the
+        // per-iteration values.
+        44 => {
+            let (top, step) = (rng.int(2, 4), rng.int(1, 5));
+            format!(
+                "\tvar fs{n} []func() int\n\
+                 \tfor lv{n} := 0; lv{n} < {top}; lv{n}++ {{\n\
+                 \t\tfs{n} = append(fs{n}, func() int {{ return lv{n} * {step} }})\n\t}}\n\
+                 \tlv{n} := 100\n\
+                 \tfor _, f := range fs{n} {{\n\t\tfmt.Print(f(), \" \")\n\t}}\n\
+                 \tfmt.Println(lv{n})\n"
+            )
+        }
+        _ => unreachable!("shape index is drawn below SHAPES"),
     }
 }
 
@@ -922,6 +1052,10 @@ struct Uses {
     /// the other way a literal past the arity limit is built.
     bulk: bool,
     generic: bool,
+    /// `strconv.ParseFloat`, which the float-literal shape calls.
+    strconv: bool,
+    /// The pointer-embedding types the promotion shape builds through.
+    embed: bool,
     /// The defer/panic/recover shape's top-level helpers.
     deferred: bool,
     /// The defined types the `%T`-over-a-defined-type shape declares, one per
@@ -944,6 +1078,9 @@ fn program(seed: u64, only: Option<u64>) -> String {
     }
     if uses.strings {
         imports.push("\"strings\"");
+    }
+    if uses.strconv {
+        imports.push("\"strconv\"");
     }
     if uses.sort {
         imports.push("\"sort\"");
@@ -1016,6 +1153,15 @@ fn program(seed: u64, only: Option<u64>) -> String {
              type myChan chan int\n\n\
              func (m myInt) triple() myInt { return m * 3 }\n\n\
              func bump(m myInt) myInt { return m + 1 }\n\n",
+        );
+    }
+    if uses.embed {
+        preamble.push_str(
+            "type embInner struct{ depth int }\n\n\
+             func (e *embInner) read() int { return e.depth * 2 }\n\n\
+             type embMid struct {\n\t*embInner\n\ttag string\n}\n\n\
+             type embOuter struct {\n\t*embMid\n\tn int\n}\n\n\
+             func (o embOuter) bump(d int) { o.depth += d; o.n += d }\n\n",
         );
     }
     if uses.generic {

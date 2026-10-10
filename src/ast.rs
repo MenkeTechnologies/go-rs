@@ -464,6 +464,9 @@ pub enum Expr {
     FuncLit {
         params: Vec<Param>,
         results: Vec<String>,
+        /// Result names aligned with `results` (`""` for an unnamed result);
+        /// all empty unless the literal declares named results.
+        result_names: Vec<String>,
         body: Vec<Stmt>,
         /// True if the last parameter is variadic (`a ...T`). As on a declared
         /// function, `Param::ty` then names the *element* type; the call site

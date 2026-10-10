@@ -449,6 +449,72 @@ result is read builds the pair (`Compiler::discard_print`). That keeps the
 common case free but does not address the general problem — any loop over
 `strconv.Atoi`, `append`, or a struct literal has the same shape.
 
+## Closed-channel misuse is not a Go panic — waiting on a fusevm release
+
+```go
+ch := make(chan int); close(ch)
+defer func() { fmt.Println(recover()) }()
+close(ch)          // go: panic: close of closed channel     go-rs: no panic
+var nc chan int
+close(nc)          // go: panic: close of nil channel        go-rs: not a Go panic
+ch <- 1            // go: recoverable "send on closed channel"
+                   // go-rs: exits 1 with `go-rs: panic: send on closed channel`
+```
+
+Channel state lives in fusevm's scheduler (`SchedReq::Close` marks the channel
+closed without checking it, and `try_send` on a closed one returns a
+`SchedError::Panic` that ends the run instead of raising a recoverable Go
+panic). The frontend cannot see channel state from a host builtin, so a
+pre-check is not possible here. Closing it needs the scheduler to raise
+recoverable panics for close-of-closed, close-of-nil and send-on-closed.
+
+## The `time` package is not available
+
+`import "time"` falls through to `$GOROOT/src/time`, which leans on the
+runtime (`linkname`, monotonic clock, timers) that go-rs does not have, and the
+load fails with a parse error. `time.Duration` arithmetic and printing,
+`time.Sleep`, `time.After` and `time.Now` are all unavailable. Closing it needs
+a vendored `time` over a scheduler timer primitive.
+
+## A conversion to a type parameter is rejected
+
+```go
+func Avg[T ~float64](xs ...T) T { var s T; for _, x := range xs { s += x }; return s / T(len(xs)) }
+// go: fine     go-rs: undefined: T
+```
+
+Generics are erased (see the zero-value entry below), so `T(x)` has no type to
+convert to; treating it as the identity would be silently wrong for int to float.
+
+## `%#v` of a typed nil pointer, func or error does not name its type
+
+```go
+type N struct{ P *int; F func(); E error }
+fmt.Printf("%#v\n", N{})   // go: main.N{P:(*int)(nil), F:(func())(nil), E:error(nil)}
+var p *int
+fmt.Printf("%#v\n", p)     // go: (*int)(nil)        go-rs: <nil>
+```
+
+A nil slice or map carries its written type (`HostObj::Nil`); a nil pointer,
+func or interface is `Value::Undef`, and a struct instance stores no field
+types, so the spelling is not recoverable at run time.
+
+## A `fmt` argument is snapshotted before later arguments are evaluated
+
+```go
+c := []int{1, 2, 3}
+fmt.Println(c, copy(c[1:], c))   // go: [1 1 2] 2     go-rs: [1 2 3] 2
+```
+
+The display copy a `fmt` operand is rebuilt into (`tag_elem_ty`) is taken as
+the operand is evaluated, so a later argument that mutates the same slice or map
+is not reflected. Go shares the backing array, so it prints the mutated value.
+
+## A slice-to-array conversion is a parse error
+
+`[2]int(x)` (Go 1.20) fails with ``expected `LBrace`, found `LParen` ``; only
+`[]T(x)` is read as a conversion.
+
 ## Unsupported stdlib calls
 
 Writer-directed output is implemented. `fmt.Fprint` / `Fprintf` / `Fprintln`
