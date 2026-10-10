@@ -78,14 +78,14 @@ is accepted as shorthand.
 .B build [\fB\-o\fR \fIout\fR] \fIFILE.go\fR
 AOT\-compile to a standalone native executable via fusevm's object emitter (no
 .B go
-toolchain needed). Concurrency programs need
+toolchain needed). Without \fB\-o\fR the output is named after the source file. Concurrency programs need
 .BR run .
 .TP
 .B vet \fIFILE.go\fR
 Parse and compile\-check; report errors, do not run.
 .TP
 .B env
-Print the Go environment (GOOS/GOARCH/GOVERSION).
+Print the Go environment as \fBKEY="value"\fR lines (GOOS, GOARCH, GOVERSION, GOENGINE, CGO_ENABLED, GOROOT, GOPATH).
 .TP
 .B install-std
 Install the vendored standard library into ~/.go-rs.
@@ -99,14 +99,14 @@ same corpus as \fB\-\-lsp\fR hover/completion and \fBdocs/reference.html\fR.
 .B version
 Print the version banner and exit.
 .TP
-.B help
-Print usage and exit.
+.B help \fR[\fICOMMAND\fR]
+Print usage, or per\-command help for \fBrun\fR, \fBbuild\fR, \fBvet\fR, \fBenv\fR, or \fBdoc\fR, and exit.
 .SH OPTIONS
 .TP
 .BR \-\-version ", " \-version
 Print the version banner and exit.
 .TP
-.BR \-h ", " \-\-help ", " \-help
+.BR \-h ", " \-\-help ", " \-help ", " \-?
 Print usage and exit.
 .TP
 .B \-\-dump\-tokens
