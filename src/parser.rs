@@ -879,6 +879,37 @@ impl Parser {
         }
     }
 
+    /// The identifiers written directly inside the first `[ … ]` of the tokens
+    /// `from..to` — the type parameters a method receiver `*Stack[T]` or
+    /// `Pair[K, V]` names.
+    fn bracket_idents(&self, from: usize, to: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        for t in &self.tokens[from.min(to)..to.min(self.tokens.len())] {
+            match &t.kind {
+                Tok::LBracket => depth += 1,
+                Tok::RBracket => depth = depth.saturating_sub(1),
+                Tok::Ident(n) if depth == 1 => out.push(n.clone()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A type-argument list `[T1, T2]`, its types as written.
+    fn type_args(&mut self) -> Result<Vec<String>, String> {
+        self.expect(&Tok::LBracket)?;
+        let mut out = Vec::new();
+        while !matches!(self.peek(), Tok::RBracket | Tok::Eof) {
+            out.push(self.type_name()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBracket)?;
+        Ok(out)
+    }
+
     fn skip_type_brackets(&mut self) -> Result<(), String> {
         self.expect(&Tok::LBracket)?;
         let mut depth = 1;
@@ -938,6 +969,7 @@ impl Parser {
         // `func (T) name(...)` / `func (*T) name(...)` a method that ignores its
         // receiver may write. An unnamed receiver gets a placeholder name the
         // body cannot refer to.
+        let mut receiver_params: Vec<String> = Vec::new();
         let receiver = if matches!(self.peek(), Tok::LParen) {
             self.advance();
             // The receiver is unnamed when the type is all that stands before
@@ -956,7 +988,9 @@ impl Parser {
             } else {
                 self.ident()?
             };
+            let rstart = self.pos;
             let rty = self.type_name()?;
+            receiver_params = self.bracket_idents(rstart, self.pos);
             self.expect(&Tok::RParen)?;
             Some(Param {
                 name: rname,
@@ -968,10 +1002,15 @@ impl Parser {
         let name = self.ident()?;
         // Erase a generic type-parameter list: `func F[T any](…)`, keeping only
         // the composite core types a `T{…}` literal in the body needs.
-        let cores = if matches!(self.peek(), Tok::LBracket) {
+        let (cores, own_params) = if matches!(self.peek(), Tok::LBracket) {
             self.type_param_list()?
         } else {
-            HashMap::new()
+            (HashMap::new(), Vec::new())
+        };
+        let type_params = if receiver.is_some() {
+            receiver_params
+        } else {
+            own_params
         };
         let outer = std::mem::replace(&mut self.type_param_cores, cores);
         let rest = self.func_rest();
@@ -987,6 +1026,7 @@ impl Parser {
             result_names,
             body: body.unwrap_or_default(),
             line,
+            type_params,
         };
         Ok((func, has_body))
     }
@@ -1027,12 +1067,15 @@ impl Parser {
     /// (`any`, `cmp.Ordered`, `~int | ~float64`, an interface) is skipped:
     /// generics are erased, and only a composite literal of the parameter
     /// (`S{}`, as `slices.Clone` writes one) needs to know what it stands for.
-    fn type_param_list(&mut self) -> Result<HashMap<String, String>, String> {
+    fn type_param_list(&mut self) -> Result<(HashMap<String, String>, Vec<String>), String> {
         let mut cores = HashMap::new();
         self.expect(&Tok::LBracket)?;
         let mut names = Vec::new();
+        let mut all_names = Vec::new();
         while !matches!(self.peek(), Tok::RBracket | Tok::Eof) {
-            names.push(self.ident()?);
+            let n = self.ident()?;
+            all_names.push(n.clone());
+            names.push(n);
             // `[K, V any]` — names sharing the constraint that follows.
             if self.eat(&Tok::Comma) {
                 continue;
@@ -1073,7 +1116,7 @@ impl Parser {
             self.eat(&Tok::Comma);
         }
         self.expect(&Tok::RBracket)?;
-        Ok(cores)
+        Ok((cores, all_names))
     }
 
     /// Parse a parameter list. Supports grouped parameters that share a type
@@ -2300,10 +2343,11 @@ impl Parser {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
-            // A literal-only operation whose exact value an `i64` step would
-            // wrap (`1<<64 - 1`) is a constant expression: give it its exact
+            // A constant operation — literals and named integer constants — whose
+            // exact value an `i64` step would wrap (`1<<64 - 1`, `big >> 65`
+            // for `big = 1<<70`) is a constant expression: give it its exact
             // value now, as Go does, instead of wrapping at run time.
-            if let Some(lit) = exact_const_literal(&lhs, &HashMap::new()) {
+            if let Some(lit) = exact_const_literal(&lhs, &self.int_consts) {
                 lhs = lit;
             }
         }
@@ -2377,7 +2421,20 @@ impl Parser {
                 if let Expr::Ident(n) = &e {
                     if self.generic_names.contains(n) {
                         let base = n.clone();
-                        self.skip_type_brackets()?;
+                        // `F[int](x)`: keep the written type arguments for the
+                        // call. Anything else erases them.
+                        let save = self.pos;
+                        match self.type_args() {
+                            Ok(targs) if matches!(self.peek(), Tok::LParen) => {
+                                e = Expr::Instantiate { name: base, targs };
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                self.pos = save;
+                                self.skip_type_brackets()?;
+                            }
+                        }
                         // `Stack[int]{ … }` — a generic struct composite literal.
                         if matches!(self.peek(), Tok::LBrace) && self.struct_names.contains(&base) {
                             e = self.struct_literal(base)?;
@@ -2691,6 +2748,19 @@ impl Parser {
         };
         self.expect(&Tok::RBracket)?;
         let elem_ty = self.type_name()?;
+        // `[N]T(x)` — a slice-to-array conversion (Go 1.20), not a literal.
+        if let (Some(n), true) = (fixed_len, matches!(self.peek(), Tok::LParen)) {
+            let line = self.line();
+            self.advance();
+            let arg = self.expr()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::Call {
+                func: Box::new(Expr::Ident(format!("[{n}]{elem_ty}"))),
+                args: vec![arg],
+                spread: false,
+                line,
+            });
+        }
         let elems = self.indexed_elems(&elem_ty, fixed_len)?;
         let len = elems.len();
         Ok(Expr::SliceLit {
@@ -3150,6 +3220,12 @@ fn const_int_exact(e: &Expr, consts: &HashMap<String, i128>, left_i64: &mut bool
             spread: false,
             ..
         } if args.len() == 1 => match func.as_ref() {
+            // `len` of a string constant is a constant.
+            Expr::Ident(f) if f == "len" => match &args[0] {
+                Expr::Str(s) => Some(s.len() as i128),
+                _ => None,
+            },
+
             // `uint64(<negative literal>)` is how [`exact_const_literal`]
             // writes a constant above `i64`: the literal is its bit pattern.
             Expr::Ident(t)

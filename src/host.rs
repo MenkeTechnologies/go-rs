@@ -331,6 +331,51 @@ pub const GCHAN_HANDLE: u16 = 994;
 /// exit, as [`GPANIC_FINISH`] does for `main`. Nothing above a goroutine's
 /// entry frame can recover it.
 pub const GPANIC_GOROUTINE_EXIT: u16 = 999;
+/// `[ch]` → `ch`, after Go's `close` checks: a nil channel panics with
+/// `close of nil channel`, a channel already closed with `close of closed
+/// channel`, and any other is recorded closed. The scheduler marks a channel
+/// closed without checking it, so the frontend keeps the closed set itself.
+pub const GCHAN_CLOSE_CHECK: u16 = 1000;
+/// `[ch]` → `ch`, after the check that sending on a closed channel is a
+/// recoverable `send on closed channel` panic rather than a fatal scheduler
+/// error.
+pub const GCHAN_SEND_CHECK: u16 = 1001;
+/// `[struct, "field"]` → `&s.field` for a field of scalar type: a
+/// `HostObj::FieldRef` naming the struct that owns the field. One handle per
+/// (struct, field), so two `&s.f` compare equal.
+pub const GADDR_FIELD: u16 = 1002;
+/// `[slice, i]` → `&s[i]` for an element of scalar type: a
+/// `HostObj::ElemRef` on the backing array's slot, one handle per slot.
+pub const GADDR_ELEM: u16 = 1003;
+/// `[recv]` → `undef`, after raising the nil-dereference panic when `recv` is
+/// a nil interface: the fall-through of a dynamically dispatched method call.
+pub const GNIL_RECV: u16 = 1004;
+/// `time.nowNano()` — the wall clock, in Unix nanoseconds.
+pub const GTIME_NOW: u16 = 1005;
+/// `time.monoNano()` — a monotonic clock, in nanoseconds since the process
+/// started.
+pub const GTIME_MONO: u16 = 1006;
+/// `time.sleepHint(ns)` — block the thread for `ns` nanoseconds: the bounded
+/// real sleep a waiting goroutine takes between clock checks.
+pub const GTIME_SLEEP: u16 = 1007;
+/// `[T0, T1, …]` — record the type arguments of the generic function about to
+/// be called, as the type names its call site resolved (`""` when it could not).
+/// The callee's prologue reads them with [`GTARG`]. Erased generics have no
+/// other way to learn what `T` stands for.
+pub const GSET_TARGS: u16 = 1008;
+/// `[i]` → type argument `i` of the call being entered (`""` if unknown); a
+/// negative `i` clears them, which the prologue does once it has read its own.
+pub const GTARG: u16 = 1009;
+/// `[typeName]` → the zero value of the named type: `0`, `0.0`, `""`, `false`,
+/// a typed nil slice or map, or `undef` when the name says nothing.
+pub const GZERO_OF: u16 = 1010;
+/// `[slice, n, "elemTy"]` → `[n]T(slice)`: a fresh array of the slice's first
+/// `n` elements (each copied as a value of `elemTy`). A shorter slice panics.
+pub const GSLICE_TO_ARRAY: u16 = 1011;
+/// `[value, "type"]` → the value, tagged with its static pointer or channel
+/// type only when it is nil, so `%#v` and `%T` can name the nil's type. A
+/// non-nil value passes through untouched.
+pub const GNIL_BOX: u16 = 1012;
 /// `[s, name0, v0, …]` → a display copy of struct `s` with the named fields
 /// replaced — how `$stringify` hands `fmt` a struct whose exported fields print
 /// through their `String()` / `Error()`.
@@ -460,6 +505,19 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GUNNAME, b_unname);
     vm.register_builtin(GDEREF, b_deref);
     vm.register_builtin(GCHAN_HANDLE, b_chan_handle);
+    vm.register_builtin(GCHAN_CLOSE_CHECK, b_chan_close_check);
+    vm.register_builtin(GADDR_FIELD, b_addr_field);
+    vm.register_builtin(GADDR_ELEM, b_addr_elem);
+    vm.register_builtin(GNIL_RECV, b_nil_recv);
+    vm.register_builtin(GTIME_NOW, b_time_now);
+    vm.register_builtin(GTIME_MONO, b_time_mono);
+    vm.register_builtin(GTIME_SLEEP, b_time_sleep);
+    vm.register_builtin(GSET_TARGS, b_set_targs);
+    vm.register_builtin(GTARG, b_targ);
+    vm.register_builtin(GZERO_OF, b_zero_of);
+    vm.register_builtin(GSLICE_TO_ARRAY, b_slice_to_array);
+    vm.register_builtin(GNIL_BOX, b_nil_box);
+    vm.register_builtin(GCHAN_SEND_CHECK, b_chan_send_check);
     vm.register_builtin(GSPREAD, b_spread);
     vm.register_builtin(GIFACE_EQ, b_iface_eq);
     vm.register_builtin(GRANGE_KEYS, b_range_keys);
@@ -531,6 +589,17 @@ static PROGRAM_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new
 /// Record `os.Args` for the program about to run.
 pub fn set_program_args(args: Vec<String>) {
     let _ = PROGRAM_ARGS.set(args);
+}
+
+thread_local! {
+    /// The subroutine name-index of the stub a call through a nil func value
+    /// lands in ([`set_nil_func`]).
+    static NIL_FUNC: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
+
+/// Record the name-index of the nil-func stub the compiler emitted.
+pub(crate) fn set_nil_func(idx: i64) {
+    NIL_FUNC.with(|n| n.set(idx));
 }
 
 thread_local! {
@@ -1020,7 +1089,12 @@ fn b_cell_set(vm: &mut VM, argc: u8) -> Value {
 /// compiler (jump to the defer drain, propagate past calls while active).
 fn b_panic(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let v = args.into_iter().next().unwrap_or(Value::Undef);
+    let mut v = args.into_iter().next().unwrap_or(Value::Undef);
+    // `panic(nil)` panics with a `*runtime.PanicNilError` (Go 1.21).
+    if matches!(v, Value::Undef) {
+        v = runtime_error_value("runtime error: panic called with nil argument")
+            .unwrap_or_else(|| Value::str("panic called with nil argument"));
+    }
     PANIC.with(|p| *p.borrow_mut() = Some(v));
     Value::Undef
 }
@@ -1251,6 +1325,13 @@ fn b_defer_leave(vm: &mut VM, argc: u8) -> Value {
 /// dispatch of a function value via `Op::CallDynamic`).
 fn b_closure_nameidx(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
+    // Calling a nil func value is a nil dereference. The call still happens —
+    // into a stub that returns at once — and the caller's unwind check finds
+    // the panic.
+    if matches!(args.first(), Some(Value::Undef) | None) {
+        runtime_panic(vm, "invalid memory address or nil pointer dereference");
+        return Value::Int(NIL_FUNC.with(|n| n.get()));
+    }
     match args.first() {
         Some(Value::Obj(id)) => HEAP.with(|h| {
             let h = h.borrow();
@@ -1486,7 +1567,16 @@ pub(crate) enum HostObj {
     Closure { name_idx: i64, captures: Vec<Value> },
     /// A one-slot mutable box for a variable captured by reference: the enclosing
     /// scope and every capturing closure share this handle, so writes propagate.
+    ///
+    /// It is also what `&x` evaluates to for a scalar variable whose address is
+    /// taken: the variable lives in the cell, and the pointer *is* the cell.
     Cell(Value),
+    /// `&s.f` for a scalar field: the struct that owns the field and its name.
+    /// Reads and writes through the pointer go to that field.
+    FieldRef { obj: u32, field: String },
+    /// `&s[i]` for a scalar element: the backing array and the element's
+    /// position in it, so every slice sharing the array sees the write.
+    ElemRef { backing: u32, pos: usize },
     /// A `float32` at a `fmt` argument position. Go's `fmt` renders a float with
     /// the shortest decimal that round-trips **at the value's own width**, so a
     /// `float32` and the `float64` holding the same bits print differently
@@ -1525,6 +1615,11 @@ pub(crate) enum HostObj {
     /// `%T` and `%#v` print. [`b_named_box`] applies it; the formatter unwraps
     /// it everywhere else, and it never reaches the program.
     Named { ty: String, inner: Value },
+    /// A slice or map operand of `fmt` awaiting its element-type tag: the
+    /// operand itself, not a copy, so a later argument that mutates it is
+    /// reflected, as it is in Go (which prints after every argument is
+    /// evaluated). [`pop_args`] rebuilds it with [`tag_elem_ty`] at the call.
+    ElemTagged { inner: Value, ty: String },
     /// A map at a `fmt` argument position whose keys or values print through
     /// `String()` / `Error()` ([`GMAP_SHOWN`]): each pair's original key, which
     /// `fmt` sorts by (`internal/fmtsort` orders the keys, not their text), beside
@@ -1875,6 +1970,16 @@ thread_local! {
     /// use and dropped by [`heap_reset`] along with the heap slot it names.
     static CHAN_CLOSED: RefCell<Option<Value>> = const { RefCell::new(None) };
 
+    /// Scheduler handles of the channels the program has closed — see
+    /// [`GCHAN_CLOSE_CHECK`].
+    static CLOSED_CHANS: RefCell<std::collections::HashSet<i64>> =
+        RefCell::new(std::collections::HashSet::new());
+
+    /// The pointer handle already made for each addressed field or element, so
+    /// `&s.f == &s.f`. Keyed by (object, field name or `#position`).
+    static ADDR_REFS: RefCell<std::collections::HashMap<(u32, String), u32>> =
+        RefCell::new(std::collections::HashMap::new());
+
     /// Struct type name → the `(name, written type)` of each of its fields that
     /// holds a **value**: a field declared `T` where `T` is a struct type (not
     /// `*T`), or a fixed-size array `[N]T`. Written once per compile by
@@ -1902,6 +2007,18 @@ pub fn set_struct_plan(plan: HashMap<String, Vec<(String, String)>>) {
     STRUCT_PLAN.with(|p| *p.borrow_mut() = plan);
 }
 
+thread_local! {
+    /// Every struct type's declared field types, in field order — what `%#v`
+    /// reads to name the type of a nil field.
+    static STRUCT_FIELD_TYPES: RefCell<HashMap<String, Vec<(String, String)>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Install the declared field types of every struct type.
+pub fn set_struct_field_types(types: HashMap<String, Vec<(String, String)>>) {
+    STRUCT_FIELD_TYPES.with(|t| *t.borrow_mut() = types);
+}
+
 /// Clear the object heap, defer stack, and panic state. Called at each run start.
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
@@ -1911,6 +2028,8 @@ pub fn heap_reset() {
     PANIC.with(|p| *p.borrow_mut() = None);
     PARKED.with(|p| p.borrow_mut().clear());
     CHAN_CLOSED.with(|c| *c.borrow_mut() = None);
+    CLOSED_CHANS.with(|c| c.borrow_mut().clear());
+    ADDR_REFS.with(|r| r.borrow_mut().clear());
     PANIC_MODE.with(|m| *m.borrow_mut() = false);
     NILS.with(|n| n.borrow_mut().clear());
     stdlib::sentinels_reset();
@@ -3100,6 +3219,8 @@ fn ptr_identity(v: &Value) -> Option<u32> {
     HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HostObj::Ptr { target }) => Some(*target),
         Some(HostObj::Struct { by_ref: true, .. }) => Some(*id),
+        // A pointer to a scalar variable, field or element is its own handle.
+        Some(HostObj::Cell(_) | HostObj::FieldRef { .. } | HostObj::ElemRef { .. }) => Some(*id),
         _ => None,
     })
 }
@@ -3372,6 +3493,10 @@ fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let target = args.first().cloned().unwrap_or(Value::Undef);
     let val = args.get(1).cloned().unwrap_or(Value::Undef);
+    if matches!(target, Value::Undef) {
+        runtime_panic(vm, "invalid memory address or nil pointer dereference");
+        return Value::Undef;
+    }
     let Value::Obj(id) = target else {
         // `&x` on a scalar yields the value, not an address, so there is nothing
         // to write back through. Naming that beats faulting as if the pointer
@@ -3381,15 +3506,7 @@ fn b_deref_set(vm: &mut VM, argc: u8) -> Value {
     };
     // A pointer that is a cell — a pointer-receiver method's receiver on a
     // non-struct type — takes the new value into the cell.
-    let in_cell = HEAP.with(|h| {
-        if let Some(HostObj::Cell(slot)) = h.borrow_mut().get_mut(id as usize) {
-            *slot = val.clone();
-            true
-        } else {
-            false
-        }
-    });
-    if in_cell {
+    if scalar_ref_set(id, &val) {
         return val;
     }
     // A pointer to a slice or map: assigning through it gives the variable a
@@ -3688,7 +3805,13 @@ fn runtime_error_value(full: &str) -> Option<Value> {
         ("runtime.boundsError", false)
     } else if full.starts_with("runtime error: ") {
         ("runtime.errorString", false)
-    } else if full == "assignment to entry in nil map" {
+    } else if matches!(
+        full,
+        "close of closed channel"
+            | "close of nil channel"
+            | "send on closed channel"
+            | "assignment to entry in nil map"
+    ) {
         ("runtime.plainError", false)
     } else if full.starts_with("interface conversion: ") {
         ("runtime.TypeAssertionError", true)
@@ -3780,6 +3903,23 @@ fn expand_spread(args: Vec<Value>) -> Vec<Value> {
             _ => None,
         }),
         _ => None,
+    };
+    let tagged = |v: &Value| match v {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::ElemTagged { inner, ty }) => Some((inner.clone(), ty.clone())),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let args: Vec<Value> = if args.iter().any(|v| tagged(v).is_some()) {
+        args.into_iter()
+            .map(|v| match tagged(&v) {
+                Some((inner, ty)) => tag_elem_ty(&inner, &ty),
+                None => v,
+            })
+            .collect()
+    } else {
+        args
     };
     if !args.iter().any(|v| spread(v).is_some()) {
         return args;
@@ -3994,9 +4134,13 @@ fn obj_type_name(id: u32) -> String {
             Some(HostObj::Struct { type_name, .. }) => package_qualified(type_name),
             Some(HostObj::Closure { .. }) => "func()".to_string(),
             Some(HostObj::Cell(v)) => go_type_name(v),
+            Some(HostObj::FieldRef { .. } | HostObj::ElemRef { .. }) => {
+                scalar_ref_get(id).map_or_else(|| "<nil>".to_string(), |v| go_type_name(&v))
+            }
             // A defined type is named, not described: `main.Weekday`, never
             // the `int` it is represented as.
             Some(HostObj::Named { ty, .. }) => go_type_spelling(ty),
+            Some(HostObj::ElemTagged { inner, ty }) => go_type_name(&tag_elem_ty(inner, ty)),
             Some(HostObj::MapShown { ty, .. }) => ty.clone(),
             // A typed nil records the type it was written as, so unlike a
             // populated slice or map it needs no guess from its contents.
@@ -4268,6 +4412,256 @@ fn is_named(v: &Value) -> bool {
     HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Named { .. })))
 }
 
+/// [`GCHAN_CLOSE_CHECK`].
+fn b_chan_close_check(vm: &mut VM, argc: u8) -> Value {
+    let ch = pop_args(vm, argc)
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Undef);
+    if matches!(ch, Value::Undef) {
+        plain_panic(vm, "close of nil channel".to_string());
+    } else if !CLOSED_CHANS.with(|c| c.borrow_mut().insert(ch.to_int())) {
+        plain_panic(vm, "close of closed channel".to_string());
+    }
+    ch
+}
+
+/// [`GCHAN_SEND_CHECK`].
+fn b_chan_send_check(vm: &mut VM, argc: u8) -> Value {
+    let ch = pop_args(vm, argc)
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Undef);
+    if !matches!(ch, Value::Undef) && CLOSED_CHANS.with(|c| c.borrow().contains(&ch.to_int())) {
+        plain_panic(vm, "send on closed channel".to_string());
+    }
+    ch
+}
+
+thread_local! {
+    /// The type arguments of the generic call being entered ([`GSET_TARGS`]).
+    static TARGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// [`GSET_TARGS`].
+fn b_set_targs(vm: &mut VM, argc: u8) -> Value {
+    let names: Vec<String> = pop_args(vm, argc).iter().map(go_str).collect();
+    TARGS.with(|t| *t.borrow_mut() = names);
+    Value::Undef
+}
+
+/// [`GTARG`].
+fn b_targ(vm: &mut VM, argc: u8) -> Value {
+    let i = pop_args(vm, argc).first().map_or(0, Value::to_int);
+    if i < 0 {
+        TARGS.with(|t| t.borrow_mut().clear());
+        return Value::Undef;
+    }
+    Value::str(TARGS.with(|t| t.borrow().get(i as usize).cloned().unwrap_or_default()))
+}
+
+/// [`GNIL_BOX`].
+fn b_nil_box(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let inner = args.first().cloned().unwrap_or(Value::Undef);
+    if !matches!(inner, Value::Undef) {
+        return inner;
+    }
+    let ty = args.get(1).map(go_str).unwrap_or_default();
+    Value::Obj(heap_alloc(HostObj::Named { ty, inner }))
+}
+
+/// [`GSLICE_TO_ARRAY`].
+fn b_slice_to_array(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let n = args.get(1).map_or(0, Value::to_int).max(0) as usize;
+    let elem_ty = args.get(2).map(go_str).unwrap_or_default();
+    let len = match args.first() {
+        Some(Value::Obj(id)) => slice_backing(*id).map_or(0, |(_, _, l)| l),
+        _ => 0,
+    };
+    if len < n {
+        runtime_panic(
+            vm,
+            format!(
+                "cannot convert slice with length {len} to array or pointer to array with length {n}"
+            ),
+        );
+        return Value::Undef;
+    }
+    let id = match args.first() {
+        Some(Value::Obj(id)) => *id,
+        _ => 0,
+    };
+    let elems: Vec<Value> = (0..n)
+        .map(|i| value_copy(slice_get(id, i).unwrap_or(Value::Undef), &elem_ty))
+        .collect();
+    Value::Obj(heap_alloc(HostObj::slice(elems)))
+}
+
+/// [`GZERO_OF`].
+fn b_zero_of(vm: &mut VM, argc: u8) -> Value {
+    let ty = pop_args(vm, argc).first().map(go_str).unwrap_or_default();
+    match ty.as_str() {
+        "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16" | "uint32"
+        | "uint64" | "uintptr" | "byte" | "rune" => Value::Int(0),
+        "float32" | "float64" => Value::Float(0.0),
+        "string" => Value::str(String::new()),
+        "bool" => Value::bool(false),
+        t if t.starts_with("[]") || t.starts_with("map[") => typed_nil(t),
+        _ => Value::Undef,
+    }
+}
+
+/// [`GTIME_NOW`].
+fn b_time_now(_vm: &mut VM, _argc: u8) -> Value {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Value::Int(d.as_nanos() as i64)
+}
+
+thread_local! {
+    /// When the process's monotonic clock started: the zero of [`GTIME_MONO`].
+    static CLOCK_START: std::time::Instant = std::time::Instant::now();
+}
+
+/// [`GTIME_MONO`].
+fn b_time_mono(_vm: &mut VM, _argc: u8) -> Value {
+    Value::Int(CLOCK_START.with(|s| s.elapsed().as_nanos() as i64))
+}
+
+/// [`GTIME_SLEEP`].
+fn b_time_sleep(vm: &mut VM, argc: u8) -> Value {
+    let ns = pop_args(vm, argc).first().map_or(0, Value::to_int);
+    if ns > 0 {
+        std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+    }
+    Value::Undef
+}
+
+/// [`GNIL_RECV`].
+fn b_nil_recv(vm: &mut VM, argc: u8) -> Value {
+    if matches!(pop_args(vm, argc).first(), Some(Value::Undef) | None) {
+        runtime_panic(vm, "invalid memory address or nil pointer dereference");
+    }
+    Value::Undef
+}
+
+/// [`GADDR_FIELD`].
+fn b_addr_field(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let name = args.get(1).map(go_str).unwrap_or_default();
+    let Some(Value::Obj(id)) = args.first().cloned() else {
+        runtime_panic(vm, "invalid memory address or nil pointer dereference");
+        return Value::Undef;
+    };
+    let id = follow(id);
+    let owner = HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HostObj::Struct { fields, .. }) if !fields.iter().any(|(f, _)| *f == name) => {
+                embedded_field_owner(&h, id, &name).unwrap_or(id)
+            }
+            _ => id,
+        }
+    });
+    addr_ref(
+        (owner, name.clone()),
+        HostObj::FieldRef {
+            obj: owner,
+            field: name,
+        },
+    )
+}
+
+/// [`GADDR_ELEM`].
+fn b_addr_elem(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let i = args.get(1).map(Value::to_int).unwrap_or(0);
+    let Some(Value::Obj(id)) = args.first().cloned() else {
+        runtime_panic(vm, "invalid memory address or nil pointer dereference");
+        return Value::Undef;
+    };
+    match slice_backing(id) {
+        Some((backing, offset, len)) if i >= 0 && (i as usize) < len => {
+            let pos = offset + i as usize;
+            addr_ref(
+                (backing, format!("#{pos}")),
+                HostObj::ElemRef { backing, pos },
+            )
+        }
+        Some((_, _, len)) => {
+            runtime_panic(vm, format!("index out of range [{i}] with length {len}"));
+            Value::Undef
+        }
+        None => {
+            runtime_panic(vm, "invalid memory address or nil pointer dereference");
+            Value::Undef
+        }
+    }
+}
+
+/// The pointer handle for `key`, allocating `obj` the first time it is asked.
+fn addr_ref(key: (u32, String), obj: HostObj) -> Value {
+    if let Some(id) = ADDR_REFS.with(|r| r.borrow().get(&key).copied()) {
+        return Value::Obj(id);
+    }
+    let id = heap_alloc(obj);
+    ADDR_REFS.with(|r| r.borrow_mut().insert(key, id));
+    Value::Obj(id)
+}
+
+/// The value a scalar pointer object addresses: the variable's cell, a struct
+/// field or a slice element. `None` for any other handle.
+fn scalar_ref_get(id: u32) -> Option<Value> {
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize)? {
+            HostObj::Cell(v) => Some(v.clone()),
+            HostObj::FieldRef { obj, field } => match h.get(*obj as usize)? {
+                HostObj::Struct { fields, .. } => fields
+                    .iter()
+                    .find(|(f, _)| f == field)
+                    .map(|(_, v)| v.clone()),
+                _ => None,
+            },
+            HostObj::ElemRef { backing, pos } => match h.get(*backing as usize)? {
+                HostObj::Slice { elems, .. } => elems.get(*pos).cloned(),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+/// Store `val` through a scalar pointer object; whether `id` was one.
+fn scalar_ref_set(id: u32, val: &Value) -> bool {
+    HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        let (obj, kind) = match h.get(id as usize) {
+            Some(HostObj::Cell(_)) => (id, None),
+            Some(HostObj::FieldRef { obj, field }) => (*obj, Some(Ok(field.clone()))),
+            Some(HostObj::ElemRef { backing, pos }) => (*backing, Some(Err(*pos))),
+            _ => return false,
+        };
+        match (h.get_mut(obj as usize), kind) {
+            (Some(HostObj::Cell(slot)), None) => *slot = val.clone(),
+            (Some(HostObj::Struct { fields, .. }), Some(Ok(name))) => {
+                match fields.iter_mut().find(|(f, _)| *f == name) {
+                    Some(slot) => slot.1 = val.clone(),
+                    None => fields.push((name, val.clone())),
+                }
+            }
+            (Some(HostObj::Slice { elems, .. }), Some(Err(pos))) if pos < elems.len() => {
+                elems[pos] = val.clone();
+            }
+            _ => return false,
+        }
+        true
+    })
+}
+
 /// [`GCHAN_HANDLE`].
 fn b_chan_handle(vm: &mut VM, argc: u8) -> Value {
     match pop_args(vm, argc).into_iter().next() {
@@ -4282,9 +4676,16 @@ fn b_chan_handle(vm: &mut VM, argc: u8) -> Value {
 fn b_deref(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let p = args.into_iter().next().unwrap_or(Value::Undef);
+    // `*p` of a nil pointer.
+    if matches!(p, Value::Undef) {
+        runtime_panic(vm, "invalid memory address or nil pointer dereference");
+        return Value::Undef;
+    }
     let Value::Obj(id) = p else { return p };
+    if let Some(v) = scalar_ref_get(id) {
+        return v;
+    }
     HEAP.with(|h| match h.borrow().get(id as usize) {
-        Some(HostObj::Cell(v)) => v.clone(),
         Some(HostObj::Ptr { target }) => Value::Obj(*target),
         _ => p.clone(),
     })
@@ -4326,7 +4727,12 @@ fn b_elem_tag(vm: &mut VM, argc: u8) -> Value {
             };
         }
     }
-    tag_elem_ty(&v, &ty)
+    // The tag is applied when the call has all its operands (see
+    // [`HostObj::ElemTagged`]); a nil composite has nothing to rebuild.
+    if nil_composite_kind(&v).is_some() || !matches!(v, Value::Obj(_)) {
+        return v;
+    }
+    Value::Obj(heap_alloc(HostObj::ElemTagged { inner: v, ty }))
 }
 
 /// Rebuild `v` with each slice node carrying the element type `ty` names at that
@@ -4506,7 +4912,25 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     };
                     return format!("{name}{{{}}}", bytes.join(", "));
                 }
-                format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(a))
+                // A nil pointer, func or channel element has no type of its own;
+                // the slice's written element type is what `%#v` names.
+                let shown = match elem_ty.as_deref() {
+                    Some(e)
+                        if e.starts_with('*')
+                            || e.starts_with("func")
+                            || e.starts_with("chan ") =>
+                    {
+                        a.iter()
+                            .map(|v| match v {
+                                Value::Undef => sharp_nil(e),
+                                v => go_str_mode(v, mode),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(sep)
+                    }
+                    _ => elems(a),
+                };
+                format!("{}{{{}}}", go_type_name(&Value::Obj(id)), shown)
             }
             Some(HostObj::SliceView {
                 backing,
@@ -4579,9 +5003,25 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     format!("{{{}}}", parts.join(" "))
                 }
                 FmtMode::SharpV => {
+                    let declared = STRUCT_FIELD_TYPES.with(|t| {
+                        t.borrow()
+                            .get(type_name.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                    });
                     let parts: Vec<String> = fields
                         .iter()
-                        .map(|(n, v)| format!("{n}:{}", go_str_mode(v, mode)))
+                        .map(|(n, v)| {
+                            // A nil pointer, func, channel or interface field has
+                            // no type of its own at run time; its declared type
+                            // is what `%#v` writes.
+                            if matches!(v, Value::Undef) {
+                                if let Some((_, ty)) = declared.iter().find(|(f, _)| f == n) {
+                                    return format!("{n}:{}", sharp_nil(ty));
+                                }
+                            }
+                            format!("{n}:{}", go_str_mode(v, mode))
+                        })
                         .collect();
                     format!("{}{{{}}}", package_qualified(type_name), parts.join(", "))
                 }
@@ -4590,10 +5030,24 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             Some(HostObj::Closure { .. }) => "<func>".to_string(),
             // A cell is an internal box; render its contents (a captured value).
             Some(HostObj::Cell(v)) => go_str_mode(v, mode),
+            Some(HostObj::ElemTagged { inner, ty }) => go_str_mode(&tag_elem_ty(inner, ty), mode),
+            Some(HostObj::FieldRef { .. } | HostObj::ElemRef { .. }) => {
+                scalar_ref_get(id).map_or_else(String::new, |v| go_str_mode(&v, mode))
+            }
             // A defined type prints as its base — except under `%#v`, where a
             // composite is written as a typed literal and the type is the
             // defined name (`main.mySlice{1, 2}`). A scalar's `%#v` carries no
             // type at all, so it needs nothing.
+            // A typed nil pointer, func or channel: `%#v` writes the type.
+            Some(HostObj::Named { ty, inner })
+                if sharp
+                    && matches!(inner, Value::Undef)
+                    && (ty.starts_with('*')
+                        || ty.starts_with("func")
+                        || ty.starts_with("chan ")) =>
+            {
+                format!("({})(nil)", go_type_spelling(ty))
+            }
             Some(HostObj::Named { ty, inner }) => {
                 let body = go_str_mode(inner, mode);
                 let composite = slice_elems(inner).is_some() || map_pairs(inner).is_some();
@@ -4609,6 +5063,19 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
         format!("&{body}")
     } else {
         body
+    }
+}
+
+/// How `%#v` writes a nil value of declared type `ty`: `(*T)(nil)` for a
+/// pointer, func or channel, and `T(nil)` for an interface.
+fn sharp_nil(ty: &str) -> String {
+    let spelled = go_type_spelling(ty);
+    if ty.starts_with('*') || ty.starts_with("func") || ty.starts_with("chan ") {
+        return format!("({spelled})(nil)");
+    }
+    match ty {
+        "any" | "interface{}" | "interface {}" => "interface {}(nil)".to_string(),
+        _ => format!("{spelled}(nil)"),
     }
 }
 

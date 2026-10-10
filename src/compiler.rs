@@ -208,8 +208,17 @@ struct FuncSig {
     variadic: bool,
 }
 
+/// A generic function's type parameters and declared parameter types.
+struct GenericFn {
+    tparams: Vec<String>,
+    param_tys: Vec<String>,
+    variadic: bool,
+}
+
 /// A collected function literal, compiled to a `$lambda_N` subroutine.
 struct LambdaInfo {
+    /// The type parameters of the generic function the literal sits in.
+    tparams: Vec<String>,
     params: Vec<Param>,
     body: Vec<Stmt>,
     /// True if the last parameter is variadic; the call site packs the trailing
@@ -229,6 +238,9 @@ struct LambdaInfo {
     /// Aligned with `captures`: whether each was captured by reference (a shared
     /// heap cell) versus by value. Reads/writes of a cell capture go through it.
     cell_captures: Vec<bool>,
+    /// Aligned with `captures`: whether each is a scalar the enclosing scope
+    /// keeps in a cell because its address is taken.
+    addr_captures: Vec<bool>,
     /// Aligned with `captures`: each one's declared Go type as the *enclosing*
     /// scope knew it. A lambda body is compiled with a fresh symbol table, so
     /// without this a captured `chan int` or `float32` would be untyped inside
@@ -447,6 +459,25 @@ struct Compiler {
     /// its declaration, so a closure that writes one and every function that
     /// reads it see the same variable.
     global_cells: HashSet<String>,
+    /// The generic functions of the program, by name: their type parameters
+    /// and declared parameter types, which a call site unifies with its
+    /// arguments' static types to resolve the type arguments.
+    generic_fns: HashMap<String, GenericFn>,
+    /// The type parameters in scope in the function being compiled. Each is
+    /// bound at run time in a local named `$T_<name>` ([`host::GTARG`]).
+    cur_tparams: Vec<String>,
+    /// Explicit type arguments of the instantiated callee being lowered
+    /// (`F[int](x)`), consumed by the call that follows.
+    explicit_targs: Option<Vec<String>>,
+    /// Locals and parameters declared with a pointer type, by name, with the
+    /// type as written. `decl_types` keeps only the pointee, so this is what
+    /// lets a nil pointer operand of `fmt` name its type.
+    ptr_types: HashMap<String, String>,
+    /// This function's scalar locals whose address is taken (`&n`). Each is
+    /// boxed in a cell, and the cell *is* the pointer `&n` evaluates to.
+    addr_cells: HashSet<String>,
+    /// Package-level scalars whose address is taken anywhere in the program.
+    global_addr_cells: HashSet<String>,
     /// Set while the `yield` closure of a range-over-func loop is emitted: it
     /// runs synchronously in the loop's own VM, so it reads and writes
     /// globals directly instead of capturing them.
@@ -465,7 +496,8 @@ struct Compiler {
 }
 
 /// Whether the program (a function body, recursing everywhere including nested
-/// literals) calls `panic` or `recover` — the gate for the unwind machinery.
+/// literals) calls `panic` or `recover`, or defers a call — the gate for the
+/// unwind machinery.
 fn body_uses_panic(body: &[Stmt]) -> bool {
     fn ex(e: &Expr) -> bool {
         match e {
@@ -519,7 +551,10 @@ fn body_uses_panic(body: &[Stmt]) -> bool {
             }
             Stmt::ForRange { body, .. } => body_uses_panic(body),
             Stmt::Block(b) => body_uses_panic(b),
-            Stmt::Go { call, .. } | Stmt::Defer { call, .. } => ex(call),
+            Stmt::Go { call, .. } => ex(call),
+            // A deferred call runs while a fault unwinds, before Go prints it:
+            // a program with a `defer` needs the unwind machinery to honor that.
+            Stmt::Defer { .. } => true,
             Stmt::Send { chan, val, .. } => ex(chan) || ex(val),
             Stmt::Select { cases, default, .. } => {
                 cases.iter().any(|c| body_uses_panic(&c.body))
@@ -591,6 +626,100 @@ fn boxed_vars(params: &[Param], body: &[Stmt]) -> HashSet<String> {
         .filter(|n| !loop_vars.contains(*n))
         .cloned()
         .collect()
+}
+
+/// Bind the type parameters in `pattern` (a declared parameter type such as
+/// `[]T` or `map[K]V`) against the static type `actual` of an argument.
+fn unify_type(pattern: &str, actual: &str, tparams: &[String], bound: &mut [Option<String>]) {
+    if let Some(i) = tparams.iter().position(|t| t == pattern) {
+        if bound[i].is_none() {
+            bound[i] = Some(actual.to_string());
+        }
+        return;
+    }
+    if let (Some(p), Some(a)) = (pattern.strip_prefix("[]"), actual.strip_prefix("[]")) {
+        return unify_type(p, a, tparams, bound);
+    }
+    if let (Some(p), Some(a)) = (pattern.strip_prefix('*'), actual.strip_prefix('*')) {
+        return unify_type(p, a, tparams, bound);
+    }
+    if let (Some(p), Some(a)) = (pattern.strip_prefix("chan "), actual.strip_prefix("chan ")) {
+        return unify_type(p, a, tparams, bound);
+    }
+    if let (Some((pk, pv)), Some((ak, av))) = (map_split(pattern), map_split(actual)) {
+        unify_type(pk, ak, tparams, bound);
+        unify_type(pv, av, tparams, bound);
+    }
+}
+
+/// Every identifier whose address `&name` is taken somewhere in `body`,
+/// descending into nested function literals.
+fn addr_taken_names(body: &[Stmt]) -> HashSet<String> {
+    fn ex(e: &Expr, out: &mut HashSet<String>) {
+        match e {
+            Expr::Unary { op, rhs } => {
+                if let (UnOp::Addr, Expr::Ident(n)) = (op, &**rhs) {
+                    out.insert(n.clone());
+                }
+                ex(rhs, out);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                ex(lhs, out);
+                ex(rhs, out);
+            }
+            Expr::Call { func, args, .. } => {
+                ex(func, out);
+                args.iter().for_each(|a| ex(a, out));
+            }
+            Expr::Selector { recv, .. } => ex(recv, out),
+            Expr::Index { recv, index } => {
+                ex(recv, out);
+                ex(index, out);
+            }
+            Expr::Slice {
+                recv,
+                low,
+                high,
+                max,
+            } => {
+                ex(recv, out);
+                for b in [low, high, max].into_iter().flatten() {
+                    ex(b, out);
+                }
+            }
+            Expr::SliceLit { elems, .. } => elems.iter().for_each(|e| ex(e, out)),
+            Expr::MapLit { pairs, .. } => pairs.iter().for_each(|(k, v)| {
+                ex(k, out);
+                ex(v, out);
+            }),
+            Expr::StructLit { fields, .. } => fields.iter().for_each(|(_, v)| ex(v, out)),
+            Expr::Make {
+                len,
+                cap,
+                elem_zero,
+                ..
+            } => {
+                for b in [len, cap].into_iter().flatten() {
+                    ex(b, out);
+                }
+                ex(elem_zero, out);
+            }
+            Expr::MakeChan { cap: Some(c), .. } => ex(c, out),
+            Expr::Recv { chan } => ex(chan, out),
+            Expr::TypeAssert { expr, .. } => ex(expr, out),
+            Expr::FuncLit { body, .. } => {
+                for s in body {
+                    walk_stmt_exprs(s, &mut |e| ex(e, out));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for s in body {
+        walk_stmt_exprs(s, &mut |e| ex(e, &mut out));
+    }
+    out
 }
 
 /// Names introduced as loop variables (a `for … := …` init or `for … range`),
@@ -1294,6 +1423,7 @@ fn iface_method_stub(sig: &str) -> Func {
         results,
         body: Vec::new(),
         line: 0,
+        type_params: Vec::new(),
     }
 }
 
@@ -1344,6 +1474,7 @@ fn forwarder(outer: &str, inner: &str, src: &Func) -> Func {
         result_names: vec![String::new(); src.results.len()],
         body,
         line: src.line,
+        type_params: Vec::new(),
     }
 }
 
@@ -1608,6 +1739,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // points at.
     // A fixed-size array field is a value too, and the plan carries its written
     // type so the copy knows whether the array's own elements are values.
+    host::set_struct_field_types(struct_fields.clone());
     host::set_struct_plan(
         struct_fields
             .iter()
@@ -1670,6 +1802,26 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         panic_jumps: Vec::new(),
         boxed: HashSet::new(),
         global_cells: HashSet::new(),
+        addr_cells: HashSet::new(),
+        global_addr_cells: HashSet::new(),
+        ptr_types: HashMap::new(),
+        generic_fns: prog
+            .funcs
+            .iter()
+            .filter(|f| f.receiver.is_none() && !f.type_params.is_empty())
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    GenericFn {
+                        tparams: f.type_params.clone(),
+                        param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        variadic: f.variadic,
+                    },
+                )
+            })
+            .collect(),
+        cur_tparams: Vec::new(),
+        explicit_targs: None,
         yield_reads_globals: false,
         active_cell_captures: HashSet::new(),
         named_results: Vec::new(),
@@ -1704,6 +1856,21 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // that reads or writes the global share it (see `global_cells`).
     c.global_cells = global_cells(prog, &c.globals);
     c.boxed = boxed_vars(&[], &prog.main);
+    // A scalar global whose address is taken in any function lives in a cell
+    // too; `main`'s own scalars are found the same way.
+    let main_decls = c.scalar_decls(&[], &prog.main);
+    let mut taken = addr_taken_names(&prog.main);
+    for f in &prog.funcs {
+        taken.extend(addr_taken_names(&f.body));
+    }
+    c.global_addr_cells = taken
+        .iter()
+        .filter(|n| main_decls.contains(*n) && c.globals.contains(*n))
+        .cloned()
+        .collect();
+    c.global_cells.extend(c.global_addr_cells.iter().cloned());
+    c.addr_cells = c.addr_scalar_vars(&[], &prog.main);
+    c.boxed.extend(c.addr_cells.iter().cloned());
     c.boxed.extend(c.global_cells.iter().cloned());
     c.fn_has_defer = body_has_defer(&prog.main);
     if c.fn_has_defer {
@@ -1735,8 +1902,16 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
 
     // ── subroutine bodies, emitted after main and jumped over ──
-    if !prog.funcs.is_empty() || !c.lambdas.is_empty() {
+    {
         let skip = c.b.emit(Op::Jump(0), 0);
+        // The subroutine a call through a nil func value lands in: the panic
+        // is already raised, so the call has only to return.
+        let nil_entry = c.b.current_pos();
+        let nil_idx = c.b.add_name("$nilfunc");
+        c.b.add_sub_entry(nil_idx, nil_entry);
+        host::set_nil_func(nil_idx as i64);
+        c.b.emit(Op::LoadUndef, 0);
+        c.b.emit(Op::ReturnValue, 0);
         for f in &prog.funcs {
             c.compile_func(f)?;
         }
@@ -1763,6 +1938,7 @@ impl Compiler {
         let mut scope = Scope::new();
         self.types.clear();
         self.decl_types.clear();
+        self.ptr_types.clear();
         // Names bound to a function literal are per *function*, like the slots
         // they live in. Carrying them across a body made a parameter dispatch
         // to whatever lambda an unrelated function had bound to that name:
@@ -1800,6 +1976,9 @@ impl Compiler {
                 base_type(&p.ty)
             };
             self.types.insert(p.name.clone(), numtype_of_ty(&ty));
+            if p.ty.starts_with('*') {
+                self.ptr_types.insert(p.name.clone(), p.ty.clone());
+            }
             self.decl_types.insert(p.name.clone(), ty);
             slot += 1;
         }
@@ -1832,6 +2011,13 @@ impl Compiler {
             }
         }
         self.boxed = boxed_vars(&analysis_params, &f.body);
+        let addr_params: Vec<Param> = if f.variadic {
+            analysis_params[..real_params.len().saturating_sub(1)].to_vec()
+        } else {
+            analysis_params.clone()
+        };
+        self.addr_cells = self.addr_scalar_vars(&addr_params, &f.body);
+        self.boxed.extend(self.addr_cells.iter().cloned());
 
         // Prologue: pop args into their slots. The last argument is on top of
         // the stack, so bind slots high-to-low (receiver deepest, at slot 0).
@@ -1853,6 +2039,23 @@ impl Compiler {
             self.types.insert(name.clone(), numtype_of_ty(ty));
             self.decl_types.insert(name.clone(), base_type(ty));
             self.emit_declare(name, f.line);
+        }
+
+        // A generic function (or a method of a generic type) binds the type
+        // arguments its caller resolved into locals `$T_<param>`.
+        self.cur_tparams = f.type_params.clone();
+        if !f.type_params.is_empty() {
+            for (i, tp) in f.type_params.iter().enumerate() {
+                self.b.emit(Op::LoadInt(i as i64), f.line);
+                self.b.emit(Op::CallBuiltin(host::GTARG, 1), f.line);
+                let v = format!("$T_{tp}");
+                self.types.insert(v.clone(), NumType::Str);
+                self.decl_types.insert(v.clone(), "string".to_string());
+                self.emit_declare(&v, f.line);
+            }
+            self.b.emit(Op::LoadInt(-1), f.line);
+            self.b.emit(Op::CallBuiltin(host::GTARG, 1), f.line);
+            self.b.emit(Op::Pop, f.line);
         }
 
         self.fn_has_defer = body_has_defer(&f.body);
@@ -1877,7 +2080,9 @@ impl Compiler {
         self.emit_panic_epilogue(&f.results, f.line);
 
         self.fn_has_defer = false;
+        self.cur_tparams = Vec::new();
         self.boxed = HashSet::new();
+        self.addr_cells = HashSet::new();
         self.named_results = Vec::new();
         self.fn_results = Vec::new();
         self.scope = None;
@@ -1895,7 +2100,15 @@ impl Compiler {
         results: &[String],
         result_names: &[String],
     ) -> i64 {
-        let captures = self.free_vars(params, body);
+        let mut captures = self.free_vars(params, body);
+        // A literal inside a generic function reads the function's type
+        // arguments as it does any captured variable.
+        for tp in &self.cur_tparams {
+            let v = format!("$T_{tp}");
+            if !captures.contains(&v) {
+                captures.push(v);
+            }
+        }
         let id = self.lambdas.len() as i64;
         // Build the closure: push each captured value, then the target lambda's
         // subroutine name-index (so a dynamically-dispatched call can resolve it).
@@ -1915,11 +2128,13 @@ impl Compiler {
             Op::CallBuiltin(host::GCLOSURE_NEW, captures.len() as u8 + 1),
             0,
         );
+        let addr_captures: Vec<bool> = captures.iter().map(|c| self.is_addr_cell(c)).collect();
         let capture_types = captures
             .iter()
             .map(|c| self.decl_types.get(c).cloned().unwrap_or_default())
             .collect();
         self.lambdas.push(LambdaInfo {
+            tparams: self.cur_tparams.clone(),
             params: params.to_vec(),
             body: body.to_vec(),
             variadic,
@@ -1928,6 +2143,7 @@ impl Compiler {
             result_names: result_names.to_vec(),
             captures,
             cell_captures,
+            addr_captures,
             capture_types,
         });
         id
@@ -2344,6 +2560,7 @@ impl Compiler {
         let capture_types = self.lambdas[id].capture_types.clone();
         let results = self.lambdas[id].results.clone();
         let result_names = self.lambdas[id].result_names.clone();
+        self.cur_tparams = self.lambdas[id].tparams.clone();
 
         let entry = self.b.current_pos();
         let name_idx = self.b.add_name(&format!("$lambda_{id}"));
@@ -2352,6 +2569,7 @@ impl Compiler {
         let mut scope = Scope::new();
         self.types.clear();
         self.decl_types.clear();
+        self.ptr_types.clear();
         // Same reason as in `compile_func`: a lambda body is compiled with a
         // fresh symbol table, so a closure name it inherited from whichever
         // function was compiled before it is not its own. A captured closure is
@@ -2413,6 +2631,21 @@ impl Compiler {
         // This lambda's own params/locals captured by a further-nested closure.
         let saved_boxed = std::mem::take(&mut self.boxed);
         self.boxed = boxed_vars(&analysis_params, &body);
+        let addr_params: Vec<Param> = if variadic {
+            analysis_params[..params.len().saturating_sub(1)].to_vec()
+        } else {
+            analysis_params.clone()
+        };
+        self.addr_cells = self.addr_scalar_vars(&addr_params, &body);
+        self.boxed.extend(self.addr_cells.iter().cloned());
+        let addr_captures = self.lambdas[id].addr_captures.clone();
+        self.addr_cells.extend(
+            captures
+                .iter()
+                .zip(&addr_captures)
+                .filter(|(_, &a)| a)
+                .map(|(n, _)| n.clone()),
+        );
         self.scope = Some(scope);
 
         // Prologue: bind the closure + params (closure deepest, at slot 0).
@@ -2458,6 +2691,7 @@ impl Compiler {
         self.named_results = Vec::new();
         self.panic_jumps = saved_panic_jumps;
         self.boxed = saved_boxed;
+        self.addr_cells = HashSet::new();
         self.fn_has_defer = false;
         self.scope = None;
         self.active_captures.clear();
@@ -2696,6 +2930,8 @@ impl Compiler {
 
     fn fv_expr(&self, e: &Expr, bound: &HashSet<String>, caps: &mut Vec<String>) {
         match e {
+            // The name of a generic function, never a captured variable.
+            Expr::Instantiate { .. } => {}
             Expr::Ident(n) => {
                 if !bound.contains(n)
                     && self.is_enclosing_var(n)
@@ -2782,6 +3018,313 @@ impl Compiler {
     }
 
     // ── variable access ────────────────────────────────────────────────────
+
+    /// For a call to a generic function, pass its type arguments to the callee:
+    /// the written ones, else those the arguments' static types fix. An
+    /// argument of the enclosing generic function's own type parameter forwards
+    /// that parameter's run-time binding.
+    fn emit_targs(&mut self, name: &str, args: &[Expr], explicit: Option<&[String]>, line: u32) {
+        let Some(g) = self.generic_fns.get(name) else {
+            return;
+        };
+        let (tparams, param_tys, variadic) = (g.tparams.clone(), g.param_tys.clone(), g.variadic);
+        let mut bound: Vec<Option<String>> = vec![None; tparams.len()];
+        for (slot, ty) in bound.iter_mut().zip(explicit.unwrap_or_default()) {
+            *slot = Some(ty.clone());
+        }
+        // Typed arguments first; an untyped constant only supplies a default
+        // type to a parameter nothing else fixed.
+        for pass in 0..2 {
+            for (i, a) in args.iter().enumerate() {
+                let pty = match param_tys.get(i) {
+                    Some(t) => t.clone(),
+                    None if variadic => param_tys.last().cloned().unwrap_or_default(),
+                    None => continue,
+                };
+                let aty = match (pass, a) {
+                    (0, Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_)) => continue,
+                    (1, Expr::Int(_)) => "int".to_string(),
+                    (1, Expr::Float(..)) => "float64".to_string(),
+                    (1, Expr::Str(_)) => "string".to_string(),
+                    (1, Expr::Bool(_)) => "bool".to_string(),
+                    (1, _) => continue,
+                    _ => self.type_name(a),
+                };
+                if aty.is_empty() {
+                    continue;
+                }
+                unify_type(&pty, &aty, &tparams, &mut bound);
+            }
+        }
+        for b in &bound {
+            match b {
+                Some(t) if self.cur_tparams.contains(t) => {
+                    self.emit_get(&format!("$T_{t}"), line);
+                }
+                Some(t) => {
+                    let u = self.underlying(&base_type(t));
+                    let c = self.b.add_constant(Value::str(u));
+                    self.b.emit(Op::LoadConst(c), line);
+                }
+                None => {
+                    let c = self.b.add_constant(Value::str(String::new()));
+                    self.b.emit(Op::LoadConst(c), line);
+                }
+            }
+        }
+        self.b
+            .emit(Op::CallBuiltin(host::GSET_TARGS, tparams.len() as u8), line);
+        self.b.emit(Op::Pop, line);
+    }
+
+    /// Lower `&x` / `&s.f` / `&a[i]` when the operand is a scalar: the pointer
+    /// is the variable's cell, or a reference to the field or element. Returns
+    /// `false` (emitting nothing) for an operand that is not an addressable
+    /// scalar, which takes the ordinary composite path.
+    fn emit_scalar_addr(&mut self, operand: &Expr) -> Result<bool, String> {
+        match operand {
+            Expr::Ident(n) if self.is_addr_cell(n) => {
+                self.emit_get_raw(n, 0);
+                Ok(true)
+            }
+            Expr::Selector { recv, field } if self.is_scalar_ty(&self.field_ty(recv, field)) => {
+                self.expr(recv)?;
+                let c = self.b.add_constant(Value::str(field.clone()));
+                self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::CallBuiltin(host::GADDR_FIELD, 2), 0);
+                Ok(true)
+            }
+            Expr::Index { recv, index } => {
+                let container = self.underlying(&self.type_name(recv));
+                let elem = array_elem_ty(&container)
+                    .or_else(|| container.strip_prefix("[]"))
+                    .unwrap_or("");
+                if elem.is_empty() || !self.is_scalar_ty(elem) {
+                    return Ok(false);
+                }
+                self.expr(recv)?;
+                self.expr(index)?;
+                self.b.emit(Op::CallBuiltin(host::GADDR_ELEM, 2), 0);
+                Ok(true)
+            }
+            // `new(int)`: a variable of its own, reachable only through the
+            // pointer.
+            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {
+                self.expr(operand)?;
+                self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether `ty` is a scalar — a number, string or bool, or a defined type
+    /// over one: a value `&x` can only address through the variable's own cell.
+    fn is_scalar_ty(&self, ty: &str) -> bool {
+        let u = self.underlying(&base_type(ty));
+        matches!(
+            u.as_str(),
+            "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+                | "float32"
+                | "float64"
+                | "complex64"
+                | "complex128"
+                | "string"
+                | "bool"
+                | "byte"
+                | "rune"
+        )
+    }
+
+    /// The names of `params` and of the locals declared in `body` (not inside
+    /// nested literals) whose declared or evident type is a scalar. An
+    /// initializer that is not a literal, a conversion, `len`/`cap` or
+    /// arithmetic over known scalars leaves the variable out: it is not boxed,
+    /// as before.
+    fn scalar_decls(&self, params: &[Param], body: &[Stmt]) -> HashSet<String> {
+        fn visit<'a>(s: &'a Stmt, out: &mut Vec<&'a Stmt>) {
+            let all = |b: &'a [Stmt], out: &mut Vec<&'a Stmt>| {
+                for s in b {
+                    visit(s, out);
+                }
+            };
+            match s {
+                Stmt::Var { .. } | Stmt::Short { .. } => out.push(s),
+                Stmt::If {
+                    init, then, els, ..
+                } => {
+                    if let Some(i) = init {
+                        visit(i, out);
+                    }
+                    all(then, out);
+                    all(els, out);
+                }
+                Stmt::For {
+                    init, post, body, ..
+                } => {
+                    for i in [init, post].into_iter().flatten() {
+                        visit(i, out);
+                    }
+                    all(body, out);
+                }
+                Stmt::ForRange { body, .. } | Stmt::Block(body) => all(body, out),
+                Stmt::Switch {
+                    init,
+                    cases,
+                    default,
+                    ..
+                } => {
+                    if let Some(i) = init {
+                        visit(i, out);
+                    }
+                    for c in cases {
+                        all(&c.body, out);
+                    }
+                    if let Some(d) = default {
+                        all(d, out);
+                    }
+                }
+                Stmt::TypeSwitch {
+                    init,
+                    cases,
+                    default,
+                    ..
+                } => {
+                    if let Some(i) = init {
+                        visit(i, out);
+                    }
+                    for c in cases {
+                        all(&c.body, out);
+                    }
+                    if let Some(d) = default {
+                        all(d, out);
+                    }
+                }
+                Stmt::Select { cases, default, .. } => {
+                    for c in cases {
+                        all(&c.body, out);
+                    }
+                    if let Some(d) = default {
+                        all(d, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out: HashSet<String> = params
+            .iter()
+            .filter(|p| self.is_scalar_ty(&p.ty))
+            .map(|p| p.name.clone())
+            .collect();
+        let mut decls: Vec<&Stmt> = Vec::new();
+        for s in body {
+            visit(s, &mut decls);
+        }
+        // Two passes, so `v := i * 2` is a scalar once `i` is known to be.
+        for _ in 0..2 {
+            for s in &decls {
+                match s {
+                    Stmt::Var {
+                        name, ty: Some(t), ..
+                    } if self.is_scalar_ty(t) => {
+                        out.insert(name.clone());
+                    }
+                    Stmt::Var {
+                        name,
+                        ty: None,
+                        init: Some(e),
+                        ..
+                    } if self.evident_scalar(e, &out) => {
+                        out.insert(name.clone());
+                    }
+                    // `n, err := strconv.Atoi(s)` / `a, b := two()`: the
+                    // callee's declared results type each name.
+                    Stmt::Short { names, values, .. }
+                        if values.len() == 1 && matches!(values[0], Expr::Call { .. }) =>
+                    {
+                        let results = self.call_result_types(&values[0]);
+                        if results.len() == names.len() {
+                            for (n, t) in names.iter().zip(&results) {
+                                if self.is_scalar_ty(t) {
+                                    out.insert(n.clone());
+                                }
+                            }
+                        } else if self.evident_scalar(&values[0], &out) {
+                            out.extend(names.iter().cloned());
+                        }
+                    }
+                    Stmt::Short { names, values, .. } if names.len() == values.len() => {
+                        for (n, v) in names.iter().zip(values) {
+                            if self.evident_scalar(v, &out) {
+                                out.insert(n.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether an initializer is evidently a scalar without type inference: a
+    /// literal, a conversion to a scalar type, `len`/`cap`, a name already
+    /// known to be a scalar, or arithmetic over those.
+    fn evident_scalar(&self, e: &Expr, known: &HashSet<String>) -> bool {
+        match e {
+            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => true,
+            Expr::Ident(n) => known.contains(n),
+            Expr::Unary {
+                op: UnOp::Neg | UnOp::Not | UnOp::BitNot,
+                rhs,
+            } => self.evident_scalar(rhs, known),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.evident_scalar(lhs, known) && self.evident_scalar(rhs, known)
+            }
+            Expr::Call { func, args, .. } => match &**func {
+                Expr::Ident(n) if n == "len" || n == "cap" => args.len() == 1,
+                Expr::Ident(n) => args.len() == 1 && self.is_scalar_ty(n),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The scalar locals of a function whose address is taken: each lives in a
+    /// cell, which is the pointer `&x` hands out. Loop variables keep Go 1.22's
+    /// per-iteration semantics and are left alone.
+    fn addr_scalar_vars(&self, params: &[Param], body: &[Stmt]) -> HashSet<String> {
+        let taken = addr_taken_names(body);
+        if taken.is_empty() {
+            return HashSet::new();
+        }
+        let decls = self.scalar_decls(params, body);
+        let mut loop_vars = HashSet::new();
+        for s in body {
+            collect_loop_vars(s, &mut loop_vars);
+        }
+        taken
+            .into_iter()
+            .filter(|n| decls.contains(n) && !loop_vars.contains(n))
+            .collect()
+    }
+
+    /// Whether `&name` is the variable's own cell: a scalar local or global
+    /// whose address the program takes.
+    fn is_addr_cell(&self, name: &str) -> bool {
+        (self.addr_cells.contains(name) && self.is_boxed(name))
+            || (self.global_addr_cells.contains(name) && self.is_global_here(name))
+    }
 
     /// Whether `name` is captured by reference in the current function — a boxed
     /// local, or a cell capture inside a lambda (both live in a shared cell).
@@ -2879,6 +3422,8 @@ impl Compiler {
             // above it, then `GCELL_SET` writes through (visible to every closure).
             self.emit_get_raw(name, line);
             self.b.emit(Op::CallBuiltin(host::GCELL_SET, 2), line);
+            // A builtin's result is always pushed; a store leaves nothing.
+            self.b.emit(Op::Pop, line);
         } else {
             self.emit_set_raw(name, line);
         }
@@ -2937,6 +3482,9 @@ impl Compiler {
                 // struct with every field zeroed (so `s.f` and methods work). A
                 // pointer `var p *T` is nil, not a zero struct.
                 let is_pointer = ty.as_ref().is_some_and(|t| t.starts_with('*'));
+                if let (true, Some(t)) = (is_pointer, ty) {
+                    self.ptr_types.insert(name.clone(), t.clone());
+                }
                 match init {
                     // `var x float64 = 3` stores a float, not the raw integer
                     // constant — Go converts on assignment to a declared type.
@@ -3325,6 +3873,12 @@ impl Compiler {
             Stmt::Defer { call, line } => self.compile_defer(call, *line)?,
             Stmt::Send { chan, val, line } => {
                 self.expr(chan)?;
+                // Sending on a closed channel is a recoverable panic; the
+                // scheduler would end the run, so the frontend's closed set is
+                // checked before the value is sent.
+                self.b
+                    .emit(Op::CallBuiltin(host::GCHAN_SEND_CHECK, 1), *line);
+                self.emit_panic_check(*line);
                 // A send transfers a *copy* of a struct value: the sender may go
                 // on mutating its own variable without the receiver seeing it.
                 // It also converts an untyped constant to the element type, so
@@ -3797,6 +4351,11 @@ impl Compiler {
                 }
                 SelectComm::Send { chan, val } => {
                     self.expr(chan)?;
+                    // A send case on a closed channel is ready, and choosing
+                    // it panics: recoverably, which the scheduler cannot do.
+                    self.b
+                        .emit(Op::CallBuiltin(host::GCHAN_SEND_CHECK, 1), line);
+                    self.emit_panic_check(line);
                     self.b.emit(Op::LoadInt(0), line); // is_recv = 0
                     self.expr(val)?;
                 }
@@ -4112,7 +4671,7 @@ impl Compiler {
                     if !self.emit_f32_arith(assign_binop(op), f32ish, line)
                         && !self.emit_u64_arith(assign_binop(op), u64ish, line)
                     {
-                        self.emit_arith(assign_binop(op), l, r, is_nonzero_const(value), line);
+                        self.emit_arith(assign_binop(op), l, r, const_int(value), line);
                         // `u8++` / `i8 += n` wrap at the variable's declared width.
                         if let Some(ty) = self.sized_int_ty(&Expr::Ident(name.clone())) {
                             self.emit_narrow(&ty, line);
@@ -4147,7 +4706,7 @@ impl Compiler {
                             assign_binop(op),
                             NumType::Unknown,
                             self.infer(value),
-                            is_nonzero_const(value),
+                            const_int(value),
                             line,
                         );
                         // `xs[i] += n` wraps at the element type's width.
@@ -4182,7 +4741,7 @@ impl Compiler {
                             assign_binop(op),
                             NumType::Unknown,
                             self.infer(value),
-                            is_nonzero_const(value),
+                            const_int(value),
                             line,
                         );
                         // `s.f += n` wraps at the field's declared width.
@@ -4223,7 +4782,7 @@ impl Compiler {
                                 assign_binop(op),
                                 NumType::Unknown,
                                 self.infer(value),
-                                is_nonzero_const(value),
+                                const_int(value),
                                 line,
                             );
                             if let Some(ty) = self.sized_int_ty(target) {
@@ -4631,6 +5190,13 @@ impl Compiler {
     /// erased [`NumType`] cannot express, since it collapses `[]T`, `map[K]V` and
     /// `any` into one `Unknown`. Everything else falls through to [`Self::emit_default`].
     fn emit_zero(&mut self, ty: &str, line: u32) {
+        // The zero of a type parameter is the zero of whatever the call site
+        // bound it to.
+        if self.cur_tparams.iter().any(|t| t == ty) {
+            self.emit_get(&format!("$T_{ty}"), line);
+            self.b.emit(Op::CallBuiltin(host::GZERO_OF, 1), line);
+            return;
+        }
         // A defined type's zero value is its base's: `var s mySlice` is a nil
         // slice, which prints `[]` and appends, not the scalar zero. (Go rejects
         // a `type` cycle, so following the chain terminates.)
@@ -4859,6 +5425,8 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
+            // An instantiation used as a value is the function itself.
+            Expr::Instantiate { name, .. } => self.expr(&Expr::Ident(name.clone()))?,
             Expr::Int(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
@@ -4888,6 +5456,9 @@ impl Compiler {
                 // copy, no op. Emitting the operand yields the shared handle, so a
                 // pointer sees the same struct the original variable holds.
                 if matches!(op, UnOp::Addr | UnOp::Deref) {
+                    if matches!(op, UnOp::Addr) && self.emit_scalar_addr(rhs)? {
+                        return Ok(());
+                    }
                     self.expr(rhs)?;
                     // `*p` reads through a captured scalar's cell, and through an
                     // `&x` pointer object to `x`'s handle — which every reader
@@ -5120,7 +5691,11 @@ impl Compiler {
                             self.b.emit(Op::LoadInt(0), 0);
                         }
                     }
-                    self.expr(elem_zero)?;
+                    if self.cur_tparams.contains(&base_type(elem_ty)) {
+                        self.emit_zero(&base_type(elem_ty), 0);
+                    } else {
+                        self.expr(elem_zero)?;
+                    }
                     // `cap` defaults to `len`; `undef` tells the host "omitted",
                     // so a negative capacity a program computed is still caught.
                     match cap {
@@ -5898,8 +6473,10 @@ impl Compiler {
             let next = self.b.current_pos();
             self.b.patch_jump(jf, next);
         }
-        // No concrete type matched — a nil interface call; yield nil.
-        self.b.emit(Op::LoadUndef, line);
+        // No concrete type matched: a call through a nil interface, which
+        // panics; anything else yields nil.
+        self.emit_get(&recv_tmp, line);
+        self.b.emit(Op::CallBuiltin(host::GNIL_RECV, 1), line);
         let end = self.b.current_pos();
         for j in end_jumps {
             self.b.patch_jump(j, end);
@@ -6078,6 +6655,15 @@ impl Compiler {
                 None => String::new(),
             },
             Expr::StructLit { type_name, .. } => type_name.clone(),
+            // `s[i:j]` has its operand's type, except that slicing an array
+            // gives the slice type of its elements.
+            Expr::Slice { recv, .. } => {
+                let t = self.type_name(recv);
+                match array_elem_ty(&self.underlying(&t)) {
+                    Some(elem) => format!("[]{elem}"),
+                    None => t,
+                }
+            }
             // A type assertion `x.(T)` has static type T.
             Expr::TypeAssert { ty, .. } => base_type(ty),
             // `&x` / `*p` name the same type as their operand (a `*Point` handle
@@ -6119,7 +6705,11 @@ impl Compiler {
                 Expr::Ident(name) if matches!(name.as_str(), "[]byte" | "[]rune") => name.clone(),
                 // `[]T(x)` / `map[K]V(x)` — a conversion to a written slice or
                 // map type has that type.
-                Expr::Ident(name) if name.starts_with("[]") || name.starts_with("map[") => {
+                Expr::Ident(name)
+                    if name.starts_with("[]")
+                        || name.starts_with("map[")
+                        || array_elem_ty(name).is_some() =>
+                {
                     name.clone()
                 }
                 // A conversion to a defined type has that type, which is the
@@ -6337,6 +6927,25 @@ impl Compiler {
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        // An integral untyped float constant (`1e6`) beside a typed integer
+        // takes that integer's type: `n / 1e6` is an integer division.
+        for (flip, c, other) in [(false, rhs, lhs), (true, lhs, rhs)] {
+            if let Expr::Float(f, _) = c {
+                let integral = f.fract() == 0.0 && f.abs() < 9.0e18;
+                let typed_int = self.infer(other) == NumType::Int
+                    && self.untyped_int_const(other).is_none()
+                    && !matches!(other, Expr::Int(_));
+                let arith = !matches!(op, BinOp::And | BinOp::Or);
+                if integral && typed_int && arith {
+                    let lit = Expr::Int(*f as i64);
+                    return if flip {
+                        self.binary(op, &lit, other)
+                    } else {
+                        self.binary(op, other, &lit)
+                    };
+                }
+            }
+        }
         // Go rejects an integer division by a constant zero at compile time;
         // a float one is `±Inf` / `NaN` at run time.
         if matches!(op, BinOp::Div | BinOp::Mod)
@@ -6432,7 +7041,7 @@ impl Compiler {
         if self.emit_u64_arith(op, u64ish, 0) {
             return Ok(());
         }
-        self.emit_arith(op, l, r, is_nonzero_const(rhs), 0);
+        self.emit_arith(op, l, r, const_int(rhs), 0);
         // Go's arithmetic is fixed-width: a sized operand makes the result wrap
         // at its own width, not at 64 bits.
         if let Some(ty) = self.sized_int_ty(&Expr::Binary {
@@ -7025,9 +7634,12 @@ impl Compiler {
 
     /// Emit an arithmetic op for two already-pushed operands, appending
     /// `TruncInt` for integer division (Go truncates `int / int` toward zero).
-    /// `safe_div` is true when the divisor is a provably-nonzero constant, so
-    /// integer `/`/`%` can use the native ops the JIT/AOT keep in registers.
-    fn emit_arith(&mut self, op: BinOp, l: NumType, r: NumType, safe_div: bool, line: u32) {
+    /// `rhs_const` is the right operand when it is an integer literal: a
+    /// provably-nonzero divisor lets integer `/`/`%` use the native ops the
+    /// JIT/AOT keep in registers, and a shift count below 64 needs no guard.
+    fn emit_arith(&mut self, op: BinOp, l: NumType, r: NumType, rhs_const: Option<i64>, line: u32) {
+        let safe_div = rhs_const.is_some_and(|n| n != 0);
+        let small_shift = rhs_const.is_some_and(|n| (0..64).contains(&n));
         match op {
             BinOp::Add => {
                 self.b.emit(Op::Add, line);
@@ -7097,10 +7709,29 @@ impl Compiler {
             BinOp::BitXor => {
                 self.b.emit(Op::BitXor, line);
             }
-            BinOp::Shl => {
+            // `Op::Shl` / `Op::Shr` mask the count to six bits, so a variable
+            // count of 64 or more would shift by `count & 63`. Go's shift by
+            // the width or more is 0 (`<<`, and `>>` of a non-negative) or the
+            // sign fill (`>>` of a negative). `m` is -1 exactly when the count
+            // exceeds 63: `<<` masks the result with `^m`, `>>` saturates the
+            // count to 63 with `count | m`.
+            BinOp::Shl if small_shift => {
                 self.b.emit(Op::Shl, line);
             }
+            BinOp::Shr if small_shift => {
+                self.b.emit(Op::Shr, line);
+            }
+            BinOp::Shl => {
+                self.emit_shift_overflow_mask(line);
+                self.b.emit(Op::BitNot, line);
+                self.b.emit(Op::Rot, line);
+                self.b.emit(Op::Rot, line);
+                self.b.emit(Op::Shl, line);
+                self.b.emit(Op::BitAnd, line);
+            }
             BinOp::Shr => {
+                self.emit_shift_overflow_mask(line);
+                self.b.emit(Op::BitOr, line);
                 self.b.emit(Op::Shr, line);
             }
             // `a &^ b` (bit clear) is `a & (^b)`.
@@ -7110,6 +7741,17 @@ impl Compiler {
             }
             other => unreachable!("emit_arith on non-arithmetic op {other:?}"),
         };
+    }
+
+    /// With `[value, count]` on the stack, leave `[value, count, m]` where `m`
+    /// is `(63 - count) >> 63`: -1 when `count > 63`, else 0.
+    fn emit_shift_overflow_mask(&mut self, line: u32) {
+        self.b.emit(Op::Dup, line);
+        self.b.emit(Op::LoadInt(63), line);
+        self.b.emit(Op::Swap, line);
+        self.b.emit(Op::Sub, line);
+        self.b.emit(Op::LoadInt(63), line);
+        self.b.emit(Op::Shr, line);
     }
 
     fn call(&mut self, func: &Expr, args: &[Expr], spread: bool, line: u32) -> Result<(), String> {
@@ -7234,6 +7876,28 @@ impl Compiler {
         spread: bool,
         line: u32,
     ) -> Result<(), String> {
+        // `F[int](x)`: the callee is the plain name, its written type
+        // arguments handed to the static call below.
+        if let Expr::Instantiate { name, targs } = func {
+            self.explicit_targs = Some(targs.clone());
+            let r = self.call_inner(&Expr::Ident(name.clone()), args, spread, line);
+            self.explicit_targs = None;
+            return r;
+        }
+        // `T(x)` where `T` is a type parameter: a conversion to whatever type
+        // the call site resolved `T` to (the identity when it could not).
+        if let Expr::Ident(n) = func {
+            if args.len() == 1
+                && self.cur_tparams.contains(n)
+                && !self.scope_has(n)
+                && !self.funcs.contains_key(n)
+            {
+                self.expr(&args[0])?;
+                self.emit_get(&format!("$T_{n}"), line);
+                self.b.emit(Op::CallBuiltin(host::GCONV, 2), line);
+                return Ok(());
+            }
+        }
         // Multi-value spread: `f(g())` where `g` returns N>1 values passes them
         // as N arguments. Evaluate `g` into a tuple, extract each element into a
         // temporary, and recurse with those temporaries as the arguments.
@@ -7525,6 +8189,19 @@ impl Compiler {
                             let t = self.b.add_constant(Value::str(ty));
                             self.b.emit(Op::LoadConst(t), line);
                             self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+                        } else {
+                            // A nil pointer or channel has no type of its own at
+                            // run time: it carries its static type into `fmt`.
+                            let ty = match a {
+                                Expr::Ident(n) => self.ptr_types.get(n).cloned(),
+                                _ => None,
+                            }
+                            .unwrap_or_else(|| self.type_name(a));
+                            if ty.starts_with('*') || ty.starts_with("chan ") {
+                                let t = self.b.add_constant(Value::str(ty));
+                                self.b.emit(Op::LoadConst(t), line);
+                                self.b.emit(Op::CallBuiltin(host::GNIL_BOX, 2), line);
+                            }
                         }
                     }
                     let argc = Self::call_arity(args.len(), &format!("fmt.{field}"), line)?;
@@ -7615,9 +8292,39 @@ impl Compiler {
                     return self.expr(&args[0]);
                 }
             }
+            // `[N]T(s)` — a slice converted to an array: a fresh array of the
+            // slice's first `N` elements.
+            if args.len() == 1 {
+                if let (Some(elem), Some(n)) = (array_elem_ty(name), array_len_of(name)) {
+                    let elem = elem.to_string();
+                    self.expr(&args[0])?;
+                    self.b.emit(Op::LoadInt(n as i64), line);
+                    let c = self.b.add_constant(Value::str(elem));
+                    self.b.emit(Op::LoadConst(c), line);
+                    self.b.emit(Op::CallBuiltin(host::GSLICE_TO_ARRAY, 3), line);
+                    self.emit_panic_check(line);
+                    self.emit_array_tag(name, line);
+                    return Ok(());
+                }
+            }
             // A type conversion `T(x)` — a builtin numeric/string/bool type name
             // applied to a single value.
             if args.len() == 1 && is_conversion_type(name) {
+                // `float64(big)` with `big` an untyped constant above `int64`:
+                // the exact value rounded once, not the operand wrapped in
+                // `i64` first.
+                if matches!(name.as_str(), "float32" | "float64") {
+                    if let Some(v) = self
+                        .untyped_int_const(&args[0])
+                        .filter(|v| i64::try_from(*v).is_err())
+                    {
+                        self.b.emit(Op::LoadFloat(v as f64), line);
+                        if name == "float32" {
+                            self.emit_f32_round(true);
+                        }
+                        return Ok(());
+                    }
+                }
                 if let (Some((lo, hi)), Some(v)) =
                     (int_type_range(name), self.untyped_int_const(&args[0]))
                 {
@@ -7690,7 +8397,11 @@ impl Compiler {
                 for a in args {
                     self.expr(a)?;
                 }
+                self.b
+                    .emit(Op::CallBuiltin(host::GCHAN_CLOSE_CHECK, 1), line);
+                self.emit_panic_check(line);
                 self.b.emit(Op::ChanClose, line);
+
                 // `close` is a statement; leave a value so ExprStmt's Pop is
                 // balanced (the op consumes the channel and pushes nothing, so
                 // synthesize an Undef result).
@@ -7778,6 +8489,26 @@ impl Compiler {
                 self.expr(&args[0])?;
                 self.expr(&args[1])?;
                 self.b.emit(Op::CallBuiltin(host::GSLICE_OVERLAP, 2), line);
+                return Ok(());
+            }
+            // The vendored `time` package's intrinsics: the clocks, a bounded
+            // real sleep, and a scheduler yield point (a `len` on a nil
+            // channel, which the scheduler answers by requeueing the caller).
+            if let Some(op) = match name.as_str() {
+                "time.nowNano" => Some(host::GTIME_NOW),
+                "time.monoNano" => Some(host::GTIME_MONO),
+                "time.sleepHint" => Some(host::GTIME_SLEEP),
+                _ => None,
+            } {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.b.emit(Op::CallBuiltin(op, args.len() as u8), line);
+                return Ok(());
+            }
+            if name == "time.yield" {
+                self.b.emit(Op::LoadInt(-1), line);
+                self.b.emit(Op::ChanLen, line);
                 return Ok(());
             }
             // `$stringify`'s display copy of a struct (`pkg::add_stringify`).
@@ -7894,6 +8625,7 @@ impl Compiler {
                 return Ok(());
             }
             if let Some(sig) = self.funcs.get(name) {
+                let explicit = self.explicit_targs.take();
                 let variadic = sig.variadic;
                 let arity = sig.arity;
                 let param_tys = sig.param_tys.clone();
@@ -7903,6 +8635,7 @@ impl Compiler {
                     // already-a-slice argument is passed directly).
                     let what = format!("`{name}`");
                     self.emit_call_operands(&param_tys, true, args, spread, &what, line)?;
+                    self.emit_targs(name, args, explicit.as_deref(), line);
                     let idx = self.b.add_name(name);
                     self.b.emit(Op::Call(idx, arity as u8), line);
                     self.emit_panic_check(line);
@@ -7917,6 +8650,7 @@ impl Compiler {
                 for (i, a) in args.iter().enumerate() {
                     self.emit_arg(a, param_tys.get(i))?;
                 }
+                self.emit_targs(name, args, explicit.as_deref(), line);
                 let idx = self.b.add_name(name);
                 self.b.emit(Op::Call(idx, args.len() as u8), line);
                 self.emit_panic_check(line);
@@ -8017,6 +8751,7 @@ impl Compiler {
 
     fn infer(&self, e: &Expr) -> NumType {
         match e {
+            Expr::Instantiate { .. } => NumType::Unknown,
             Expr::Int(_) => NumType::Int,
             Expr::Float(..) => NumType::Float,
             Expr::Str(_) => NumType::Str,
@@ -8424,8 +9159,11 @@ fn is_builtin_call(name: &str) -> bool {
 /// Whether `e` is a provably-nonzero constant — so an integer `/`/`%` by it can
 /// never divide by zero and may use the native (register-lowered) op instead of
 /// the panic-checking builtin.
-fn is_nonzero_const(e: &Expr) -> bool {
-    matches!(e, Expr::Int(n) if *n != 0)
+fn const_int(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(n) => Some(*n),
+        _ => None,
+    }
 }
 
 fn assign_binop(op: AssignOp) -> BinOp {

@@ -27,6 +27,10 @@ const INTRINSICS: &[(&str, &str)] = &[
     ("errors", "runtimeTypeTag"),
     ("os", "writeFd"),
     ("slices", "sliceOverlap"),
+    ("time", "nowNano"),
+    ("time", "monoNano"),
+    ("time", "sleepHint"),
+    ("time", "yield"),
 ];
 
 /// Whether a type name is the parser's canonical name for an anonymous interface
@@ -535,6 +539,7 @@ fn add_errorf_type(prog: &mut Program) {
             variadic: false,
             results: vec![ret.to_string()],
             result_names: vec![String::new()],
+            type_params: Vec::new(),
             body: vec![Stmt::Return(
                 vec![Expr::Selector {
                     recv: Box::new(Expr::Ident("e".to_string())),
@@ -821,6 +826,7 @@ fn add_stringify(prog: &mut Program) {
         variadic: false,
         results: vec!["any".to_string()],
         result_names: vec![String::new()],
+        type_params: Vec::new(),
         body: vec![
             Stmt::TypeSwitch {
                 init: None,
@@ -1307,6 +1313,11 @@ impl Qualifier {
 
     fn expr(&self, e: &mut Expr, bound: &HashSet<String>) {
         match e {
+            Expr::Instantiate { name, .. } => {
+                if !bound.contains(name) && self.own.contains(name) {
+                    *name = self.qual(name);
+                }
+            }
             // A bare identifier referring to this package's own top-level name.
             Expr::Ident(n) => {
                 if !bound.contains(n) && self.own.contains(n) {

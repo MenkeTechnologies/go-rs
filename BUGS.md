@@ -307,44 +307,33 @@ indices into the scheduler's `chans` vector, so `0` is a valid one and the
 frontend has no sentinel it can emit instead: `try_recv` on an out-of-range id
 raises a panic rather than blocking, which is not what a nil channel does.
 
-## `&x` on a scalar has no address, so two pointers to equal values compare equal
+## A scalar whose type is not evident at its declaration has no address
 
 ```go
-p1, p2 := 1, 1
-fmt.Println(&p1 == &p2)   // go: false   go-rs: true
+func pick() int { return 1 }
+type W struct{ v int }
+w := W{}
+x := w.v                // a field read: no declared type to read it off
+p := &x
+*p = 9                  // go-rs: cannot assign through a pointer to a non-composite value
 ```
 
-go-rs models `&x` on a non-struct as the value itself, so a `*int` carries no
-identity to compare: `==` falls through to the value, and two distinct pointers
-to equal values are one key of a `map[*int]V` rather than two. A pointer *field*
-inside a struct key inherits the same merge.
+`&x` on a scalar variable is the variable's own cell, but a variable is put in
+one only when its address is taken *and* its declaration shows it to be a
+scalar: a `var x T`, a parameter or named result of a scalar type, or `:=` from
+a literal, a conversion, `len` / `cap`, another such variable, arithmetic over
+those, or a call whose declared results are scalar (a declared function or a
+native stdlib function: `n, err := strconv.Atoi(s)`). Anything else — the
+initializer is a field read, an index, a method call or a channel receive — is
+left as the value, as before: it works as a read-only copy of the pointee and
+`*p = v` is refused rather than answered. Typing the initializer needs the
+expression typing a full checker has. A `for` / `range` loop variable is not
+boxed either (Go 1.22 gives each iteration its own).
 
-`&x` on a **composite** is no longer affected: it allocates a `HostObj::Ptr`
-addressing the variable's handle, so it binds, stores and compares as a pointer.
-That machinery cannot reach a scalar for the reason the gap exists — an `int` is
-not a heap object, so `GPTR_TO` has nothing to point at and passes the value
-through. `*p = v` through such a pointer is refused rather than answered:
-
-```go
-a := 5
-pa := &a
-*pa = 9   // go-rs: cannot assign through a pointer to a non-composite value
-```
-
-Closing it means boxing any scalar whose address is taken — a heap cell of its
-own, which the closure-capture path already builds for a different reason — and
-teaching `*p` to read through one. That changes what every `&x` and `*p` on a
-scalar costs, and every loop holding such a variable would leave the tracing
-tier, so it is a deliberate trade rather than an oversight.
-
-The one place a pointer to a non-struct is made implicitly is closed: calling a
-pointer-receiver method on a defined slice or integer type (`func (s *Stack)
-Push(v int) { *s = append(*s, v) }`) hands the method a cell holding the
-receiver, reads and writes `*s` through it, and stores the result back into the
-variable, field or element the method was called on
-(`parity-scripts/pointer_receiver_defined_types.go`). The cell lives for the
-call, so a method that keeps `s` beyond it sees none of the caller's later
-writes.
+`&xs[i]` and `&s.f` are references to the element or field and need the
+container's static type to be known as a scalar slice, array or struct field.
+`&m[k]` is not addressable in Go either. A `**T` to a *pointer* variable and
+`(*[N]T)(s)` (a slice converted to a pointer to an array) are not modelled.
 
 ## A pointer nested inside a printed value prints as the value
 
@@ -449,71 +438,68 @@ result is read builds the pair (`Compiler::discard_print`). That keeps the
 common case free but does not address the general problem — any loop over
 `strconv.Atoi`, `append`, or a struct literal has the same shape.
 
-## Closed-channel misuse is not a Go panic — waiting on a fusevm release
+## A sender blocked on a channel that is then closed does not panic
 
 ```go
-ch := make(chan int); close(ch)
-defer func() { fmt.Println(recover()) }()
-close(ch)          // go: panic: close of closed channel     go-rs: no panic
-var nc chan int
-close(nc)          // go: panic: close of nil channel        go-rs: not a Go panic
-ch <- 1            // go: recoverable "send on closed channel"
-                   // go-rs: exits 1 with `go-rs: panic: send on closed channel`
+ch := make(chan int)
+go func() { defer func() { fmt.Println(recover()) }(); ch <- 1 }()
+close(ch)   // go: the sender panics "send on closed channel"
+            // go-rs: the sender stays parked; if nothing else runs, a deadlock report
 ```
 
-Channel state lives in fusevm's scheduler (`SchedReq::Close` marks the channel
-closed without checking it, and `try_send` on a closed one returns a
-`SchedError::Panic` that ends the run instead of raising a recoverable Go
-panic). The frontend cannot see channel state from a host builtin, so a
-pre-check is not possible here. Closing it needs the scheduler to raise
-recoverable panics for close-of-closed, close-of-nil and send-on-closed.
+`close` of a closed or nil channel, a send on a channel that is already closed
+(a plain send or a `select` send case) and the zero value a receive yields are
+all as Go's: the frontend keeps the set of closed channels
+(`host::GCHAN_CLOSE_CHECK` / `GCHAN_SEND_CHECK`) because the scheduler marks a
+channel closed without checking it. What it cannot see is a goroutine already
+*blocked* in a send when the channel is closed: the scheduler wakes blocked
+receivers on a close and leaves blocked senders parked. Waking them with a
+recoverable panic needs the scheduler to do it.
 
-## The `time` package is not available
+## `time` is the deterministic subset only
 
-`import "time"` falls through to `$GOROOT/src/time`, which leans on the
-runtime (`linkname`, monotonic clock, timers) that go-rs does not have, and the
-load fails with a parse error. `time.Duration` arithmetic and printing,
-`time.Sleep`, `time.After` and `time.Now` are all unavailable. Closing it needs
-a vendored `time` over a scheduler timer primitive.
+`time` is vendored (`goroot/time.go`): `Duration` arithmetic, `String()`,
+`ParseDuration`, UTC and fixed-zone `Time` values (`Date`, `Unix*`, `Add`, `Sub`,
+`AddDate`, `Truncate`, `Round`, the calendar accessors, `Format`, `Parse`),
+`Now` / `Since` / `Until` over a monotonic clock, and `Sleep`, `After`, `Tick`,
+`Timer`, `Ticker`, `AfterFunc`. What is not there: named zones
+(`LoadLocation`; `Local` is UTC), the encoding methods (`MarshalJSON`,
+`MarshalText`), `ISOWeek`, and `Parse` of a zone abbreviation other than `UTC`
+(it becomes a zero-offset fixed zone carrying that name).
 
-## A conversion to a type parameter is rejected
+The scheduler has no timer queue, so a sleeper waits by re-reading the clock and
+yielding (a `len` on a nil channel, which requeues the goroutine) with a bounded
+real sleep between reads, and wakes in deadline order among sleepers. A sleeping
+goroutine therefore always counts as runnable: a program whose only other
+goroutines are blocked forever waits out its sleepers rather than reporting a
+deadlock, as Go does, but it burns a wakeup per millisecond while it does.
+
+## A method of a generic type is not told its type arguments
 
 ```go
-func Avg[T ~float64](xs ...T) T { var s T; for _, x := range xs { s += x }; return s / T(len(xs)) }
-// go: fine     go-rs: undefined: T
+type Stack[T any] struct{ items []T }
+func (s *Stack[T]) Pop() T { var zero T; ...; return zero }   // go: 0     go-rs: <nil>
+var s Stack[int]
+fmt.Println(s.Pop())
 ```
 
-Generics are erased (see the zero-value entry below), so `T(x)` has no type to
-convert to; treating it as the identity would be silently wrong for int to float.
+A generic *function* receives its type arguments at the call — the written
+ones, or those the arguments' static types fix — and its body's `T(x)`,
+`var z T` and `make([]T, n)` use them (`parity-scripts/generic_type_parameter_conversion.go`).
+A method of a generic type has no call-site arguments to read: the receiver's
+`T` would have to travel on the value, which is the `%T` gap two entries down.
+There `T(x)` is the identity and `var z T` is the nil that arithmetic and
+concatenation treat as the identity. A function reached through a function
+value (`f := Map[int, string]`) or a `go` / `defer` statement is likewise not
+told: its type parameters read as unknown.
 
-## `%#v` of a typed nil pointer, func or error does not name its type
+## `%#v` of a nil pointer reached through an untyped value
 
-```go
-type N struct{ P *int; F func(); E error }
-fmt.Printf("%#v\n", N{})   // go: main.N{P:(*int)(nil), F:(func())(nil), E:error(nil)}
-var p *int
-fmt.Printf("%#v\n", p)     // go: (*int)(nil)        go-rs: <nil>
-```
-
-A nil slice or map carries its written type (`HostObj::Nil`); a nil pointer,
-func or interface is `Value::Undef`, and a struct instance stores no field
-types, so the spelling is not recoverable at run time.
-
-## A `fmt` argument is snapshotted before later arguments are evaluated
-
-```go
-c := []int{1, 2, 3}
-fmt.Println(c, copy(c[1:], c))   // go: [1 1 2] 2     go-rs: [1 2 3] 2
-```
-
-The display copy a `fmt` operand is rebuilt into (`tag_elem_ty`) is taken as
-the operand is evaluated, so a later argument that mutates the same slice or map
-is not reflected. Go shares the backing array, so it prints the mutated value.
-
-## A slice-to-array conversion is a parse error
-
-`[2]int(x)` (Go 1.20) fails with ``expected `LBrace`, found `LParen` ``; only
-`[]T(x)` is read as a conversion.
+A nil pointer, func or channel is named by its static type as an operand and as
+a struct field or slice element (`parity-scripts/sharp_v_typed_nil_fields.go`),
+and a nil interface field is written `T(nil)`. What stays untyped is a nil
+pointer reached only through a *value* whose static type go-rs does not carry:
+a result of a call through a function value, or an `any` holding one.
 
 ## Unsupported stdlib calls
 
@@ -852,22 +838,20 @@ type), so the one format path has to accept `%w` and render it as `%v`. Keeping
 `Errorf` correct is worth more than rejecting a verb that is only ever written
 inside it. Separating them means giving `Errorf` its own formatter entry point.
 
-## The zero value of a type parameter is `nil`
+## The zero value of a type parameter is `nil` in a generic type's method and in `iter.Pull`
 
 ```go
-func first[T any](xs []T) T { var zero T; if len(xs) == 0 { return zero }; return xs[0] }
-fmt.Println(first([]int{}))          // go: 0        go-rs: <nil>
+func (s *Stack[T]) Pop() T { var zero T; if len(s.items) == 0 { return zero }; ... }
+fmt.Println(s.Pop())                 // go: 0        go-rs: <nil>
 next, stop := iter.Pull(seq)         // after the sequence ends:
 v, ok := next()                      // go: 0 false  go-rs: <nil> false
 ```
 
-Generics are erased: one body runs for every instantiation, so inside it `T`
-names no type and `var zero T` has nothing to be the zero *of*. go-rs makes it
-`nil`, which arithmetic and string concatenation treat as the identity (so a
-generic sum or join is right) but which prints as `<nil>`. The vendored
-`iter.Pull` / `Pull2` return that zero once the sequence is over, the same way
-Go's do. Closing it needs the instantiation's type arguments at run time —
-monomorphizing, or passing the type arguments as hidden parameters.
+In a generic *function* the zero value follows the call site's type argument.
+Where none reaches the body (a method of a generic type, a function called
+through a function value or by `go` / `defer`, `iter.Pull`'s vendored body) the
+zero is the nil that arithmetic and string concatenation treat as the identity,
+which prints as `<nil>`. See the entry above on methods of a generic type.
 
 ## `%T` of an instantiated generic type omits its type arguments
 

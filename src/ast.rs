@@ -169,6 +169,11 @@ pub struct Func {
     pub result_names: Vec<String>,
     pub body: Vec<Stmt>,
     pub line: u32,
+    /// The type parameters of a generic function (`func F[T any, U any]`), or
+    /// of the generic type a method's receiver names (`func (s *S[T])`), in
+    /// declaration order. Their bindings reach the body at run time through
+    /// the type-argument channel (`host::GTARG`).
+    pub type_params: Vec<String>,
 }
 
 /// A single function parameter: a name and its declared Go type.
@@ -472,6 +477,13 @@ pub enum Expr {
         /// function, `Param::ty` then names the *element* type; the call site
         /// packs the trailing arguments into the slice the body binds.
         variadic: bool,
+    },
+    /// An explicitly instantiated generic function, `F[int, string]`: the
+    /// function's name and the written type arguments. Only the callee of a
+    /// call keeps them; elsewhere the instantiation is the plain name.
+    Instantiate {
+        name: String,
+        targs: Vec<String>,
     },
     /// A type assertion `expr.(ty)` (`ty == "type"` marks the type-switch guard).
     TypeAssert {
