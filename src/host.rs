@@ -341,7 +341,7 @@ pub const GMAP_KEYS: u16 = 941;
 pub const GMAP_VALS: u16 = 942;
 /// `[m, keys, vals]` → the display copy `fmt` prints for a map whose keys or
 /// values print through `String()` / `Error()`: `keys` / `vals` are the
-/// rendered [`GMAP_KEYS`] / [`GMAP_VALS`] — see [`HostObj::MapShown`].
+/// rendered [`GMAP_KEYS`] / [`GMAP_VALS`] — see `HostObj::MapShown`.
 pub const GMAP_SHOWN: u16 = 943;
 /// `[typeName, "m1,m2,…"]` — record a concrete type's method set. Emitted once
 /// per method-bearing type in the program prologue, and only when the program
