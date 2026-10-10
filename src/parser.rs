@@ -2671,6 +2671,33 @@ impl Parser {
                 }
             }
             Tok::LParen => {
+                // `(*T)(x)` — a conversion to a pointer type, which leaves the
+                // value as it is. Only when `T` names a type (a built-in, a
+                // struct or a defined one): `(*f)(x)` calls through a pointer.
+                if matches!(self.peek(), Tok::Star) {
+                    let save = self.pos;
+                    self.advance();
+                    if let Ok(ty) = self.type_name() {
+                        let is_type = self.struct_names.contains(&ty)
+                            || self.defined.contains_key(&ty)
+                            || INT_TYPE_NAMES.contains(&ty.as_str())
+                            || matches!(
+                                ty.as_str(),
+                                "float32" | "float64" | "string" | "bool" | "error" | "any"
+                            );
+                        if is_type
+                            && matches!(self.peek(), Tok::RParen)
+                            && matches!(self.peek2(), Tok::LParen)
+                        {
+                            self.advance();
+                            self.advance();
+                            let inner = self.expr()?;
+                            self.expect(&Tok::RParen)?;
+                            return Ok(inner);
+                        }
+                    }
+                    self.pos = save;
+                }
                 // Parentheses reset the composite-literal suppression: `if
                 // (Point{}).x > 0 { … }` is a valid composite inside a header.
                 let saved = self.no_composite;

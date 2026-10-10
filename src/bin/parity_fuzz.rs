@@ -218,7 +218,7 @@ fn str_expr(rng: &mut Rng, depth: u32) -> String {
 /// block of every program to shape `N`, which is what makes a newly added shape
 /// measurable on its own: mixed into the other 31 it would contribute a handful
 /// of statements per program and its divergence rate would be unreadable.
-const SHAPES: u64 = 45;
+const SHAPES: u64 = 61;
 
 /// Emit a random block of statements. `n` is a fresh var-name suffix. `only`
 /// pins the shape instead of drawing one.
@@ -1029,6 +1029,385 @@ fn block(rng: &mut Rng, n: u64, uses: &mut Uses, only: Option<u64>) -> String {
                  \tfmt.Println(lv{n})\n"
             )
         }
+        // ── integer wraparound, by type ───────────────────────────────────
+        // Every width and signedness: operands are variables set near the
+        // type's limits, so the arithmetic wraps rather than being rejected as
+        // a constant overflow, and the same value is read back through
+        // conversions to every other width.
+        45 => {
+            let (ty, lo, hi) = *rng.pick(&[
+                ("int8", -128i64, 127i64),
+                ("int16", -32768, 32767),
+                ("int32", -2147483648, 2147483647),
+                ("int64", i64::MIN + 1, i64::MAX),
+                ("uint8", 0, 255),
+                ("uint16", 0, 65535),
+                ("uint32", 0, 4294967295),
+                ("int", i64::MIN + 1, i64::MAX),
+            ]);
+            let edge = |rng: &mut Rng| match rng.below(4) {
+                0 => lo,
+                1 => hi,
+                2 => lo + rng.int(0, 5),
+                _ => hi - rng.int(0, 5),
+            };
+            let (a, b) = (edge(rng), edge(rng));
+            let sh = rng.int(0, 9);
+            let neg = if lo < 0 {
+                format!("-a{n}, ")
+            } else {
+                String::new()
+            };
+            format!(
+                "\tvar a{n} {ty} = {a}\n\tvar b{n} {ty} = {b}\n\
+                 \tfmt.Println(a{n}+b{n}, a{n}-b{n}, a{n}*b{n}, {neg}^a{n}, a{n}&^b{n})\n\
+                 \tfmt.Println(a{n}<<{sh}, a{n}>>{sh}, a{n}^b{n}, a{n}|b{n}, a{n}&b{n})\n\
+                 \tfmt.Println(int8(a{n}), int16(a{n}), int32(a{n}), uint8(a{n}), uint16(a{n}), uint32(a{n}), uint64(a{n}), int64(a{n}))\n\
+                 \ta{n}++\n\tb{n}--\n\ta{n} += b{n}\n\ta{n} *= 3\n\tfmt.Println(a{n}, b{n}, a{n} < b{n}, a{n} == b{n})\n"
+            )
+        }
+        // ── shifts by a variable count, at and past the width ─────────────
+        46 => {
+            let ty = *rng.pick(&[
+                "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "int",
+                "uint",
+            ]);
+            let cty = *rng.pick(&["uint", "int", "uint8", "uint16", "int64"]);
+            let (v, c) = (rng.int(1, 120), rng.int(0, 70));
+            format!(
+                "\tvar v{n} {ty} = {v}\n\tvar c{n} {cty} = {c}\n\
+                 \tfmt.Println(v{n}<<c{n}, v{n}>>c{n}, (v{n}^0x55)<<c{n}, ^v{n}>>c{n})\n\
+                 \tvar w{n} {ty} = v{n}\n\tw{n} <<= c{n}\n\tvar x{n} {ty} = v{n} * 2\n\tx{n} >>= c{n}\n\
+                 \tfmt.Println(w{n}, x{n}, 1<<c{n} == 0, uint64(1)<<c{n}, int64(-1)>>c{n})\n"
+            )
+        }
+        // ── untyped constant arithmetic ───────────────────────────────────
+        // Exact, and only narrowed by the type that finally holds it: iota
+        // blocks with skips and expressions, shifts of 1 past 64 bits brought
+        // back down, integer vs rational division, constants as floats.
+        47 => {
+            let (a, b, c) = (rng.int(1, 9), rng.int(2, 7), rng.int(40, 100));
+            let (k, m) = (rng.int(1, 5), rng.int(2, 9));
+            format!(
+                "\tconst (\n\t\tc0_{n} = iota * {k}\n\t\tc1_{n}\n\t\t_\n\t\tc3_{n}\n\t\tc4_{n} = 1 << (iota + {a})\n\t\tc5_{n}\n\t)\n\
+                 \tconst big{n} = 1 << {c}\n\tconst half{n} = big{n} >> ({c} - 3)\n\
+                 \tconst q{n} = {a} / {b}\n\tconst r{n} = {a} % {b}\n\tconst f{n} = {a} / {b}.0\n\
+                 \tconst mix{n} = ({a}*{b} + {m}) << 2 / 3\n\
+                 \tfmt.Println(c0_{n}, c1_{n}, c3_{n}, c4_{n}, c5_{n})\n\
+                 \tfmt.Println(half{n}, q{n}, r{n}, f{n}, mix{n}, big{n}/(big{n}>>2))\n\
+                 \tfmt.Printf(\"%T %T %T %v\\n\", q{n}, f{n}, half{n}, float64(big{n}))\n\
+                 \tvar f64_{n} float64 = {a} / {b}\n\tvar f32_{n} float32 = 1 / {b}.0\n\
+                 \tfmt.Println(f64_{n}, f32_{n}, {a}/{b}*{b}, {a}.0/{b}*{b}, 'a'+{a}, \"s\"+\"t\", len(\"héllo\"))\n"
+            )
+        }
+        // ── strings, runes and bytes ──────────────────────────────────────
+        48 => {
+            uses.utf8 = true;
+            let w = *rng.pick(&[
+                "héllo",
+                "世界!",
+                "a😀b",
+                "naïve café",
+                "日本語",
+                "plain",
+                "",
+                "ß→Σ",
+            ]);
+            let (i, j) = (rng.int(0, 3), rng.int(0, 2));
+            format!(
+                "\ts{n} := \"{w}\"\n\
+                 \tfor i{n}, r{n} := range s{n} {{\n\t\tfmt.Print(i{n}, \":\", r{n}, \"=\", string(r{n}), \" \")\n\t}}\n\tfmt.Println()\n\
+                 \trs{n} := []rune(s{n})\n\tbs{n} := []byte(s{n})\n\
+                 \tfmt.Println(len(s{n}), len(rs{n}), len(bs{n}), utf8.RuneCountInString(s{n}), utf8.ValidString(s{n}))\n\
+                 \tfmt.Println(rs{n}, bs{n})\n\
+                 \tfmt.Printf(\"%q %x %U %c|%5.2s|%-6s|\\n\", s{n}, s{n}, rs{n}, rs{n}, s{n}, s{n})\n\
+                 \tif len(rs{n}) > {i} {{\n\t\trs{n}[{i}] = 'Z'\n\t}}\n\
+                 \tbs{n} = append(bs{n}, \"!?\"...)\n\
+                 \tfmt.Println(string(rs{n}), string(bs{n}), string(rs{n}[:len(rs{n})/2]), string(rune(65+{j})), s{n} < \"m\", s{n} + \"é\" == \"{w}é\")\n"
+            )
+        }
+        // ── append aliasing and capacity growth ───────────────────────────
+        // Half the programs print the slice (so it escapes and Go allocates
+        // on the heap), half only read it through len / cap / index (so it
+        // stays in the frame and grows from a stack buffer): the two give
+        // different capacities and both have to match.
+        49 => {
+            let elem = *rng.pick(&["int", "int8", "int32", "float64", "string", "bool", "byte"]);
+            let lit = match elem {
+                "string" => "\"s\"",
+                "bool" => "true",
+                "float64" => "1.5",
+                _ => "7",
+            };
+            let (cnt, pre) = (rng.int(4, 40), rng.below(3));
+            let init = match pre {
+                0 => format!("var s{n} []{elem}"),
+                1 => format!("s{n} := []{elem}{{}}"),
+                _ => format!("s{n} := make([]{elem}, 0, {})", rng.int(1, 6)),
+            };
+            let escapes = rng.below(2) == 0;
+            let tail = if escapes {
+                format!("\tfmt.Println(s{n})\n")
+            } else {
+                format!("\tfmt.Println(len(s{n}), s{n}[0])\n")
+            };
+            let (lo, hi) = (rng.int(0, 2), rng.int(2, 4));
+            format!(
+                "\t{init}\n\
+                 \tfor i{n} := 0; i{n} < {cnt}; i{n}++ {{\n\
+                 \t\ts{n} = append(s{n}, {lit})\n\
+                 \t\tif i{n} < 3 || i{n}%9 == 0 {{\n\t\t\tfmt.Print(cap(s{n}), \" \")\n\t\t}}\n\t}}\n\
+                 \tfmt.Println(len(s{n}), cap(s{n}))\n\
+                 \tsub{n} := s{n}[{lo}:{hi}]\n\
+                 \tsub{n} = append(sub{n}, {lit})\n\
+                 \tfmt.Println(len(sub{n}), cap(sub{n}), len(s{n}))\n\
+                 \tcl{n} := s{n}[{lo}:{hi}:{hi}]\n\tcl{n} = append(cl{n}, {lit}, {lit})\n\
+                 \tfmt.Println(len(cl{n}), cap(cl{n}))\n\
+                 \tdup{n} := append([]{elem}(nil), s{n}...)\n\
+                 \tfmt.Println(len(dup{n}), cap(dup{n}))\n{tail}"
+            )
+        }
+        // ── maps: counting and ordered output ─────────────────────────────
+        50 => {
+            uses.sort = true;
+            let words: Vec<&str> = (0..rng.int(3, 9)).map(|_| *rng.pick(WORDS)).collect();
+            let lit = words
+                .iter()
+                .map(|w| format!("\"{w}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let k = rng.int(1, 3);
+            format!(
+                "\tcnt{n} := map[string]int{{}}\n\
+                 \tfor i{n}, w{n} := range []string{{{lit}}} {{\n\t\tcnt{n}[w{n}] += i{n} + 1\n\t}}\n\
+                 \tkeys{n} := make([]string, 0, len(cnt{n}))\n\
+                 \tfor k{n} := range cnt{n} {{\n\t\tkeys{n} = append(keys{n}, k{n})\n\t}}\n\
+                 \tsort.Strings(keys{n})\n\
+                 \tfor _, k{n} := range keys{n} {{\n\t\tfmt.Print(k{n}, \"=\", cnt{n}[k{n}], \" \")\n\t}}\n\tfmt.Println(len(cnt{n}))\n\
+                 \tgrp{n} := map[int][]string{{}}\n\
+                 \tfor k{n}, v{n} := range cnt{n} {{\n\t\tgrp{n}[v{n}%{k}] = append(grp{n}[v{n}%{k}], k{n})\n\t}}\n\
+                 \tfor g{n} := range grp{n} {{\n\t\tsort.Strings(grp{n}[g{n}])\n\t}}\n\
+                 \tfmt.Println(grp{n})\n\
+                 \tfor _, k{n} := range keys{n} {{\n\t\tif cnt{n}[k{n}]%2 == 0 {{\n\t\t\tdelete(cnt{n}, k{n})\n\t\t}}\n\t}}\n\
+                 \tv{n}, ok{n} := cnt{n}[\"nope\"]\n\
+                 \tfmt.Println(cnt{n}, v{n}, ok{n}, len(cnt{n}))\n"
+            )
+        }
+        // ── goroutines, WaitGroup, Mutex, atomics, deterministic joins ────
+        51 => {
+            uses.sync = true;
+            let (w, per) = (rng.int(2, 6), rng.int(1, 8));
+            format!(
+                "\tvar mu{n} sync.Mutex\n\tvar wg{n} sync.WaitGroup\n\ttotal{n} := 0\n\
+                 \tslots{n} := make([]int, {w})\n\
+                 \tres{n} := make(chan int, {w})\n\
+                 \tfor g{n} := 0; g{n} < {w}; g{n}++ {{\n\
+                 \t\twg{n}.Add(1)\n\
+                 \t\tgo func() {{\n\t\t\tdefer wg{n}.Done()\n\
+                 \t\t\tfor j{n} := 0; j{n} < {per}; j{n}++ {{\n\
+                 \t\t\t\tmu{n}.Lock()\n\t\t\t\ttotal{n} += g{n} + j{n}\n\t\t\t\tmu{n}.Unlock()\n\t\t\t}}\n\
+                 \t\t\tslots{n}[g{n}] = g{n} * g{n}\n\
+                 \t\t\tres{n} <- g{n}*10 + {per}\n\
+                 \t\t}}()\n\t}}\n\
+                 \twg{n}.Wait()\n\tclose(res{n})\n\
+                 \tgot{n} := 0\n\tcnt{n} := 0\n\
+                 \tfor v{n} := range res{n} {{\n\t\tgot{n} += v{n}\n\t\tcnt{n}++\n\t}}\n\
+                 \tvar once{n} sync.Once\n\
+                 \tfor i{n} := 0; i{n} < 3; i{n}++ {{\n\t\tonce{n}.Do(func() {{ fmt.Println(\"once\", i{n}) }})\n\t}}\n\
+                 \tfmt.Println(total{n}, slots{n}, got{n}, cnt{n})\n"
+            )
+        }
+        // ── panic values, recover results, re-panic, panic in defer ───────
+        52 => {
+            uses.rtypes = true;
+            let which = rng.below(5);
+            let v = rng.int(1, 50);
+            let body = match which {
+                0 => format!("panic(fmt.Sprintf(\"boom %d\", {v}))"),
+                1 => format!("panic(&MyErr{{{v}}})"),
+                2 => format!("panic(ValErr(\"v{v}\"))"),
+                3 => format!("var a []int\n\t\t\t_ = a[{v}]"),
+                _ => format!("var m map[string]int\n\t\t\tm[\"k\"] = {v}"),
+            };
+            format!(
+                "\tfunc() {{\n\
+                 \t\tdefer func() {{\n\
+                 \t\t\tr := recover()\n\
+                 \t\t\tfmt.Println(\"outer\", r)\n\
+                 \t\t\tif e, ok := r.(error); ok {{\n\t\t\t\tfmt.Println(\"is error:\", e.Error())\n\t\t\t}}\n\
+                 \t\t}}()\n\
+                 \t\tdefer func() {{\n\
+                 \t\t\tif r := recover(); r != nil {{\n\t\t\t\tfmt.Println(\"inner\", r)\n\t\t\t\tpanic(fmt.Sprint(\"re-\", r))\n\t\t\t}}\n\
+                 \t\t}}()\n\
+                 \t\tfunc() {{\n\t\t\t{body}\n\t\t}}()\n\
+                 \t\tfmt.Println(\"unreachable\")\n\
+                 \t}}()\n\
+                 \tfmt.Println(\"after{n}\")\n"
+            )
+        }
+        // ── method values and method expressions ──────────────────────────
+        53 => {
+            uses.rtypes = true;
+            let (a, d) = (rng.int(0, 20), rng.int(1, 9));
+            format!(
+                "\tc{n} := Counter{{{a}}}\n\
+                 \tval{n} := c{n}.Value\n\tinc{n} := c{n}.Inc\n\
+                 \tinc{n}()\n\tinc{n}()\n\
+                 \tfmt.Println(val{n}(), c{n}.Value(), c{n}.n)\n\
+                 \tvf{n} := Counter.Value\n\tpf{n} := (*Counter).Add\n\
+                 \tpf{n}(&c{n}, {d})\n\
+                 \tfmt.Println(vf{n}(c{n}), c{n}.Add({d}).Add(1).Value())\n\
+                 \tfs{n} := []func() int{{c{n}.Value, func() int {{ return c{n}.n * 2 }}}}\n\
+                 \tc{n}.Inc()\n\
+                 \tfor _, f := range fs{n} {{\n\t\tfmt.Print(f(), \" \")\n\t}}\n\tfmt.Println()\n"
+            )
+        }
+        // ── interface embedding, assertions and type switches ─────────────
+        54 => {
+            uses.rtypes = true;
+            let (w, h) = (rng.int(1, 9), rng.int(1, 9));
+            format!(
+                "\tvar an{n} Animal = &Dog{{\"rex\", {w}}}\n\
+                 \tvar sp{n} Speaker = an{n}\n\
+                 \tfmt.Println(an{n}.Speak(), an{n}.Move({h}), sp{n}.Speak())\n\
+                 \tif mv, ok := sp{n}.(Mover); ok {{\n\t\tfmt.Println(\"mover\", mv.Move(1))\n\t}}\n\
+                 \tif _, ok := sp{n}.(Cat); !ok {{\n\t\tfmt.Println(\"not a cat\")\n\t}}\n\
+                 \tvals{n} := []any{{{w}, \"s\", 2.5, nil, Rect{{{w}, {h}}}, Sq{{{h}}}, &Dog{{\"d\", 0}}, Cat{{\"c\"}}, []int{{1}}, true}}\n\
+                 \tfor _, v{n} := range vals{n} {{\n\
+                 \t\tswitch x := v{n}.(type) {{\n\
+                 \t\tcase nil:\n\t\t\tfmt.Print(\"nil \")\n\
+                 \t\tcase int, float64:\n\t\t\tfmt.Print(\"num \", x, \" \")\n\
+                 \t\tcase string:\n\t\t\tfmt.Print(\"str \", len(x), \" \")\n\
+                 \t\tcase fmt.Stringer:\n\t\t\tfmt.Print(\"stringer \", x.String(), \" \")\n\
+                 \t\tcase Shape:\n\t\t\tfmt.Print(\"shape \", x.Area(), \" \")\n\
+                 \t\tcase Speaker:\n\t\t\tfmt.Print(\"speaker \", x.Speak(), \" \")\n\
+                 \t\tcase []int:\n\t\t\tfmt.Print(\"ints \", len(x), \" \")\n\
+                 \t\tdefault:\n\t\t\tfmt.Printf(\"other %T \", x)\n\t\t}}\n\t}}\n\tfmt.Println()\n"
+            )
+        }
+        // ── generic constraints and instantiation ─────────────────────────
+        55 => {
+            uses.generic2 = true;
+            let (a, b) = (rng.int(1, 9), rng.int(1, 9));
+            format!(
+                "\txs{n} := []int{{{a}, {b}, {a} + {b}}}\n\tfs{n} := []float64{{{a}.5, {b}.25}}\n\
+                 \tfmt.Println(gsum(xs{n}), gsum(fs{n}), gmax({a}, {b}), gmax(\"x\", \"y\"), gmax(2.5, 1.5))\n\
+                 \tfmt.Println(gmap(xs{n}, func(i int) string {{ return fmt.Sprint(i * 2) }}), gfilter(xs{n}, func(i int) bool {{ return i%2 == 0 }}))\n\
+                 \tfmt.Println(gavg(xs{n}), gavg(fs{n}), gconv[int, float64]({a}), gconv[float64, int]({a}.9))\n\
+                 \tfmt.Println(greduce(xs{n}, 0, func(acc, x int) int {{ return acc*2 + x }}), gzero[int](), gzero[string]() == \"\", gzero[bool]())\n"
+            )
+        }
+        // ── struct comparison and printing ────────────────────────────────
+        56 => {
+            uses.rtypes = true;
+            let (a, b) = (rng.int(0, 9), rng.int(0, 9));
+            format!(
+                "\tp{n} := Rect{{{a}, {b}}}\n\tq{n} := Rect{{{b}, {a}}}\n\
+                 \tfmt.Println(p{n} == q{n}, p{n} == Rect{{{a}, {b}}}, p{n} != q{n})\n\
+                 \tfmt.Printf(\"%v %+v %#v\\n\", p{n}, p{n}, p{n})\n\
+                 \tnest{n} := Nest{{Rect: p{n}, Tags: []string{{\"a\", \"b\"}}, Ptr: nil, M: map[string]int{{\"z\": {a}, \"a\": {b}}}}}\n\
+                 \tfmt.Printf(\"%v\\n%+v\\n\", nest{n}, nest{n})\n\
+                 \tarr{n} := [2]Rect{{p{n}, q{n}}}\n\
+                 \tfmt.Println(arr{n}, arr{n} == [2]Rect{{p{n}, q{n}}}, &p{n} == &p{n})\n\
+                 \tm{n} := map[Rect]string{{p{n}: \"p\", q{n}: \"q\"}}\n\
+                 \tfmt.Println(m{n}[Rect{{{a}, {b}}}], len(m{n}))\n"
+            )
+        }
+        // ── labeled break / continue and goto ─────────────────────────────
+        57 => {
+            let (x, y, z) = (rng.int(2, 6), rng.int(2, 6), rng.int(0, 8));
+            format!(
+                "\tcount{n} := 0\n\
+                 outer{n}:\n\
+                 \tfor i{n} := 0; i{n} < {x}; i{n}++ {{\n\
+                 \t\tfor j{n} := 0; j{n} < {y}; j{n}++ {{\n\
+                 \t\t\tswitch {{\n\
+                 \t\t\tcase j{n} == {z} % {y}:\n\t\t\t\tcontinue outer{n}\n\
+                 \t\t\tcase i{n}*j{n} > {z}:\n\t\t\t\tbreak outer{n}\n\
+                 \t\t\t}}\n\
+                 \t\t\tcount{n} += i{n}*10 + j{n}\n\t\t}}\n\t}}\n\
+                 \tk{n} := 0\n\
+                 retry{n}:\n\
+                 \tk{n}++\n\
+                 \tif k{n} < {x} {{\n\t\tgoto retry{n}\n\t}}\n\
+                 \tfmt.Println(count{n}, k{n})\n\
+                 \tsel{n} := 0\n\
+                 sw{n}:\n\
+                 \tswitch {{\n\tcase {z} > 2:\n\t\tfor {{\n\t\t\tsel{n}++\n\t\t\tif sel{n} > {y} {{\n\t\t\t\tbreak sw{n}\n\t\t\t}}\n\t\t}}\n\
+                 \tdefault:\n\t\tsel{n} = -1\n\t}}\n\
+                 \tfmt.Println(sel{n})\n"
+            )
+        }
+        // ── per-iteration loop variables (Go 1.22) ────────────────────────
+        58 => {
+            uses.sync = true;
+            let (top, step) = (rng.int(2, 5), rng.int(1, 4));
+            format!(
+                "\tvar fs{n} []func() int\n\tvar ps{n} []*int\n\
+                 \tfor i{n} := 0; i{n} < {top}; i{n}++ {{\n\
+                 \t\tfs{n} = append(fs{n}, func() int {{ i{n} += {step}; return i{n} }})\n\
+                 \t\tps{n} = append(ps{n}, &i{n})\n\t}}\n\
+                 \tfor _, f := range fs{n} {{\n\t\tfmt.Print(f(), \" \", f(), \" \")\n\t}}\n\
+                 \tfor _, p := range ps{n} {{\n\t\tfmt.Print(*p, \" \")\n\t}}\n\tfmt.Println()\n\
+                 \tvar wg{n} sync.WaitGroup\n\tout{n} := make([]int, {top})\n\
+                 \tfor i{n} := range {top} {{\n\t\twg{n}.Add(1)\n\t\tgo func() {{\n\t\t\tdefer wg{n}.Done()\n\t\t\tout{n}[i{n}] = i{n} * {step}\n\t\t}}()\n\t}}\n\
+                 \twg{n}.Wait()\n\
+                 \tfor _, w{n} := range []string{{\"a\", \"b\", \"c\"}} {{\n\t\tdefer fmt.Print(w{n}, \" \")\n\t}}\n\
+                 \tfmt.Println(out{n})\n"
+            )
+        }
+        // ── strings / strconv / sort / unicode calls ──────────────────────
+        59 => {
+            uses.strings = true;
+            uses.strconv = true;
+            uses.sort = true;
+            uses.unicode = true;
+            let w = *rng.pick(&[
+                "Hello, World",
+                "  go rs  ",
+                "a,b,,c",
+                "ÀÉÎ õü",
+                "x=1;y=2",
+                "12abc34",
+            ]);
+            let (num, base) = (rng.int(-300, 300), *rng.pick(&[2i64, 8, 10, 16, 36]));
+            format!(
+                "\tw{n} := \"{w}\"\n\
+                 \tfmt.Println(strings.ToUpper(w{n}), strings.ToLower(w{n}), strings.TrimSpace(w{n}), strings.Fields(w{n}), strings.Split(w{n}, \",\"))\n\
+                 \tfmt.Println(strings.Contains(w{n}, \"o\"), strings.Index(w{n}, \"l\"), strings.LastIndex(w{n}, \"l\"), strings.Count(w{n}, \"\"), strings.Repeat(\"ab\", 2), strings.Replace(w{n}, \"l\", \"L\", 1))\n\
+                 \tfmt.Println(strings.Map(func(r rune) rune {{\n\t\tif unicode.IsLetter(r) {{\n\t\t\treturn unicode.ToUpper(r)\n\t\t}}\n\t\treturn -1\n\t}}, w{n}), strings.TrimFunc(w{n}, unicode.IsDigit), strings.Title(w{n}))\n\
+                 \tfmt.Println(strconv.Itoa({num}), strconv.FormatInt({num}, {base}), strconv.Quote(w{n}), strconv.FormatFloat(float64({num})/7, 'f', 3, 64))\n\
+                 \tn{n}, err{n} := strconv.Atoi(w{n})\n\tfmt.Println(n{n}, err{n})\n\
+                 \tp{n}, perr{n} := strconv.ParseInt(\"{num}\", 10, 8)\n\tfmt.Println(p{n}, perr{n})\n\
+                 \tsl{n} := strings.Split(w{n}, \"\")\n\tsort.Strings(sl{n})\n\
+                 \tfmt.Println(sl{n}, sort.SearchStrings(sl{n}, \"l\"), unicode.IsUpper(rune(w{n}[0])), unicode.IsSpace(' '))\n\
+                 \tbefore{n}, after{n}, found{n} := strings.Cut(w{n}, \"=\")\n\tfmt.Println(before{n}, after{n}, found{n})\n"
+            )
+        }
+        // ── errors.Is / As / Join / Unwrap and %w ─────────────────────────
+        60 => {
+            uses.rtypes = true;
+            uses.errors = true;
+            let (a, b) = (rng.int(1, 9), rng.int(1, 9));
+            format!(
+                "\tbase{n} := &MyErr{{{a}}}\n\
+                 \tw1{n} := fmt.Errorf(\"layer1: %w\", base{n})\n\
+                 \tw2{n} := fmt.Errorf(\"layer2 %d: %w\", {b}, w1{n})\n\
+                 \tvar target{n} *MyErr\n\
+                 \tis1{n} := errors.Is(w2{n}, base{n})\n\
+                 \tas1{n} := errors.As(w2{n}, &target{n})\n\
+                 \tfmt.Println(w2{n}, is1{n}, as1{n}, target{n}.code)\n\
+                 \tfmt.Println(errors.Unwrap(w2{n}) == w1{n}, errors.Unwrap(errors.Unwrap(w2{n})) == error(base{n}), errors.Unwrap(base{n}))\n\
+                 \tj{n} := errors.Join(w1{n}, ValErr(\"v\"), nil)\n\
+                 \tvar ve{n} ValErr\n\
+                 \tis2{n} := errors.Is(j{n}, base{n})\n\
+                 \tas2{n} := errors.As(j{n}, &ve{n})\n\
+                 \tfmt.Println(j{n}, is2{n}, as2{n}, ve{n})\n\
+                 \tmulti{n} := fmt.Errorf(\"a: %w, b: %w\", base{n}, ValErr(\"m\"))\n\
+                 \tfmt.Println(multi{n}, errors.Is(multi{n}, base{n}), errors.Is(multi{n}, ValErr(\"m\")), errors.Is(multi{n}, ValErr(\"z\")))\n\
+                 \tfmt.Printf(\"%v|%s|%q|%T\\n\", base{n}, base{n}, ValErr(\"q\"), w1{n})\n"
+            )
+        }
         _ => unreachable!("shape index is drawn below SHAPES"),
     }
 }
@@ -1061,6 +1440,15 @@ struct Uses {
     /// The defined types the `%T`-over-a-defined-type shape declares, one per
     /// base kind, plus a method on one of them and a function taking it.
     defined: bool,
+    /// `unicode/utf8`, `sync`, `unicode`: imports the newer shapes reference.
+    utf8: bool,
+    sync: bool,
+    unicode: bool,
+    /// The method / interface / error types the method-value, interface,
+    /// struct-print and errors shapes build on.
+    rtypes: bool,
+    /// The generic helpers the constraint shape instantiates.
+    generic2: bool,
 }
 
 /// Build a complete, deterministic-output Go program for `seed`.
@@ -1087,6 +1475,15 @@ fn program(seed: u64, only: Option<u64>) -> String {
     }
     if uses.math {
         imports.push("\"math\"");
+    }
+    if uses.utf8 {
+        imports.push("\"unicode/utf8\"");
+    }
+    if uses.sync {
+        imports.push("\"sync\"");
+    }
+    if uses.unicode {
+        imports.push("\"unicode\"");
     }
     let import_block = if imports.len() == 1 {
         format!("import {}\n", imports[0])
@@ -1162,6 +1559,46 @@ fn program(seed: u64, only: Option<u64>) -> String {
              type embMid struct {\n\t*embInner\n\ttag string\n}\n\n\
              type embOuter struct {\n\t*embMid\n\tn int\n}\n\n\
              func (o embOuter) bump(d int) { o.depth += d; o.n += d }\n\n",
+        );
+    }
+    if uses.rtypes {
+        preamble.push_str(
+            "type Counter struct{ n int }\n\n\
+             func (c Counter) Value() int { return c.n }\n\n\
+             func (c *Counter) Inc() { c.n++ }\n\n\
+             func (c *Counter) Add(d int) *Counter { c.n += d; return c }\n\n\
+             type Speaker interface{ Speak() string }\n\n\
+             type Mover interface{ Move(d int) int }\n\n\
+             type Animal interface {\n\tSpeaker\n\tMover\n}\n\n\
+             type Dog struct {\n\tname string\n\tpos  int\n}\n\n\
+             func (d *Dog) Speak() string { return d.name + \" woof\" }\n\n\
+             func (d *Dog) Move(n int) int { d.pos += n; return d.pos }\n\n\
+             type Cat struct{ name string }\n\n\
+             func (c Cat) Speak() string { return c.name + \" meow\" }\n\n\
+             type Shape interface{ Area() int }\n\n\
+             type Rect struct{ w, h int }\n\n\
+             func (r Rect) Area() int { return r.w * r.h }\n\n\
+             type Sq struct{ s int }\n\n\
+             func (s Sq) Area() int { return s.s * s.s }\n\n\
+             func (s Sq) String() string { return fmt.Sprintf(\"Sq(%d)\", s.s) }\n\n\
+             type Nest struct {\n\tRect\n\tTags []string\n\tPtr  *Rect\n\tM    map[string]int\n}\n\n\
+             type MyErr struct{ code int }\n\n\
+             func (e *MyErr) Error() string { return fmt.Sprintf(\"myerr %d\", e.code) }\n\n\
+             type ValErr string\n\n\
+             func (e ValErr) Error() string { return \"valerr \" + string(e) }\n\n",
+        );
+    }
+    if uses.generic2 {
+        preamble.push_str(
+            "type Num interface{ ~int | ~float64 }\n\n\
+             func gsum[T Num](xs []T) T {\n\tvar s T\n\tfor _, x := range xs {\n\t\ts += x\n\t}\n\treturn s\n}\n\n\
+             func gmax[T int | float64 | string](a, b T) T {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n\
+             func gmap[T, U any](xs []T, f func(T) U) []U {\n\tr := make([]U, 0, len(xs))\n\tfor _, x := range xs {\n\t\tr = append(r, f(x))\n\t}\n\treturn r\n}\n\n\
+             func gfilter[T any](xs []T, p func(T) bool) []T {\n\tvar r []T\n\tfor _, x := range xs {\n\t\tif p(x) {\n\t\t\tr = append(r, x)\n\t\t}\n\t}\n\treturn r\n}\n\n\
+             func gavg[T Num](xs []T) T { return gsum(xs) / T(len(xs)) }\n\n\
+             func gconv[T, U Num](x T) U { return U(x) }\n\n\
+             func greduce[T, A any](xs []T, init A, f func(A, T) A) A {\n\tacc := init\n\tfor _, x := range xs {\n\t\tacc = f(acc, x)\n\t}\n\treturn acc\n}\n\n\
+             func gzero[T any]() T {\n\tvar z T\n\treturn z\n}\n\n",
         );
     }
     if uses.generic {

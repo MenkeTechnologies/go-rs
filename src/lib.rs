@@ -14,6 +14,7 @@ pub mod banner;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+pub mod escape;
 pub mod host;
 mod isprint;
 pub mod lexer;

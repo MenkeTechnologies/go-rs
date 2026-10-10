@@ -219,6 +219,8 @@ struct GenericFn {
 struct LambdaInfo {
     /// The type parameters of the generic function the literal sits in.
     tparams: Vec<String>,
+    /// The enclosing function's non-escaping variables the literal can name.
+    stack_slices: HashSet<String>,
     params: Vec<Param>,
     body: Vec<Stmt>,
     /// True if the last parameter is variadic; the call site packs the trailing
@@ -469,6 +471,11 @@ struct Compiler {
     /// Explicit type arguments of the instantiated callee being lowered
     /// (`F[int](x)`), consumed by the call that follows.
     explicit_targs: Option<Vec<String>>,
+    /// The program's escape analysis ([`crate::escape`]).
+    escape: crate::escape::Escape,
+    /// The current function's variables that never leave its frame: an `append`
+    /// to one starts from a stack buffer.
+    stack_slices: HashSet<String>,
     /// Locals and parameters declared with a pointer type, by name, with the
     /// type as written. `decl_types` keeps only the pointee, so this is what
     /// lets a nil pointer operand of `fmt` name its type.
@@ -621,11 +628,55 @@ fn boxed_vars(params: &[Param], body: &[Stmt]) -> HashSet<String> {
     for s in body {
         collect_loop_vars(s, &mut loop_vars);
     }
+    // A loop variable a closure *writes* needs a cell of its own per iteration
+    // (re-made before each post statement); one that is only read is captured
+    // by value, which already gives each iteration its own.
+    let written = closure_assigned_names(body);
     captured
         .intersection(&locals)
-        .filter(|n| !loop_vars.contains(*n))
+        .filter(|n| !loop_vars.contains(*n) || written.contains(*n))
         .cloned()
         .collect()
+}
+
+/// The names assigned (`=`, `op=`, `++`) inside function literals anywhere in
+/// `body`.
+fn closure_assigned_names(body: &[Stmt]) -> HashSet<String> {
+    fn ex(e: &Expr, out: &mut HashSet<String>) {
+        match e {
+            Expr::FuncLit { body, .. } => {
+                let mut v = Vec::new();
+                assigned_idents(body, &mut v);
+                out.extend(v);
+                for s in body {
+                    walk_stmt_exprs(s, &mut |e| ex(e, out));
+                }
+            }
+            Expr::Unary { rhs, .. } => ex(rhs, out),
+            Expr::Binary { lhs, rhs, .. } => {
+                ex(lhs, out);
+                ex(rhs, out);
+            }
+            Expr::Call { func, args, .. } => {
+                ex(func, out);
+                args.iter().for_each(|a| ex(a, out));
+            }
+            Expr::Selector { recv, .. } => ex(recv, out),
+            Expr::Index { recv, index } => {
+                ex(recv, out);
+                ex(index, out);
+            }
+            Expr::SliceLit { elems, .. } => elems.iter().for_each(|x| ex(x, out)),
+            Expr::StructLit { fields, .. } => fields.iter().for_each(|(_, v)| ex(v, out)),
+            Expr::TypeAssert { expr, .. } => ex(expr, out),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for s in body {
+        walk_stmt_exprs(s, &mut |e| ex(e, &mut out));
+    }
+    out
 }
 
 /// Bind the type parameters in `pattern` (a declared parameter type such as
@@ -1805,6 +1856,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         addr_cells: HashSet::new(),
         global_addr_cells: HashSet::new(),
         ptr_types: HashMap::new(),
+        escape: crate::escape::Escape::analyze(prog),
+        stack_slices: HashSet::new(),
         generic_fns: prog
             .funcs
             .iter()
@@ -1870,6 +1923,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         .collect();
     c.global_cells.extend(c.global_addr_cells.iter().cloned());
     c.addr_cells = c.addr_scalar_vars(&[], &prog.main);
+    c.stack_slices = c.escape.non_escaping(&[], &[], &prog.main, true);
     c.boxed.extend(c.addr_cells.iter().cloned());
     c.boxed.extend(c.global_cells.iter().cloned());
     c.fn_has_defer = body_has_defer(&prog.main);
@@ -1957,6 +2011,9 @@ impl Compiler {
         // A method binds its receiver to slot 0; parameters follow.
         let mut slot = 0u16;
         if let Some(r) = &f.receiver {
+            if r.ty.starts_with('*') {
+                self.ptr_types.insert(r.name.clone(), r.ty.clone());
+            }
             scope.slots.insert(r.name.clone(), slot);
             self.types.insert(r.name.clone(), numtype_of_ty(&r.ty));
             self.decl_types.insert(r.name.clone(), base_type(&r.ty));
@@ -2011,6 +2068,12 @@ impl Compiler {
             }
         }
         self.boxed = boxed_vars(&analysis_params, &f.body);
+        self.stack_slices = {
+            let mut ps: Vec<Param> = f.receiver.iter().cloned().collect();
+            ps.extend(f.params.iter().cloned());
+            self.escape
+                .non_escaping(&ps, &f.result_names, &f.body, false)
+        };
         let addr_params: Vec<Param> = if f.variadic {
             analysis_params[..real_params.len().saturating_sub(1)].to_vec()
         } else {
@@ -2081,6 +2144,7 @@ impl Compiler {
 
         self.fn_has_defer = false;
         self.cur_tparams = Vec::new();
+        self.stack_slices = HashSet::new();
         self.boxed = HashSet::new();
         self.addr_cells = HashSet::new();
         self.named_results = Vec::new();
@@ -2135,6 +2199,7 @@ impl Compiler {
             .collect();
         self.lambdas.push(LambdaInfo {
             tparams: self.cur_tparams.clone(),
+            stack_slices: self.stack_slices.clone(),
             params: params.to_vec(),
             body: body.to_vec(),
             variadic,
@@ -2542,8 +2607,11 @@ impl Compiler {
             self.emit_zero(&format!("[]{elem}"), line);
         } else {
             let rest = args[fixed..].to_vec();
+            // Each trailing argument converts to the parameter's element type:
+            // a float for `...float64`, an interface box for `...error`.
+            let elem = param_tys.last().cloned();
             self.emit_lit_chunked(host::GSLICE_LIT, 0, 1, rest.len(), line, |c, i| {
-                c.emit_value(&rest[i])
+                c.emit_arg(&rest[i], elem.as_ref())
             })?;
         }
         Ok(param_tys.len())
@@ -2561,6 +2629,16 @@ impl Compiler {
         let results = self.lambdas[id].results.clone();
         let result_names = self.lambdas[id].result_names.clone();
         self.cur_tparams = self.lambdas[id].tparams.clone();
+        {
+            let (ps, rn, b) = (
+                self.lambdas[id].params.clone(),
+                self.lambdas[id].result_names.clone(),
+                self.lambdas[id].body.clone(),
+            );
+            let mut own = self.escape.non_escaping(&ps, &rn, &b, false);
+            own.extend(self.lambdas[id].stack_slices.iter().cloned());
+            self.stack_slices = own;
+        }
 
         let entry = self.b.current_pos();
         let name_idx = self.b.add_name(&format!("$lambda_{id}"));
@@ -2692,6 +2770,7 @@ impl Compiler {
         self.panic_jumps = saved_panic_jumps;
         self.boxed = saved_boxed;
         self.addr_cells = HashSet::new();
+        self.stack_slices = HashSet::new();
         self.fn_has_defer = false;
         self.scope = None;
         self.active_captures.clear();
@@ -3019,6 +3098,89 @@ impl Compiler {
 
     // ── variable access ────────────────────────────────────────────────────
 
+    /// Tell the `append` about to be called its element's size and whether the
+    /// element holds pointers, which is what Go's allocator rounds the grown
+    /// capacity by. Nothing is emitted when the element type is not known.
+    fn emit_append_size(&mut self, base: Option<&Expr>, spread: bool, line: u32) {
+        let Some(base) = base else { return };
+        let container = self.underlying(&self.type_name(base));
+        let Some(elem) = container
+            .strip_prefix("[]")
+            .map(str::to_string)
+            .or_else(|| array_elem_ty(&container).map(str::to_string))
+        else {
+            return;
+        };
+        let Some((size, _, ptrs)) = self.type_layout(&elem, 0) else {
+            return;
+        };
+        if size == 0 {
+            return;
+        }
+        // An `append` to a variable that never leaves its frame grows from a
+        // stack buffer when empty ([`crate::escape`]).
+        // (a spread `append(s, t...)` always allocates).
+        let root = match base {
+            Expr::Slice { recv, .. } => recv,
+            other => other,
+        };
+        let on_stack = !spread && matches!(root, Expr::Ident(n) if self.stack_slices.contains(n));
+        self.b.emit(
+            Op::LoadInt((size as i64) * 4 + i64::from(on_stack) * 2 + i64::from(ptrs)),
+            line,
+        );
+        self.b.emit(Op::CallBuiltin(host::GAPPEND_SIZE, 1), line);
+        self.b.emit(Op::Pop, line);
+    }
+
+    /// `(size, alignment, holds pointers)` of a written type on a 64-bit
+    /// target, or `None` when it cannot be named. A struct is laid out in field
+    /// order with Go's alignment, an array is `N` elements.
+    fn type_layout(&self, ty: &str, depth: usize) -> Option<(usize, usize, bool)> {
+        if depth > 8 {
+            return None;
+        }
+        let ty = self.underlying(ty.trim());
+        let t = ty.as_str();
+        let scalar = |n: usize| Some((n, n, false));
+        let pointer = Some((8, 8, true));
+        match t {
+            "int" | "uint" | "uintptr" | "int64" | "uint64" | "float64" => scalar(8),
+            "int32" | "uint32" | "float32" | "rune" => scalar(4),
+            "int16" | "uint16" => scalar(2),
+            "int8" | "uint8" | "byte" | "bool" => scalar(1),
+            "complex64" => Some((8, 4, false)),
+            "complex128" => Some((16, 8, false)),
+            "string" => Some((16, 8, true)),
+            "error" | "any" | "interface{}" | "interface {}" => Some((16, 8, true)),
+            _ if t.starts_with("[]") => Some((24, 8, true)),
+            _ if t.starts_with('*')
+                || t.starts_with("map[")
+                || t.starts_with("chan ")
+                || t.starts_with("func") =>
+            {
+                pointer
+            }
+            _ if self.iface_names.contains(t) => Some((16, 8, true)),
+            _ if array_elem_ty(t).is_some() => {
+                let n = array_len_of(t)?;
+                let (size, align, ptrs) = self.type_layout(array_elem_ty(t)?, depth + 1)?;
+                Some((size * n, align, ptrs && n > 0))
+            }
+            _ => {
+                let fields = self.struct_fields.get(t)?;
+                let (mut off, mut max_align, mut ptrs) = (0usize, 1usize, false);
+                for (_, fty) in fields {
+                    let (size, align, p) = self.type_layout(fty, depth + 1)?;
+                    off = off.div_ceil(align) * align + size;
+                    max_align = max_align.max(align);
+                    ptrs |= p;
+                }
+                Some((off.div_ceil(max_align) * max_align, max_align, ptrs))
+            }
+        }
+    }
+
     /// For a call to a generic function, pass its type arguments to the callee:
     /// the written ones, else those the arguments' static types fix. An
     /// argument of the enclosing generic function's own type parameter forwards
@@ -3301,22 +3463,15 @@ impl Compiler {
     }
 
     /// The scalar locals of a function whose address is taken: each lives in a
-    /// cell, which is the pointer `&x` hands out. Loop variables keep Go 1.22's
-    /// per-iteration semantics and are left alone.
+    /// cell, which is the pointer `&x` hands out. A loop variable is given a
+    /// fresh cell per iteration, as Go 1.22 gives it a fresh variable.
     fn addr_scalar_vars(&self, params: &[Param], body: &[Stmt]) -> HashSet<String> {
         let taken = addr_taken_names(body);
         if taken.is_empty() {
             return HashSet::new();
         }
         let decls = self.scalar_decls(params, body);
-        let mut loop_vars = HashSet::new();
-        for s in body {
-            collect_loop_vars(s, &mut loop_vars);
-        }
-        taken
-            .into_iter()
-            .filter(|n| decls.contains(n) && !loop_vars.contains(n))
-            .collect()
+        taken.into_iter().filter(|n| decls.contains(n)).collect()
     }
 
     /// Whether `&name` is the variable's own cell: a scalar local or global
@@ -3546,6 +3701,30 @@ impl Compiler {
                 values,
                 line,
             } => {
+                // A name bound to `&x` or to a call whose result is a pointer
+                // holds a pointer: returning or passing it must not copy.
+                for (n, v) in names.iter().zip(values) {
+                    let ptr = match v {
+                        Expr::Unary {
+                            op: UnOp::Addr,
+                            rhs,
+                        } => Some(format!("*{}", self.type_name(rhs))),
+                        Expr::Call { .. } => self
+                            .call_result_types(v)
+                            .first()
+                            .filter(|t| t.starts_with('*'))
+                            .cloned(),
+                        _ => None,
+                    };
+                    match ptr {
+                        Some(t) => {
+                            self.ptr_types.insert(n.clone(), t);
+                        }
+                        None => {
+                            self.ptr_types.remove(n);
+                        }
+                    }
+                }
                 // `v, ok := x.(T)` / `<-ch` / `m[k]` — the three comma-ok forms,
                 // lowered to a pair of temporaries and declared from them.
                 if names.len() == 2 && values.len() == 1 {
@@ -4013,6 +4192,24 @@ impl Compiler {
         }
         // `continue` lands here — run the post statement, then re-test.
         let post_pos = self.b.current_pos();
+        // Go 1.22: the next iteration's variable is a fresh copy of this one's,
+        // and the post statement runs on the copy. A variable in a cell gets a
+        // new cell holding the current value, so closures and pointers made
+        // this iteration keep the old one.
+        let loop_names: Vec<String> = match init.as_deref() {
+            Some(Stmt::Short { names, .. }) => names.clone(),
+            Some(Stmt::Var { name, .. }) => vec![name.clone()],
+            _ => Vec::new(),
+        };
+        let boxed_names: Vec<String> = loop_names
+            .into_iter()
+            .filter(|n| self.boxed.contains(n))
+            .collect();
+        for name in &boxed_names {
+            self.emit_get(name, 0);
+            self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
+            self.emit_set_raw(name, 0);
+        }
         if let Some(p) = post {
             self.stmt(p)?;
         }
@@ -5962,6 +6159,15 @@ impl Compiler {
         {
             self.b.emit(Op::CallBuiltin(host::GSTRUCT_COPY, 1), 0);
             return Ok(());
+        }
+        // A variable declared as a pointer to a struct is a reference, however
+        // its handle came to be: it is not copied on the way out.
+        if let Expr::Ident(n) = e {
+            if self.structs.contains(&base_type(&ty))
+                && self.ptr_types.get(n).is_some_and(|t| t.starts_with('*'))
+            {
+                return Ok(());
+            }
         }
         self.emit_copy_for(&ty);
         Ok(())
@@ -8380,6 +8586,9 @@ impl Compiler {
             if name == "panic" {
                 for a in args {
                     self.emit_value(a)?;
+                    // The operand is an `any`: a defined type keeps its name
+                    // (and its `Error` / `String` method) through the panic.
+                    self.emit_iface_box(a, line);
                 }
                 let argc = Self::call_arity(args.len(), "panic", line)?;
                 self.b.emit(Op::CallBuiltin(host::GPANIC, argc), line);
@@ -8431,6 +8640,7 @@ impl Compiler {
                     self.expr(a)?;
                 }
                 let argc = Self::call_arity(args.len() + 1, "append", line)?;
+                self.emit_append_size(args.first(), true, line);
                 self.b
                     .emit(Op::CallBuiltin(host::GAPPEND_SPREAD, argc), line);
                 return Ok(());
@@ -8577,6 +8787,9 @@ impl Compiler {
                     }
                 }
                 let argc = Self::call_arity(args.len(), name, line)?;
+                if id == host::GAPPEND {
+                    self.emit_append_size(args.first(), false, line);
+                }
                 self.b.emit(Op::CallBuiltin(id, argc), line);
                 return Ok(());
             }
@@ -8889,6 +9102,21 @@ fn fold_untyped_int(e: &Expr, name: &dyn Fn(&str) -> Option<i128>) -> Option<i12
         // lexer's `18446744073709551615`, the parser's `uint64(-1)` — whose
         // type the pattern alone does not tell.
         Expr::Int(n) => (*n >= 0).then(|| i128::from(*n)),
+        // A constant above `int64` is written `uint64(<bit pattern>)` by the
+        // parser's exact folding; its value is the pattern read unsigned.
+        Expr::Call {
+            func,
+            args,
+            spread: false,
+            ..
+        } if matches!(&**func, Expr::Ident(t) if t == "uint64")
+            && matches!(args.as_slice(), [Expr::Int(n)] if *n < 0) =>
+        {
+            match args.as_slice() {
+                [Expr::Int(n)] => Some(i128::from(*n as u64)),
+                _ => None,
+            }
+        }
         Expr::Ident(n) => name(n),
         Expr::Unary { op: UnOp::Neg, rhs } => fold_untyped_int(rhs, name)?.checked_neg(),
         Expr::Unary {

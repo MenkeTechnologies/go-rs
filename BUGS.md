@@ -33,6 +33,8 @@ func show[T any](v T) { fmt.Println(v) }
 show(Weekday(3))                    // go: Wed            go-rs: 3
 type S struct{ M map[string]Weekday }
 fmt.Println(S{map[string]Weekday{"a": 1}})   // go: {map[a:Wed]}  go-rs: {map[a:1]}
+func showAll(vs ...any) { fmt.Println(vs...) }
+showAll([]Weekday{1})               // go: [Wed]         go-rs: [1]
 ```
 
 A defined non-struct value is boxed with its type name
@@ -349,22 +351,40 @@ One level down Go prints the pointer's hex address instead, which no two runs
 reproduce, so go-rs keeps printing the value there rather than inventing an
 address.
 
-## `append` capacity misses Go's malloc size-class rounding
+## `append` capacity follows an approximation of Go's escape analysis
 
 ```go
-var s []int
-s = append(s, 1, 2, 3, 4, 5)
-fmt.Println(cap(s))   // go: 6     go-rs: 5
+func build() []int { var r []int; r = append(r, 1); return r }
+q := build()
+fmt.Println(cap(q))   // go: 4 (build is inlined; r stays in main's frame)   go-rs: 1
 ```
 
-`runtime.nextslicecap` is ported faithfully (see `next_slice_cap` in
-`src/host.rs`), so the repeated-single-append doubling sequence
-`1 2 4 4 8 8 8 8 16 …` matches exactly. Go then rounds the new backing array's
-**byte** size up to a malloc size class — 5 ints is 40 bytes, which rounds to
-the 48-byte class, giving cap 6. go-rs has no static element type at run time,
-so it cannot compute the byte size. Sniffing it from the element values would
-give the wrong answer for `[]byte` (1 byte) and for struct elements, so it is
-left unrounded rather than confidently wrong.
+The growth rule is Go's: `runtime.nextslicecap`, then the byte size rounded up
+to the allocator's size class (a block of pointers over 512 bytes loses 8 bytes
+to the malloc header), with the element size taken from the slice's static type
+(`host::GAPPEND_SIZE`). On top of it, an `append` to an empty slice whose
+backing array stays in the frame lands in a 32-byte stack buffer when the
+elements fit (`cap == 4` after one `append` to a `[]int`, not `1`), and that
+verdict is an escape analysis (`src/escape.rs`): a flow graph over locals with
+sinks for stores to globals, maps, channels and goroutines, `fmt` operands,
+`&x`, and returns, plus per-function summaries of what each parameter does.
+
+It is an approximation, deliberately biased to "escapes" (the heap capacities
+are what go-rs produced before it existed). What it does not model:
+
+- **Inlining.** Go decides after inlining, so a small function returning a
+  slice it built lets the caller's use decide; here a returned slice always
+  escapes. The same applies to a closure called in place.
+- **Element flow through containers it cannot type.** A `[]T` read through an
+  index or `range` carries the container's flows unless the container's written
+  type shows scalar elements, so a slice of slices or pointers is treated as
+  aliasing its contents.
+- **Slices held in a struct field or a map value.** An `append` whose base is
+  not a plain local variable gets the heap rule.
+- **The standard library is a table**: packages whose functions do not keep a
+  slice argument (`strings`, `bytes`, `slices`, `maps`, `strconv`, `sort` except
+  the `Interface` and `Slice` entry points, `errors.Join`) and the rest, which
+  do. A new package falls on the "keeps" side.
 
 ## `%T` in a computed format string names the rendered type
 

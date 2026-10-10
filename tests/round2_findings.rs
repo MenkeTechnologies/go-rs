@@ -360,3 +360,186 @@ y x
 "#
     );
 }
+
+#[test]
+fn append_capacity_escape_analysis() {
+    // an append to a slice that stays in its frame grows from a stack buffer
+    let (out, code) = run_file(&script("append_capacity_escape_analysis"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        r#"plain 4
+total 4
+keep 1
+ret 4
+first 4
+sort.Ints 4
+join 2
+structlit 4 1
+closure 4 1
+subslice 4 1
+println 1 [1]
+sub 4
+app 4
+1
+pr 4
+rec 4
+viaClosure 4
+method-leak 1
+method-noleak 4 1
+slices.Sort 4
+slices.Contains 4 true
+copyvar 4 1
+copy 4 false
+append-other 4 4
+2d 1
+4,4,4,4 9
+"#
+    );
+}
+
+#[test]
+fn append_capacity_size_classes() {
+    // growth is rounded to the allocator size class by element size
+    let (out, code) = run_file(&script("append_capacity_size_classes"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        r#"int [1 2 4 8 16 32 64 128 256 512 848] 700
+[]
+int8 [8 16 32 64 128 256 512 896] 700
+[]
+int16 [4 8 16 32 64 128 256 512 896 1344 2048 3072 4096] 4000
+[]
+int32 [2 4 8 16 32 64 128 256 512 864] 700
+[]
+float64 [1 2 4 8 16 32 64 128 256 512 848] 700
+[]
+bool [8 16 32 64 128 256 512 896 1408 2048 3072 4096] 4000
+[]
+string [1 2 4 8 16 32 71 143 303 591 1023] 700
+[]
+P3 [1 2 4 8 16 32 64 128 256 512 853] 700
+[]
+PP [1 2 4 8 16 32 71 143 303 591 1023 1535 2560 3584 5120] 4000
+[]
+S5 [1 2 4 8 16 32 67 134 272 544 1024] 700
+[]
+[3]int [1 2 4 8 16 32 64 128 256 512 853] 700
+[]
+[]int [1 2 4 8 16 37 74 170 341 682 1135 1706 2389 3413 4778] 4000
+[]
+*int [1 2 4 8 16 32 64 143 287 607 1023] 700
+[]
+byte [8 16 32 64 128 256 512 896] 700
+[]
+int64 [1 2 4 8 16 32 64 128 256 512 848 1280 1792 2560 3408 5120] 4000
+[]
+uint16 [4 8 16 32 64 128 256 512 896] 700
+[]
+complex128 [1 2 4 8 16 32 64 128 256 512 848] 700
+[]
+any [1 2 4 8 16 32 71 143 303 591 1023 1535 2560 3584 5120] 4000
+[]
+map[string]int [1 2 4 8 16 32 64 143 287 607 1023] 700
+[]
+error [1 2 4 8 16 32 71 143 303 591 1023] 700
+[]
+"#
+    );
+}
+
+#[test]
+fn append_capacity_spread_and_multi() {
+    // spread and multi-element appends allocate unless they fit the buffer
+    let (out, code) = run_file(&script("append_capacity_spread_and_multi"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        r#"spread3 3
+multi2 4
+strspread2 8
+bytes3 32
+multi5 6
+spread4 4
+spread5 6
+str3 3
+slice0 4
+grow-multi 8
+make00 4
+2d 4
+"#
+    );
+}
+
+#[test]
+fn append_capacity_stdlib_escape() {
+    // which stdlib calls keep a slice argument
+    let (out, code) = run_file(&script("append_capacity_stdlib_escape"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        r#"sort.Ints 4
+sort.Strings 2
+sort.Float64s 4
+sort.Slice 1
+sort.SearchInts 4
+strings.Join 2
+slices.Max 4
+slices.Reverse 4
+slices.Clone 4
+slices.Equal 4
+bytes.Contains 32
+errors.Join 2
+fmt.Sprint(len) 4
+fmt.Sprintf 1
+chan 1
+go-closure 1
+defer-closure 4
+map-store 1 1
+addr 1 1
+nested 4 1
+iface 4
+anon-struct 4 1
+range 4
+"#
+    );
+}
+
+#[test]
+fn defined_type_panic_variadic_interface_method_chain() {
+    // defined types keep their type through panic and variadic interface parameters
+    let (out, code) = run_file(&script(
+        "defined_type_panic_variadic_interface_method_chain",
+    ));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        r#"code x true code x
+L3|code y|4|s|
+code a
+code b true code a
+true false
+5 5
+5 15 17
+true
+"#
+    );
+}
+
+#[test]
+fn loop_variable_closure_writes_and_address() {
+    // a closure that writes the loop variable, or a pointer to it, keeps its iteration
+    let (out, code) = run_file(&script("loop_variable_closure_writes_and_address"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        r#"2 4 3 5 4 6 5 7 6 8 
+4 5 6 7 8 
+20 40 118 136 216 232 
+[100 101 102 103]
+a!a!! b!b!! c!c!! 
+1 3 
+"#
+    );
+}

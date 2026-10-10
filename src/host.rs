@@ -376,6 +376,13 @@ pub const GSLICE_TO_ARRAY: u16 = 1011;
 /// type only when it is nil, so `%#v` and `%T` can name the nil's type. A
 /// non-nil value passes through untouched.
 pub const GNIL_BOX: u16 = 1012;
+/// `[info]` — the element size the next `append` rounds its new capacity by:
+/// `size * 4 + stack * 2 + has_pointers`, or `0` when the element type is
+/// unknown; `stack` says the slice's escape analysis verdict is "stays in the
+/// frame", which gives an append to an empty slice a 32-byte buffer to grow
+/// from. Consumed by the append that follows, and emitted after its operands
+/// are evaluated.
+pub const GAPPEND_SIZE: u16 = 1013;
 /// `[s, name0, v0, …]` → a display copy of struct `s` with the named fields
 /// replaced — how `$stringify` hands `fmt` a struct whose exported fields print
 /// through their `String()` / `Error()`.
@@ -517,6 +524,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GZERO_OF, b_zero_of);
     vm.register_builtin(GSLICE_TO_ARRAY, b_slice_to_array);
     vm.register_builtin(GNIL_BOX, b_nil_box);
+    vm.register_builtin(GAPPEND_SIZE, b_append_size);
     vm.register_builtin(GCHAN_SEND_CHECK, b_chan_send_check);
     vm.register_builtin(GSPREAD, b_spread);
     vm.register_builtin(GIFACE_EQ, b_iface_eq);
@@ -2903,9 +2911,28 @@ fn next_slice_cap(new_len: usize, old_cap: usize) -> usize {
 /// return a view of the live prefix — the reallocating half of Go's
 /// `growslice`. The spare room is zero-filled with the slice's own element
 /// shape so later appends have somewhere to land.
-fn grow_slice(elems: Vec<Value>, old_cap: usize) -> Value {
+fn grow_slice(elems: Vec<Value>, old_cap: usize, info: i64) -> Value {
     let new_len = elems.len();
-    let cap = next_slice_cap(new_len, old_cap);
+    let (size, on_stack, has_ptrs) = ((info >> 2).max(0) as usize, info & 2 != 0, info & 1 != 0);
+    // An append to an empty slice that stays in its frame, and whose elements
+    // fit, lands in a 32-byte buffer on the stack: the buffer's capacity, and
+    // no allocation. One that does not fit goes to `growslice` from the empty
+    // slice as usual.
+    if on_stack && old_cap == 0 && size > 0 && new_len * size <= 32 {
+        let cap = 32 / size;
+        return finish_grow(elems, new_len, cap);
+    }
+    let mut cap = next_slice_cap(new_len, old_cap);
+    // `growslice` then rounds the new array's byte size up to the allocator's
+    // block size, and the capacity is what fits in that block.
+    if let Some(c) = round_up_size(cap * size, !has_ptrs).checked_div(size) {
+        cap = c;
+    }
+    finish_grow(elems, new_len, cap)
+}
+
+/// The grown slice: `elems` zero-extended to `cap`, viewed at `new_len`.
+fn finish_grow(elems: Vec<Value>, new_len: usize, cap: usize) -> Value {
     // Go zeroes the tail of the new array; go-rs has no element type here, so
     // the filler is the untyped zero. It is never readable through the returned
     // slice (indices past `len` are out of bounds) — only a later append or a
@@ -2936,6 +2963,8 @@ fn b_append(vm: &mut VM, argc: u8) -> Value {
 /// Append `args` to the slice `recv` — the shared body of [`b_append`] and
 /// [`b_append_spread`].
 fn append_values(vm: &mut VM, recv: Value, args: Vec<Value>) -> Value {
+    // The element-size hint is for this append alone, however it ends.
+    let info = APPEND_SIZE.with(|c| c.replace(0));
     match recv {
         Value::Obj(id) => {
             // `append(*p, x)` hands over the pointer, not the slice it addresses.
@@ -2985,7 +3014,7 @@ fn append_values(vm: &mut VM, recv: Value, args: Vec<Value>) -> Value {
                 });
                 out = moved_elems(out);
                 out.extend(args);
-                return grow_slice(out, cap);
+                return grow_slice(out, cap, info);
             }
             // A plain slice is its own backing with `cap == len`, so every append
             // reallocates — as it does in Go, which is why `b := append(a, x)`
@@ -3005,7 +3034,7 @@ fn append_values(vm: &mut VM, recv: Value, args: Vec<Value>) -> Value {
                 let old_cap = out.len();
                 let mut out = moved_elems(out);
                 out.extend(args);
-                return grow_slice(out, old_cap);
+                return grow_slice(out, old_cap, info);
             }
             {
                 ffi_fault(
@@ -4458,6 +4487,50 @@ fn b_targ(vm: &mut VM, argc: u8) -> Value {
         return Value::Undef;
     }
     Value::str(TARGS.with(|t| t.borrow().get(i as usize).cloned().unwrap_or_default()))
+}
+
+thread_local! {
+    /// [`GAPPEND_SIZE`]'s pending value.
+    static APPEND_SIZE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`GAPPEND_SIZE`].
+fn b_append_size(vm: &mut VM, argc: u8) -> Value {
+    let info = pop_args(vm, argc).first().map_or(0, Value::to_int);
+    APPEND_SIZE.with(|c| c.set(info));
+    Value::Undef
+}
+
+/// Go's malloc size classes up to the largest small object, in bytes.
+const SIZE_CLASSES: [usize; 68] = [
+    0, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320,
+    352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792,
+    2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728,
+    10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264, 28672,
+    32768,
+];
+
+/// Port of `runtime.roundupsize`: the size of the block the allocator hands out
+/// for a request of `size` bytes. A block of pointer-holding objects over 512
+/// bytes carries an 8-byte malloc header the caller cannot use.
+fn round_up_size(size: usize, noscan: bool) -> usize {
+    const MAX_SMALL: usize = 32768;
+    const HEADER: usize = 8;
+    const MIN_FOR_HEADER: usize = 512;
+    const PAGE: usize = 8192;
+    let mut req = size;
+    if req <= MAX_SMALL - HEADER {
+        if !noscan && req > MIN_FOR_HEADER {
+            req += HEADER;
+        }
+        let class = SIZE_CLASSES
+            .iter()
+            .copied()
+            .find(|&c| c >= req)
+            .unwrap_or(req);
+        return class - (req - size);
+    }
+    (size + PAGE - 1) & !(PAGE - 1)
 }
 
 /// [`GNIL_BOX`].
