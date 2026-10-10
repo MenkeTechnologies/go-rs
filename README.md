@@ -19,8 +19,7 @@
 
 **Go in Rust** — a Go frontend hosted on the
 [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM with a
-three-tier Cranelift JIT — the same engine behind `zshrs`, `strykelang`,
-`awkrs`, `vimlrs`, `elisprs`, `rubylang`, `javars`, `kotlinrs`, and `scalars`.
+three-tier Cranelift JIT, shared with the other fusevm frontends and hosts.
 No `go` toolchain, no `gc` compiler, no runtime.
 
 go-rs is a **pure frontend**: it lexes Go (with the language's automatic
