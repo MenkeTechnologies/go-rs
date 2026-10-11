@@ -403,3 +403,45 @@ fn sharp_floats_and_non_finite_padding() {
 -00001.5|%!d(float32=-00001.5)\n",
     );
 }
+
+/// `%#v` writes an unsigned integer in hex at every depth, and reads a
+/// declared type for what the value cannot say: a nil interface element, a
+/// `[]byte` field built by conversion, a nil defined slice or map, and the key
+/// and value types of a tagged map.
+#[test]
+fn sharp_v_reads_declared_types() {
+    let src = r#"
+package main
+
+import "fmt"
+
+type ID uint16
+type Names []string
+type Lookup map[string]int
+type Rec struct {
+	B  []byte
+	Ks []ID
+	N  Names
+	E  error
+	U  uint64
+}
+
+func main() {
+	var u uint = 7
+	fmt.Printf("%#v %#v %#v\n", u, ID(255), []any{nil, 1})
+	fmt.Printf("%#v\n", Rec{B: []byte("hi"), Ks: []ID{1}, U: 1 << 63})
+	fmt.Printf("%#v %v %#v\n", map[ID]Names{7: {"z"}, 1: nil}, Lookup(nil), Lookup(nil))
+	fmt.Printf("%#v %T\n", map[string]any{"a": nil}, map[string]any{})
+}
+"#;
+    let (stdout, ok) = run(src);
+    assert!(ok, "program failed; stdout was: {stdout:?}");
+    assert_eq!(
+        stdout,
+        r#"0x7 0xff []interface {}{interface {}(nil), 1}
+main.Rec{B:[]uint8{0x68, 0x69}, Ks:[]main.ID{0x1}, N:main.Names(nil), E:error(nil), U:0x8000000000000000}
+map[main.ID]main.Names{0x1:main.Names(nil), 0x7:main.Names{"z"}} map[] main.Lookup(nil)
+map[string]interface {}{"a":interface {}(nil)} map[string]interface {}
+"#
+    );
+}

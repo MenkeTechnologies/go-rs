@@ -1791,6 +1791,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // A fixed-size array field is a value too, and the plan carries its written
     // type so the copy knows whether the array's own elements are values.
     host::set_struct_field_types(struct_fields.clone());
+    host::set_defined_bases(prog.defined.iter().cloned().collect());
     host::set_struct_plan(
         struct_fields
             .iter()
@@ -7597,9 +7598,14 @@ impl Compiler {
         // it too — `map[myStr]myInt` prints as `map[main.myStr]main.myInt`. Only
         // the map case needs this: a slice already carries its element type
         // through [`Self::elem_tag_spec`].
+        // A map of interface values is named the same way: its pairs cannot
+        // describe a type whose values differ from one another, and a nil value
+        // in it is written `interface {}(nil)` by `%#v`.
         let mentions_defined = ty
             .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|w| self.defined_types.contains_key(w));
+            .any(|w| {
+                self.defined_types.contains_key(w) || matches!(w, "any" | "interface" | "error")
+            });
         (mentions_defined && ty.starts_with("map[")).then(|| ty.to_string())
     }
 

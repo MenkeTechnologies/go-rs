@@ -2027,6 +2027,82 @@ pub fn set_struct_field_types(types: HashMap<String, Vec<(String, String)>>) {
     STRUCT_FIELD_TYPES.with(|t| *t.borrow_mut() = types);
 }
 
+thread_local! {
+    /// Every non-struct defined type's base as written (`type ID uint32` is
+    /// `ID → uint32`) — what `%#v` follows to learn a declared type's kind.
+    static DEFINED_BASES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Install the base of every non-struct defined type.
+pub fn set_defined_bases(bases: HashMap<String, String>) {
+    DEFINED_BASES.with(|b| *b.borrow_mut() = bases);
+}
+
+/// Whether `ty` is a defined (non-struct) type.
+fn is_defined_ty(ty: &str) -> bool {
+    DEFINED_BASES.with(|b| b.borrow().contains_key(ty))
+}
+
+/// `ty` with every defined type followed to its base. Go rejects a cyclic
+/// type declaration, so the chain ends; the bound only guards a malformed table.
+fn underlying_ty(ty: &str) -> String {
+    let mut t = ty.to_string();
+    for _ in 0..64 {
+        match DEFINED_BASES.with(|b| b.borrow().get(&t).cloned()) {
+            Some(base) if base != t => t = base,
+            _ => break,
+        }
+    }
+    t
+}
+
+/// Whether a value of declared type `ty` is an unsigned integer, which Go's
+/// `printValue` writes under `%#v` with `fmt0x64(v, true)`: `0x2`, not `2`.
+fn is_unsigned_ty(ty: &str) -> bool {
+    matches!(
+        underlying_ty(ty).as_str(),
+        "uint" | "uint8" | "byte" | "uint16" | "uint32" | "uint64" | "uintptr"
+    )
+}
+
+/// `%#v` of one element, field, key or value whose declared type is `ty`.
+///
+/// The declared type supplies what the value alone lacks: the type a nil
+/// interface, pointer, func or channel is written with (`interface {}(nil)`,
+/// `(*int)(nil)`), the hex form of an unsigned integer, and the defined name of
+/// a composite stored without its box (`main.Names{"z"}` in a
+/// `map[ID]Names`).
+fn sharp_typed(v: &Value, ty: &str) -> String {
+    match v {
+        Value::Undef => sharp_nil(ty),
+        Value::Int(n) if is_unsigned_ty(ty) => format!("{:#x}", *n as u64),
+        _ if nil_composite_kind(v).is_some() && is_defined_ty(ty) => {
+            format!("{}(nil)", go_type_spelling(ty))
+        }
+        // A slice built where no element type was stamped (`[]byte("ab")`)
+        // takes the declared one: `B:[]uint8{0x61, 0x62}`, not `[]int{97, 98}`.
+        _ if slice_untagged(v) && underlying_ty(ty).starts_with("[]") => {
+            let under = underlying_ty(ty);
+            let body: Vec<String> = slice_elems(v)
+                .unwrap_or_default()
+                .iter()
+                .map(|e| sharp_typed(e, &under[2..]))
+                .collect();
+            format!("{}{{{}}}", go_type_spelling(ty), body.join(", "))
+        }
+        _ => {
+            let body = go_str_mode(v, FmtMode::SharpV);
+            let composite = slice_elems(v).is_some() || map_pairs(v).is_some();
+            match body.find('{') {
+                Some(i) if composite && is_defined_ty(ty) && !is_named(v) => {
+                    format!("{}{}", go_type_spelling(ty), &body[i..])
+                }
+                _ => body,
+            }
+        }
+    }
+}
+
 /// Clear the object heap, defer stack, and panic state. Called at each run start.
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
@@ -4985,23 +5061,19 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     };
                     return format!("{name}{{{}}}", bytes.join(", "));
                 }
-                // A nil pointer, func or channel element has no type of its own;
-                // the slice's written element type is what `%#v` names.
-                let shown = match elem_ty.as_deref() {
-                    Some(e)
-                        if e.starts_with('*')
-                            || e.starts_with("func")
-                            || e.starts_with("chan ") =>
-                    {
-                        a.iter()
-                            .map(|v| match v {
-                                Value::Undef => sharp_nil(e),
-                                v => go_str_mode(v, mode),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(sep)
-                    }
-                    _ => elems(a),
+                // The written element type is what `%#v` reads for a nil
+                // interface, pointer, func or channel element and for an
+                // unsigned one (see `sharp_typed`).
+                let declared = elem_ty
+                    .clone()
+                    .or_else(|| arr_ty.as_deref().and_then(elem_ty_spelling));
+                let shown = match declared {
+                    Some(e) => a
+                        .iter()
+                        .map(|v| sharp_typed(v, &e))
+                        .collect::<Vec<_>>()
+                        .join(sep),
+                    None => elems(a),
                 };
                 format!("{}{{{}}}", go_type_name(&Value::Obj(id)), shown)
             }
@@ -5011,12 +5083,22 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                 len,
                 ..
             }) => {
-                let view: Vec<Value> = match h.get(*backing as usize) {
-                    Some(HostObj::Slice { elems: a, .. }) => a[*offset..*offset + *len].to_vec(),
-                    _ => Vec::new(),
+                let (view, declared) = match h.get(*backing as usize) {
+                    Some(HostObj::Slice {
+                        elems: a, elem_ty, ..
+                    }) => (a[*offset..*offset + *len].to_vec(), elem_ty.clone()),
+                    _ => (Vec::new(), None),
                 };
                 if sharp {
-                    format!("{}{{{}}}", go_type_name(&Value::Obj(id)), elems(&view))
+                    let shown = match declared {
+                        Some(e) => view
+                            .iter()
+                            .map(|v| sharp_typed(v, &e))
+                            .collect::<Vec<_>>()
+                            .join(sep),
+                        None => elems(&view),
+                    };
+                    format!("{}{{{}}}", go_type_name(&Value::Obj(id)), shown)
                 } else {
                     format!("[{}]", elems(&view))
                 }
@@ -5035,7 +5117,9 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             }
             // A `float32` prints its own width's shortest decimal.
             Some(HostObj::F32(f)) => format_float32(*f),
-            // An unsigned 64-bit integer prints its unsigned digits.
+            // An unsigned 64-bit integer prints its unsigned digits — in hex
+            // under `%#v`, as every unsigned integer does there.
+            Some(HostObj::U64 { val, .. }) if sharp => format!("{val:#x}"),
             Some(HostObj::U64 { val, .. }) => val.to_string(),
             // Only reachable if a receive site failed to map the sentinel away;
             // it stands for "no value", which is what Go's nil prints as.
@@ -5085,15 +5169,13 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
                     let parts: Vec<String> = fields
                         .iter()
                         .map(|(n, v)| {
-                            // A nil pointer, func, channel or interface field has
-                            // no type of its own at run time; its declared type
-                            // is what `%#v` writes.
-                            if matches!(v, Value::Undef) {
-                                if let Some((_, ty)) = declared.iter().find(|(f, _)| f == n) {
-                                    return format!("{n}:{}", sharp_nil(ty));
-                                }
+                            // The declared type names a nil pointer, func,
+                            // channel or interface field and makes an unsigned
+                            // one hex (see `sharp_typed`).
+                            match declared.iter().find(|(f, _)| f == n) {
+                                Some((_, ty)) => format!("{n}:{}", sharp_typed(v, ty)),
+                                None => format!("{n}:{}", go_str_mode(v, mode)),
                             }
-                            format!("{n}:{}", go_str_mode(v, mode))
                         })
                         .collect();
                     format!("{}{{{}}}", package_qualified(type_name), parts.join(", "))
@@ -5121,14 +5203,17 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
             {
                 format!("({})(nil)", go_type_spelling(ty))
             }
-            Some(HostObj::Named { ty, inner }) => {
-                let body = go_str_mode(inner, mode);
-                let composite = slice_elems(inner).is_some() || map_pairs(inner).is_some();
-                match body.find('{').filter(|_| sharp && composite) {
-                    Some(i) => format!("{}{}", go_type_spelling(ty), &body[i..]),
-                    None => body,
-                }
-            }
+            Some(HostObj::Named { ty, inner }) if sharp => named_sharp(ty, inner),
+            // `Lookup(nil)` is a nil map of a defined type, which prints empty.
+            Some(HostObj::Named {
+                ty,
+                inner: Value::Undef,
+            }) if underlying_ty(ty).starts_with("map[") => "map[]".to_string(),
+            Some(HostObj::Named {
+                ty,
+                inner: Value::Undef,
+            }) if underlying_ty(ty).starts_with("[]") => "[]".to_string(),
+            Some(HostObj::Named { inner, .. }) => go_str_mode(inner, mode),
             None => "<nil>".to_string(),
         }
     });
@@ -5136,6 +5221,61 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
         format!("&{body}")
     } else {
         body
+    }
+}
+
+/// `%#v` of a value boxed with its static type `ty` ([`HostObj::Named`]).
+///
+/// An unsigned integer is hex. A map is written as a literal of `ty` with each
+/// key and value rendered against the key and value types `ty` declares, since
+/// the map object itself records neither. A nil map or slice of a defined type
+/// is `main.T(nil)`. Any other composite is its own `%#v` with the type name
+/// replaced by `ty` (`main.mySlice{1, 2}`); a scalar's carries no type at all.
+fn named_sharp(ty: &str, inner: &Value) -> String {
+    if let Value::Int(n) = inner {
+        if is_unsigned_ty(ty) {
+            return format!("{:#x}", *n as u64);
+        }
+    }
+    if nil_composite_kind(inner).is_some() && is_defined_ty(ty) {
+        return format!("{}(nil)", go_type_spelling(ty));
+    }
+    // `Lookup(nil)` converts to a nil that is not a map object at all.
+    if matches!(inner, Value::Undef) && is_defined_ty(ty) {
+        let under = underlying_ty(ty);
+        let spelled = go_type_spelling(ty);
+        return match under.starts_with('*')
+            || under.starts_with("func")
+            || under.starts_with("chan ")
+        {
+            true => format!("({spelled})(nil)"),
+            false => format!("{spelled}(nil)"),
+        };
+    }
+    let under = underlying_ty(ty);
+    if let (Some(pairs), Some(kt), Some(vt)) = (
+        map_pairs(inner),
+        key_ty_spelling(&under),
+        elem_ty_spelling(&under),
+    ) {
+        let mut rows: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    go_str_mode(k, FmtMode::V),
+                    format!("{}:{}", sharp_typed(k, &kt), sharp_typed(v, &vt)),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| map_key_cmp(&a.0, &b.0));
+        let body: Vec<String> = rows.into_iter().map(|(_, r)| r).collect();
+        return format!("{}{{{}}}", go_type_spelling(ty), body.join(", "));
+    }
+    let body = go_str_mode(inner, FmtMode::SharpV);
+    let composite = slice_elems(inner).is_some() || map_pairs(inner).is_some();
+    match body.find('{').filter(|_| composite) {
+        Some(i) => format!("{}{}", go_type_spelling(ty), &body[i..]),
+        None => body,
     }
 }
 
@@ -6191,6 +6331,28 @@ fn slice_bytes(v: &Value) -> Option<Vec<u8>> {
 /// Whether a written element type spells one of Go's byte types.
 fn is_byte_elem(t: &str) -> bool {
     matches!(t, "byte" | "uint8")
+}
+
+/// Whether `v` is a slice that records no written type at all — neither an
+/// array type nor a [`GELEM_TAG`] element type — so its elements alone would
+/// decide how `%#v` names it.
+fn slice_untagged(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        let id = match h.get(*id as usize) {
+            Some(HostObj::SliceView { backing, .. }) => *backing,
+            _ => *id,
+        };
+        matches!(
+            h.get(id as usize),
+            Some(HostObj::Slice {
+                arr_ty: None,
+                elem_ty: None,
+                ..
+            })
+        )
+    })
 }
 
 /// The element type [`GELEM_TAG`] stamped on a slice, if any.

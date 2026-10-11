@@ -89,9 +89,10 @@ fmt.Printf("%T\n", map[string]int{})   // go: map[string]int
 
 A map carries no element type on the object, so `go_type_name` (`src/host.rs`)
 names it from the first pair — and an empty one has none. A map whose written
-type mentions a *defined* type is tagged at the `fmt` call site and so is named
-exactly (`map[main.myStr]main.myInt`, even when empty); a map of predeclared
-types is not, because tagging every map would put a box on the common path for
+type mentions a *defined* type, a sized integer or an interface (`any`,
+`error`) is tagged at the `fmt` call site and so is named exactly
+(`map[main.myStr]main.myInt`, `map[string]interface {}`, even when empty); a
+map of other predeclared types is not, because tagging every map would put a box on the common path for
 a name that is almost always already right. A slice does not have this gap: its
 element type is stamped by `GELEM_TAG`.
 
