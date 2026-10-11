@@ -381,3 +381,25 @@ fn an_unknown_verb_on_nil_names_no_type() {
         "[%!p(<nil>)][%!y(<nil>)][%!y(int=5)]\n",
     );
 }
+
+/// The `#` flag on a float verb is Go's `fmtFloat` sharp branch: the decimal
+/// point is forced and `%g`/`%x` keep trailing zeros up to the precision, with
+/// the `x` of `0x` counted as a digit (hence `0x1.8000p+01`, five, not six).
+/// An infinity or NaN is never zero-filled, and `+Inf` keeps its sign unless
+/// the space flag replaces it.
+#[test]
+fn sharp_floats_and_non_finite_padding() {
+    assert_prints(
+        r#"	fmt.Printf("%#g|%#.3g|%#.0e|%#.0f|%#g\n", 1.0, 2.0, 5.0, 3.0, 0.0)
+	fmt.Printf("%#x|%#X|%#.2x|%#b\n", 3.0, 1.0, 1.0, 1.0)
+	big := 1e308
+	inf := big * 10
+	fmt.Printf("%08g|% g|%+ e|%08v\n", inf, inf, inf, -inf)
+	var a float32 = -1.5
+	fmt.Printf("%08v|%08d\n", a, a)"#,
+        "1.00000|2.00|5.e+00|3.|0.00000\n\
+0x1.8000p+01|0X1.P+00|0x1.00p+00|4503599627370496p-52\n    \
++Inf| Inf|+Inf|    -Inf\n\
+-00001.5|%!d(float32=-00001.5)\n",
+    );
+}

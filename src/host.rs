@@ -6282,10 +6282,14 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             } else {
                 format!("{:.*}", spec.prec.unwrap_or(6), x)
             };
-            signed(s, spec)
+            signed(sharp_float(s, verb, spec), spec)
         }
         'e' | 'E' => signed(
-            format_float_e(arg_float(v), Some(spec.prec.unwrap_or(6)), verb == 'E'),
+            sharp_float(
+                format_float_e(arg_float(v), Some(spec.prec.unwrap_or(6)), verb == 'E'),
+                verb,
+                spec,
+            ),
             spec,
         ),
         // `%g` with no precision is the shortest round-tripping decimal —
@@ -6302,7 +6306,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
                 }
                 _ => format_float_g(arg_float(v), spec.prec, verb == 'G'),
             };
-            signed(s, spec)
+            signed(sharp_float(s, verb, spec), spec)
         }
         // A precision is a minimum digit count here, so the sign is split off
         // the magnitude and [`int_precision`] pads between them: `%+.3d` of `7`
@@ -6328,7 +6332,7 @@ fn scalar_verb(v: &Value, verb: char, spec: &Spec) -> String {
             } else {
                 format_float_bx(x, verb, spec.prec, unbox_f32(v).is_some())
             };
-            signed(s, spec)
+            signed(sharp_float(s, verb, spec), spec)
         }
         // `%x`/`%X` hex-encode a string bytewise.
         'x' | 'X' if matches!(v, Value::Str(_)) => hex_bytes(go_str(v).as_bytes(), verb, spec),
@@ -6446,15 +6450,15 @@ fn bad_verb(v: &Value, verb: char, spec: &Spec, depth: usize) -> Option<String> 
             "<nil>".to_string()
         });
     }
+    // A `float32` is a float here too: it is boxed, not a `Value::Float`.
+    let float = matches!(v, Value::Float(_)) || unbox_f32(v).is_some();
     let bad = match verb {
-        'd' | 'o' | 'O' | 'c' | 'U' => {
-            matches!(v, Value::Str(_) | Value::Bool(_) | Value::Float(_))
-        }
+        'd' | 'o' | 'O' | 'c' | 'U' => float || matches!(v, Value::Str(_) | Value::Bool(_)),
         'b' => matches!(v, Value::Str(_) | Value::Bool(_)),
         'x' | 'X' => matches!(v, Value::Bool(_)),
         'f' | 'F' | 'e' | 'E' | 'g' | 'G' => matches!(v, Value::Str(_) | Value::Bool(_)),
-        'q' => matches!(v, Value::Bool(_) | Value::Float(_)),
-        's' => matches!(v, Value::Bool(_) | Value::Int(_) | Value::Float(_)),
+        'q' => float || matches!(v, Value::Bool(_)),
+        's' => float || matches!(v, Value::Bool(_) | Value::Int(_)),
         't' => !matches!(v, Value::Bool(_)),
         _ => false,
     };
@@ -6501,11 +6505,74 @@ fn int_precision(sign: &str, prefix: &str, digits: &str, prec: Option<usize>) ->
 
 /// Apply `+` — or the space that stands in for it — to an unsigned float
 /// rendering.
+///
+/// Go's `fmtFloat` formats every float with its sign and then decides what to
+/// keep: a positive infinity keeps its `+` unless the ` ` flag (without `+`)
+/// turns it into a space — `%g` of `+Inf` is `+Inf`, `% g` is ` Inf` — while
+/// every other value, `NaN` included, shows a sign only when a flag asks.
 fn signed(s: String, spec: &Spec) -> String {
     if s.starts_with('-') {
         return s;
     }
+    if let Some(inf) = s.strip_prefix('+') {
+        let sign = if spec.space && !spec.plus { " " } else { "+" };
+        return format!("{sign}{inf}");
+    }
     format!("{}{s}", sign_of(false, spec))
+}
+
+/// The `#` flag on a float verb, ported from the `f.sharp` branch of Go's
+/// `fmt.fmtFloat` (fmt/format.go): force a decimal point, and for `%g`/`%G`/
+/// `%x` restore the trailing zeros the shortest form dropped, up to the
+/// precision (6 when none is written). `%#g` of `1.0` is `1.00000`, `%#.0e` of
+/// `5.0` is `5.e+00`. Go counts every non-`0` character after the first nonzero
+/// one — so under `%x` the `x` of the `0x` prefix counts as a digit, which is
+/// why `%#x` of `3.0` is `0x1.8000p+01` — and `%X` is absent from its list, so
+/// `%#X` only adds the point. `%b` and the non-finite values are untouched.
+fn sharp_float(s: String, verb: char, spec: &Spec) -> String {
+    let body = s.trim_start_matches(['-', '+']);
+    if !spec.sharp || verb == 'b' || body.starts_with(['I', 'N']) {
+        return s;
+    }
+    let sign = &s[..s.len() - body.len()];
+    let mut digits: i64 = match verb {
+        'g' | 'G' | 'x' => spec.prec.map_or(6, |p| p as i64),
+        _ => 0,
+    };
+    let (mut num, mut tail) = (String::with_capacity(s.len() + 8), "");
+    let mut has_point = false;
+    let mut saw_nonzero = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '.' => has_point = true,
+            'p' | 'P' => {
+                tail = &body[i..];
+                break;
+            }
+            'e' | 'E' if !matches!(verb, 'x' | 'X') => {
+                tail = &body[i..];
+                break;
+            }
+            _ => {
+                saw_nonzero |= c != '0';
+                if saw_nonzero {
+                    digits -= 1;
+                }
+            }
+        }
+        num.push(c);
+    }
+    if !has_point {
+        // A lone leading `0` contributes once to the digit count.
+        if num == "0" {
+            digits -= 1;
+        }
+        num.push('.');
+    }
+    for _ in 0..digits.max(0) {
+        num.push('0');
+    }
+    format!("{sign}{num}{tail}")
 }
 
 /// How many fill characters `body` needs to reach the spec's width, or `None`
@@ -6551,8 +6618,14 @@ fn pad_number(body: &str, verb: char, spec: &Spec) -> String {
     // Go drops the `0` flag there and pads the rest of the width with spaces:
     // `%05.2d` of `3` is `   03`, not `00003`. A float keeps both, because its
     // precision counts fraction digits rather than leading ones.
-    let zero =
-        spec.zero && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'O' | 'b'));
+    // An infinity or NaN does not look like a number, so Go's `fmtFloat` clears
+    // the `0` flag before padding it: `%08g` of `+Inf` is `    +Inf`.
+    let non_finite = body
+        .trim_start_matches(['-', '+', ' '])
+        .starts_with(['I', 'N']);
+    let zero = spec.zero
+        && !(spec.prec.is_some() && matches!(verb, 'd' | 'x' | 'X' | 'o' | 'O' | 'b'))
+        && !non_finite;
     if !zero {
         return format!("{}{body}", " ".repeat(fill));
     }
@@ -6576,7 +6649,10 @@ fn pad_number(body: &str, verb: char, spec: &Spec) -> String {
 /// Whether a `fmt` operand renders as a number, and so takes [`pad_number`]'s
 /// sign-first zero fill rather than [`pad_text`]'s.
 fn is_num_operand(v: &Value) -> bool {
-    arg_uint(v).is_some() || matches!(unname(v), Value::Int(_) | Value::Float(_))
+    let v = unname(v);
+    arg_uint(&v).is_some()
+        || matches!(v, Value::Int(_) | Value::Float(_))
+        || unbox_f32(&v).is_some()
 }
 
 /// A minimal `strings` and `strconv` standard library. Each exported function
