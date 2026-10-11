@@ -3665,3 +3665,28 @@ fn constant_overflow_and_division_by_zero_are_compile_errors() {
         assert!(!out.contains("start"), "{body}: ran, output {out:?}");
     }
 }
+
+#[test]
+fn strings_replace_with_an_empty_old_string_inserts_between_runes() {
+    // Go's `strings.Replace` matches an empty `old` at the start and after each
+    // rune (`Count(s, "")` is the rune count plus one), so it interleaves
+    // `new` — never splitting a multi-byte rune — and `n` caps how many.
+    let src = r#"package main
+
+import "fmt"
+import "strings"
+
+func main() {
+	for _, n := range []int{-1, 0, 1, 3, 4, 9} {
+		fmt.Printf("%q ", strings.Replace("héy", "", "-", n))
+	}
+	fmt.Printf("%q %q %q\n", strings.ReplaceAll("", "", "+"), strings.ReplaceAll("日本", "", "|"), strings.Replace("aaa", "a", "bb", 2))
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed: {out:?}");
+    assert_eq!(
+        out,
+        "\"-h-é-y-\" \"héy\" \"-héy\" \"-h-é-y\" \"-h-é-y-\" \"-h-é-y-\" \"+\" \"|日|本|\" \"bbbba\"\n"
+    );
+}

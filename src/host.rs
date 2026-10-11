@@ -7698,14 +7698,7 @@ pub mod stdlib {
         let old = args.get(1).map(go_str).unwrap_or_default();
         let new = args.get(2).map(go_str).unwrap_or_default();
         let n = args.get(3).map(|v| v.to_int()).unwrap_or(-1);
-        if old.is_empty() {
-            return Value::str(s);
-        }
-        Value::str(if n < 0 {
-            s.replace(&old, &new)
-        } else {
-            s.replacen(&old, &new, n as usize)
-        })
+        Value::str(go_replace(&s, &old, &new, n))
     }
 
     fn b_replace_all(vm: &mut VM, argc: u8) -> Value {
@@ -7713,11 +7706,38 @@ pub mod stdlib {
         let s = args.first().map(go_str).unwrap_or_default();
         let old = args.get(1).map(go_str).unwrap_or_default();
         let new = args.get(2).map(go_str).unwrap_or_default();
-        Value::str(if old.is_empty() {
-            s
-        } else {
-            s.replace(&old, &new)
-        })
+        Value::str(go_replace(&s, &old, &new, -1))
+    }
+
+    /// Go's `strings.Replace`: the first `n` non-overlapping instances of `old`
+    /// replaced by `new` (all of them when `n < 0`). An empty `old` matches at
+    /// the start and after every rune, so it inserts `new` between the runes —
+    /// `Replace("abc", "", "-", -1)` is `-a-b-c-` — up to `n` times.
+    fn go_replace(s: &str, old: &str, new: &str, n: i64) -> String {
+        if old == new || n == 0 {
+            return s.to_string();
+        }
+        if !old.is_empty() {
+            return match usize::try_from(n) {
+                Ok(n) => s.replacen(old, new, n),
+                Err(_) => s.replace(old, new),
+            };
+        }
+        // `Count(s, "")` is the rune count plus one.
+        let m = s.chars().count() + 1;
+        let n = usize::try_from(n).map_or(m, |n| n.min(m));
+        let mut out = String::with_capacity(s.len() + n * new.len());
+        let mut rest = s;
+        for i in 0..n {
+            if i > 0 {
+                let w = rest.chars().next().map_or(0, char::len_utf8);
+                out.push_str(&rest[..w]);
+                rest = &rest[w..];
+            }
+            out.push_str(new);
+        }
+        out.push_str(rest);
+        out
     }
 
     fn b_split(vm: &mut VM, argc: u8) -> Value {
