@@ -409,7 +409,7 @@ var err error = errors.New("x")
 _ = err.(interface{ Unwrap() error })
 // go:    panic: interface conversion: *errors.errorString is not
 //        interface { Unwrap() error }: missing method Unwrap
-// go-rs: panic: interface conversion: main.errors.errorString is not
+// go-rs: panic: interface conversion: *errors.errorString is not
 //        interface{Unwrap/0:error}: missing method Unwrap
 ```
 
@@ -421,9 +421,9 @@ source, which it cannot recover: tokens carry a line but no byte offset.
 
 A *named* interface is not affected — `x.(Stringer)` panics with Go's exact
 `interface conversion: int is not main.Stringer: missing method String`, and so
-does `x.(error)`. The synthesized `errors`/`fmt` error types keep the `main.`
-qualifier of the one package go-rs compiles, and lose the `*` for the reason in
-the pointer entry above.
+does `x.(error)`. The dynamic-type half of the message is Go's too: the
+synthesized `errors` type is named `*errors.errorString` (re-measured at go-rs
+0.1.14 against go1.27.2), so only the interface's spelling differs.
 
 ## `fmt.Errorf` used as a value panics
 
@@ -582,11 +582,12 @@ unchecked rather than risk rejecting a valid program:
   locals are not folded.
 
 The same missing knowledge leaves one corner of exact constant arithmetic open:
-an expression outside a conversion that *names* a constant above `int64`:
+a shift of a *stdlib* constant above `int64`. A constant the program declares
+itself now folds exactly — `const big = 1<<64 - 1; uint64(big >> 4)` prints
+`1152921504606846975` in both (re-measured at go-rs 0.1.14 against go1.27.2) —
+but `math.MaxUint64` does not:
 
 ```go
-const big = 1<<64 - 1
-fmt.Println(uint64(big >> 4))            // go: 1152921504606846975   go-rs: 18446744073709551615
 fmt.Println(uint64(math.MaxUint64 >> 1)) // go: 9223372036854775807   go-rs: 18446744073709551615
 ```
 
@@ -689,7 +690,8 @@ holding different types are never equal however the numbers line up. That rule
 is implemented — `iface_eq` (`src/host.rs`) compares `go_type_name` before the
 value, and the compiler routes an `==`/`!=` with an interface-typed operand to
 `GIFACE_EQ` rather than emitting the native op. It decides every crossing go-rs
-can see at run time: `any(1) == any(1.0)` is false, so is `any(1) == any("1")`,
+can see at run time when an operand is a variable of interface type:
+`var x any = 1; x == any("1")` is false, so is the same against `any(1.0)`,
 so are two struct types with the same field, and an interface holding a *typed*
 nil (a nil slice or map) is not equal to `nil`. The gates are
 `parity-scripts/iface_equality.go`, `tests/iface_equality.rs`, and shape 38 of
@@ -768,6 +770,44 @@ answers instead. `iface_eq` gets the dynamic *type* right here — both are
 and a func have no `==`, which is the same static-type knowledge the entry above
 wants on the value.
 
+## Two `any(…)` conversions compare by value, not by dynamic type
+
+```go
+fmt.Println(any(1) == any("1"))     // go: false   go-rs: true
+fmt.Println(any(1) != any("1"))     // go: true    go-rs: false
+fmt.Println(any(1) == any(1.0))     // go: false   go-rs: true
+a, b := any(1), any("1")
+fmt.Println(a == b)                 // go: false   go-rs: true
+```
+
+Measured at go-rs 0.1.14 against go1.27.2. The same comparison with one side a
+declared interface variable is right (`var x any = 1; x == any("1")` is false,
+`any(true) == any(1)` is false), so the `GIFACE_EQ` routing in the entry above
+is missing only where *both* operands are conversion expressions, or variables
+whose interface type comes from one through `:=`. The integer/string pair then
+compares `1` with `"1"` as equal values.
+
+## A type assertion or type switch to a slice or map type ignores the element type
+
+```go
+var v any = []string{"a"}
+s, ok := v.([]int)
+fmt.Println(s, ok)                  // go: [] false   go-rs: [a] true
+var m any = map[string]int{}
+_, ok = m.(map[string]string)
+fmt.Println(ok)                     // go: false      go-rs: true
+switch v.(type) {
+case []int:    fmt.Println("[]int") // go-rs takes this case
+case []string: fmt.Println("[]string") // go takes this one
+}
+```
+
+Measured at go-rs 0.1.14 against go1.27.2. A `[]T` assertion succeeds on a slice
+of another element type (`[]string` as `[]int` and `[]int` as `[]string` both
+report `ok`), and a `map[K]V` assertion on a map of another value type, so a failed `comma-ok`
+check reports success and hands back the wrong-typed value, and a type switch
+takes the first slice (or map) case whatever its element type.
+
 ## Rebinding through a pointer to a slice that escapes the function
 
 ```go
@@ -824,14 +864,15 @@ byte of U+0080's encoding) where Go answers `128`.
 
 ```go
 func a() { type T struct{ X int } }
-func b() { type T struct{ Y string } }   // go: two types   go-rs: one, from `a`
+func b() { type T struct{ Y string } }   // go: two types   go-rs: one, from `b`
 ```
 
 A body-local `type` is parsed and hoisted to the program's declarations, which
 is where the compiler reads every type from. That is right for everything the
 name is observable through — `%T` prints `main.T` whether the declaration was
 local or package-level — and wrong only when two blocks declare *different*
-types under one name, where the first one parsed wins. A local declaration that
+types under one name, where the last one parsed wins (`fmt.Printf("%+v", T{1})`
+in `a` prints `{Y:1}` at go-rs 0.1.14). A local declaration that
 shadows a package-level name has the same collision.
 
 Closing it needs a scope chain in the parser and mangled names in the program,
