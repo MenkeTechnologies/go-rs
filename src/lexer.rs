@@ -361,7 +361,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 } else {
                     let ch = src[i..].chars().next().unwrap();
                     if ch == '\n' {
-                        line += 1;
+                        return Err(format!("go-rs: newline in string on line {line}"));
                     }
                     s.push(ch);
                     i += ch.len_utf8();
@@ -415,6 +415,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 cp
             } else {
                 let ch = src[i..].chars().next().unwrap();
+                if ch == '\n' {
+                    return Err(format!("go-rs: newline in rune literal on line {line}"));
+                }
                 i += ch.len_utf8();
                 ch as u32
             };

@@ -1419,10 +1419,20 @@ fn fold_extreme(vm: &mut VM, argc: u8, want_min: bool) -> Value {
                 } else {
                     y > x
                 }
-            } else if want_min {
-                b.to_float() < a.to_float()
             } else {
-                b.to_float() > a.to_float()
+                let (x, y) = (a.to_float(), b.to_float());
+                if x.is_nan() {
+                    false // a NaN operand makes the result NaN
+                } else if y.is_nan() {
+                    true
+                } else if x == 0.0 && y == 0.0 {
+                    // -0 is the smaller zero
+                    x.is_sign_negative() != want_min && x.is_sign_negative() != y.is_sign_negative()
+                } else if want_min {
+                    y < x
+                } else {
+                    y > x
+                }
             };
             if pick_b {
                 b
@@ -7316,8 +7326,8 @@ pub mod stdlib {
         vm.register_builtin(POW, |vm, a| math2(vm, a, f64::powf));
         vm.register_builtin(MOD_F, |vm, a| math2(vm, a, |x, y| x % y));
         vm.register_builtin(HYPOT, |vm, a| math2(vm, a, f64::hypot));
-        vm.register_builtin(MAX_F, |vm, a| math2(vm, a, f64::max));
-        vm.register_builtin(MIN_F, |vm, a| math2(vm, a, f64::min));
+        vm.register_builtin(MAX_F, |vm, a| math2(vm, a, go_max));
+        vm.register_builtin(MIN_F, |vm, a| math2(vm, a, go_min));
         vm.register_builtin(SIN, |vm, a| math1(vm, a, f64::sin));
         vm.register_builtin(COS, |vm, a| math1(vm, a, f64::cos));
         vm.register_builtin(TAN, |vm, a| math1(vm, a, f64::tan));
@@ -7447,6 +7457,36 @@ pub mod stdlib {
     }
 
     /// A two-float-arg → float `math` builtin.
+    /// `math.Max`: `+Inf` beats `NaN`, any other `NaN` wins, and `+0` beats `-0`.
+    fn go_max(x: f64, y: f64) -> f64 {
+        if x == f64::INFINITY || y == f64::INFINITY {
+            f64::INFINITY
+        } else if x.is_nan() || y.is_nan() {
+            f64::NAN
+        } else if x == 0.0 && y == 0.0 {
+            if x.is_sign_negative() { y } else { x }
+        } else if x > y {
+            x
+        } else {
+            y
+        }
+    }
+
+    /// `math.Min`: `-Inf` beats `NaN`, any other `NaN` wins, and `-0` beats `+0`.
+    fn go_min(x: f64, y: f64) -> f64 {
+        if x == f64::NEG_INFINITY || y == f64::NEG_INFINITY {
+            f64::NEG_INFINITY
+        } else if x.is_nan() || y.is_nan() {
+            f64::NAN
+        } else if x == 0.0 && y == 0.0 {
+            if x.is_sign_negative() { x } else { y }
+        } else if x < y {
+            x
+        } else {
+            y
+        }
+    }
+
     fn math2(vm: &mut VM, argc: u8, f: impl Fn(f64, f64) -> f64) -> Value {
         let args = pop_args(vm, argc);
         let a = args.first().map(|v| v.to_float()).unwrap_or(0.0);

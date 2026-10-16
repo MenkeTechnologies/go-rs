@@ -168,3 +168,28 @@ fn negative_shift_count_panics() {
          64 0 -1 0\n100 0 -1 0\n0 2\n"
     );
 }
+
+#[test]
+fn min_max_propagate_nan_and_order_signed_zero() {
+    // `math.Max`/`math.Min` and the builtins: NaN wins (except against the
+    // matching infinity for math.Max/Min), `-0` is the smaller zero
+    let (out, code) = run_file(&script("min_max_nan_and_signed_zero"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "NaN NaN NaN NaN\n+Inf NaN -Inf NaN\n0 0 -0 -0\ntrue true -2 -3 +Inf -Inf\n\
+         true true false false true\nNaN NaN 2.5 2 b 1\n"
+    );
+}
+
+#[test]
+fn raw_newline_in_a_string_or_rune_literal_is_a_build_error() {
+    for lit in ["\"a\nb\"", "'\n'"] {
+        let (out, err, code) = run_src(&format!(
+            "package main\n\nimport \"fmt\"\n\nfunc main() {{ fmt.Println({lit}) }}\n"
+        ));
+        assert_ne!(code, 0, "literal {lit:?} should not build");
+        assert_eq!(out, "");
+        assert!(err.contains("newline in"), "stderr: {err}");
+    }
+}
