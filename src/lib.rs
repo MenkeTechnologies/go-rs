@@ -21,6 +21,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod parser;
 pub mod pkg;
+pub mod returns;
 pub mod rust_ffi;
 pub mod scope;
 pub mod stdlib_vendor;

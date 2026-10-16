@@ -344,6 +344,11 @@ left unchecked are listed in [BUGS.md](BUGS.md).
 An import the program never refers to (`name.` appears nowhere in the source) is a
 build error, as in Go; a blank import (`_ "pkg"`) binds no name and is exempt.
 
+A function with results must end in a terminating statement (`missing return`, by
+Go's spec rules for `if`/`else`, `for {}`, `switch`, `select`, `panic`, `goto`), and each
+`return` must give as many values as the function has results (a bare `return` needs
+named results; `return f()` may spread a multi-value call) — both build errors.
+
 **Bundled packages.** The standard-library packages vendored into the binary
 (`errors`, `sync`, `sync/atomic`, `time`, `unicode/utf16`, `cmp`, `io`, `bufio` (its `Writer`), `bytes`,
 `iter`, `slices`, `maps`, `math/bits`) always resolve to the binary's own copy; any other import resolves from `~/.go-rs/src`, then from

@@ -100,3 +100,53 @@ fn import_used_only_as_a_type_or_blank_is_accepted() {
     );
     assert_eq!((out.as_str(), code), ("ok\n", 0), "stderr: {err}");
 }
+
+#[test]
+fn every_terminating_statement_form_satisfies_missing_return() {
+    // if/else chains, `for {}`, switch with default and fallthrough, type
+    // switch, select, panic, goto, labeled loops, nested blocks
+    let (out, code) = run_file(&script("terminating_statements"));
+    assert_eq!(code, 0);
+    assert_eq!(out, "1 4 1 i 3\n1 a\n");
+}
+
+fn build_error(body: &str) -> String {
+    let (out, err, code) = run_src(&format!("package main\n\nimport \"fmt\"\n\n{body}\n"));
+    assert_ne!(code, 0, "should not build: {body}");
+    assert_eq!(out, "");
+    err
+}
+
+#[test]
+fn missing_return_is_a_build_error() {
+    for body in [
+        "func f() int { fmt.Println(\"x\") }\nfunc main() { f() }",
+        // a `for` with a condition, a `break`, a switch without default, an if without else
+        "func f(x int) int { for x < 3 { return 1 } }\nfunc main() { fmt.Println(f(1)) }",
+        "func f() int { for { break } }\nfunc main() { fmt.Println(f()) }",
+        "func f(x int) int { switch x { case 1: return 1 } }\nfunc main() { fmt.Println(f(1)) }",
+        "func f(x int) int { if x > 0 { return 1 } }\nfunc main() { fmt.Println(f(1)) }",
+        "func main() { g := func() int { fmt.Println() }; g() }",
+    ] {
+        let err = build_error(body);
+        assert!(err.contains("missing return"), "{body}\nstderr: {err}");
+    }
+}
+
+#[test]
+fn return_value_count_must_match_results() {
+    for (body, want) in [
+        ("func main() { fmt.Println(); return 1 }", "too many return values"),
+        ("func f() (int, int) { return 1 }\nfunc main() { fmt.Println(f()) }", "not enough return values"),
+        ("func f() int { return }\nfunc main() { fmt.Println(f()) }", "not enough return values"),
+        ("func f() int { return 1, 2 }\nfunc main() { fmt.Println(f()) }", "too many return values"),
+    ] {
+        let err = build_error(body);
+        assert!(err.contains(want), "{body}\nstderr: {err}");
+    }
+    // a bare return with named results, and `return f()` spreading a call, are valid
+    let (out, err, code) = run_src(
+        "package main\n\nimport \"fmt\"\n\nfunc a() (n int) { n = 2; return }\nfunc b() (int, string) { return 1, \"s\" }\nfunc c() (int, string) { return b() }\nfunc main() { fmt.Println(a()); fmt.Println(c()) }\n",
+    );
+    assert_eq!((out.as_str(), code), ("2\n1 s\n", 0), "stderr: {err}");
+}

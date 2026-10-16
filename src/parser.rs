@@ -50,6 +50,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         type_param_cores: HashMap::new(),
         pkg_names: HashSet::new(),
         imported: Vec::new(),
+        check_returns: false,
     };
     // Integer constants first: a defined type's base can be an array sized by
     // one (`type d [MaxCase]rune`).
@@ -118,6 +119,9 @@ struct Parser {
     /// Each import as written: the name it binds, its path, and its line — what
     /// the unused-import check reads.
     imported: Vec<(String, String, u32)>,
+    /// Whether finished function bodies are checked against their result lists
+    /// (`returns::check`) — on for the program being run, off for packages.
+    check_returns: bool,
 }
 
 /// The canonical name of an interface type with method set `methods`:
@@ -417,6 +421,7 @@ impl Parser {
         self.skip_semis();
         self.expect(&Tok::Package)?;
         let package = self.ident()?;
+        self.check_returns = package == "main";
         self.skip_semis();
 
         let mut imports = Vec::new();
@@ -1058,6 +1063,10 @@ impl Parser {
         let rest = self.func_rest();
         self.type_param_cores = outer;
         let (params, variadic, result_names, results, body) = rest?;
+        if let (true, Some(b)) = (self.check_returns, &body) {
+            crate::returns::check(&results, &result_names, b)
+                .map_err(|e| format!("go-rs: {e} in function `{name}` (line {line})"))?;
+        }
         let has_body = body.is_some();
         let func = Func {
             name,
@@ -2757,6 +2766,10 @@ impl Parser {
                 let (result_names, results): (Vec<String>, Vec<String>) =
                     self.results()?.into_iter().unzip();
                 let body = self.block()?;
+                if self.check_returns {
+                    crate::returns::check(&results, &result_names, &body)
+                        .map_err(|e| format!("go-rs: {e} in function literal (line {line})"))?;
+                }
                 Ok(Expr::FuncLit {
                     params,
                     results,
