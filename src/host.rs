@@ -383,6 +383,13 @@ pub const GNIL_BOX: u16 = 1012;
 /// from. Consumed by the append that follows, and emitted after its operands
 /// are evaluated.
 pub const GAPPEND_SIZE: u16 = 1013;
+
+/// `[rendered, operand]` → `rendered`, marked as text of a non-string-kind
+/// operand when `operand` is not itself of string kind. `fmt.Print`/`Sprint`
+/// put a space between two operands unless one is a string, and an operand
+/// printed through `String()` / `Error()` has already become a string by the
+/// time the spacing is decided.
+pub const GPRINT_TEXT: u16 = 1014;
 /// `[s, name0, v0, …]` → a display copy of struct `s` with the named fields
 /// replaced — how `$stringify` hands `fmt` a struct whose exported fields print
 /// through their `String()` / `Error()`.
@@ -524,6 +531,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GZERO_OF, b_zero_of);
     vm.register_builtin(GSLICE_TO_ARRAY, b_slice_to_array);
     vm.register_builtin(GNIL_BOX, b_nil_box);
+    vm.register_builtin(GPRINT_TEXT, b_print_text);
     vm.register_builtin(GAPPEND_SIZE, b_append_size);
     vm.register_builtin(GCHAN_SEND_CHECK, b_chan_send_check);
     vm.register_builtin(GSPREAD, b_spread);
@@ -4609,6 +4617,24 @@ fn round_up_size(size: usize, noscan: bool) -> usize {
     (size + PAGE - 1) & !(PAGE - 1)
 }
 
+/// [`GPRINT_TEXT`].
+fn b_print_text(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let rendered = args.first().cloned().unwrap_or(Value::Undef);
+    let operand = args.get(1).cloned().unwrap_or(Value::Undef);
+    if matches!(unname(&operand), Value::Str(_)) || !matches!(rendered, Value::Str(_)) {
+        return rendered;
+    }
+    Value::Obj(heap_alloc(HostObj::Named {
+        ty: PRINT_TEXT_TY.to_string(),
+        inner: rendered,
+    }))
+}
+
+/// The `HostObj::Named` tag [`b_print_text`] puts on rendered text. The text
+/// prints as itself everywhere; only `Print` spacing sees it is not a string.
+const PRINT_TEXT_TY: &str = "$text";
+
 /// [`GNIL_BOX`].
 fn b_nil_box(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
@@ -5746,14 +5772,26 @@ fn b_eprint(vm: &mut VM, argc: u8) -> Value {
     Value::Undef
 }
 
-/// Go's `Print`/builtin-`print` spacing: a space is inserted between two
-/// operands only when neither is a string.
+/// Whether `Print` counts `v` as a string: a string, or a defined string type —
+/// but not the text of a `String()` / `Error()` call on something else.
+fn is_string_kind(v: &Value) -> bool {
+    let Value::Obj(id) = v else {
+        return matches!(v, Value::Str(_));
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Named { ty, inner }) => ty != PRINT_TEXT_TY && matches!(inner, Value::Str(_)),
+        _ => false,
+    })
+}
+
+/// Go's `Print` spacing: a space is inserted between two operands only when
+/// neither is of string kind — a defined string type (`type S string`) counts.
 fn go_print_spacing(args: &[Value]) -> String {
     let mut out = String::new();
     for (i, v) in args.iter().enumerate() {
         if i > 0 {
-            let prev_str = matches!(args[i - 1], Value::Str(_));
-            let cur_str = matches!(v, Value::Str(_));
+            let prev_str = is_string_kind(&args[i - 1]);
+            let cur_str = is_string_kind(v);
             if !prev_str && !cur_str {
                 out.push(' ');
             }

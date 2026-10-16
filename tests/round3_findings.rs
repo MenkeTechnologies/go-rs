@@ -51,3 +51,16 @@ fn tuple_assignment_evaluates_lhs_index_operands_first() {
         "2 [9 2 3]\n2 [9 7 3]\nb map[a:5]\n1 0 [[0 4] [0 0]]\n1 [20 10 30]\n"
     );
 }
+
+#[test]
+fn print_spaces_operands_by_kind_not_by_rendered_text() {
+    // `Print`/`Sprint` separate two operands unless one is of string kind: a
+    // `Stringer`/`error` renders to text but is not a string, and a defined
+    // string type is
+    let (out, code) = run_file(&script("print_spacing_string_kind"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "A A|\nC C|\nab|\nssss|\ne e|\nE E|\nP P|\n1 AxA 2|\nA A\ne e\nab1 2c\np1 2q\nA A|\n"
+    );
+}

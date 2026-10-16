@@ -8387,12 +8387,29 @@ impl Compiler {
                             }
                         }
                         if has_stringify && calls_methods {
+                            // `Print` / `Sprint` space two operands unless one is
+                            // of string kind, which the rendered text no longer
+                            // says: keep the operand to mark it.
+                            let print_spaced = matches!(field.as_str(), "Print" | "Sprint");
+                            let operand = format!("$pt{n}_{}", self.temp_counter);
+                            self.temp_counter += 1;
+                            if print_spaced {
+                                self.types.insert(operand.clone(), self.infer(a));
+                                self.decl_types.insert(operand.clone(), self.type_name(a));
+                                self.expr(a)?;
+                                self.emit_set(&operand, line);
+                            }
+                            let shown = if print_spaced { Expr::Ident(operand.clone()) } else { a.clone() };
                             self.call(
                                 &Expr::Ident("$stringify".to_string()),
-                                std::slice::from_ref(a),
+                                std::slice::from_ref(&shown),
                                 false,
                                 line,
                             )?;
+                            if print_spaced {
+                                self.emit_get(&operand, line);
+                                self.b.emit(Op::CallBuiltin(host::GPRINT_TEXT, 2), line);
+                            }
                         } else {
                             self.expr(a)?;
                             // `*p` hands `fmt` the struct value, not the pointer:
