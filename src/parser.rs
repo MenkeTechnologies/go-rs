@@ -787,6 +787,10 @@ impl Parser {
                 names.push(self.ident()?);
             }
             let ty = self.type_name()?;
+            // A field tag (`json:"…"`) is accepted and ignored.
+            if matches!(self.peek(), Tok::Str(_)) {
+                self.advance();
+            }
             for n in names {
                 fields.push(Param {
                     name: n,

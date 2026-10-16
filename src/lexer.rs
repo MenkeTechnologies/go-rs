@@ -241,7 +241,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         }
 
         // numbers (int or float)
-        if c.is_ascii_digit() {
+        // `.5` is a float literal: a `.` directly followed by a digit.
+        if c.is_ascii_digit() || (c == '.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) {
             let start = i;
             // Base-prefixed integer literals: `0x1F`, `0o17`, `0b1010` (with `_`
             // digit separators). Parsed here; decimal/float handled below.
