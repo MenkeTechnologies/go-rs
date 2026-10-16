@@ -49,6 +49,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         untyped_consts: Vec::new(),
         type_param_cores: HashMap::new(),
         pkg_names: HashSet::new(),
+        imported: Vec::new(),
     };
     // Integer constants first: a defined type's base can be an array sized by
     // one (`type d [MaxCase]rune`).
@@ -114,6 +115,9 @@ struct Parser {
     /// what tells `pkg.Func[T](…)` 's type arguments apart from an index of a
     /// field `r.handlers["up"](…)`.
     pkg_names: HashSet<String>,
+    /// Each import as written: the name it binds, its path, and its line — what
+    /// the unused-import check reads.
+    imported: Vec<(String, String, u32)>,
 }
 
 /// The canonical name of an interface type with method set `methods`:
@@ -226,6 +230,18 @@ fn skip_type_param_tokens(tokens: &[Token], j: usize) -> usize {
         j += 1;
     }
     j
+}
+
+/// The name an import path binds: its last element, or the one before it for a
+/// major-version suffix (`math/rand/v2` binds `rand`).
+fn package_name_of(path: &str) -> String {
+    let mut parts = path.rsplit('/');
+    let last = parts.next().unwrap_or(path);
+    let versioned = last.len() > 1 && last.starts_with('v') && last[1..].bytes().all(|b| b.is_ascii_digit());
+    match parts.next() {
+        Some(prev) if versioned => prev.to_string(),
+        _ => last.to_string(),
+    }
 }
 
 /// Collect names declared as `type Name <kind>` — `kind` is `Tok::Struct` or
@@ -506,6 +522,10 @@ impl Parser {
             interfaces.push(InterfaceDecl { name, methods });
         }
 
+        if package == "main" {
+            self.check_imports_used()?;
+        }
+
         let mut defined: Vec<(String, String)> = self.defined.drain().collect();
         defined.sort();
         Ok(Program {
@@ -518,6 +538,21 @@ impl Parser {
             defined,
             untyped_consts: std::mem::take(&mut self.untyped_consts),
         })
+    }
+
+    /// Go rejects an import the file never refers to. The name counts as used
+    /// by any `name.` in the source — a selector, or a qualified type — so a
+    /// shadowing local can only hide an unused import, never reject a valid one.
+    fn check_imports_used(&self) -> Result<(), String> {
+        for (name, path, line) in &self.imported {
+            let used = self.tokens.windows(2).any(|w| {
+                matches!((&w[0].kind, &w[1].kind), (Tok::Ident(n), Tok::Dot) if n == name)
+            });
+            if !used {
+                return Err(format!("go-rs: \"{path}\" imported and not used (line {line})"));
+            }
+        }
+        Ok(())
     }
 
     /// The constant integer value of `e` under the constants in scope.
@@ -955,7 +990,10 @@ impl Parser {
         };
         match self.advance() {
             Tok::Str(s) => {
-                let name = alias.unwrap_or_else(|| s.rsplit('/').next().unwrap_or(&s).to_string());
+                let name = alias.unwrap_or_else(|| package_name_of(&s));
+                if name != "_" {
+                    self.imported.push((name.clone(), s.clone(), self.line()));
+                }
                 self.pkg_names.insert(name);
                 Ok(s)
             }

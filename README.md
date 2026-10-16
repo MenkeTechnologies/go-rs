@@ -341,6 +341,9 @@ than a wrapped value or a run-time panic. A converted constant is emitted as its
 exact value, so `int64(big >> 8)` with `const big = 1 << 70` is right. The cases
 left unchecked are listed in [BUGS.md](BUGS.md).
 
+An import the program never refers to (`name.` appears nowhere in the source) is a
+build error, as in Go; a blank import (`_ "pkg"`) binds no name and is exempt.
+
 **Bundled packages.** The standard-library packages vendored into the binary
 (`errors`, `sync`, `sync/atomic`, `time`, `unicode/utf16`, `cmp`, `io`, `bufio` (its `Writer`), `bytes`,
 `iter`, `slices`, `maps`, `math/bits`) always resolve to the binary's own copy; any other import resolves from `~/.go-rs/src`, then from
