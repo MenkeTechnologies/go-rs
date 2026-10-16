@@ -945,3 +945,34 @@ knows it was a rune: a variable it initializes is typed `int`. A rune that
 gets its type from a declaration (`var r rune = 'a'`, a `[]rune` element, a
 `range` over a string) is `int32` as in Go.
 
+
+## There is no type checker, so most type and scope errors build
+
+go-rs diagnoses the errors listed in the README (constant range, import not
+used, missing return, return-value count, label misuse, and a handful more) and
+nothing else of Go's static checking. Each of these is a build error in `go` and
+runs in go-rs:
+
+```go
+func main() { x := 1; fmt.Println("a") }          // declared and not used: x
+func main() { fmt.Println(undefinedName) }         // undefined: undefinedName
+func main() { x := 1; x := 2; fmt.Println(x) }     // no new variables on left side of :=
+func main() { var s string = 5; fmt.Println(s) }   // cannot use 5 as string
+func main() { fmt.Println(1 + "a") }               // mismatched types
+func main() { const c = 1; c = 2 }                 // cannot assign to c
+func main() { fmt.Println(int(3.5)) }              // constant 3.5 truncated to integer
+```
+
+Closing these needs static types for every expression, which the compiler does
+not carry (`infer` returns a coarse `NumType`). The two that need only scopes —
+unused variables and `:=` without a new variable — are blocked on `func main`
+sharing the global scope (`scope.rs`): a package-level `var` and a `main` local
+are not told apart once the globals are prepended to `main`'s body.
+
+An unrecovered panic's first stderr line also differs for values `go` prints
+specially: `panic(S("x"))` for `type S string` prints `panic: main.S("x")`, and a
+struct or slice prints its type and address (`panic: (main.T) 0x…`); go-rs prints
+the value as `%v` would. A re-panic inside a deferred call lacks Go's
+`panic: first [recovered]` chain. `recover()` of a nil panic and of a slice
+conversion failure report `%T` as `runtime.errorString` where Go has
+`*runtime.PanicNilError` / `runtime.boundsError`. Exit codes and stdout agree.
