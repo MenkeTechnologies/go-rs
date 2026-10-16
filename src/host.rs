@@ -384,6 +384,9 @@ pub const GNIL_BOX: u16 = 1012;
 /// are evaluated.
 pub const GAPPEND_SIZE: u16 = 1013;
 
+/// `[count]` → `count`, panicking `negative shift amount` when it is negative.
+pub const GSHIFT_COUNT: u16 = 1015;
+
 /// `[rendered, operand]` → `rendered`, marked as text of a non-string-kind
 /// operand when `operand` is not itself of string kind. `fmt.Print`/`Sprint`
 /// put a space between two operands unless one is a string, and an operand
@@ -531,6 +534,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GZERO_OF, b_zero_of);
     vm.register_builtin(GSLICE_TO_ARRAY, b_slice_to_array);
     vm.register_builtin(GNIL_BOX, b_nil_box);
+    vm.register_builtin(GSHIFT_COUNT, b_shift_count);
     vm.register_builtin(GPRINT_TEXT, b_print_text);
     vm.register_builtin(GAPPEND_SIZE, b_append_size);
     vm.register_builtin(GCHAN_SEND_CHECK, b_chan_send_check);
@@ -4615,6 +4619,15 @@ fn round_up_size(size: usize, noscan: bool) -> usize {
         return class - (req - size);
     }
     (size + PAGE - 1) & !(PAGE - 1)
+}
+
+/// [`GSHIFT_COUNT`].
+fn b_shift_count(vm: &mut VM, argc: u8) -> Value {
+    let count = pop_args(vm, argc).into_iter().next().unwrap_or(Value::Undef);
+    if count.to_int() < 0 {
+        runtime_panic(vm, "negative shift amount");
+    }
+    count
 }
 
 /// [`GPRINT_TEXT`].

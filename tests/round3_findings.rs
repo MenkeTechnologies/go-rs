@@ -150,3 +150,21 @@ fn return_value_count_must_match_results() {
     );
     assert_eq!((out.as_str(), code), ("2\n1 s\n", 0), "stderr: {err}");
 }
+
+#[test]
+fn negative_shift_count_panics() {
+    // a runtime shift count below zero is `negative shift amount`, for `<<`,
+    // `>>` and their assignment forms; counts at or past the width still shift
+    let (out, code) = run_file(&script("negative_shift_count"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "shl runtime error: negative shift amount\n\
+         shr runtime error: negative shift amount\n\
+         shl-assign runtime error: negative shift amount\n\
+         shr-assign runtime error: negative shift amount\n\
+         neg-expr runtime error: negative shift amount\n\
+         0 1 -8 5\n1 2 -4 10\n63 -9223372036854775808 -1 9223372036854775808\n\
+         64 0 -1 0\n100 0 -1 0\n0 2\n"
+    );
+}

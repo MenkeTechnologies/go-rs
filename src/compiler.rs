@@ -7982,6 +7982,7 @@ impl Compiler {
                 self.b.emit(Op::Shr, line);
             }
             BinOp::Shl => {
+                self.emit_shift_count_check(line);
                 self.emit_shift_overflow_mask(line);
                 self.b.emit(Op::BitNot, line);
                 self.b.emit(Op::Rot, line);
@@ -7990,6 +7991,7 @@ impl Compiler {
                 self.b.emit(Op::BitAnd, line);
             }
             BinOp::Shr => {
+                self.emit_shift_count_check(line);
                 self.emit_shift_overflow_mask(line);
                 self.b.emit(Op::BitOr, line);
                 self.b.emit(Op::Shr, line);
@@ -8001,6 +8003,13 @@ impl Compiler {
             }
             other => unreachable!("emit_arith on non-arithmetic op {other:?}"),
         };
+    }
+
+    /// A negative shift count panics (`negative shift amount`). With `[value,
+    /// count]` on the stack the count is checked and left in place.
+    fn emit_shift_count_check(&mut self, line: u32) {
+        self.b.emit(Op::CallBuiltin(host::GSHIFT_COUNT, 1), line);
+        self.emit_panic_check(line);
     }
 
     /// With `[value, count]` on the stack, leave `[value, count, m]` where `m`
