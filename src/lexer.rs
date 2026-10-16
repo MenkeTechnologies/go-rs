@@ -576,6 +576,10 @@ fn keyword_or_ident(word: &str) -> Tok {
 
 fn unescape(c: char) -> char {
     match c {
+        'a' => '\x07',
+        'b' => '\x08',
+        'f' => '\x0c',
+        'v' => '\x0b',
         'n' => '\n',
         't' => '\t',
         'r' => '\r',

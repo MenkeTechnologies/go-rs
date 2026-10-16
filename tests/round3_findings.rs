@@ -193,3 +193,19 @@ fn raw_newline_in_a_string_or_rune_literal_is_a_build_error() {
         assert!(err.contains("newline in"), "stderr: {err}");
     }
 }
+
+#[test]
+fn bell_backspace_formfeed_and_vertical_tab_escapes() {
+    // `\a \b \f \v` are the control bytes 7, 8, 12, 11 in string and rune literals
+    let (out, code) = run_file(&script("escape_a_b_f_v"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "4 [7 8 12 11]\n\
+         [7 8 12 11 13 9 10 92 39 65 65 233 128512]\n\
+         \"\\a\\b\\f\\v\\r\\t\\n\\\\\\\"\\x00\\x1f\\x7f\"\n\
+         \"\\a\\b\\f\\v\" '\\a'\n\
+         '\\a' \"\\a\\u00e9\"\n\
+         [7 8 12 11 92 34]\n"
+    );
+}
