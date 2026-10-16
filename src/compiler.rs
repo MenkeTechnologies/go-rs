@@ -4838,10 +4838,58 @@ impl Compiler {
             self.emit_set(&tmp, line);
             tmps.push(tmp);
         }
+        // Go evaluates the index operands of every left-hand side before any
+        // assignment happens: `i, x[i] = 2, 9` stores into the old `x[i]`.
+        let assigned: HashSet<&str> = targets
+            .iter()
+            .filter_map(|t| match t {
+                Expr::Ident(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut targets = targets.to_vec();
+        let mut snaps = 0;
+        for target in &mut targets {
+            self.snapshot_index_operands(target, &assigned, n, &mut snaps, line)?;
+        }
         for (target, tmp) in targets.iter().zip(tmps) {
             self.assign(target, AssignOp::Set, &Expr::Ident(tmp), line)?;
         }
         Ok(())
+    }
+
+    /// Replace each index operand inside the assignment target `target` that reads
+    /// a variable the same statement assigns with a temp holding its current
+    /// value (see `assign_multi`).
+    fn snapshot_index_operands(
+        &mut self,
+        target: &mut Expr,
+        assigned: &HashSet<&str>,
+        n: u32,
+        snaps: &mut usize,
+        line: u32,
+    ) -> Result<(), String> {
+        match target {
+            Expr::Selector { recv, .. } => {
+                self.snapshot_index_operands(recv, assigned, n, snaps, line)
+            }
+            Expr::Index { recv, index } => {
+                self.snapshot_index_operands(recv, assigned, n, snaps, line)?;
+                let mut mentioned = HashSet::new();
+                free_expr(index, &HashSet::new(), &mut mentioned);
+                if mentioned.iter().any(|m| assigned.contains(m.as_str())) {
+                    let tmp = format!("$amx{n}_{snaps}");
+                    *snaps += 1;
+                    self.types.insert(tmp.clone(), self.infer(index));
+                    self.decl_types.insert(tmp.clone(), self.type_name(index));
+                    self.emit_value(index)?;
+                    self.emit_set(&tmp, line);
+                    **index = Expr::Ident(tmp);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Lower an assignment `target op= value` where `target` is an lvalue: a

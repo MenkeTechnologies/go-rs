@@ -40,3 +40,14 @@ fn float_literal_without_integer_part() {
         "0.5 0.25 5 0.1 1 1.5 -0.75\nfloat64 float64 [0.5 1]\n[2 3] 2\n"
     );
 }
+
+#[test]
+fn tuple_assignment_evaluates_lhs_index_operands_first() {
+    // `i, x[i] = 2, 9` stores into the x[i] of the OLD i
+    let (out, code) = run_file(&script("tuple_assign_lhs_index_operands"));
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "2 [9 2 3]\n2 [9 7 3]\nb map[a:5]\n1 0 [[0 4] [0 0]]\n1 [20 10 30]\n"
+    );
+}
