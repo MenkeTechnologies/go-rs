@@ -8369,7 +8369,7 @@ impl Compiler {
                         }
                         let calls_methods = match (&verbs, n) {
                             (Some(_), 0) => false,
-                            (Some(vs), n) => vs.get(n - 1).map_or(true, |(sharp, v)| {
+                            (Some(vs), n) => vs.get(n - 1).is_none_or(|(sharp, v)| {
                                 !sharp && matches!(v, 'v' | 's' | 'q' | 'x' | 'X' | 'w')
                             }),
                             (None, _) => true,

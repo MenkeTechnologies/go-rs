@@ -2,7 +2,7 @@
 name = "go-rs"
 version = "0.1.14"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.82"
 description = "Go on the fusevm bytecode VM — compiles to fusevm::Chunk, runs on a shared three-tier Cranelift JIT"
 license = "MIT"
 documentation = "https://docs.rs/go-rs"
