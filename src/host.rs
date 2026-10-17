@@ -4633,7 +4633,10 @@ fn round_up_size(size: usize, noscan: bool) -> usize {
 
 /// [`GSHIFT_COUNT`].
 fn b_shift_count(vm: &mut VM, argc: u8) -> Value {
-    let count = pop_args(vm, argc).into_iter().next().unwrap_or(Value::Undef);
+    let count = pop_args(vm, argc)
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Undef);
     if count.to_int() < 0 {
         runtime_panic(vm, "negative shift amount");
     }
@@ -7464,7 +7467,11 @@ pub mod stdlib {
         } else if x.is_nan() || y.is_nan() {
             f64::NAN
         } else if x == 0.0 && y == 0.0 {
-            if x.is_sign_negative() { y } else { x }
+            if x.is_sign_negative() {
+                y
+            } else {
+                x
+            }
         } else if x > y {
             x
         } else {
@@ -7479,7 +7486,11 @@ pub mod stdlib {
         } else if x.is_nan() || y.is_nan() {
             f64::NAN
         } else if x == 0.0 && y == 0.0 {
-            if x.is_sign_negative() { x } else { y }
+            if x.is_sign_negative() {
+                x
+            } else {
+                y
+            }
         } else if x < y {
             x
         } else {

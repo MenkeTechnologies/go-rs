@@ -241,7 +241,8 @@ fn skip_type_param_tokens(tokens: &[Token], j: usize) -> usize {
 fn package_name_of(path: &str) -> String {
     let mut parts = path.rsplit('/');
     let last = parts.next().unwrap_or(path);
-    let versioned = last.len() > 1 && last.starts_with('v') && last[1..].bytes().all(|b| b.is_ascii_digit());
+    let versioned =
+        last.len() > 1 && last.starts_with('v') && last[1..].bytes().all(|b| b.is_ascii_digit());
     match parts.next() {
         Some(prev) if versioned => prev.to_string(),
         _ => last.to_string(),
@@ -550,11 +551,13 @@ impl Parser {
     /// shadowing local can only hide an unused import, never reject a valid one.
     fn check_imports_used(&self) -> Result<(), String> {
         for (name, path, line) in &self.imported {
-            let used = self.tokens.windows(2).any(|w| {
-                matches!((&w[0].kind, &w[1].kind), (Tok::Ident(n), Tok::Dot) if n == name)
-            });
+            let used = self.tokens.windows(2).any(
+                |w| matches!((&w[0].kind, &w[1].kind), (Tok::Ident(n), Tok::Dot) if n == name),
+            );
             if !used {
-                return Err(format!("go-rs: \"{path}\" imported and not used (line {line})"));
+                return Err(format!(
+                    "go-rs: \"{path}\" imported and not used (line {line})"
+                ));
             }
         }
         Ok(())

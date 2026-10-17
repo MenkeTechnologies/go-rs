@@ -82,7 +82,9 @@ fn ends_terminating(body: &[Stmt]) -> bool {
 fn terminating(s: &Stmt) -> bool {
     match s {
         Stmt::Return(..) | Stmt::Goto(..) => true,
-        Stmt::ExprStmt(Expr::Call { func, .. }) => matches!(&**func, Expr::Ident(n) if n == "panic"),
+        Stmt::ExprStmt(Expr::Call { func, .. }) => {
+            matches!(&**func, Expr::Ident(n) if n == "panic")
+        }
         Stmt::Block(b) => ends_terminating(b),
         Stmt::If { then, els, .. } => ends_terminating(then) && ends_terminating(els),
         Stmt::For {
@@ -101,11 +103,11 @@ fn terminating(s: &Stmt) -> bool {
                 && cases.iter().all(|c| ends_terminating_or_falls(&c.body))
                 && default.as_deref().is_some_and(ends_terminating_or_falls)
                 && !cases.iter().any(|c| breaks_out(&c.body, label.as_deref()))
-                && !default.as_deref().is_some_and(|d| breaks_out(d, label.as_deref()))
+                && !default
+                    .as_deref()
+                    .is_some_and(|d| breaks_out(d, label.as_deref()))
         }
-        Stmt::TypeSwitch {
-            cases, default, ..
-        } => {
+        Stmt::TypeSwitch { cases, default, .. } => {
             default.is_some()
                 && cases.iter().all(|c| ends_terminating(&c.body))
                 && default.as_deref().is_some_and(ends_terminating)
@@ -142,13 +144,16 @@ fn stmt_breaks_out(s: &Stmt, label: Option<&str>, direct: bool) -> bool {
         Stmt::Block(b) => any(b, direct),
         Stmt::For { body, .. } | Stmt::ForRange { body, .. } => any(body, false),
         Stmt::Switch { cases, default, .. } => {
-            cases.iter().any(|c| any(&c.body, false)) || any(default.as_deref().unwrap_or(&[]), false)
+            cases.iter().any(|c| any(&c.body, false))
+                || any(default.as_deref().unwrap_or(&[]), false)
         }
         Stmt::TypeSwitch { cases, default, .. } => {
-            cases.iter().any(|c| any(&c.body, false)) || any(default.as_deref().unwrap_or(&[]), false)
+            cases.iter().any(|c| any(&c.body, false))
+                || any(default.as_deref().unwrap_or(&[]), false)
         }
         Stmt::Select { cases, default, .. } => {
-            cases.iter().any(|c| any(&c.body, false)) || any(default.as_deref().unwrap_or(&[]), false)
+            cases.iter().any(|c| any(&c.body, false))
+                || any(default.as_deref().unwrap_or(&[]), false)
         }
         _ => false,
     }

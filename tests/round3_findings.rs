@@ -89,7 +89,10 @@ fn unused_import_is_a_build_error() {
     );
     assert_ne!(code, 0);
     assert_eq!(out, "", "nothing runs when the build fails");
-    assert!(err.contains("\"os\" imported and not used"), "stderr: {err}");
+    assert!(
+        err.contains("\"os\" imported and not used"),
+        "stderr: {err}"
+    );
 }
 
 #[test]
@@ -136,10 +139,22 @@ fn missing_return_is_a_build_error() {
 #[test]
 fn return_value_count_must_match_results() {
     for (body, want) in [
-        ("func main() { fmt.Println(); return 1 }", "too many return values"),
-        ("func f() (int, int) { return 1 }\nfunc main() { fmt.Println(f()) }", "not enough return values"),
-        ("func f() int { return }\nfunc main() { fmt.Println(f()) }", "not enough return values"),
-        ("func f() int { return 1, 2 }\nfunc main() { fmt.Println(f()) }", "too many return values"),
+        (
+            "func main() { fmt.Println(); return 1 }",
+            "too many return values",
+        ),
+        (
+            "func f() (int, int) { return 1 }\nfunc main() { fmt.Println(f()) }",
+            "not enough return values",
+        ),
+        (
+            "func f() int { return }\nfunc main() { fmt.Println(f()) }",
+            "not enough return values",
+        ),
+        (
+            "func f() int { return 1, 2 }\nfunc main() { fmt.Println(f()) }",
+            "too many return values",
+        ),
     ] {
         let err = build_error(body);
         assert!(err.contains(want), "{body}\nstderr: {err}");

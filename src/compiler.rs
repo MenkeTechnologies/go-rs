@@ -8408,7 +8408,11 @@ impl Compiler {
                                 self.expr(a)?;
                                 self.emit_set(&operand, line);
                             }
-                            let shown = if print_spaced { Expr::Ident(operand.clone()) } else { a.clone() };
+                            let shown = if print_spaced {
+                                Expr::Ident(operand.clone())
+                            } else {
+                                a.clone()
+                            };
                             self.call(
                                 &Expr::Ident("$stringify".to_string()),
                                 std::slice::from_ref(&shown),
