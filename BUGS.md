@@ -545,9 +545,6 @@ What is still missing from that corner:
   mappings and the `iter` sequences (`Lines`, `SplitSeq`, …) are not vendored;
   a call is a compile error. The common package functions are
   (`parity-scripts/bytes_package_funcs.go`).
-- **`strings`' `iter` sequences** — `Lines`, `SplitSeq`, `SplitAfterSeq`,
-  `FieldsSeq`, `FieldsFuncSeq` (Go 1.24, `strings/iter.go`) — are not
-  synthesized; a call is reported as an unsupported call.
 - **`bufio` is only its `Writer`.** `Reader` and `Scanner` read from an
   `io.Reader`, which go-rs's `io` does not have, and there is no `os.Stdin`
   to scan.

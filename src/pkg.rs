@@ -423,6 +423,11 @@ pub const STRINGS_SOURCE: &[&str] = &[
     "SplitAfter",
     "SplitAfterN",
     "LastIndexAny",
+    "Lines",
+    "SplitSeq",
+    "SplitAfterSeq",
+    "FieldsSeq",
+    "FieldsFuncSeq",
     "Replacer",
     "NewReplacer",
 ];

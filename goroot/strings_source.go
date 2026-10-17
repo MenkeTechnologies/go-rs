@@ -210,3 +210,102 @@ func runeWidth(s string, i int) int {
 	}
 	return 4
 }
+
+// Lines returns an iterator over the newline-terminated lines in the string s.
+// The lines yielded include their terminating newlines. If s is empty, the
+// iterator yields no lines at all. If s does not end in a newline, the final
+// yielded line will not end in a newline.
+func Lines(s string) func(yield func(string) bool) {
+	return func(yield func(string) bool) {
+		for len(s) > 0 {
+			var line string
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				line, s = s[:i+1], s[i+1:]
+			} else {
+				line, s = s, ""
+			}
+			if !yield(line) {
+				return
+			}
+		}
+	}
+}
+
+// explodeSeq yields one string per rune of s.
+func explodeSeq(s string) func(yield func(string) bool) {
+	return func(yield func(string) bool) {
+		for i, r := range s {
+			if !yield(s[i : i+len(string(r))]) {
+				return
+			}
+		}
+	}
+}
+
+// splitSeq is SplitSeq or SplitAfterSeq, configured by how many bytes of sep
+// to include in the results (none or all).
+func splitSeq(s, sep string, sepSave int) func(yield func(string) bool) {
+	if len(sep) == 0 {
+		return explodeSeq(s)
+	}
+	return func(yield func(string) bool) {
+		for {
+			i := strings.Index(s, sep)
+			if i < 0 {
+				break
+			}
+			frag := s[:i+sepSave]
+			if !yield(frag) {
+				return
+			}
+			s = s[i+len(sep):]
+		}
+		yield(s)
+	}
+}
+
+// SplitSeq returns an iterator over substrings of s split around separators.
+func SplitSeq(s, sep string) func(yield func(string) bool) {
+	return splitSeq(s, sep, 0)
+}
+
+// SplitAfterSeq returns an iterator over substrings of s split after each
+// instance of sep.
+func SplitAfterSeq(s, sep string) func(yield func(string) bool) {
+	return splitSeq(s, sep, len(sep))
+}
+
+// FieldsSeq returns an iterator over substrings of s split around runs of
+// whitespace characters, as defined by unicode.IsSpace.
+func FieldsSeq(s string) func(yield func(string) bool) {
+	return func(yield func(string) bool) {
+		for _, f := range strings.Fields(s) {
+			if !yield(f) {
+				return
+			}
+		}
+	}
+}
+
+// FieldsFuncSeq returns an iterator over substrings of s split around runs of
+// Unicode code points satisfying f(c).
+func FieldsFuncSeq(s string, f func(rune) bool) func(yield func(string) bool) {
+	return func(yield func(string) bool) {
+		start := -1
+		for i, r := range s {
+			if f(r) {
+				if start >= 0 {
+					if !yield(s[start:i]) {
+						return
+					}
+					start = -1
+				}
+			} else if start < 0 {
+				start = i
+			}
+		}
+		if start >= 0 {
+			yield(s[start:])
+		}
+	}
+}
