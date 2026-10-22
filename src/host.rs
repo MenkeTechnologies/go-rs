@@ -77,6 +77,10 @@ pub const GSTRUCT_BIND: u16 = 857;
 /// stdout, because those are the only two files a synthesized `*os.File` is
 /// ever built for.
 pub const GWRITE_FD: u16 = 858;
+/// `os.readFd(fd, n)` — the read behind `os.Stdin`: up to `n` bytes from the
+/// descriptor as a `[]byte`, empty at end of input. Only descriptor 0 is ever
+/// built, so that is the only one read.
+pub const GREAD_FD: u16 = 1016;
 /// `slices.sliceOverlap(a, b)` — whether two slices share a backing array and
 /// their element ranges intersect. The vendored `slices.overlaps` asks this in
 /// place of Go's `unsafe` address arithmetic, which go-rs has no model of.
@@ -513,6 +517,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GSTRUCT_COPY, b_struct_copy);
     vm.register_builtin(GSTRUCT_BIND, b_struct_bind);
     vm.register_builtin(GWRITE_FD, b_write_fd);
+    vm.register_builtin(GREAD_FD, b_read_fd);
     vm.register_builtin(GSLICE_OVERLAP, b_slice_overlap);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
@@ -3600,6 +3605,22 @@ fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
         }
     }
     Value::Undef
+}
+
+fn b_read_fd(vm: &mut VM, argc: u8) -> Value {
+    use std::io::Read as _;
+    let args = pop_args(vm, argc);
+    let want = args.get(1).map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
+    let mut buf = vec![0u8; want];
+    // One `read(2)`, as `os.File.Read` is one: a short read is returned as is
+    // and the caller (`bufio`, `io.ReadAll`) asks again. A failed read reads as
+    // end of input, since the synthesized `os.File` has no errno to report.
+    let n = match args.first().map(|v| v.to_int()) {
+        Some(0) => std::io::stdin().lock().read(&mut buf).unwrap_or(0),
+        _ => 0,
+    };
+    let elems = buf[..n].iter().map(|&b| Value::Int(b as i64)).collect();
+    Value::Obj(heap_alloc(HostObj::slice(elems)))
 }
 
 fn b_ptr_to(vm: &mut VM, argc: u8) -> Value {

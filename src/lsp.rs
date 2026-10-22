@@ -197,7 +197,7 @@ const CORPUS: &[Entry] = &[
         "go",
         "Keyword",
         "go f(args)",
-        "Spawns a goroutine: `f` and its arguments are evaluated now, then the call runs on fusevm's cooperative scheduler. Lowers to `Op::Go`, one of the six concurrency opcodes go-rs uses from fusevm 0.15.",
+        "Spawns a goroutine: `f` and its arguments are evaluated now, then the call runs on fusevm's cooperative scheduler. Lowers to `Op::Go`, one of the concurrency opcodes go-rs uses from fusevm.",
         "go worker(id, results)",
     ),
     e(
@@ -1763,7 +1763,7 @@ const CORPUS: &[Entry] = &[
         "os.Getenv",
         "Package os",
         "os.Getenv(key string) string",
-        "The value of the named environment variable, or the empty string when it is unset. It is the only `os` function wired — `os.Exit`, `os.Args`, `os.Open` and the rest are reported as unsupported calls at compile time.",
+        "The value of the named environment variable, or the empty string when it is unset. Beside it, `os` wires `os.Exit`, `os.Args`, and the three standard streams `os.Stdin` / `os.Stdout` / `os.Stderr` (a `*os.File` that is an `io.Reader` / `io.Writer`); `os.Open`, `os.ReadFile` and the rest are reported as unsupported calls at compile time.",
         "home := os.Getenv(\"HOME\")",
     ),
     // ── Package errors (real Go source, vendored in goroot/errors.go) ──

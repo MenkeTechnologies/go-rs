@@ -1570,7 +1570,7 @@ case 3:
         <article class="doc-entry" id="doc-package-os-1">
           <h3><a class="doc-anchor" href="#doc-package-os-1">#</a> <code>os.Getenv</code></h3>
           <pre><code class="lang-go">os.Getenv(key string) string</code></pre>
-          <p>The value of the named environment variable, or the empty string when it is unset. It is the only `os` function wired — `os.Exit`, `os.Args`, `os.Open` and the rest are reported as unsupported calls at compile time.</p>
+          <p>The value of the named environment variable, or the empty string when it is unset. Beside it, `os` wires `os.Exit`, `os.Args`, and the three standard streams `os.Stdin` / `os.Stdout` / `os.Stderr` (a `*os.File` that is an `io.Reader` / `io.Writer`); `os.Open`, `os.ReadFile` and the rest are reported as unsupported calls at compile time.</p>
           <pre><code class="lang-go">home := os.Getenv("HOME")</code></pre>
         </article>
       </section>

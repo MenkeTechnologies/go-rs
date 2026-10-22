@@ -5810,11 +5810,11 @@ impl Compiler {
                     // not constants: `errors.Is` compares them by pointer, so each
                     // mention must yield the one handle the host memoizes rather
                     // than a fresh chunk constant.
-                    // `os.Stdout` / `os.Stderr` are package-level *vars* the
+                    // `os.Stdin` / `os.Stdout` / `os.Stderr` are package-level *vars* the
                     // linker synthesizes (`goroot/os_file.go`). `os` is native,
                     // so nothing rewrote the selector into the qualified name
                     // the way it would for a source package — this does.
-                    if pkg == "os" && matches!(field.as_str(), "Stdout" | "Stderr") {
+                    if pkg == "os" && matches!(field.as_str(), "Stdin" | "Stdout" | "Stderr") {
                         let name = format!("os.{field}");
                         if self.scope_has(&name) || self.globals.contains(&name) {
                             self.emit_get(&name, 0);
@@ -6679,8 +6679,13 @@ impl Compiler {
             // method. Go tells the two apart by the name's declaration, and a
             // type cannot declare both, so the field is what the call means:
             // read it and dispatch the value it holds, as every other
-            // expression yielding a function value is dispatched.
-            if self.field_ty(recv, method).starts_with("func") {
+            // expression yielding a function value is dispatched. The field's
+            // type may be a defined func type (`split bufio.SplitFunc`), so it
+            // is read through to its base.
+            if self
+                .underlying(&self.field_ty(recv, method))
+                .starts_with("func")
+            {
                 let field = Expr::Selector {
                     recv: Box::new(recv.clone()),
                     field: method.to_string(),
@@ -8769,12 +8774,19 @@ impl Compiler {
             }
             // The vendored `errors` package's one host intrinsic: the runtime type
             // tag a type switch dispatches on, which `asTag` compares against.
-            // The `os` package's one host intrinsic: the write behind
-            // `os.Stdout` / `os.Stderr`, which no Go source can express.
+            // The `os` package's two host intrinsics: the write behind
+            // `os.Stdout` / `os.Stderr` and the read behind `os.Stdin`, which
+            // no Go source can express.
             if name == "os.writeFd" && args.len() == 2 {
                 self.expr(&args[0])?;
                 self.expr(&args[1])?;
                 self.b.emit(Op::CallBuiltin(host::GWRITE_FD, 2), line);
+                return Ok(());
+            }
+            if name == "os.readFd" && args.len() == 2 {
+                self.expr(&args[0])?;
+                self.expr(&args[1])?;
+                self.b.emit(Op::CallBuiltin(host::GREAD_FD, 2), line);
                 return Ok(());
             }
             // The vendored `slices` package's one host intrinsic, standing in for

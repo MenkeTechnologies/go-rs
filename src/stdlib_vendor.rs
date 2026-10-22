@@ -12,6 +12,7 @@ pub const PACKAGES: &[(&str, &str)] = &[
     ("sync", include_str!("../goroot/sync.go")),
     ("sync/atomic", include_str!("../goroot/atomic.go")),
     ("time", include_str!("../goroot/time.go")),
+    ("unicode/utf8", include_str!("../goroot/utf8.go")),
     ("unicode/utf16", include_str!("../goroot/utf16.go")),
     ("cmp", include_str!("../goroot/cmp.go")),
     ("io", include_str!("../goroot/io.go")),

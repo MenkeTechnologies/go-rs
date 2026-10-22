@@ -26,6 +26,7 @@ pub const NATIVE: &[&str] = &["fmt", "strings", "strconv", "math", "sort", "os"]
 const INTRINSICS: &[(&str, &str)] = &[
     ("errors", "runtimeTypeTag"),
     ("os", "writeFd"),
+    ("os", "readFd"),
     ("slices", "sliceOverlap"),
     ("time", "nowNano"),
     ("time", "monoNano"),
@@ -52,6 +53,11 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     let mut order: Vec<String> = Vec::new();
     for path in main.imports.clone() {
         load_recursive(&path, &mut loaded, &mut order)?;
+    }
+    // `os.File.Read` reports `io.EOF`, so a program that imports `os` needs the
+    // `io` sentinels linked even when it never names `io` itself.
+    if main.imports.iter().any(|p| p == "os") {
+        load_recursive("io", &mut loaded, &mut order)?;
     }
     // `main` keeps its own names, but its references to imported source packages
     // (`errors.New` → the qualified `errors.New`) are rewritten — before the

@@ -2,24 +2,519 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package bufio — the buffered `Writer` a Go program wraps `os.Stdout` in.
+// Package bufio — the buffered `Reader` and `Writer` a Go program wraps
+// `os.Stdin` / `os.Stdout` in, and the `Scanner` it reads lines with.
 //
-// This is the write half of the standard library's bufio.go, verbatim but for
-// two adaptations, neither observable:
-//   - `unicode/utf8`, which this package does not import, appears as its two
-//     constants (`RuneSelf`, `UTFMax`) and as `copy` of the rune's encoding in
-//     place of `utf8.EncodeRune`.
-//   - `ReadFrom` is absent with the `Reader` and `Scanner` halves: go-rs's
-//     `io` has no `Reader`, and `os.File` is only the two output streams.
+// This is the standard library's bufio.go and scan.go, verbatim but for three
+// adaptations, none observable:
+//   - `Writer.WriteRune` encodes the rune with `copy` of its string form in
+//     place of `utf8.EncodeRune` (the same bytes).
+//   - `Reader.ReadString` joins its fragments with `append` + `string` instead
+//     of a `strings.Builder`, which is synthesized only for a program that
+//     imports `strings` itself.
+//   - `Reader.WriteTo`, `Writer.ReadFrom` and `ReadWriter` are absent: go-rs's
+//     `io` has no `WriterTo` / `ReaderFrom`, and nothing a `Reader`'s or
+//     `Writer`'s own methods do is reached through them.
 package bufio
 
-import "io"
+import (
+	"bytes"
+	"errors"
+	"io"
+	"unicode/utf8"
+)
 
 const (
 	defaultBufSize = 4096
 )
 
-// buffered output
+var (
+	ErrInvalidUnreadByte = errors.New("bufio: invalid use of UnreadByte")
+	ErrInvalidUnreadRune = errors.New("bufio: invalid use of UnreadRune")
+	ErrBufferFull        = errors.New("bufio: buffer full")
+	ErrNegativeCount     = errors.New("bufio: negative count")
+)
+
+// Buffered input.
+
+// Reader implements buffering for an io.Reader object.
+// A new Reader is created by calling [NewReader] or [NewReaderSize];
+// alternatively the zero value of a Reader may be used after calling [Reader.Reset]
+// on it.
+type Reader struct {
+	buf          []byte
+	rd           io.Reader // reader provided by the client
+	r, w         int       // buf read and write positions
+	err          error
+	lastByte     int // last byte read for UnreadByte; -1 means invalid
+	lastRuneSize int // size of last rune read for UnreadRune; -1 means invalid
+}
+
+const minReadBufferSize = 16
+const maxConsecutiveEmptyReads = 100
+
+// NewReaderSize returns a new [Reader] whose buffer has at least the specified
+// size. If the argument io.Reader is already a [Reader] with large enough
+// size, it returns the underlying [Reader].
+func NewReaderSize(rd io.Reader, size int) *Reader {
+	// Is it already a Reader?
+	b, ok := rd.(*Reader)
+	if ok && len(b.buf) >= size {
+		return b
+	}
+	r := new(Reader)
+	r.reset(make([]byte, max(size, minReadBufferSize)), rd)
+	return r
+}
+
+// NewReader returns a new [Reader] whose buffer has the default size.
+func NewReader(rd io.Reader) *Reader {
+	return NewReaderSize(rd, defaultBufSize)
+}
+
+// Size returns the size of the underlying buffer in bytes.
+func (b *Reader) Size() int { return len(b.buf) }
+
+// Reset discards any buffered data, resets all state, and switches
+// the buffered reader to read from r.
+// Calling Reset on the zero value of [Reader] initializes the internal buffer
+// to the default size.
+// Calling b.Reset(b) (that is, resetting a [Reader] to itself) does nothing.
+func (b *Reader) Reset(r io.Reader) {
+	// If a Reader r is passed to NewReader, NewReader will return r.
+	// Different layers of code may do that, and then later pass r
+	// to Reset. Avoid infinite recursion in that case.
+	if b == r {
+		return
+	}
+	if b.buf == nil {
+		b.buf = make([]byte, defaultBufSize)
+	}
+	b.reset(b.buf, r)
+}
+
+func (b *Reader) reset(buf []byte, r io.Reader) {
+	*b = Reader{
+		buf:          buf,
+		rd:           r,
+		lastByte:     -1,
+		lastRuneSize: -1,
+	}
+}
+
+var errNegativeRead = errors.New("bufio: reader returned negative count from Read")
+
+// fill reads a new chunk into the buffer.
+func (b *Reader) fill() {
+	// Slide existing data to beginning.
+	if b.r > 0 {
+		copy(b.buf, b.buf[b.r:b.w])
+		b.w -= b.r
+		b.r = 0
+	}
+
+	if b.w >= len(b.buf) {
+		panic("bufio: tried to fill full buffer")
+	}
+
+	// Read new data: try a limited number of times.
+	for i := maxConsecutiveEmptyReads; i > 0; i-- {
+		n, err := b.rd.Read(b.buf[b.w:])
+		if n < 0 {
+			panic(errNegativeRead)
+		}
+		b.w += n
+		if err != nil {
+			b.err = err
+			return
+		}
+		if n > 0 {
+			return
+		}
+	}
+	b.err = io.ErrNoProgress
+}
+
+func (b *Reader) readErr() error {
+	err := b.err
+	b.err = nil
+	return err
+}
+
+// Peek returns the next n bytes without advancing the reader. The bytes stop
+// being valid at the next read call. If necessary, Peek will read more bytes
+// into the buffer in order to make n bytes available. If Peek returns fewer
+// than n bytes, it also returns an error explaining why the read is short.
+// The error is [ErrBufferFull] if n is larger than b's buffer size.
+//
+// Calling Peek prevents a [Reader.UnreadByte] or [Reader.UnreadRune] call from succeeding
+// until the next read operation.
+func (b *Reader) Peek(n int) ([]byte, error) {
+	if n < 0 {
+		return nil, ErrNegativeCount
+	}
+
+	b.lastByte = -1
+	b.lastRuneSize = -1
+
+	for b.w-b.r < n && b.w-b.r < len(b.buf) && b.err == nil {
+		b.fill() // b.w-b.r < len(b.buf) => buffer is not full
+	}
+
+	if n > len(b.buf) {
+		return b.buf[b.r:b.w], ErrBufferFull
+	}
+
+	// 0 <= n <= len(b.buf)
+	var err error
+	if avail := b.w - b.r; avail < n {
+		// not enough data in buffer
+		n = avail
+		err = b.readErr()
+		if err == nil {
+			err = ErrBufferFull
+		}
+	}
+	return b.buf[b.r : b.r+n], err
+}
+
+// Discard skips the next n bytes, returning the number of bytes discarded.
+//
+// If Discard skips fewer than n bytes, it also returns an error.
+// If 0 <= n <= b.Buffered(), Discard is guaranteed to succeed without
+// reading from the underlying io.Reader.
+func (b *Reader) Discard(n int) (discarded int, err error) {
+	if n < 0 {
+		return 0, ErrNegativeCount
+	}
+	if n == 0 {
+		return
+	}
+
+	b.lastByte = -1
+	b.lastRuneSize = -1
+
+	remain := n
+	for {
+		skip := b.Buffered()
+		if skip == 0 {
+			b.fill()
+			skip = b.Buffered()
+		}
+		if skip > remain {
+			skip = remain
+		}
+		b.r += skip
+		remain -= skip
+		if remain == 0 {
+			return n, nil
+		}
+		if b.err != nil {
+			return n - remain, b.readErr()
+		}
+	}
+}
+
+// Read reads data into p.
+// It returns the number of bytes read into p.
+// The bytes are taken from at most one Read on the underlying [Reader],
+// hence n may be less than len(p).
+// To read exactly len(p) bytes, use io.ReadFull(b, p).
+// If the underlying [Reader] can return a non-zero count with io.EOF,
+// then this Read method can do so as well; see the [io.Reader] docs.
+func (b *Reader) Read(p []byte) (n int, err error) {
+	n = len(p)
+	if n == 0 {
+		if b.Buffered() > 0 {
+			return 0, nil
+		}
+		return 0, b.readErr()
+	}
+	if b.r == b.w {
+		if b.err != nil {
+			return 0, b.readErr()
+		}
+		if len(p) >= len(b.buf) {
+			// Large read, empty buffer.
+			// Read directly into p to avoid copy.
+			n, b.err = b.rd.Read(p)
+			if n < 0 {
+				panic(errNegativeRead)
+			}
+			if n > 0 {
+				b.lastByte = int(p[n-1])
+				b.lastRuneSize = -1
+			}
+			return n, b.readErr()
+		}
+		// One read.
+		// Do not use b.fill, which will loop.
+		b.r = 0
+		b.w = 0
+		n, b.err = b.rd.Read(b.buf)
+		if n < 0 {
+			panic(errNegativeRead)
+		}
+		if n == 0 {
+			return 0, b.readErr()
+		}
+		b.w += n
+	}
+
+	// copy as much as we can
+	// Note: if the slice panics here, it is probably because
+	// the underlying reader returned a bad count. See issue 49795.
+	n = copy(p, b.buf[b.r:b.w])
+	b.r += n
+	b.lastByte = int(b.buf[b.r-1])
+	b.lastRuneSize = -1
+	return n, nil
+}
+
+// ReadByte reads and returns a single byte.
+// If no byte is available, returns an error.
+func (b *Reader) ReadByte() (byte, error) {
+	b.lastRuneSize = -1
+	for b.r == b.w {
+		if b.err != nil {
+			return 0, b.readErr()
+		}
+		b.fill() // buffer is empty
+	}
+	c := b.buf[b.r]
+	b.r++
+	b.lastByte = int(c)
+	return c, nil
+}
+
+// UnreadByte unreads the last byte. Only the most recently read byte can be unread.
+//
+// UnreadByte returns an error if the most recent method called on the
+// [Reader] was not a read operation. Notably, [Reader.Peek], [Reader.Discard], and [Reader.WriteTo] are not
+// considered read operations.
+func (b *Reader) UnreadByte() error {
+	if b.lastByte < 0 || b.r == 0 && b.w > 0 {
+		return ErrInvalidUnreadByte
+	}
+	// b.r > 0 || b.w == 0
+	if b.r > 0 {
+		b.r--
+	} else {
+		// b.r == 0 && b.w == 0
+		b.w = 1
+	}
+	b.buf[b.r] = byte(b.lastByte)
+	b.lastByte = -1
+	b.lastRuneSize = -1
+	return nil
+}
+
+// ReadRune reads a single UTF-8 encoded Unicode character and returns the
+// rune and its size in bytes. If the encoded rune is invalid, it consumes one byte
+// and returns unicode.ReplacementChar (U+FFFD) with a size of 1.
+func (b *Reader) ReadRune() (r rune, size int, err error) {
+	for b.r+utf8.UTFMax > b.w && !utf8.FullRune(b.buf[b.r:b.w]) && b.err == nil && b.w-b.r < len(b.buf) {
+		b.fill() // b.w-b.r < len(buf) => buffer is not full
+	}
+	b.lastRuneSize = -1
+	if b.r == b.w {
+		return 0, 0, b.readErr()
+	}
+	r, size = utf8.DecodeRune(b.buf[b.r:b.w])
+	b.r += size
+	b.lastByte = int(b.buf[b.r-1])
+	b.lastRuneSize = size
+	return r, size, nil
+}
+
+// UnreadRune unreads the last rune. If the most recent method called on
+// the [Reader] was not a [Reader.ReadRune], [Reader.UnreadRune] returns an error. (In this
+// regard it is stricter than [Reader.UnreadByte], which will unread the last byte
+// from any read operation.)
+func (b *Reader) UnreadRune() error {
+	if b.lastRuneSize < 0 || b.r < b.lastRuneSize {
+		return ErrInvalidUnreadRune
+	}
+	b.r -= b.lastRuneSize
+	b.lastByte = -1
+	b.lastRuneSize = -1
+	return nil
+}
+
+// Buffered returns the number of bytes that can be read from the current buffer.
+func (b *Reader) Buffered() int { return b.w - b.r }
+
+// ReadSlice reads until the first occurrence of delim in the input,
+// returning a slice pointing at the bytes in the buffer.
+// The bytes stop being valid at the next read.
+// If ReadSlice encounters an error before finding a delimiter,
+// it returns all the data in the buffer and the error itself (often io.EOF).
+// ReadSlice fails with error [ErrBufferFull] if the buffer fills without a delim.
+// Because the data returned from ReadSlice will be overwritten
+// by the next I/O operation, most clients should use
+// [Reader.ReadBytes] or ReadString instead.
+// ReadSlice returns err != nil if and only if line does not end in delim.
+func (b *Reader) ReadSlice(delim byte) (line []byte, err error) {
+	s := 0 // search start index
+	for {
+		// Search buffer.
+		if i := bytes.IndexByte(b.buf[b.r+s:b.w], delim); i >= 0 {
+			i += s
+			line = b.buf[b.r : b.r+i+1]
+			b.r += i + 1
+			break
+		}
+
+		// Pending error?
+		if b.err != nil {
+			line = b.buf[b.r:b.w]
+			b.r = b.w
+			err = b.readErr()
+			break
+		}
+
+		// Buffer full?
+		if b.Buffered() >= len(b.buf) {
+			b.r = b.w
+			line = b.buf
+			err = ErrBufferFull
+			break
+		}
+
+		s = b.w - b.r // do not rescan area we scanned before
+
+		b.fill() // buffer is not full
+	}
+
+	// Handle last byte, if any.
+	if i := len(line) - 1; i >= 0 {
+		b.lastByte = int(line[i])
+		b.lastRuneSize = -1
+	}
+
+	return
+}
+
+// ReadLine is a low-level line-reading primitive. Most callers should use
+// [Reader.ReadBytes]('\n') or [Reader.ReadString]('\n') instead or use a [Scanner].
+//
+// ReadLine tries to return a single line, not including the end-of-line bytes.
+// If the line was too long for the buffer then isPrefix is set and the
+// beginning of the line is returned. The rest of the line will be returned
+// from future calls. isPrefix will be false when returning the last fragment
+// of the line. The returned buffer is only valid until the next call to
+// ReadLine. ReadLine either returns a non-nil line or it returns an error,
+// never both.
+//
+// The text returned from ReadLine does not include the line end ("\r\n" or "\n").
+// No indication or error is given if the input ends without a final line end.
+// Calling [Reader.UnreadByte] after ReadLine will always unread the last byte read
+// (possibly a character belonging to the line end) even if that byte is not
+// part of the line returned by ReadLine.
+func (b *Reader) ReadLine() (line []byte, isPrefix bool, err error) {
+	line, err = b.ReadSlice('\n')
+	if err == ErrBufferFull {
+		// Handle the case where "\r\n" straddles the buffer.
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			// Put the '\r' back on buf and drop it from line.
+			// Let the next call to ReadLine check for "\r\n".
+			if b.r == 0 {
+				// should be unreachable
+				panic("bufio: tried to rewind past start of buffer")
+			}
+			b.r--
+			line = line[:len(line)-1]
+		}
+		return line, true, nil
+	}
+
+	if len(line) == 0 {
+		if err != nil {
+			line = nil
+		}
+		return
+	}
+	err = nil
+
+	if line[len(line)-1] == '\n' {
+		drop := 1
+		if len(line) > 1 && line[len(line)-2] == '\r' {
+			drop = 2
+		}
+		line = line[:len(line)-drop]
+	}
+	return
+}
+
+// collectFragments reads until the first occurrence of delim in the input. It
+// returns (slice of full buffers, remaining bytes before delim, total number
+// of bytes in the combined first two elements, error).
+// The complete result is equal to
+// `bytes.Join(append(fullBuffers, finalFragment), nil)`, which has a
+// length of `totalLen`. The result is structured in this way to allow callers
+// to minimize allocations and copies.
+func (b *Reader) collectFragments(delim byte) (fullBuffers [][]byte, finalFragment []byte, totalLen int, err error) {
+	var frag []byte
+	// Use ReadSlice to look for delim, accumulating full buffers.
+	for {
+		var e error
+		frag, e = b.ReadSlice(delim)
+		if e == nil { // got final fragment
+			break
+		}
+		if e != ErrBufferFull { // unexpected error
+			err = e
+			break
+		}
+
+		// Make a copy of the buffer.
+		buf := bytes.Clone(frag)
+		fullBuffers = append(fullBuffers, buf)
+		totalLen += len(buf)
+	}
+
+	totalLen += len(frag)
+	return fullBuffers, frag, totalLen, err
+}
+
+// ReadBytes reads until the first occurrence of delim in the input,
+// returning a slice containing the data up to and including the delimiter.
+// If ReadBytes encounters an error before finding a delimiter,
+// it returns the data read before the error and the error itself (often io.EOF).
+// ReadBytes returns err != nil if and only if the returned data does not end in
+// delim.
+// For simple uses, a Scanner may be more convenient.
+func (b *Reader) ReadBytes(delim byte) ([]byte, error) {
+	full, frag, n, err := b.collectFragments(delim)
+	// Allocate new buffer to hold the full pieces and the fragment.
+	buf := make([]byte, n)
+	n = 0
+	// Copy full pieces and fragment in.
+	for i := range full {
+		n += copy(buf[n:], full[i])
+	}
+	copy(buf[n:], frag)
+	return buf, err
+}
+
+// ReadString reads until the first occurrence of delim in the input,
+// returning a string containing the data up to and including the delimiter.
+// If ReadString encounters an error before finding a delimiter,
+// it returns the data read before the error and the error itself (often io.EOF).
+// ReadString returns err != nil if and only if the returned data does not end in
+// delim.
+// For simple uses, a Scanner may be more convenient.
+func (b *Reader) ReadString(delim byte) (string, error) {
+	full, frag, n, err := b.collectFragments(delim)
+	// Allocate new buffer to hold the full pieces and the fragment.
+	buf := make([]byte, 0, n)
+	// Copy full pieces and fragment in.
+	for _, fb := range full {
+		buf = append(buf, fb...)
+	}
+	buf = append(buf, frag...)
+	return string(buf), err
+}
 
 // Writer implements buffering for an [io.Writer] object.
 // If an error occurs writing to a [Writer], no more data will be
@@ -226,4 +721,419 @@ func (b *Writer) WriteString(s string) (int, error) {
 	b.n += n
 	nn += n
 	return nn, nil
+}
+
+// Scanner provides a convenient interface for reading data such as
+// a file of newline-delimited lines of text. Successive calls to
+// the [Scanner.Scan] method will step through the 'tokens' of a file, skipping
+// the bytes between the tokens. The specification of a token is
+// defined by a split function of type [SplitFunc]; the default split
+// function breaks the input into lines with line termination stripped. [Scanner.Split]
+// functions are defined in this package for scanning a file into
+// lines, bytes, UTF-8-encoded runes, and space-delimited words. The
+// client may instead provide a custom split function.
+//
+// Scanning stops unrecoverably at EOF, the first I/O error, or a token too
+// large to fit in the [Scanner.Buffer]. When a scan stops, the reader may have
+// advanced arbitrarily far past the last token. Programs that need more
+// control over error handling or large tokens, or must run sequential scans
+// on a reader, should use [bufio.Reader] instead.
+type Scanner struct {
+	r            io.Reader // The reader provided by the client.
+	split        SplitFunc // The function to split the tokens.
+	maxTokenSize int       // Maximum size of a token; modified by tests.
+	token        []byte    // Last token returned by split.
+	buf          []byte    // Buffer used as argument to split.
+	start        int       // First non-processed byte in buf.
+	end          int       // End of data in buf.
+	err          error     // Sticky error.
+	empties      int       // Count of successive empty tokens.
+	scanCalled   bool      // Scan has been called; buffer is in use.
+	done         bool      // Scan has finished.
+}
+
+// SplitFunc is the signature of the split function used to tokenize the
+// input. The arguments are an initial substring of the remaining unprocessed
+// data and a flag, atEOF, that reports whether the [Reader] has no more data
+// to give. The return values are the number of bytes to advance the input
+// and the next token to return to the user, if any, plus an error, if any.
+//
+// Scanning stops if the function returns an error, in which case some of
+// the input may be discarded. If that error is [ErrFinalToken], scanning
+// stops with no error. A non-nil token delivered with [ErrFinalToken]
+// will be the last token, and a nil token with [ErrFinalToken]
+// immediately stops the scanning.
+//
+// Otherwise, the [Scanner] advances the input. If the token is not nil,
+// the [Scanner] returns it to the user. If the token is nil, the
+// Scanner reads more data and continues scanning; if there is no more
+// data--if atEOF was true--the [Scanner] returns. If the data does not
+// yet hold a complete token, for instance if it has no newline while
+// scanning lines, a [SplitFunc] can return (0, nil, nil) to signal the
+// [Scanner] to read more data into the slice and try again with a
+// longer slice starting at the same point in the input.
+//
+// The function is never called with an empty data slice unless atEOF
+// is true. If atEOF is true, however, data may be non-empty and,
+// as always, holds unprocessed text.
+type SplitFunc func(data []byte, atEOF bool) (advance int, token []byte, err error)
+
+// Errors returned by Scanner.
+var (
+	ErrTooLong         = errors.New("bufio.Scanner: token too long")
+	ErrNegativeAdvance = errors.New("bufio.Scanner: SplitFunc returns negative advance count")
+	ErrAdvanceTooFar   = errors.New("bufio.Scanner: SplitFunc returns advance count beyond input")
+	ErrBadReadCount    = errors.New("bufio.Scanner: Read returned impossible count")
+)
+
+const (
+	// MaxScanTokenSize is the maximum size used to buffer a token
+	// unless the user provides an explicit buffer with [Scanner.Buffer].
+	// The actual maximum token size may be smaller as the buffer
+	// may need to include, for instance, a newline.
+	MaxScanTokenSize = 64 * 1024
+
+	startBufSize = 4096 // Size of initial allocation for buffer.
+)
+
+// NewScanner returns a new [Scanner] to read from r.
+// The split function defaults to [ScanLines].
+func NewScanner(r io.Reader) *Scanner {
+	return &Scanner{
+		r:            r,
+		split:        ScanLines,
+		maxTokenSize: MaxScanTokenSize,
+	}
+}
+
+// Err returns the first non-EOF error that was encountered by the [Scanner].
+func (s *Scanner) Err() error {
+	if s.err == io.EOF {
+		return nil
+	}
+	return s.err
+}
+
+// Bytes returns the most recent token generated by a call to [Scanner.Scan].
+// The underlying array may point to data that will be overwritten
+// by a subsequent call to Scan. It does no allocation.
+func (s *Scanner) Bytes() []byte {
+	return s.token
+}
+
+// Text returns the most recent token generated by a call to [Scanner.Scan]
+// as a newly allocated string holding its bytes.
+func (s *Scanner) Text() string {
+	return string(s.token)
+}
+
+// ErrFinalToken is a special sentinel error value. It is intended to be
+// returned by a Split function to indicate that the scanning should stop
+// with no error. If the token being delivered with this error is not nil,
+// the token is the last token.
+//
+// The value is useful to stop processing early or when it is necessary to
+// deliver a final empty token (which is different from a nil token).
+// One could achieve the same behavior with a custom error value but
+// providing one here is tidier.
+// See the emptyFinalToken example for a use of this value.
+var ErrFinalToken = errors.New("final token")
+
+// Scan advances the [Scanner] to the next token, which will then be
+// available through the [Scanner.Bytes] or [Scanner.Text] method. It returns false when
+// there are no more tokens, either by reaching the end of the input or an error.
+// After Scan returns false, the [Scanner.Err] method will return any error that
+// occurred during scanning, except that if it was [io.EOF], [Scanner.Err]
+// will return nil.
+// Scan panics if the split function returns too many empty
+// tokens without advancing the input. This is a common error mode for
+// scanners.
+func (s *Scanner) Scan() bool {
+	if s.done {
+		return false
+	}
+	s.scanCalled = true
+	// Loop until we have a token.
+	for {
+		// See if we can get a token with what we already have.
+		// If we've run out of data but have an error, give the split function
+		// a chance to recover any remaining, possibly empty token.
+		if s.end > s.start || s.err != nil {
+			advance, token, err := s.split(s.buf[s.start:s.end], s.err != nil)
+			if err != nil {
+				if err == ErrFinalToken {
+					s.token = token
+					s.done = true
+					// When token is not nil, it means the scanning stops
+					// with a trailing token, and thus the return value
+					// should be true to indicate the existence of the token.
+					return token != nil
+				}
+				s.setErr(err)
+				return false
+			}
+			if !s.advance(advance) {
+				return false
+			}
+			s.token = token
+			if token != nil {
+				if s.err == nil || advance > 0 {
+					s.empties = 0
+				} else {
+					// Returning tokens not advancing input at EOF.
+					s.empties++
+					if s.empties > maxConsecutiveEmptyReads {
+						panic("bufio.Scan: too many empty tokens without progressing")
+					}
+				}
+				return true
+			}
+		}
+		// We cannot generate a token with what we are holding.
+		// If we've already hit EOF or an I/O error, we are done.
+		if s.err != nil {
+			// Shut it down.
+			s.start = 0
+			s.end = 0
+			return false
+		}
+		// Must read more data.
+		// First, shift data to beginning of buffer if there's lots of empty space
+		// or space is needed.
+		if s.start > 0 && (s.end == len(s.buf) || s.start > len(s.buf)/2) {
+			copy(s.buf, s.buf[s.start:s.end])
+			s.end -= s.start
+			s.start = 0
+		}
+		// Is the buffer full? If so, resize.
+		if s.end == len(s.buf) {
+			// Guarantee no overflow in the multiplication below.
+			const maxInt = int(^uint(0) >> 1)
+			if len(s.buf) >= s.maxTokenSize || len(s.buf) > maxInt/2 {
+				s.setErr(ErrTooLong)
+				return false
+			}
+			newSize := len(s.buf) * 2
+			if newSize == 0 {
+				newSize = startBufSize
+			}
+			newSize = min(newSize, s.maxTokenSize)
+			newBuf := make([]byte, newSize)
+			copy(newBuf, s.buf[s.start:s.end])
+			s.buf = newBuf
+			s.end -= s.start
+			s.start = 0
+		}
+		// Finally we can read some input. Make sure we don't get stuck with
+		// a misbehaving Reader. Officially we don't need to do this, but let's
+		// be extra careful: Scanner is for safe, simple jobs.
+		for loop := 0; ; {
+			n, err := s.r.Read(s.buf[s.end:len(s.buf)])
+			if n < 0 || len(s.buf)-s.end < n {
+				s.setErr(ErrBadReadCount)
+				break
+			}
+			s.end += n
+			if err != nil {
+				s.setErr(err)
+				break
+			}
+			if n > 0 {
+				s.empties = 0
+				break
+			}
+			loop++
+			if loop > maxConsecutiveEmptyReads {
+				s.setErr(io.ErrNoProgress)
+				break
+			}
+		}
+	}
+}
+
+// advance consumes n bytes of the buffer. It reports whether the advance was legal.
+func (s *Scanner) advance(n int) bool {
+	if n < 0 {
+		s.setErr(ErrNegativeAdvance)
+		return false
+	}
+	if n > s.end-s.start {
+		s.setErr(ErrAdvanceTooFar)
+		return false
+	}
+	s.start += n
+	return true
+}
+
+// setErr records the first error encountered.
+func (s *Scanner) setErr(err error) {
+	if s.err == nil || s.err == io.EOF {
+		s.err = err
+	}
+}
+
+// Buffer controls memory allocation by the Scanner.
+// It sets the initial buffer to use when scanning
+// and the maximum size of buffer that may be allocated during scanning.
+// The contents of the buffer are ignored.
+//
+// The maximum token size must be less than the larger of max and cap(buf).
+// If max <= cap(buf), [Scanner.Scan] will use this buffer only and do no allocation.
+//
+// By default, [Scanner.Scan] uses an internal buffer and sets the
+// maximum token size to [MaxScanTokenSize].
+//
+// Buffer panics if it is called after scanning has started.
+func (s *Scanner) Buffer(buf []byte, max int) {
+	if s.scanCalled {
+		panic("Buffer called after Scan")
+	}
+	s.buf = buf[0:cap(buf)]
+	s.maxTokenSize = max
+}
+
+// Split sets the split function for the [Scanner].
+// The default split function is [ScanLines].
+//
+// Split panics if it is called after scanning has started.
+func (s *Scanner) Split(split SplitFunc) {
+	if s.scanCalled {
+		panic("Split called after Scan")
+	}
+	s.split = split
+}
+
+// Split functions
+
+// ScanBytes is a split function for a [Scanner] that returns each byte as a token.
+func ScanBytes(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	return 1, data[0:1], nil
+}
+
+var errorRune = []byte(string(utf8.RuneError))
+
+// ScanRunes is a split function for a [Scanner] that returns each
+// UTF-8-encoded rune as a token. The sequence of runes returned is
+// equivalent to that from a range loop over the input as a string, which
+// means that erroneous UTF-8 encodings translate to U+FFFD = "\xef\xbf\xbd".
+// Because of the Scan interface, this makes it impossible for the client to
+// distinguish correctly encoded replacement runes from encoding errors.
+func ScanRunes(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+
+	// Fast path 1: ASCII.
+	if data[0] < utf8.RuneSelf {
+		return 1, data[0:1], nil
+	}
+
+	// Fast path 2: Correct UTF-8 decode without error.
+	_, width := utf8.DecodeRune(data)
+	if width > 1 {
+		// It's a valid encoding. Width cannot be one for a correctly encoded
+		// non-ASCII rune.
+		return width, data[0:width], nil
+	}
+
+	// We know it's an error: we have width==1 and implicitly r==utf8.RuneError.
+	// Is the error because there wasn't a full rune to be decoded?
+	// FullRune distinguishes correctly between erroneous and incomplete encodings.
+	if !atEOF && !utf8.FullRune(data) {
+		// Incomplete; get more bytes.
+		return 0, nil, nil
+	}
+
+	// We have a real UTF-8 encoding error. Return a properly encoded error rune
+	// but advance only one byte. This matches the behavior of a range loop over
+	// an incorrectly encoded string.
+	return 1, errorRune, nil
+}
+
+// dropCR drops a terminal \r from the data.
+func dropCR(data []byte) []byte {
+	if len(data) > 0 && data[len(data)-1] == '\r' {
+		return data[0 : len(data)-1]
+	}
+	return data
+}
+
+// ScanLines is a split function for a [Scanner] that returns each line of
+// text, stripped of any trailing end-of-line marker. The returned line may
+// be empty. The end-of-line marker is one optional carriage return followed
+// by one mandatory newline. In regular expression notation, it is `\r?\n`.
+// The last non-empty line of input will be returned even if it has no
+// newline.
+func ScanLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		// We have a full newline-terminated line.
+		return i + 1, dropCR(data[0:i]), nil
+	}
+	// If we're at EOF, we have a final, non-terminated line. Return it.
+	if atEOF {
+		return len(data), dropCR(data), nil
+	}
+	// Request more data.
+	return 0, nil, nil
+}
+
+// isSpace reports whether the character is a Unicode white space character.
+// We avoid dependency on the unicode package, but check validity of the implementation
+// in the tests.
+func isSpace(r rune) bool {
+	if r <= '\u00FF' {
+		// Obvious ASCII ones: \t through \r plus space. Plus two Latin-1 oddballs.
+		switch r {
+		case ' ', '\t', '\n', '\v', '\f', '\r':
+			return true
+		case '\u0085', '\u00A0':
+			return true
+		}
+		return false
+	}
+	// High-valued ones.
+	if '\u2000' <= r && r <= '\u200a' {
+		return true
+	}
+	switch r {
+	case '\u1680', '\u2028', '\u2029', '\u202f', '\u205f', '\u3000':
+		return true
+	}
+	return false
+}
+
+// ScanWords is a split function for a [Scanner] that returns each
+// space-separated word of text, with surrounding spaces deleted. It will
+// never return an empty string. The definition of space is set by
+// unicode.IsSpace.
+func ScanWords(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	// Skip leading spaces.
+	start := 0
+	for width := 0; start < len(data); start += width {
+		var r rune
+		r, width = utf8.DecodeRune(data[start:])
+		if !isSpace(r) {
+			break
+		}
+	}
+	// Scan until space, marking end of word.
+	for width, i := 0, start; i < len(data); i += width {
+		var r rune
+		r, width = utf8.DecodeRune(data[i:])
+		if isSpace(r) {
+			return i + width, data[start:i], nil
+		}
+	}
+	// If we're at EOF, we have a final, non-empty, non-terminated word. Return it.
+	if atEOF && len(data) > start {
+		return len(data), data[start:], nil
+	}
+	// Request more data.
+	return start, nil, nil
 }
