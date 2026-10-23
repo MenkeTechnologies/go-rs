@@ -136,6 +136,11 @@ pub struct InterfaceDecl {
     pub name: String,
     /// The method set, each entry encoded by [`method_sig`].
     pub methods: Vec<String>,
+    /// The interfaces it embeds (`RuneReader` in `io.RuneScanner`), as
+    /// written and then qualified by the linker, which folds their methods
+    /// into [`Self::methods`] once every package is merged
+    /// (`pkg::flatten_embedded_interfaces`).
+    pub embeds: Vec<String>,
 }
 
 /// The canonical encoding of one method in a method set: `name/arity:results`

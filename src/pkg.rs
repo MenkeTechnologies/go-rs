@@ -32,6 +32,7 @@ const INTRINSICS: &[(&str, &str)] = &[
     ("os", "fdSize"),
     ("os", "unlinkPath"),
     ("os", "rmdirPath"),
+    ("fmt", "typeString"),
     ("syscall", "strerror"),
     ("syscall", "sysConst"),
     ("slices", "sliceOverlap"),
@@ -63,9 +64,17 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     // even when it never names them. They are loaded first, so their
     // initializers are the leading ones and `os`'s own can follow them
     // directly — ahead of any other package's, which may read `os.Stdout`.
-    let uses_os = main.imports.iter().any(|p| p == "os");
+    // `fmt`'s scanners (`goroot/fmt_scan.go`) read `os.Stdin` through an
+    // `io.Reader`, so a program that calls one links `os` too.
+    let uses_scan = uses_fmt_scan(&main);
+    let uses_os = uses_scan || main.imports.iter().any(|p| p == "os");
     if uses_os {
         for path in OS_DEPS {
+            load_recursive(path, &mut loaded, &mut order)?;
+        }
+    }
+    if uses_scan {
+        for path in FMT_SCAN_DEPS {
             load_recursive(path, &mut loaded, &mut order)?;
         }
     }
@@ -93,8 +102,14 @@ pub fn link(mut main: Program) -> Result<Program, String> {
         main.interfaces.extend(pkg.interfaces);
         main.defined.extend(pkg.defined);
     }
+    // `fmt`'s scanning half: its tables follow every imported package's
+    // initializers and precede the program's own globals.
+    let fmt_init_at = init_globals.len();
     init_globals.extend(std::mem::take(&mut main.main));
     main.main = init_globals;
+    if uses_scan {
+        add_fmt_scan(&mut main, fmt_init_at)?;
+    }
     // `strconv`'s Go half reaches `ErrSyntax`, so it is linked before the
     // check below that decides whether the error types are needed.
     if uses_strconv_source(&main) {
@@ -132,12 +147,63 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     if main.imports.iter().any(|p| p == "sort") {
         add_sort_source(&mut main)?;
     }
-    if main.imports.iter().any(|p| p == "math") {
+    if uses_scan || main.imports.iter().any(|p| p == "math") {
         add_math_source(&mut main)?;
     }
+    flatten_embedded_interfaces(&mut main);
     add_sort_search(&mut main);
     add_stringify(&mut main);
     Ok(main)
+}
+
+/// Fold each interface's embedded interfaces into its own method set, so
+/// `io.RuneScanner` carries `ReadRune` from the `RuneReader` it embeds: a call
+/// through it destructures `ReadRune`'s three results and a type satisfies it
+/// only with both methods. Runs once every package is merged and qualified, so
+/// an embed across packages (`io.Reader` in a user interface) resolves. The
+/// predeclared `error` is `interface{ Error() string }`; a name that is no
+/// interface (a constraint's `int`, `comparable`) adds nothing.
+fn flatten_embedded_interfaces(prog: &mut Program) {
+    fn collect(
+        name: &str,
+        decls: &HashMap<String, (Vec<String>, Vec<String>)>,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        if name == "error" {
+            out.push(method_sig("Error", 0, &["string".to_string()]));
+            return;
+        }
+        if let Some((methods, embeds)) = decls.get(name) {
+            out.extend(methods.iter().cloned());
+            for e in embeds {
+                collect(e, decls, seen, out);
+            }
+        }
+    }
+    if prog.interfaces.iter().all(|i| i.embeds.is_empty()) {
+        return;
+    }
+    let decls: HashMap<String, (Vec<String>, Vec<String>)> = prog
+        .interfaces
+        .iter()
+        .map(|i| (i.name.clone(), (i.methods.clone(), i.embeds.clone())))
+        .collect();
+    for i in &mut prog.interfaces {
+        let mut seen = HashSet::from([i.name.clone()]);
+        let mut folded = Vec::new();
+        for e in &i.embeds {
+            collect(e, &decls, &mut seen, &mut folded);
+        }
+        for m in folded {
+            if !i.methods.contains(&m) {
+                i.methods.push(m);
+            }
+        }
+    }
 }
 
 /// The names package `sort` declares in Go source (`goroot/sort.go`) rather
@@ -453,6 +519,55 @@ fn add_os_file(prog: &mut Program, at: usize) -> Result<(), String> {
     qualify(&mut pkg, "os", true);
     prog.types.append(&mut pkg.types);
     prog.funcs.append(&mut pkg.funcs);
+    let inits = std::mem::take(&mut pkg.main);
+    prog.main.splice(at..at, inits);
+    Ok(())
+}
+
+/// The packages `goroot/fmt_scan.go` imports beyond `os`'s ([`OS_DEPS`]),
+/// linked into every program that calls one of `fmt`'s scanners.
+const FMT_SCAN_DEPS: &[&str] = &["errors", "unicode/utf8"];
+
+/// The names package `fmt` declares in Go source (`goroot/fmt_scan.go`): the
+/// scanning family and its two interfaces. A program's `fmt.<Name>` is
+/// rewritten to the qualified identifier, the way [`SORT_SOURCE`] is; the print
+/// family stays host builtins.
+pub const FMT_SOURCE: &[&str] = &[
+    "Scan",
+    "Scanln",
+    "Scanf",
+    "Sscan",
+    "Sscanln",
+    "Sscanf",
+    "Fscan",
+    "Fscanln",
+    "Fscanf",
+    "ScanState",
+    "Scanner",
+];
+
+/// Whether the program names one of [`FMT_SOURCE`] — called, used as a value,
+/// or as a type (`fmt.ScanState` in a custom `Scan` method's signature).
+fn uses_fmt_scan(prog: &Program) -> bool {
+    let named_in_type = |ty: &str| FMT_SOURCE.iter().any(|n| ty.contains(&format!("fmt.{n}")));
+    program_has_expr(prog, &|e| {
+        FMT_SOURCE.iter().any(|f| is_selector(e, "fmt", f))
+    }) || prog
+        .funcs
+        .iter()
+        .any(|f| f.params.iter().any(|p| named_in_type(&p.ty)))
+}
+
+/// Synthesize package `fmt`'s scanning half and qualify it under `fmt`. Its
+/// package-level tables are spliced in at `at`, after the initializers of the
+/// packages it imports.
+fn add_fmt_scan(prog: &mut Program, at: usize) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/fmt_scan.go"))?;
+    qualify(&mut pkg, "fmt", true);
+    prog.types.append(&mut pkg.types);
+    prog.funcs.append(&mut pkg.funcs);
+    prog.interfaces.append(&mut pkg.interfaces);
+    prog.defined.append(&mut pkg.defined);
     let inits = std::mem::take(&mut pkg.main);
     prog.main.splice(at..at, inits);
     Ok(())
@@ -1122,6 +1237,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         if p == "os" {
             source_half.insert(import_alias(p).to_string(), OS_SOURCE);
         }
+        if p == "fmt" {
+            source_half.insert(import_alias(p).to_string(), FMT_SOURCE);
+        }
     }
 
     let q = Qualifier {
@@ -1152,6 +1270,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
     for i in &mut prog.interfaces {
         if rename && !is_anon_iface(&i.name) {
             i.name = q.qual(&i.name);
+        }
+        for e in &mut i.embeds {
+            *e = q.qual_type(e);
         }
     }
     for f in &mut prog.funcs {

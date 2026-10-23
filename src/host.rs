@@ -4729,6 +4729,11 @@ fn b_named_box(vm: &mut VM, argc: u8) -> Value {
         return inner;
     }
     let ty = args.get(1).map(go_str).unwrap_or_default();
+    // A pointer type's tag (`*[]uint8`, `*int64`) names the pointer itself,
+    // so it boxes the pointer as it is.
+    if ty.starts_with('*') {
+        return Value::Obj(heap_alloc(HostObj::Named { ty, inner }));
+    }
     // `&g` of a defined composite is a pointer to the named value, so the name
     // goes behind the pointer: `%T` is `*main.Grid` and `%v` is `&[1 2]`.
     let target = match &inner {

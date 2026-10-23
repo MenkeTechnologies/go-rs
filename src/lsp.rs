@@ -813,6 +813,48 @@ const CORPUS: &[Entry] = &[
         "Builds a real error value. When a program calls it, the linker synthesizes an `$errorString` struct with an `Error() string` method, and the call becomes `&$errorString{s: fmt.Sprintf(format, a…)}`. `%w` is not modelled — it formats like `%v`, and there is no `errors.Is` or `Unwrap` to recover the wrapped error with.",
         "return fmt.Errorf(\"bad input %d\", n)",
     ),
+    e(
+        "fmt.Scan",
+        "Package fmt",
+        "fmt.Scan(a …any) (n int, err error)",
+        "Reads space-separated values from standard input into the pointers it is handed, newlines counting as space, and returns how many it stored. Go's own `scan.go` (`goroot/fmt_scan.go`): every `*int`…`*uint64`, `*float32`/`*float64`, `*string`, `*bool` and `*[]byte` operand, base prefixes and `_` separators under `%v`, a type implementing `fmt.Scanner`, and Go's error text (`expected integer`, `unexpected newline`, `EOF`).",
+        "var n int\nfmt.Scan(&n)",
+    ),
+    e(
+        "fmt.Scanln",
+        "Package fmt",
+        "fmt.Scanln(a …any) (n int, err error)",
+        "Like `fmt.Scan`, but stops at a newline, and after the last operand there must be a newline or end of input.",
+        "var a, b string\nfmt.Scanln(&a, &b)",
+    ),
+    e(
+        "fmt.Scanf",
+        "Package fmt",
+        "fmt.Scanf(format string, a …any) (n int, err error)",
+        "Reads standard input as directed by the format: literal text must match, a space matches any run of spaces, a newline must match one, and each verb (`%d %x %o %b %c %s %q %f %t %v`, with an optional width, and `%%`) scans one operand.",
+        "fmt.Scanf(\"%s %d\\n\", &name, &age)",
+    ),
+    e(
+        "fmt.Sscan",
+        "Package fmt",
+        "fmt.Sscan(str string, a …any) (n int, err error)",
+        "`fmt.Scan` over the string instead of standard input. `Sscanln` and `Sscanf` are the `Scanln` and `Scanf` forms.",
+        "n, err := fmt.Sscan(\"12 34\", &a, &b)",
+    ),
+    e(
+        "fmt.Sscanf",
+        "Package fmt",
+        "fmt.Sscanf(str string, format string, a …any) (n int, err error)",
+        "`fmt.Scanf` over the string instead of standard input.",
+        "fmt.Sscanf(\"x=3\", \"x=%d\", &x)",
+    ),
+    e(
+        "fmt.Fscan",
+        "Package fmt",
+        "fmt.Fscan(r io.Reader, a …any) (n int, err error)",
+        "`fmt.Scan` over any `io.Reader`. A reader that is also an `io.RuneScanner` (a `*bufio.Reader`) is read directly, so what one call leaves unread is there for the next; any other is read a byte at a time. `Fscanln` and `Fscanf` are the `Scanln` and `Scanf` forms.",
+        "in := bufio.NewReader(os.Stdin)\nfmt.Fscan(in, &n)",
+    ),
     // ── Format verb (host.rs `sprintf`) ──
     e(
         "%v",

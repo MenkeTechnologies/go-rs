@@ -3316,6 +3316,15 @@ impl Compiler {
         )
     }
 
+    /// Whether a variable of type `ty` needs its own cell for `&x` to address
+    /// it: a scalar ([`Self::is_scalar_ty`]) or an interface. An interface
+    /// value is `nil` or the handle of its dynamic value, so a pointer to the
+    /// variable cannot be that handle — `*errp = err` through `&err` must
+    /// rebind the variable, not overwrite the error it held.
+    fn is_addr_cell_ty(&self, ty: &str) -> bool {
+        self.is_scalar_ty(ty) || (!ty.starts_with('*') && self.is_iface_ty(ty))
+    }
+
     /// The names of `params` and of the locals declared in `body` (not inside
     /// nested literals) whose declared or evident type is a scalar. An
     /// initializer that is not a literal, a conversion, `len`/`cap` or
@@ -3393,7 +3402,7 @@ impl Compiler {
         }
         let mut out: HashSet<String> = params
             .iter()
-            .filter(|p| self.is_scalar_ty(&p.ty))
+            .filter(|p| self.is_addr_cell_ty(&p.ty))
             .map(|p| p.name.clone())
             .collect();
         let mut decls: Vec<&Stmt> = Vec::new();
@@ -3406,7 +3415,7 @@ impl Compiler {
                 match s {
                     Stmt::Var {
                         name, ty: Some(t), ..
-                    } if self.is_scalar_ty(t) => {
+                    } if self.is_addr_cell_ty(t) => {
                         out.insert(name.clone());
                     }
                     Stmt::Var {
@@ -3425,7 +3434,7 @@ impl Compiler {
                         let results = self.call_result_types(&values[0]);
                         if results.len() == names.len() {
                             for (n, t) in names.iter().zip(&results) {
-                                if self.is_scalar_ty(t) {
+                                if self.is_addr_cell_ty(t) {
                                     out.insert(n.clone());
                                 }
                             }
@@ -3716,7 +3725,7 @@ impl Compiler {
                         Expr::Unary {
                             op: UnOp::Addr,
                             rhs,
-                        } => Some(format!("*{}", self.type_name(rhs))),
+                        } => Some(format!("*{}", self.pointee_ty(rhs))),
                         Expr::Call { .. } => self
                             .call_result_types(v)
                             .first()
@@ -3769,9 +3778,14 @@ impl Compiler {
                         // result keeps the signature a call through the name
                         // packs and destructures by (`next, stop :=
                         // iter.Pull(seq)`).
+                        // A pointer result is recorded by its pointee, as a
+                        // `var p *T` is, so `h.rs` finds `H`'s field.
                         let ty = result_tys.get(i).cloned().unwrap_or_default();
                         self.types.insert(name.clone(), numtype_of_ty(&ty));
-                        self.decl_types.insert(name.clone(), ty);
+                        if ty.starts_with('*') {
+                            self.ptr_types.insert(name.clone(), ty.clone());
+                        }
+                        self.decl_types.insert(name.clone(), base_type(&ty));
                         self.emit_declare(name, *line);
                     }
                 }
@@ -4488,6 +4502,8 @@ impl Compiler {
         let base = base_type(ty);
         if ty.starts_with('*') && self.structs.contains(&base) {
             format!("*{base}")
+        } else if let Some(tag) = basic_ptr_tag(ty) {
+            tag
         } else {
             type_to_tag(ty)
         }
@@ -5607,6 +5623,11 @@ impl Compiler {
                 self.types.insert(ptr.clone(), NumType::Unknown);
                 self.emit_set(&ptr, 0);
                 self.addr_writebacks.push((target, ptr));
+                // Handed to an interface parameter (`fmt.Sscan(s, &b)` with
+                // `b []byte`), the operand carries its pointer type.
+                if param_ty.is_some_and(|t| self.is_iface_ty(t)) {
+                    self.emit_iface_box(a, 0);
+                }
                 return Ok(());
             }
             if let Expr::Ident(p) = a {
@@ -6616,6 +6637,16 @@ impl Compiler {
                     recv,
                     Expr::Ident(_) | Expr::Selector { .. } | Expr::Index { .. }
                 );
+            // Through a local `p := &s` of a slice or map, the method may
+            // retarget the pointer (`*s = append(*s, v)`); `s` is reloaded
+            // through it after the call, as for `f(p)` ([`Self::emit_arg`]).
+            if let Expr::Ident(p) = recv {
+                if let Some(target) = self.ptr_aliases.get(p).cloned() {
+                    if self.call_depth > 0 && !by_value {
+                        self.addr_writebacks.push((target, p.clone()));
+                    }
+                }
+            }
             let cell = format!("$rcell{}", self.temp_counter);
             self.expr(recv)?;
             if write_back {
@@ -7359,9 +7390,14 @@ impl Compiler {
             || self.iface_methods.contains_key(ty)
     }
 
-    /// Whether `e` names a pointer held as a cell — see [`Self::cell_ptrs`].
+    /// Whether `e` names a pointer held as a cell — see [`Self::cell_ptrs`] —
+    /// or a local bound to one (`p := &v`, `var p *Count`), whose declared
+    /// type is `*T` for a defined non-struct `T`.
     fn is_cell_ptr(&self, e: &Expr) -> bool {
-        matches!(e, Expr::Ident(n) if self.cell_ptrs.contains(n))
+        matches!(e, Expr::Ident(n) if self.cell_ptrs.contains(n)
+        || self.ptr_types.get(n).is_some_and(|t| {
+            t.starts_with('*') && self.defined_types.contains_key(&base_type(t))
+        }))
     }
 
     /// The synthesized `$stringifyAll_T` for a `fmt` operand whose static type
@@ -7468,12 +7504,52 @@ impl Compiler {
     /// The box is [`host::HostObj::Named`], the same tag `fmt` arguments carry;
     /// every place a value leaves an interface for a concrete type unwraps it
     /// ([`host::GUNNAME`]).
+    ///
+    /// A pointer to a basic type (`*int64`, `*string`, `*[]byte`) is boxed with
+    /// its type too: it is a cell at run time, which says nothing of the width
+    /// or kind it points at, so `case *int64:` could not be told from `case
+    /// *int:` — the type switch `fmt.Sscan` dispatches its operands on.
     fn emit_iface_box(&mut self, e: &Expr, line: u32) {
         let ty = self.type_name(e);
         if self.defined_types.contains_key(&ty) {
             let c = self.b.add_constant(Value::str(ty));
             self.b.emit(Op::LoadConst(c), line);
             self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+        } else if let Some(tag) = self.static_ptr_ty(e).and_then(|t| basic_ptr_tag(&t)) {
+            let c = self.b.add_constant(Value::str(tag));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+        }
+    }
+
+    /// The type `&rhs` points at. `new(T)` of a basic `T` is parsed as `&` of
+    /// the zero literal, which names no type, so a bare literal takes its
+    /// default type (`new(int)` is a `*int`).
+    fn pointee_ty(&self, rhs: &Expr) -> String {
+        match rhs {
+            Expr::Int(_) => "int".to_string(),
+            Expr::Float(..) => "float64".to_string(),
+            Expr::Bool(_) => "bool".to_string(),
+            _ => self.type_name(rhs),
+        }
+    }
+
+    /// The pointer type `e` is statically known to have — `&x`, a local or
+    /// parameter declared or bound as a pointer, a call returning one — as
+    /// written (`*int64`). [`Self::type_name`] names only the pointee.
+    fn static_ptr_ty(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Unary {
+                op: UnOp::Addr,
+                rhs,
+            } => Some(format!("*{}", self.pointee_ty(rhs))),
+            Expr::Ident(n) => self.ptr_types.get(n).cloned(),
+            Expr::Call { .. } => self
+                .call_result_types(e)
+                .first()
+                .filter(|t| t.starts_with('*'))
+                .cloned(),
+            _ => None,
         }
     }
 
@@ -8850,6 +8926,21 @@ impl Compiler {
                     .emit(Op::CallBuiltin(host::GSTRUCT_WITH, args.len() as u8), line);
                 return Ok(());
             }
+            // The vendored `fmt` scanner's one intrinsic, standing in for
+            // `reflect.Value.Type().String()`: `%T`'s text for an operand it
+            // cannot scan.
+            if name == "fmt.typeString" && args.len() == 1 {
+                let text = Expr::Call {
+                    func: Box::new(Expr::Selector {
+                        recv: Box::new(Expr::Ident("fmt".to_string())),
+                        field: "Sprintf".to_string(),
+                    }),
+                    args: vec![Expr::Str("%T".to_string()), args[0].clone()],
+                    spread: false,
+                    line,
+                };
+                return self.expr(&text);
+            }
             if name == "errors.runtimeTypeTag" && args.len() == 1 {
                 self.expr(&args[0])?;
                 self.b.emit(Op::CallBuiltin(host::GTYPETAG, 1), line);
@@ -9452,6 +9543,39 @@ fn operand_verbs(format: &str) -> Vec<(bool, char)> {
 /// see [`Compiler::runtime_tag`]), `[]T` → `[]`, `map[..]` → `map`,
 /// `func…` → `func`, and interface types (`any`, `interface{…}`, `error`) → `""`
 /// (which matches any value).
+/// The runtime tag of a pointer to a basic type — `*int64`, `*string`, `*bool`,
+/// `*[]byte` — spelled as `%T` prints it (`*byte` is `*uint8`, `*rune` is
+/// `*int32`), or `None` for any other type. Such a pointer is boxed with this
+/// tag when it enters an interface ([`Compiler::emit_iface_box`]).
+fn basic_ptr_tag(ty: &str) -> Option<String> {
+    let pointee = match ty.strip_prefix('*')? {
+        "byte" => "uint8",
+        "rune" => "int32",
+        "[]byte" => "[]uint8",
+        p => p,
+    };
+    let basic = matches!(
+        pointee,
+        "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "float32"
+            | "float64"
+            | "string"
+            | "bool"
+            | "[]uint8"
+    );
+    basic.then(|| format!("*{pointee}"))
+}
+
 fn type_to_tag(ty: &str) -> String {
     let ty = ty.trim_start_matches('*');
     // A fixed-size array shares the slice's runtime object, so it shares the

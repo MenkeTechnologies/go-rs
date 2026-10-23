@@ -8,11 +8,10 @@
 // and give meaning to. The full package is built on `sync`, `errors` and a
 // dozen adapter types whose behaviour is only observable through a real file
 // descriptor; what a Go program actually names when it writes portable code is
-// the two one-method interfaces below, the helper over them, and the
-// `ErrShortWrite` a buffered writer reports.
-//
-// They carry no implementation of their own — an interface is a method set, and
-// go-rs already dispatches one — so the whole package is the contract.
+// the `Reader` / `Writer` interfaces and the rune-at-a-time `RuneReader` /
+// `RuneScanner` that `bufio` and `fmt`'s scanners speak, the helpers over
+// them (`WriteString`, `ReadAll`, `ReadAtLeast`, `ReadFull`), and the sentinel
+// errors they report. The declarations are Go's own.
 package io
 
 import "errors"
@@ -133,4 +132,65 @@ func ReadAll(r Reader) ([]byte, error) {
 			next += next / 2
 		}
 	}
+}
+
+// ErrShortBuffer means that a read required a longer buffer than was provided.
+var ErrShortBuffer = errors.New("short buffer")
+
+// RuneReader is the interface that wraps the ReadRune method.
+//
+// ReadRune reads a single encoded Unicode character
+// and returns the rune and its size in bytes. If no character is
+// available, err will be set.
+type RuneReader interface {
+	ReadRune() (r rune, size int, err error)
+}
+
+// RuneScanner is the interface that adds the UnreadRune method to the
+// basic ReadRune method.
+//
+// UnreadRune causes the next call to ReadRune to return the last rune read.
+// If the last operation was not a successful call to ReadRune, UnreadRune may
+// return an error, unread the last rune read (or the rune prior to the
+// last-unread rune), or (in implementations that support the [Seeker] interface)
+// seek to the start of the rune before the current offset.
+type RuneScanner interface {
+	RuneReader
+	UnreadRune() error
+}
+
+// ReadAtLeast reads from r into buf until it has read at least min bytes.
+// It returns the number of bytes copied and an error if fewer bytes were read.
+// The error is EOF only if no bytes were read.
+// If an EOF happens after reading fewer than min bytes,
+// ReadAtLeast returns [ErrUnexpectedEOF].
+// If min is greater than the length of buf, ReadAtLeast returns [ErrShortBuffer].
+// On return, n >= min if and only if err == nil.
+// If r returns an error having read at least min bytes, the error is dropped.
+func ReadAtLeast(r Reader, buf []byte, min int) (n int, err error) {
+	if len(buf) < min {
+		return 0, ErrShortBuffer
+	}
+	for n < min && err == nil {
+		var nn int
+		nn, err = r.Read(buf[n:])
+		n += nn
+	}
+	if n >= min {
+		err = nil
+	} else if n > 0 && err == EOF {
+		err = ErrUnexpectedEOF
+	}
+	return
+}
+
+// ReadFull reads exactly len(buf) bytes from r into buf.
+// It returns the number of bytes copied and an error if fewer bytes were read.
+// The error is EOF only if no bytes were read.
+// If an EOF happens after reading some but not all the bytes,
+// ReadFull returns [ErrUnexpectedEOF].
+// On return, n == len(buf) if and only if err == nil.
+// If r returns an error having read at least len(buf) bytes, the error is dropped.
+func ReadFull(r Reader, buf []byte) (n int, err error) {
+	return ReadAtLeast(r, buf, len(buf))
 }

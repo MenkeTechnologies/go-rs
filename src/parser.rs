@@ -23,37 +23,11 @@ enum TypeDecl {
 /// Parse Go source into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = lex(src)?;
-    // Pre-scan `type <IDENT> struct` so a `T{…}` composite literal can be told
-    // apart from an identifier `T` followed by a block `{`.
-    let struct_names = scan_type_names(&tokens, &Tok::Struct);
-    let iface_names = scan_type_names(&tokens, &Tok::Interface);
-    // Pre-scan generic declarations — a `func Name[…]` / `type Name[…]` (Go 1.18
-    // type parameters). go-rs is dynamically typed on the fusevm value model, so
-    // generics are handled by *erasure*: the type-parameter and type-argument
-    // brackets are consumed and dropped. Recording the generic names lets a use
-    // site (`Name[int](…)`) tell an instantiation apart from an index `xs[i]`.
-    let generic_names = scan_generic_names(&tokens);
-    let mut p = Parser {
-        tokens,
-        pos: 0,
-        struct_names,
-        iface_names,
-        generic_names,
-        no_composite: false,
-        anon_structs: HashMap::new(),
-        anon_interfaces: HashMap::new(),
-        local_types: Vec::new(),
-        local_interfaces: Vec::new(),
-        defined: HashMap::new(),
-        int_consts: HashMap::new(),
-        untyped_consts: Vec::new(),
-        type_param_cores: HashMap::new(),
-        pkg_names: HashSet::new(),
-        imported: Vec::new(),
-        check_returns: false,
-    };
+    let mut p = Parser::new(tokens);
     // Integer constants first: a defined type's base can be an array sized by
-    // one (`type d [MaxCase]rune`).
+    // one (`type d [MaxCase]rune`), or by an imported package's
+    // (`[utf8.UTFMax]byte`).
+    p.seed_imported_consts();
     p.scan_int_consts();
     // Pre-scan `type Name <base>` over a non-struct base, with the real type
     // grammar rather than a token pattern — the base can be any type expression
@@ -62,6 +36,43 @@ pub fn parse(src: &str) -> Result<Program, String> {
     // is one, so the names have to be known before the program is walked.
     p.scan_defined_types();
     p.program()
+}
+
+impl Parser {
+    /// A parser over `tokens` with the declaration-level pre-scans that need
+    /// only the token stream done: struct, interface and generic names.
+    fn new(tokens: Vec<Token>) -> Parser {
+        // Pre-scan `type <IDENT> struct` so a `T{…}` composite literal can be
+        // told apart from an identifier `T` followed by a block `{`.
+        let struct_names = scan_type_names(&tokens, &Tok::Struct);
+        let iface_names = scan_type_names(&tokens, &Tok::Interface);
+        // Pre-scan generic declarations — a `func Name[…]` / `type Name[…]`
+        // (Go 1.18 type parameters). go-rs is dynamically typed on the fusevm
+        // value model, so generics are handled by *erasure*: the
+        // type-parameter and type-argument brackets are consumed and dropped.
+        // Recording the generic names lets a use site (`Name[int](…)`) tell an
+        // instantiation apart from an index `xs[i]`.
+        let generic_names = scan_generic_names(&tokens);
+        Parser {
+            tokens,
+            pos: 0,
+            struct_names,
+            iface_names,
+            generic_names,
+            no_composite: false,
+            anon_structs: HashMap::new(),
+            anon_interfaces: HashMap::new(),
+            local_types: Vec::new(),
+            local_interfaces: Vec::new(),
+            defined: HashMap::new(),
+            int_consts: HashMap::new(),
+            untyped_consts: Vec::new(),
+            type_param_cores: HashMap::new(),
+            pkg_names: HashSet::new(),
+            imported: Vec::new(),
+            check_returns: false,
+        }
+    }
 }
 
 struct Parser {
@@ -525,7 +536,11 @@ impl Parser {
         // type-assertion or type-switch position) so the compiler can test a
         // value's method set against them.
         for (name, methods) in std::mem::take(&mut self.anon_interfaces) {
-            interfaces.push(InterfaceDecl { name, methods });
+            interfaces.push(InterfaceDecl {
+                name,
+                methods,
+                embeds: Vec::new(),
+            });
         }
 
         if package == "main" {
@@ -606,6 +621,40 @@ impl Parser {
             }
             Stmt::Block(ss) => ss.iter_mut().for_each(|s| self.fold_exact_consts(s)),
             _ => {}
+        }
+    }
+
+    /// Seed [`Parser::int_consts`] with the exported integer constants of
+    /// every vendored package the file imports, as `name.Const` under the name
+    /// the import binds, so an array length written `[utf8.UTFMax]byte` folds
+    /// to `[4]byte` the way a local constant does. Each package is parsed in
+    /// isolation, so its constants are not otherwise known here. The import
+    /// clause is read with the real import grammar and the position and the
+    /// import bookkeeping are restored afterwards.
+    fn seed_imported_consts(&mut self) {
+        let saved = (self.pos, self.imported.len(), self.pkg_names.clone());
+        self.skip_semis();
+        let mut paths = Vec::new();
+        if self.eat(&Tok::Package) && self.ident().is_ok() {
+            self.skip_semis();
+            while self.eat(&Tok::Import) {
+                if self.parse_import(&mut paths).is_err() {
+                    break;
+                }
+                self.skip_semis();
+            }
+        }
+        let bound: Vec<(String, String)> = self
+            .imported
+            .drain(saved.1..)
+            .map(|(name, path, _)| (name, path))
+            .collect();
+        self.pos = saved.0;
+        self.pkg_names = saved.2;
+        for (name, path) in bound {
+            for (c, v) in vendored_int_consts(&path) {
+                self.int_consts.insert(format!("{name}.{c}"), v);
+            }
         }
     }
 
@@ -715,8 +764,12 @@ impl Parser {
         match self.peek() {
             Tok::Interface => {
                 self.advance();
-                let methods = self.interface_body()?;
-                Ok(Some(TypeDecl::Interface(InterfaceDecl { name, methods })))
+                let (methods, embeds) = self.interface_body()?;
+                Ok(Some(TypeDecl::Interface(InterfaceDecl {
+                    name,
+                    methods,
+                    embeds,
+                })))
             }
             _ => {
                 self.expect(&Tok::Struct)?;
@@ -731,17 +784,22 @@ impl Parser {
     }
 
     /// Parse an interface body `{ … }` into its method set, each entry encoded by
-    /// [`method_sig`]. The `interface` keyword is already consumed; the opening
-    /// `{` is the current token.
+    /// [`method_sig`], and the names it embeds. The `interface` keyword is
+    /// already consumed; the opening `{` is the current token.
     ///
-    /// An element is either a method (`name(params) results`) or a generic
-    /// type-constraint term (`~int | ~float64`, an embedded constraint name). A
-    /// method is exactly `Ident (`; anything else is a constraint term, which
-    /// go-rs erases — constraints contribute no methods.
-    fn interface_body(&mut self) -> Result<Vec<String>, String> {
+    /// An element is a method (`name(params) results`), an embedded interface
+    /// (`RuneReader`, `io.Reader`: a lone, possibly qualified, name), or a
+    /// generic type-constraint term (`~int | ~float64`). A lone name is
+    /// recorded either way — one naming no interface (`int`, `comparable`)
+    /// contributes no methods when the linker folds embeds in. Any other
+    /// constraint term is erased.
+    fn interface_body(&mut self) -> Result<(Vec<String>, Vec<String>), String> {
         self.expect(&Tok::LBrace)?;
         self.skip_semis();
         let mut methods = Vec::new();
+        let mut embeds = Vec::new();
+        let ends_element =
+            |t: Option<&Token>| matches!(t.map(|t| &t.kind), Some(Tok::Semi | Tok::RBrace));
         while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
             if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::LParen) {
                 let name = self.ident()?;
@@ -749,6 +807,17 @@ impl Parser {
                 let arity = self.skip_param_list()?;
                 let results = self.result_types()?;
                 methods.push(method_sig(&name, arity, &results));
+            } else if let Tok::Ident(first) = self.peek().clone() {
+                let at = self.pos;
+                if ends_element(self.tokens.get(at + 1)) {
+                    embeds.push(first);
+                } else if let (Some(Tok::Dot), Some(Tok::Ident(second)), true) = (
+                    self.tokens.get(at + 1).map(|t| &t.kind),
+                    self.tokens.get(at + 2).map(|t| &t.kind),
+                    ends_element(self.tokens.get(at + 3)),
+                ) {
+                    embeds.push(format!("{first}.{second}"));
+                }
             }
             // Skip to the end of the element (a constraint term including `~`,
             // `|`, and bracketed types — a method's results are already parsed).
@@ -758,7 +827,7 @@ impl Parser {
             self.skip_semis();
         }
         self.expect(&Tok::RBrace)?;
-        Ok(methods)
+        Ok((methods, embeds))
     }
 
     /// Consume an already-opened interface-method parameter list and return how
@@ -1395,7 +1464,7 @@ impl Parser {
             // assertion against it can test the value's method set.
             Tok::Interface => {
                 self.advance();
-                let mut methods = self.interface_body()?;
+                let (mut methods, _) = self.interface_body()?;
                 let name = iface_name(&mut methods);
                 if !methods.is_empty() {
                     self.anon_interfaces.entry(name.clone()).or_insert(methods);
@@ -3291,6 +3360,37 @@ fn unsigned_width(t: &str) -> Option<u32> {
     }
 }
 
+/// The exported integer constants a vendored package declares at top level
+/// (`unicode/utf8` → `UTFMax`, `RuneSelf`, …), empty for a package that is not
+/// vendored. Each package is lexed and scanned once per process.
+fn vendored_int_consts(path: &str) -> HashMap<String, i128> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, i128>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = cache.lock().expect("const cache").get(path) {
+        return found.clone();
+    }
+    let consts: HashMap<String, i128> = crate::stdlib_vendor::source(path)
+        .and_then(|src| lex(&src).ok())
+        .map(|tokens| {
+            let mut p = Parser::new(tokens);
+            p.seed_imported_consts();
+            p.scan_int_consts();
+            p.int_consts
+                .into_iter()
+                .filter(|(n, _)| {
+                    !n.contains('.') && n.starts_with(|c: char| c.is_ascii_uppercase())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    cache
+        .lock()
+        .expect("const cache")
+        .insert(path.to_string(), consts.clone());
+    consts
+}
+
 /// [`const_int_wide`], also reporting through `left_i64` whether any step's
 /// value — an operand, an intermediate or the result — lies outside `i64`.
 /// That is exactly when evaluating the expression at run time in `i64`
@@ -3299,6 +3399,12 @@ fn const_int_exact(e: &Expr, consts: &HashMap<String, i128>, left_i64: &mut bool
     let v = match e {
         Expr::Int(n) => Some(i128::from(*n)),
         Expr::Ident(name) => consts.get(name).copied(),
+        // An imported package's constant (`utf8.UTFMax`), keyed by the name
+        // the import binds — see [`Parser::seed_imported_consts`].
+        Expr::Selector { recv, field } => match recv.as_ref() {
+            Expr::Ident(pkg) => consts.get(&format!("{pkg}.{field}")).copied(),
+            _ => None,
+        },
         Expr::Call {
             func,
             args,
