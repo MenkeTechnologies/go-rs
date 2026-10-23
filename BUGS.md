@@ -597,15 +597,13 @@ What is still missing from that corner:
   `CreateTemp` / `MkdirTemp` and `Chmod` are not there: a call is a compile
   error. `ReadFile` sizes its first buffer with an `fstat(2)` intrinsic in
   place of `f.Stat()`, so `cap` of its result matches Go's.
-- **`os.PathError` and `os.FileMode` are resolved by the linker, not as type
-  aliases.** go-rs's parser has no `type A = B`; the two names `os` declares as
-  aliases of the `io/fs` types are rewritten to `fs.PathError` /
-  `fs.FileMode` wherever a program writes them (`pkg::OS_TYPE_ALIASES`). A
-  program's own alias declaration is still a parse error:
-
-  ```go
-  type Celsius = float64   // go: an alias    go-rs: expected type, found `Assign`
-  ```
+- **`os.PathError` and `os.FileMode` are resolved by the linker.** Type
+  aliases are resolved per file (`parser::resolve_type_aliases`), so the two
+  names `os` declares as aliases of the `io/fs` types cannot reach a
+  program's file that way; the linker rewrites `os.PathError` /
+  `os.FileMode` to `fs.PathError` / `fs.FileMode` wherever a program writes
+  them (`pkg::OS_TYPE_ALIASES`). A generic alias (`type A[T any] = []T`, Go
+  1.24) is a parse error.
 - **`os.O_*` are variables.** Go declares `O_CREATE` and the other flags as
   constants of the platform's `syscall` values; their numbers differ between
   Linux and Darwin, and go-rs reads them from the host at start-up, so a

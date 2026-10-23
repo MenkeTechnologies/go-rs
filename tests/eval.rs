@@ -3690,3 +3690,60 @@ func main() {
         "\"-h-é-y-\" \"héy\" \"-héy\" \"-h-é-y\" \"-h-é-y-\" \"-h-é-y-\" \"+\" \"|日|本|\" \"bbbba\"\n"
     );
 }
+
+/// `type A = B` is an alias: `A` *is* `B` — `%T` names `B`, `B`'s methods
+/// are `A`'s, a value of one is assignable to the other and `case A:` matches
+/// a `B`. An alias may name a composite, another package's type, or an alias
+/// declared after it, and an import used only by an alias is used. Before,
+/// the declaration was a parse error (`expected type, found Assign`).
+#[test]
+fn type_alias_is_the_aliased_type() {
+    let (out, ok) = run_capturing_stderr(
+        r#"package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+)
+
+type Point struct{ X, Y int }
+
+func (p Point) Sum() int { return p.X + p.Y }
+
+type P = Point
+
+type (
+	Celsius = float64
+	Builder = strings.Builder
+	Unused  = io.Reader
+)
+
+type Outer = Inner
+type Inner = []int
+
+func main() {
+	p := P{1, 2}
+	var q Point = p
+	fmt.Printf("%T %v %d\n", p, p == q, p.Sum())
+	var c Celsius = 1.5
+	fmt.Printf("%T %v\n", c, c*2)
+	var sb Builder
+	sb.WriteString("ok")
+	fmt.Println(sb.String())
+	o := Outer{3, 4}
+	fmt.Printf("%T %v\n", o, o)
+	var v any = q
+	switch v.(type) {
+	case P:
+		fmt.Println("case P")
+	}
+}
+"#,
+    );
+    assert!(ok, "program failed; output was: {out:?}");
+    assert_eq!(
+        out,
+        "main.Point true 3\nfloat64 3\nok\n[]int [3 4]\ncase P\n"
+    );
+}

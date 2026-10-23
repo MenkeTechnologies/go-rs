@@ -22,8 +22,9 @@ enum TypeDecl {
 
 /// Parse Go source into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
-    let tokens = lex(src)?;
+    let (tokens, alias_targets) = resolve_type_aliases(lex(src)?);
     let mut p = Parser::new(tokens);
+    p.alias_targets = alias_targets;
     // Integer constants first: a defined type's base can be an array sized by
     // one (`type d [MaxCase]rune`), or by an imported package's
     // (`[utf8.UTFMax]byte`).
@@ -71,11 +72,16 @@ impl Parser {
             pkg_names: HashSet::new(),
             imported: Vec::new(),
             check_returns: false,
+            alias_targets: Vec::new(),
         }
     }
 }
 
 struct Parser {
+    /// The tokens of every type alias's target ([`resolve_type_aliases`]) —
+    /// removed from [`Self::tokens`] with their declarations, but an import
+    /// they name is used.
+    alias_targets: Vec<Token>,
     tokens: Vec<Token>,
     pos: usize,
     /// Names declared as `type T struct` — enables `T{…}` composite literals.
@@ -195,6 +201,78 @@ fn type_spec_positions(tokens: &[Token]) -> Vec<usize> {
         i = j;
     }
     out
+}
+
+/// Resolve Go type aliases (`type A = B`) in the token stream: each alias
+/// declaration is removed and every later use of the name is replaced by the
+/// tokens of the type it denotes. An alias *is* that type — same identity,
+/// same method set, the same `%T` — so after the rewrite the rest of the
+/// front end sees only the target, the way the spec defines it. An alias of
+/// an alias is resolved through to the end. A name after a `.` is a field,
+/// method or another package's member and is left alone. A generic alias
+/// (`type A[T any] = …`) is not an alias spec here and stays a parse error.
+///
+/// Also returns every alias's target tokens, which is where an import used
+/// only by an alias (`type B = strings.Builder`) is used.
+fn resolve_type_aliases(mut tokens: Vec<Token>) -> (Vec<Token>, Vec<Token>) {
+    let kind = |tokens: &[Token], i: usize| tokens.get(i).map(|t| t.kind.clone());
+    let mut aliases: HashMap<String, Vec<Token>> = HashMap::new();
+    let mut remove: Vec<(usize, usize)> = Vec::new();
+    for p in type_spec_positions(&tokens) {
+        let (Some(Tok::Ident(name)), Some(Tok::Assign)) = (kind(&tokens, p), kind(&tokens, p + 1))
+        else {
+            continue;
+        };
+        // The aliased type runs to the `;` (or the group's `)`) at its own depth.
+        let mut end = p + 2;
+        let mut depth = 0usize;
+        while end < tokens.len() {
+            match tokens[end].kind {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace if depth == 0 => break,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Semi if depth == 0 => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        aliases.insert(name, tokens[p + 2..end].to_vec());
+        let through_semi = end + usize::from(matches!(kind(&tokens, end), Some(Tok::Semi)));
+        // A lone `type A = B` goes with its keyword; a group member alone.
+        let standalone = p > 0 && matches!(tokens[p - 1].kind, Tok::Type);
+        remove.push((if standalone { p - 1 } else { p }, through_semi));
+    }
+    if aliases.is_empty() {
+        return (tokens, Vec::new());
+    }
+    let targets: Vec<Token> = aliases.values().flatten().cloned().collect();
+    for (from, to) in remove.into_iter().rev() {
+        tokens.drain(from..to);
+    }
+    // Expand until no alias name is left, bounded so a cycle (`type A = B;
+    // type B = A`, which Go rejects) cannot loop forever.
+    for _ in 0..=aliases.len() {
+        let mut changed = false;
+        let mut out = Vec::with_capacity(tokens.len());
+        for (i, t) in tokens.iter().enumerate() {
+            let after_dot = i > 0 && matches!(tokens[i - 1].kind, Tok::Dot);
+            match &t.kind {
+                Tok::Ident(n) if !after_dot && aliases.contains_key(n) => {
+                    changed = true;
+                    out.extend(aliases[n].iter().map(|a| Token {
+                        kind: a.kind.clone(),
+                        line: t.line,
+                    }));
+                }
+                _ => out.push(t.clone()),
+            }
+        }
+        tokens = out;
+        if !changed {
+            break;
+        }
+    }
+    (tokens, targets)
 }
 
 /// The token index just past an optional `[ … ]` generic type-parameter list at
@@ -566,9 +644,9 @@ impl Parser {
     /// shadowing local can only hide an unused import, never reject a valid one.
     fn check_imports_used(&self) -> Result<(), String> {
         for (name, path, line) in &self.imported {
-            let used = self.tokens.windows(2).any(
-                |w| matches!((&w[0].kind, &w[1].kind), (Tok::Ident(n), Tok::Dot) if n == name),
-            );
+            let names_pkg = |w: &[Token]| matches!((&w[0].kind, &w[1].kind), (Tok::Ident(n), Tok::Dot) if n == name);
+            let used = self.tokens.windows(2).any(names_pkg)
+                || self.alias_targets.windows(2).any(names_pkg);
             if !used {
                 return Err(format!(
                     "go-rs: \"{path}\" imported and not used (line {line})"
