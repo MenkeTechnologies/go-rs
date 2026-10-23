@@ -1763,8 +1763,36 @@ const CORPUS: &[Entry] = &[
         "os.Getenv",
         "Package os",
         "os.Getenv(key string) string",
-        "The value of the named environment variable, or the empty string when it is unset. Beside it, `os` wires `os.Exit`, `os.Args`, and the three standard streams `os.Stdin` / `os.Stdout` / `os.Stderr` (a `*os.File` that is an `io.Reader` / `io.Writer`); `os.Open`, `os.ReadFile` and the rest are reported as unsupported calls at compile time.",
+        "The value of the named environment variable, or the empty string when it is unset. Beside it, `os` wires `os.Exit`, `os.Args`, the three standard streams `os.Stdin` / `os.Stdout` / `os.Stderr`, and files (`os.Open`, `os.ReadFile`, `os.WriteFile`, …); `Stat`, `Mkdir`, `ReadDir` and the rest are reported as unsupported calls at compile time.",
         "home := os.Getenv(\"HOME\")",
+    ),
+    e(
+        "os.ReadFile",
+        "Package os",
+        "os.ReadFile(name string) ([]byte, error)",
+        "The whole contents of the named file. A successful call returns `err == nil`, not `io.EOF`; a failure is a `*fs.PathError` wrapping a `syscall.Errno` (`open x: no such file or directory`), which `errors.Is(err, fs.ErrNotExist)` and `os.IsNotExist` recognize. Go's own source (`goroot/os_file.go`).",
+        "data, err := os.ReadFile(\"input.txt\")",
+    ),
+    e(
+        "os.WriteFile",
+        "Package os",
+        "os.WriteFile(name string, data []byte, perm os.FileMode) error",
+        "Writes `data` to the named file, creating it with `perm` (before umask) if it does not exist and truncating it if it does.",
+        "err := os.WriteFile(\"out.txt\", []byte(\"done\n\"), 0644)",
+    ),
+    e(
+        "os.Open",
+        "Package os",
+        "os.Open(name string) (*os.File, error)",
+        "Opens the named file for reading. The `*os.File` is an `io.Reader` (`Read`, `io.EOF` at end of file) and an `io.Writer` when opened for writing (`os.Create`, `os.OpenFile` with `os.O_WRONLY` / `O_RDWR` / `O_APPEND` / `O_CREATE` / `O_EXCL` / `O_TRUNC`); `Close` releases it, and any later use reports `os.ErrClosed`.",
+        "f, err := os.Open(\"input.txt\")\nif err != nil {\n\treturn err\n}\ndefer f.Close()\nsc := bufio.NewScanner(f)",
+    ),
+    e(
+        "os.Remove",
+        "Package os",
+        "os.Remove(name string) error",
+        "Removes the named file or empty directory; the error is a `*fs.PathError` (`remove d: directory not empty`).",
+        "os.Remove(\"out.txt\")",
     ),
     // ── Package errors (real Go source, vendored in goroot/errors.go) ──
     e(

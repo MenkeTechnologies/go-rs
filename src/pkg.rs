@@ -27,6 +27,13 @@ const INTRINSICS: &[(&str, &str)] = &[
     ("errors", "runtimeTypeTag"),
     ("os", "writeFd"),
     ("os", "readFd"),
+    ("os", "openFd"),
+    ("os", "closeFd"),
+    ("os", "fdSize"),
+    ("os", "unlinkPath"),
+    ("os", "rmdirPath"),
+    ("syscall", "strerror"),
+    ("syscall", "sysConst"),
     ("slices", "sliceOverlap"),
     ("time", "nowNano"),
     ("time", "monoNano"),
@@ -51,13 +58,20 @@ fn import_alias(path: &str) -> &str {
 pub fn link(mut main: Program) -> Result<Program, String> {
     let mut loaded: HashMap<String, Program> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
+    // `os`'s Go half (`goroot/os_file.go`) reports `io.EOF`, `*fs.PathError`
+    // and `syscall.Errno`, so a program that imports `os` links those packages
+    // even when it never names them. They are loaded first, so their
+    // initializers are the leading ones and `os`'s own can follow them
+    // directly — ahead of any other package's, which may read `os.Stdout`.
+    let uses_os = main.imports.iter().any(|p| p == "os");
+    if uses_os {
+        for path in OS_DEPS {
+            load_recursive(path, &mut loaded, &mut order)?;
+        }
+    }
+    let os_deps = order.len();
     for path in main.imports.clone() {
         load_recursive(&path, &mut loaded, &mut order)?;
-    }
-    // `os.File.Read` reports `io.EOF`, so a program that imports `os` needs the
-    // `io` sentinels linked even when it never names `io` itself.
-    if main.imports.iter().any(|p| p == "os") {
-        load_recursive("io", &mut loaded, &mut order)?;
     }
     // `main` keeps its own names, but its references to imported source packages
     // (`errors.New` → the qualified `errors.New`) are rewritten — before the
@@ -66,9 +80,14 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     // Merge loaded packages (dependencies first) ahead of `main`'s own code, so
     // package-level initializers run before `main` does.
     let mut init_globals: Vec<Stmt> = Vec::new();
-    for path in &order {
+    // Where `os`'s initializers go: just after those of the packages it needs.
+    let mut os_init_at = 0;
+    for (i, path) in order.iter().enumerate() {
         let pkg = loaded.remove(path).expect("loaded package");
         init_globals.extend(pkg.main); // the package's init-order globals
+        if i + 1 == os_deps {
+            os_init_at = init_globals.len();
+        }
         main.funcs.extend(pkg.funcs);
         main.types.extend(pkg.types);
         main.interfaces.extend(pkg.interfaces);
@@ -104,11 +123,11 @@ pub fn link(mut main: Program) -> Result<Program, String> {
         add_strings_func(&mut main)?;
         add_strings_source(&mut main)?;
     }
-    // `os.Stdout` / `os.Stderr` the same way. Their initializers are
+    // `os`'s files and standard streams the same way. Their initializers are
     // package-level vars, so they are spliced ahead of the program's own
     // globals — a `var out = os.Stdout` must see them already built.
-    if main.imports.iter().any(|p| p == "os") {
-        add_os_file(&mut main)?;
+    if uses_os {
+        add_os_file(&mut main, os_init_at)?;
     }
     if main.imports.iter().any(|p| p == "sort") {
         add_sort_source(&mut main)?;
@@ -380,16 +399,62 @@ fn uses_strconv_error(prog: &Program) -> bool {
     })
 }
 
-/// Synthesize `os.Stdout` / `os.Stderr` and the `*os.File` behind them. Their
-/// package-level initializers are spliced to the *front* of the program's
-/// globals, because a user global may read one.
-fn add_os_file(prog: &mut Program) -> Result<(), String> {
+/// The packages `goroot/os_file.go` imports, linked into every program that
+/// imports `os`.
+const OS_DEPS: &[&str] = &["io", "io/fs", "syscall"];
+
+/// The names package `os` declares in Go source (`goroot/os_file.go`) rather
+/// than as host builtins. A program's `os.<Name>` is rewritten to the
+/// qualified identifier, the way [`SORT_SOURCE`] is. `Stdin` / `Stdout` /
+/// `Stderr` are absent: the compiler resolves those selectors itself.
+pub const OS_SOURCE: &[&str] = &[
+    "File",
+    "NewFile",
+    "Open",
+    "Create",
+    "OpenFile",
+    "ReadFile",
+    "WriteFile",
+    "Remove",
+    "IsExist",
+    "IsNotExist",
+    "IsPermission",
+    "ErrInvalid",
+    "ErrPermission",
+    "ErrExist",
+    "ErrNotExist",
+    "ErrClosed",
+    "O_RDONLY",
+    "O_WRONLY",
+    "O_RDWR",
+    "O_APPEND",
+    "O_CREATE",
+    "O_EXCL",
+    "O_SYNC",
+    "O_TRUNC",
+];
+
+/// Go's `os` declares `type PathError = fs.PathError` and `type FileMode =
+/// fs.FileMode`. go-rs has no type aliases, so the linker resolves the two
+/// names: a program's `os.PathError` *is* the `io/fs` type, which is what
+/// `errors.As` matches and `%T` prints (`*fs.PathError`).
+const OS_TYPE_ALIASES: &[(&str, &str)] = &[
+    ("PathError", "io/fs.PathError"),
+    ("FileMode", "io/fs.FileMode"),
+];
+
+/// Synthesize package `os`'s Go half: the `*os.File` type, `Open` /
+/// `ReadFile` / `WriteFile` / `Remove` and the three standard streams. Its
+/// package-level initializers are spliced in at `at` — after those of the
+/// packages it imports ([`OS_DEPS`]), ahead of every other global, because a
+/// user global may read `os.Stdout`.
+fn add_os_file(prog: &mut Program, at: usize) -> Result<(), String> {
     let mut pkg = crate::parse(include_str!("../goroot/os_file.go"))?;
     qualify(&mut pkg, "os", true);
     prog.types.append(&mut pkg.types);
     prog.funcs.append(&mut pkg.funcs);
     let inits = std::mem::take(&mut pkg.main);
-    prog.main.splice(0..0, inits);
+    prog.main.splice(at..at, inits);
     Ok(())
 }
 
@@ -1054,6 +1119,9 @@ fn qualify(prog: &mut Program, path: &str, rename: bool) {
         if p == "strconv" {
             source_half.insert(import_alias(p).to_string(), STRCONV_SOURCE);
         }
+        if p == "os" {
+            source_half.insert(import_alias(p).to_string(), OS_SOURCE);
+        }
     }
 
     let q = Qualifier {
@@ -1143,6 +1211,16 @@ impl Qualifier {
         if let Some((a, t)) = ty.split_once('.') {
             if let Some(p) = self.aliases.get(a) {
                 return format!("{p}.{t}");
+            }
+            // `os.PathError` / `os.FileMode`: aliases of `io/fs` types.
+            if self
+                .source_half
+                .get(a)
+                .is_some_and(|names| *names == OS_SOURCE)
+            {
+                if let Some((_, target)) = OS_TYPE_ALIASES.iter().find(|(n, _)| *n == t) {
+                    return target.to_string();
+                }
             }
         }
         if self.own.contains(ty) {

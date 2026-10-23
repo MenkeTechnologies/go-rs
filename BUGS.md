@@ -545,12 +545,29 @@ What is still missing from that corner:
   mappings and the `iter` sequences (`Lines`, `SplitSeq`, …) are not vendored;
   a call is a compile error. The common package functions are
   (`parity-scripts/bytes_package_funcs.go`).
-- **`bufio` is only its `Writer`.** `Reader` and `Scanner` read from an
-  `io.Reader`, which go-rs's `io` does not have, and there is no `os.Stdin`
-  to scan.
-- **`os.File` is only the two standard streams.** There is no `Open`, `Create`
-  or `Read` — `writeFd` is the package's one intrinsic and only ever sees
-  descriptors 1 and 2.
+- **`os.File` has no metadata or positioning.** `Open` / `Create` /
+  `OpenFile` / `ReadFile` / `WriteFile` / `Remove` and `File.Read` / `Write` /
+  `WriteString` / `Close` / `Name` / `Fd` are Go's own bodies over `read(2)` /
+  `write(2)` intrinsics (`goroot/os_file.go`), but `Stat` / `Lstat` /
+  `FileInfo`, `Seek` / `ReadAt` / `WriteAt`, `Mkdir` / `MkdirAll` /
+  `RemoveAll` / `Rename`, `ReadDir`, `Getwd` / `Chdir`, `TempDir` /
+  `CreateTemp` / `MkdirTemp` and `Chmod` are not there: a call is a compile
+  error. `ReadFile` sizes its first buffer with an `fstat(2)` intrinsic in
+  place of `f.Stat()`, so `cap` of its result matches Go's.
+- **`os.PathError` and `os.FileMode` are resolved by the linker, not as type
+  aliases.** go-rs's parser has no `type A = B`; the two names `os` declares as
+  aliases of the `io/fs` types are rewritten to `fs.PathError` /
+  `fs.FileMode` wherever a program writes them (`pkg::OS_TYPE_ALIASES`). A
+  program's own alias declaration is still a parse error:
+
+  ```go
+  type Celsius = float64   // go: an alias    go-rs: expected type, found `Assign`
+  ```
+- **`os.O_*` are variables.** Go declares `O_CREATE` and the other flags as
+  constants of the platform's `syscall` values; their numbers differ between
+  Linux and Darwin, and go-rs reads them from the host at start-up, so a
+  constant expression over one (`const f = os.O_CREATE | os.O_TRUNC`) is
+  evaluated at run time. The value and its `int` type are Go's.
 
 ## Constant-overflow is diagnosed only where the constant's type is certain
 

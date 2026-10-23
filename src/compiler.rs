@@ -373,6 +373,10 @@ struct Compiler {
     /// It is the only static-type path to a method call's result, which `%T`
     /// needs when the method returns a defined type.
     method_result_ty: HashMap<(String, String), String>,
+    /// Every declared result type of each method, keyed like `methods`: the
+    /// signature a method *value* `f.Read` carries, and what `n, err :=
+    /// f.Read(p)` types its names from.
+    method_results: HashMap<(String, String), Vec<String>>,
     /// Each method's declared parameter types, keyed by `(receiver type,
     /// method name)`. Go converts an untyped constant argument to the
     /// parameter's type at the call, the same as for a plain function.
@@ -1558,6 +1562,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut methods: HashMap<(String, String), usize> = HashMap::new();
     let mut method_nresults: HashMap<(String, String), usize> = HashMap::new();
     let mut method_result_ty: HashMap<(String, String), String> = HashMap::new();
+    let mut method_results: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut method_param_tys: HashMap<(String, String), Vec<String>> = HashMap::new();
     // Methods declared with a *value* receiver (`func (t T)`, not `func (t *T)`).
     // Go binds such a receiver to a copy, so the method cannot mutate the caller's
@@ -1569,6 +1574,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             Some(r) => {
                 methods.insert((base_type(&r.ty), f.name.clone()), f.params.len());
                 method_nresults.insert((base_type(&r.ty), f.name.clone()), f.results.len());
+                method_results.insert((base_type(&r.ty), f.name.clone()), f.results.clone());
                 method_param_tys.insert(
                     (base_type(&r.ty), f.name.clone()),
                     f.params.iter().map(|p| p.ty.clone()).collect(),
@@ -1827,6 +1833,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         variadic_methods,
         method_nresults,
         method_result_ty,
+        method_results,
         method_param_tys,
         iface_methods,
         iface_names,
@@ -6457,12 +6464,7 @@ impl Compiler {
             Some(&arity) => (
                 arity,
                 self.method_param_tys.get(&key).cloned().unwrap_or_default(),
-                match self.method_result_ty.get(&key) {
-                    Some(r) if self.method_nresults.get(&key).copied().unwrap_or(0) > 0 => {
-                        vec![r.clone()]
-                    }
-                    _ => Vec::new(),
-                },
+                self.method_results.get(&key).cloned().unwrap_or_default(),
             ),
             None => {
                 let prefix = format!("{field}/");
@@ -6482,10 +6484,8 @@ impl Compiler {
                 (arity, vec![String::new(); arity], results)
             }
         };
-        // Only the first result is carried: the compiler's own signature tables
-        // record one, and a multi-result method value is rare enough that a
-        // wrong arity here would be worse than the current field-read error.
-        let results = results.into_iter().take(1).collect::<Vec<_>>();
+        // Every result is carried, so a method value of `Read(p []byte) (int,
+        // error)` is the `func([]byte) (int, error)` a caller destructures.
         let params: Vec<Param> = (0..arity)
             .map(|i| Param {
                 // Cannot collide with anything the program wrote.
@@ -6786,7 +6786,11 @@ impl Compiler {
                     // has an untyped receiver, so this yields `None`.)
                     let rt = self.type_name(recv);
                     if !rt.is_empty() {
-                        if let Some(n) = self.method_nresults.get(&(rt.clone(), field.clone())) {
+                        // Keyed by the base type: a receiver typed `*File`
+                        // (`f, err := os.Open(p)`) calls the methods declared
+                        // on `File`.
+                        if let Some(n) = self.method_nresults.get(&(base_type(&rt), field.clone()))
+                        {
                             return Some(*n);
                         }
                         // An *interface*-typed receiver declares no method of
@@ -6855,6 +6859,16 @@ impl Compiler {
         // (`strconv.ParseUint` yields a `uint64`, not an untyped integer).
         if let Some(Expr::FuncLit { results, .. }) = self.stdlib_func_lit(func) {
             return results;
+        }
+        // A method call: the method's declared results on the receiver's base
+        // type.
+        if let Expr::Selector { recv, field } = func.as_ref() {
+            let rt = self.type_name(recv);
+            if !rt.is_empty() {
+                if let Some(rs) = self.method_results.get(&(base_type(&rt), field.clone())) {
+                    return rs.clone();
+                }
+            }
         }
         func_sig(&self.underlying(&self.type_name(func)))
             .map(|s| s.results)
@@ -6952,10 +6966,22 @@ impl Compiler {
                 }
                 // A field's declared type, looked up on the receiver's struct.
                 let rt = self.type_name(recv);
-                self.struct_fields
+                let field_ty = self
+                    .struct_fields
                     .get(&rt)
                     .and_then(|fs| fs.iter().find(|(n, _)| n == field))
-                    .map(|(_, t)| base_type(t))
+                    .map(|(_, t)| base_type(t));
+                // Not a field: a method value `f.Read` has the method's
+                // signature as its type, so `g := f.Read; n, err := g(p)`
+                // destructures what the method returns.
+                field_ty
+                    .or_else(|| {
+                        let key = (base_type(&rt), field.clone());
+                        let results = self.method_results.get(&key)?;
+                        let params = self.method_param_tys.get(&key)?;
+                        let variadic = self.variadic_methods.contains(&key);
+                        Some(func_type_spelling(params, variadic, results))
+                    })
                     .unwrap_or_default()
             }
             Expr::Call { func, .. } => match func.as_ref() {
@@ -8774,19 +8800,17 @@ impl Compiler {
             }
             // The vendored `errors` package's one host intrinsic: the runtime type
             // tag a type switch dispatches on, which `asTag` compares against.
-            // The `os` package's two host intrinsics: the write behind
-            // `os.Stdout` / `os.Stderr` and the read behind `os.Stdin`, which
-            // no Go source can express.
-            if name == "os.writeFd" && args.len() == 2 {
-                self.expr(&args[0])?;
-                self.expr(&args[1])?;
-                self.b.emit(Op::CallBuiltin(host::GWRITE_FD, 2), line);
-                return Ok(());
-            }
-            if name == "os.readFd" && args.len() == 2 {
-                self.expr(&args[0])?;
-                self.expr(&args[1])?;
-                self.b.emit(Op::CallBuiltin(host::GREAD_FD, 2), line);
+            // The `os` and `syscall` host intrinsics: the file syscalls behind
+            // `*os.File`, `os.Remove` and `syscall.Errno`, which no Go source
+            // can express.
+            if let Some(&(_, id, argc)) = host::FILE_INTRINSICS
+                .iter()
+                .find(|(n, _, argc)| *n == name && args.len() == *argc as usize)
+            {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.b.emit(Op::CallBuiltin(id, argc), line);
                 return Ok(());
             }
             // The vendored `slices` package's one host intrinsic, standing in for

@@ -1570,8 +1570,38 @@ case 3:
         <article class="doc-entry" id="doc-package-os-1">
           <h3><a class="doc-anchor" href="#doc-package-os-1">#</a> <code>os.Getenv</code></h3>
           <pre><code class="lang-go">os.Getenv(key string) string</code></pre>
-          <p>The value of the named environment variable, or the empty string when it is unset. Beside it, `os` wires `os.Exit`, `os.Args`, and the three standard streams `os.Stdin` / `os.Stdout` / `os.Stderr` (a `*os.File` that is an `io.Reader` / `io.Writer`); `os.Open`, `os.ReadFile` and the rest are reported as unsupported calls at compile time.</p>
+          <p>The value of the named environment variable, or the empty string when it is unset. Beside it, `os` wires `os.Exit`, `os.Args`, the three standard streams `os.Stdin` / `os.Stdout` / `os.Stderr`, and files (`os.Open`, `os.ReadFile`, `os.WriteFile`, …); `Stat`, `Mkdir`, `ReadDir` and the rest are reported as unsupported calls at compile time.</p>
           <pre><code class="lang-go">home := os.Getenv("HOME")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-os-2">
+          <h3><a class="doc-anchor" href="#doc-package-os-2">#</a> <code>os.ReadFile</code></h3>
+          <pre><code class="lang-go">os.ReadFile(name string) ([]byte, error)</code></pre>
+          <p>The whole contents of the named file. A successful call returns `err == nil`, not `io.EOF`; a failure is a `*fs.PathError` wrapping a `syscall.Errno` (`open x: no such file or directory`), which `errors.Is(err, fs.ErrNotExist)` and `os.IsNotExist` recognize. Go's own source (`goroot/os_file.go`).</p>
+          <pre><code class="lang-go">data, err := os.ReadFile("input.txt")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-os-3">
+          <h3><a class="doc-anchor" href="#doc-package-os-3">#</a> <code>os.WriteFile</code></h3>
+          <pre><code class="lang-go">os.WriteFile(name string, data []byte, perm os.FileMode) error</code></pre>
+          <p>Writes `data` to the named file, creating it with `perm` (before umask) if it does not exist and truncating it if it does.</p>
+          <pre><code class="lang-go">err := os.WriteFile("out.txt", []byte("done
+"), 0644)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-os-4">
+          <h3><a class="doc-anchor" href="#doc-package-os-4">#</a> <code>os.Open</code></h3>
+          <pre><code class="lang-go">os.Open(name string) (*os.File, error)</code></pre>
+          <p>Opens the named file for reading. The `*os.File` is an `io.Reader` (`Read`, `io.EOF` at end of file) and an `io.Writer` when opened for writing (`os.Create`, `os.OpenFile` with `os.O_WRONLY` / `O_RDWR` / `O_APPEND` / `O_CREATE` / `O_EXCL` / `O_TRUNC`); `Close` releases it, and any later use reports `os.ErrClosed`.</p>
+          <pre><code class="lang-go">f, err := os.Open("input.txt")
+if err != nil {
+	return err
+}
+defer f.Close()
+sc := bufio.NewScanner(f)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-package-os-5">
+          <h3><a class="doc-anchor" href="#doc-package-os-5">#</a> <code>os.Remove</code></h3>
+          <pre><code class="lang-go">os.Remove(name string) error</code></pre>
+          <p>Removes the named file or empty directory; the error is a `*fs.PathError` (`remove d: directory not empty`).</p>
+          <pre><code class="lang-go">os.Remove("out.txt")</code></pre>
         </article>
       </section>
 

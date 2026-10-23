@@ -72,15 +72,41 @@ pub const GSTRUCT_COPY: u16 = 823;
 /// pointer, so `q := p` on a `*T` has to share what `p` points at.
 pub const GSTRUCT_BIND: u16 = 857;
 
-/// `os.writeFd(fd, s)` — the write behind `os.Stdout` / `os.Stderr`, which no
-/// Go source in `goroot/` can name. Descriptor 2 is stderr; anything else is
-/// stdout, because those are the only two files a synthesized `*os.File` is
-/// ever built for.
+/// `os.writeFd(fd, p)` — the `write(2)` behind every `*os.File`, which no Go
+/// source in `goroot/` can name: the count written, or the negated errno.
 pub const GWRITE_FD: u16 = 858;
-/// `os.readFd(fd, n)` — the read behind `os.Stdin`: up to `n` bytes from the
-/// descriptor as a `[]byte`, empty at end of input. Only descriptor 0 is ever
-/// built, so that is the only one read.
+/// `os.readFd(fd, p)` — the `read(2)` behind every `*os.File`, into `p`: the
+/// count read (0 at end of file), or the negated errno.
 pub const GREAD_FD: u16 = 1016;
+/// `os.openFd(name, flag, perm)` — `open(2)`: the descriptor, or the negated errno.
+pub const GOPEN_FD: u16 = 1017;
+/// `os.closeFd(fd)` — `close(2)`: 0, or the errno.
+pub const GCLOSE_FD: u16 = 1018;
+/// `os.fdSize(fd)` — `fstat(2)`'s size, or -1.
+pub const GFD_SIZE: u16 = 1019;
+/// `os.unlinkPath(name)` — `unlink(2)`: 0, or the errno.
+pub const GUNLINK_PATH: u16 = 1020;
+/// `os.rmdirPath(name)` — `rmdir(2)`: 0, or the errno.
+pub const GRMDIR_PATH: u16 = 1021;
+/// `syscall.strerror(n)` — the text Go's `Errno.Error` table holds for `n`.
+pub const GSTRERROR: u16 = 1022;
+/// `syscall.sysConst(name)` — a platform-dependent errno / `O_*` value.
+pub const GSYS_CONST: u16 = 1023;
+
+/// The host intrinsics the vendored `os` and `syscall` sources call, by their
+/// qualified name: each lowers to a [`fusevm::Op::CallBuiltin`] of its
+/// arguments, in order.
+pub const FILE_INTRINSICS: &[(&str, u16, u8)] = &[
+    ("os.writeFd", GWRITE_FD, 2),
+    ("os.readFd", GREAD_FD, 2),
+    ("os.openFd", GOPEN_FD, 3),
+    ("os.closeFd", GCLOSE_FD, 1),
+    ("os.fdSize", GFD_SIZE, 1),
+    ("os.unlinkPath", GUNLINK_PATH, 1),
+    ("os.rmdirPath", GRMDIR_PATH, 1),
+    ("syscall.strerror", GSTRERROR, 1),
+    ("syscall.sysConst", GSYS_CONST, 1),
+];
 /// `slices.sliceOverlap(a, b)` — whether two slices share a backing array and
 /// their element ranges intersect. The vendored `slices.overlaps` asks this in
 /// place of Go's `unsafe` address arithmetic, which go-rs has no model of.
@@ -518,6 +544,13 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GSTRUCT_BIND, b_struct_bind);
     vm.register_builtin(GWRITE_FD, b_write_fd);
     vm.register_builtin(GREAD_FD, b_read_fd);
+    vm.register_builtin(GOPEN_FD, b_open_fd);
+    vm.register_builtin(GCLOSE_FD, b_close_fd);
+    vm.register_builtin(GFD_SIZE, b_fd_size);
+    vm.register_builtin(GUNLINK_PATH, b_unlink_path);
+    vm.register_builtin(GRMDIR_PATH, b_rmdir_path);
+    vm.register_builtin(GSTRERROR, b_strerror);
+    vm.register_builtin(GSYS_CONST, b_sys_const);
     vm.register_builtin(GSLICE_OVERLAP, b_slice_overlap);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
@@ -3586,41 +3619,202 @@ fn b_slice_overlap(vm: &mut VM, argc: u8) -> Value {
     Value::Bool(overlap)
 }
 
-fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
-    use std::io::Write as _;
-    let args = pop_args(vm, argc);
-    let text = args.get(1).map(go_str).unwrap_or_default();
-    // Unbuffered, and flushed at once, so a write to `os.Stdout` interleaves
-    // with `fmt.Println` in the order the program made them.
-    match args.first().map(|v| v.to_int()) {
-        Some(2) => {
-            let mut e = std::io::stderr();
-            let _ = e.write_all(text.as_bytes());
-            let _ = e.flush();
+/// The bytes of a `[]byte` (or a `string`) argument, as the syscall that
+/// writes them sees them.
+fn byte_arg(v: Option<&Value>) -> Vec<u8> {
+    match v {
+        Some(Value::Obj(id)) => {
+            let len = slice_backing(*id).map(|(_, _, l)| l).unwrap_or(0);
+            (0..len)
+                .filter_map(|i| slice_get(*id, i))
+                .map(|b| b.to_int() as u8)
+                .collect()
         }
-        _ => {
-            let mut o = std::io::stdout();
-            let _ = o.write_all(text.as_bytes());
-            let _ = o.flush();
-        }
+        Some(v) => go_str(v).into_bytes(),
+        None => Vec::new(),
     }
-    Value::Undef
 }
 
+/// A path argument as the C string the syscall takes. Go refuses a name with
+/// a NUL byte (`EINVAL`) before making the call; `None` is that refusal.
+fn path_arg(v: Option<&Value>) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(v.map(go_str).unwrap_or_default()).ok()
+}
+
+/// The calling thread's `errno` after a failed syscall.
+fn last_errno() -> i64 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO) as i64
+}
+
+/// `os.writeFd(fd, p)` — one `write(2)` of `p` (a `[]byte` or a `string`):
+/// the count written, or the negated errno. Descriptors 1 and 2 go through the
+/// process's own stdout/stderr handles, flushed at once, so a write to
+/// `os.Stdout` interleaves with `fmt.Println` in the order the program made
+/// them.
+fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let bytes = byte_arg(args.get(1));
+    let fd = args.first().map(|v| v.to_int()).unwrap_or(1);
+    let std_write = |w: &mut dyn std::io::Write| match w.write_all(&bytes).and_then(|_| w.flush()) {
+        Ok(()) => bytes.len() as i64,
+        Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64),
+    };
+    let n = match fd {
+        1 => std_write(&mut std::io::stdout()),
+        2 => std_write(&mut std::io::stderr()),
+        _ => {
+            // SAFETY: `bytes` outlives the call and its length is passed with it.
+            let n = unsafe { libc::write(fd as i32, bytes.as_ptr().cast(), bytes.len()) };
+            match n < 0 {
+                true => -last_errno(),
+                false => n as i64,
+            }
+        }
+    };
+    Value::Int(n)
+}
+
+/// `os.readFd(fd, p)` — one `read(2)` into `p`: the count read (0 at end of
+/// file), or the negated errno. A short read is returned as is and the caller
+/// (`bufio`, `io.ReadAll`, `os.ReadFile`) asks again. Descriptor 0 reads
+/// through the process's stdin handle.
 fn b_read_fd(vm: &mut VM, argc: u8) -> Value {
     use std::io::Read as _;
     let args = pop_args(vm, argc);
-    let want = args.get(1).map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
-    let mut buf = vec![0u8; want];
-    // One `read(2)`, as `os.File.Read` is one: a short read is returned as is
-    // and the caller (`bufio`, `io.ReadAll`) asks again. A failed read reads as
-    // end of input, since the synthesized `os.File` has no errno to report.
-    let n = match args.first().map(|v| v.to_int()) {
-        Some(0) => std::io::stdin().lock().read(&mut buf).unwrap_or(0),
-        _ => 0,
+    let Some(Value::Obj(dst)) = args.get(1).cloned() else {
+        return Value::Int(0);
     };
-    let elems = buf[..n].iter().map(|&b| Value::Int(b as i64)).collect();
-    Value::Obj(heap_alloc(HostObj::slice(elems)))
+    let want = slice_backing(dst).map(|(_, _, l)| l).unwrap_or(0);
+    let mut buf = vec![0u8; want];
+    let n = match args.first().map(|v| v.to_int()).unwrap_or(0) {
+        0 => match std::io::stdin().lock().read(&mut buf) {
+            Ok(n) => n as i64,
+            Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64),
+        },
+        fd => {
+            // SAFETY: `buf` is `want` bytes long and outlives the call.
+            let n = unsafe { libc::read(fd as i32, buf.as_mut_ptr().cast(), want) };
+            match n < 0 {
+                true => -last_errno(),
+                false => n as i64,
+            }
+        }
+    };
+    for (i, &b) in buf.iter().take(n.max(0) as usize).enumerate() {
+        slice_set(dst, i, Value::Int(b as i64));
+    }
+    Value::Int(n)
+}
+
+/// `os.openFd(name, flag, perm)` — `open(2)` with Go's `O_*` flag bits (the
+/// platform's own, see [`b_sys_const`]) plus `O_CLOEXEC`, as Go's `os` always
+/// adds it: the new descriptor, or the negated errno.
+fn b_open_fd(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let Some(path) = path_arg(args.first()) else {
+        return Value::Int(-(libc::EINVAL as i64));
+    };
+    let flag = args.get(1).map(|v| v.to_int()).unwrap_or(0) as i32;
+    let perm = args.get(2).map(|v| v.to_int()).unwrap_or(0) as libc::c_uint;
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    let fd = unsafe { libc::open(path.as_ptr(), flag | libc::O_CLOEXEC, perm) };
+    Value::Int(match fd < 0 {
+        true => -last_errno(),
+        false => fd as i64,
+    })
+}
+
+/// `os.closeFd(fd)` — `close(2)`: 0, or the errno.
+fn b_close_fd(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let fd = args.first().map(|v| v.to_int()).unwrap_or(-1) as i32;
+    // SAFETY: closing a descriptor number has no memory effects.
+    let rc = unsafe { libc::close(fd) };
+    Value::Int(if rc < 0 { last_errno() } else { 0 })
+}
+
+/// `os.fdSize(fd)` — the size `fstat(2)` reports, or -1 when it fails; what
+/// `os.ReadFile` sizes its first buffer from (Go's `f.Stat().Size()`).
+fn b_fd_size(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let fd = args.first().map(|v| v.to_int()).unwrap_or(-1) as i32;
+    // SAFETY: `st` is a plain-data out-parameter `fstat` fills.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    Value::Int(if rc < 0 { -1 } else { st.st_size as i64 })
+}
+
+/// `os.unlinkPath(name)` / `os.rmdirPath(name)` — the two syscalls Go's
+/// `os.Remove` tries in turn: 0, or the errno.
+fn b_unlink_path(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let Some(path) = path_arg(args.first()) else {
+        return Value::Int(libc::EINVAL as i64);
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    let rc = unsafe { libc::unlink(path.as_ptr()) };
+    Value::Int(if rc < 0 { last_errno() } else { 0 })
+}
+fn b_rmdir_path(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let Some(path) = path_arg(args.first()) else {
+        return Value::Int(libc::EINVAL as i64);
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    let rc = unsafe { libc::rmdir(path.as_ptr()) };
+    Value::Int(if rc < 0 { last_errno() } else { 0 })
+}
+
+/// `syscall.strerror(n)` — the C library's message for errno `n` with its
+/// first letter lowercased unless the second is uppercase, the rule Go's
+/// `mkerrors.sh` applies when it generates the `Errno.Error` table
+/// ("No such file or directory" → "no such file or directory"). Empty for a
+/// number the C library does not know, where Go prints `errno N`.
+fn b_strerror(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let n = args.first().map(|v| v.to_int()).unwrap_or(0) as i32;
+    // SAFETY: `strerror` returns a NUL-terminated static or thread-local
+    // buffer, copied out before any other libc call.
+    let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(n)) }
+        .to_string_lossy()
+        .into_owned();
+    if n <= 0 || msg.starts_with("Unknown error") {
+        return Value::str(String::new());
+    }
+    let mut b = msg.into_bytes();
+    if b.len() >= 2 && b[0].is_ascii_uppercase() && b[1].is_ascii_lowercase() {
+        b[0] = b[0].to_ascii_lowercase();
+    }
+    Value::str(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// `syscall.sysConst(name)` — the running platform's value of an errno or
+/// `open(2)` flag whose number differs between Linux and Darwin (`ENOTEMPTY` is
+/// 39 on one and 66 on the other), which Go's per-platform `zerrors_*.go`
+/// tables spell as constants.
+fn b_sys_const(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = match args.first().map(go_str).unwrap_or_default().as_str() {
+        "EAGAIN" => libc::EAGAIN,
+        "EWOULDBLOCK" => libc::EWOULDBLOCK,
+        "ETIMEDOUT" => libc::ETIMEDOUT,
+        "ENOTEMPTY" => libc::ENOTEMPTY,
+        "ENOSYS" => libc::ENOSYS,
+        "ENOTSUP" => libc::ENOTSUP,
+        "EOPNOTSUPP" => libc::EOPNOTSUPP,
+        "O_RDONLY" => libc::O_RDONLY,
+        "O_WRONLY" => libc::O_WRONLY,
+        "O_RDWR" => libc::O_RDWR,
+        "O_APPEND" => libc::O_APPEND,
+        "O_CREAT" => libc::O_CREAT,
+        "O_EXCL" => libc::O_EXCL,
+        "O_SYNC" => libc::O_SYNC,
+        "O_TRUNC" => libc::O_TRUNC,
+        _ => -1,
+    };
+    Value::Int(v as i64)
 }
 
 fn b_ptr_to(vm: &mut VM, argc: u8) -> Value {
