@@ -817,7 +817,7 @@ const CORPUS: &[Entry] = &[
         "fmt.Scan",
         "Package fmt",
         "fmt.Scan(a …any) (n int, err error)",
-        "Reads space-separated values from standard input into the pointers it is handed, newlines counting as space, and returns how many it stored. Go's own `scan.go` (`goroot/fmt_scan.go`): every `*int`…`*uint64`, `*float32`/`*float64`, `*string`, `*bool` and `*[]byte` operand, base prefixes and `_` separators under `%v`, a type implementing `fmt.Scanner`, and Go's error text (`expected integer`, `unexpected newline`, `EOF`).",
+        "Reads space-separated values from standard input into the pointers it is handed, newlines counting as space, and returns how many it stored. Go's own `scan.go` (`goroot/fmt_scan.go`): every `*int`…`*uint64`, `*float32`/`*float64`, `*string`, `*bool` and `*[]byte` operand and a pointer to a defined type over one of them (`*Celsius`), base prefixes and `_` separators under `%v`, a type implementing `fmt.Scanner`, and Go's error text (`expected integer`, `unexpected newline`, `EOF`).",
         "var n int\nfmt.Scan(&n)",
     ),
     e(

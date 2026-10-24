@@ -47,6 +47,7 @@ impl Parser {
         // told apart from an identifier `T` followed by a block `{`.
         let struct_names = scan_type_names(&tokens, &Tok::Struct);
         let iface_names = scan_type_names(&tokens, &Tok::Interface);
+        let scalar_defined = scan_scalar_defined(&tokens);
         // Pre-scan generic declarations — a `func Name[…]` / `type Name[…]`
         // (Go 1.18 type parameters). go-rs is dynamically typed on the fusevm
         // value model, so generics are handled by *erasure*: the
@@ -59,6 +60,7 @@ impl Parser {
             pos: 0,
             struct_names,
             iface_names,
+            scalar_defined,
             generic_names,
             no_composite: false,
             anon_structs: HashMap::new(),
@@ -88,6 +90,9 @@ struct Parser {
     struct_names: HashSet<String>,
     /// Names declared as `type I interface` — their zero value is `nil`.
     iface_names: HashSet<String>,
+    /// Defined types over a scalar (`type Celsius float64`), with the basic
+    /// type underneath — what `new(Celsius)` allocates the zero of.
+    scalar_defined: HashMap<String, String>,
     /// Names declared generic (`func F[…]` / `type T[…]`) — enables telling an
     /// instantiation `F[int](…)` apart from an index expression `xs[i]`.
     generic_names: HashSet<String>,
@@ -355,6 +360,34 @@ fn scan_type_names(tokens: &[Token], kind: &Tok) -> HashSet<String> {
         }
     }
     names
+}
+
+/// Pre-scan `type Name Base` declarations whose base resolves, through other
+/// such declarations, to a predeclared scalar type: name → that scalar.
+fn scan_scalar_defined(tokens: &[Token]) -> HashMap<String, String> {
+    let mut bases = HashMap::new();
+    for p in type_spec_positions(tokens) {
+        if let (Some(Tok::Ident(n)), Some(Tok::Ident(b))) = (
+            tokens.get(p).map(|t| &t.kind),
+            tokens.get(p + 1).map(|t| &t.kind),
+        ) {
+            bases.insert(n.clone(), b.clone());
+        }
+    }
+    let resolve = |name: &String| {
+        let mut t = name;
+        for _ in 0..=bases.len() {
+            match bases.get(t) {
+                Some(b) => t = b,
+                None => break,
+            }
+        }
+        is_scalar_basic(t).then(|| t.clone())
+    };
+    bases
+        .keys()
+        .filter_map(|n| Some((n.clone(), resolve(n)?)))
+        .collect()
 }
 
 /// Collect the names of generic declarations: `func Name[…]` (with or without a
@@ -2875,12 +2908,17 @@ impl Parser {
                 // `(*T)(x)` — a conversion to a pointer type, which leaves the
                 // value as it is. Only when `T` names a type (a built-in, a
                 // struct or a defined one): `(*f)(x)` calls through a pointer.
+                // It is kept as the conversion call `*T(x)`, the way `[]T(x)`
+                // is, because the pointer's type is what `%T`, dispatch and an
+                // interface box read.
                 if matches!(self.peek(), Tok::Star) {
                     let save = self.pos;
+                    let line = self.line();
                     self.advance();
                     if let Ok(ty) = self.type_name() {
                         let is_type = self.struct_names.contains(&ty)
                             || self.defined.contains_key(&ty)
+                            || self.scalar_defined.contains_key(&ty)
                             || INT_TYPE_NAMES.contains(&ty.as_str())
                             || matches!(
                                 ty.as_str(),
@@ -2894,7 +2932,12 @@ impl Parser {
                             self.advance();
                             let inner = self.expr()?;
                             self.expect(&Tok::RParen)?;
-                            return Ok(inner);
+                            return Ok(Expr::Call {
+                                func: Box::new(Expr::Ident(format!("*{ty}"))),
+                                args: vec![inner],
+                                spread: false,
+                                line,
+                            });
                         }
                     }
                     self.pos = save;
@@ -3225,6 +3268,15 @@ impl Parser {
             Expr::StructLit {
                 type_name: ty,
                 fields: Vec::new(),
+            }
+        } else if let Some(basic) = self.scalar_defined.get(&ty) {
+            // `new(Celsius)` is `&` of the zero converted to `Celsius`, so the
+            // pointer is typed `*Celsius` rather than `*int`.
+            Expr::Call {
+                func: Box::new(Expr::Ident(ty.clone())),
+                args: vec![zero_expr(basic)],
+                spread: false,
+                line: 0,
             }
         } else {
             zero_expr(&ty)

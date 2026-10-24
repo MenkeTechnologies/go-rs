@@ -33,6 +33,8 @@ const INTRINSICS: &[(&str, &str)] = &[
     ("os", "unlinkPath"),
     ("os", "rmdirPath"),
     ("fmt", "typeString"),
+    ("fmt", "ptrElemKind"),
+    ("fmt", "setPtrElem"),
     ("syscall", "strerror"),
     ("syscall", "sysConst"),
     ("slices", "sliceOverlap"),
@@ -912,8 +914,17 @@ fn add_stringify(prog: &mut Program) {
     all_types.retain(|t| !t.contains('.'));
     all_types.sort();
     all_types.dedup();
+    // A pointer to a defined scalar is a distinct dynamic type with its own
+    // `$stringify` case, and a `[]*T` element is boxed as one only when the
+    // helper's parameter says so: it gets a `$stringifyAll_ptr_T(xs []*T)`.
+    let scalar_ptrs = all_types
+        .iter()
+        .filter(|t| prog.is_scalar_defined(t))
+        .map(|t| (format!("*{t}"), format!("ptr_{t}")))
+        .collect::<Vec<_>>();
     for (elem, name) in std::iter::once(("any".to_string(), "any".to_string()))
         .chain(all_types.iter().map(|t| (t.clone(), t.clone())))
+        .chain(scalar_ptrs)
     {
         let src = format!(
             "package p\nfunc h(xs []{elem}) []any {{\n\tout := make([]any, len(xs))\n\tfor i := 0; i < len(xs); i++ {{\n\t\tout[i] = placeholder(xs[i])\n\t}}\n\treturn out\n}}\n"
@@ -942,7 +953,9 @@ fn add_stringify(prog: &mut Program) {
     // A struct value and a pointer to one are distinct dynamic types: the value
     // has only its value-receiver methods, the pointer has them all. So a
     // struct's `T` case calls the method its value has, if any, and its `*T`
-    // case the one the pointer has. Any other type has one tag for both.
+    // case the one the pointer has. So does a defined scalar type, whose
+    // pointer enters an interface tagged `*T`. Any other type has one tag for
+    // both.
     let call = |func: Expr, args: Vec<Expr>| Expr::Call {
         func: Box::new(func),
         args,
@@ -960,7 +973,7 @@ fn add_stringify(prog: &mut Program) {
     };
     let mut arms: Vec<(String, Expr)> = Vec::new();
     for (ty, on_value, on_ptr) in &reach {
-        if !shown.structs.contains(ty.as_str()) {
+        if !shown.structs.contains(ty.as_str()) && !prog.is_scalar_defined(ty) {
             arms.push((ty.clone(), method_call(on_ptr)));
             continue;
         }
@@ -1532,6 +1545,9 @@ impl Qualifier {
             Expr::Ident(n) => {
                 if !bound.contains(n) && self.own.contains(n) {
                     *n = self.qual(n);
+                } else if n.starts_with('*') {
+                    // The conversion `(*T)(x)`, parsed as a call of `*T`.
+                    *n = self.qual_type(n);
                 }
             }
             // `alias.field` on an imported source package → a qualified identifier.

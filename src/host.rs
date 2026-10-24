@@ -92,9 +92,17 @@ pub const GRMDIR_PATH: u16 = 1021;
 pub const GSTRERROR: u16 = 1022;
 /// `syscall.sysConst(name)` — a platform-dependent errno / `O_*` value.
 pub const GSYS_CONST: u16 = 1023;
+/// `fmt.ptrElemKind(arg)` — `reflect.ValueOf(arg).Elem().Kind()` for the one
+/// pointer the vendored scanner's type switch cannot name: a pointer to a
+/// defined scalar (`*Celsius`), answered with its underlying basic type
+/// (`float64`). Anything else answers `""`.
+pub const GPTR_ELEM_KIND: u16 = 1024;
+/// `fmt.setPtrElem(arg, v)` — `reflect.Value.Elem().Set*`: store `v` through
+/// such a pointer.
+pub const GPTR_ELEM_SET: u16 = 1025;
 
-/// The host intrinsics the vendored `os` and `syscall` sources call, by their
-/// qualified name: each lowers to a [`fusevm::Op::CallBuiltin`] of its
+/// The host intrinsics the vendored `os`, `syscall` and `fmt` sources call, by
+/// their qualified name: each lowers to a [`fusevm::Op::CallBuiltin`] of its
 /// arguments, in order.
 pub const FILE_INTRINSICS: &[(&str, u16, u8)] = &[
     ("os.writeFd", GWRITE_FD, 2),
@@ -106,6 +114,8 @@ pub const FILE_INTRINSICS: &[(&str, u16, u8)] = &[
     ("os.rmdirPath", GRMDIR_PATH, 1),
     ("syscall.strerror", GSTRERROR, 1),
     ("syscall.sysConst", GSYS_CONST, 1),
+    ("fmt.ptrElemKind", GPTR_ELEM_KIND, 1),
+    ("fmt.setPtrElem", GPTR_ELEM_SET, 2),
 ];
 /// `slices.sliceOverlap(a, b)` — whether two slices share a backing array and
 /// their element ranges intersect. The vendored `slices.overlaps` asks this in
@@ -551,6 +561,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GRMDIR_PATH, b_rmdir_path);
     vm.register_builtin(GSTRERROR, b_strerror);
     vm.register_builtin(GSYS_CONST, b_sys_const);
+    vm.register_builtin(GPTR_ELEM_KIND, b_ptr_elem_kind);
+    vm.register_builtin(GPTR_ELEM_SET, b_ptr_elem_set);
     vm.register_builtin(GSLICE_OVERLAP, b_slice_overlap);
     vm.register_builtin(GARRAY_COPY, b_array_copy);
     vm.register_builtin(GLIT_EXTEND, b_lit_extend);
@@ -1492,7 +1504,10 @@ fn b_typeof(vm: &mut VM, argc: u8) -> Value {
             // type, which is the type whose method set the pointer satisfies.
             match h.get(follow(*id) as usize) {
                 Some(HostObj::Struct { type_name, .. }) => Value::str(type_name.clone()),
-                Some(HostObj::Named { ty, .. }) => Value::str(ty.clone()),
+                // A pointer to a defined scalar is boxed as `*T`
+                // (`emit_iface_box`); it dispatches on `T` like a struct
+                // pointer, and the arm reads through it for a value method.
+                Some(HostObj::Named { ty, .. }) => Value::str(ty.trim_start_matches('*')),
                 _ => Value::str(""),
             }
         }),
@@ -5110,6 +5125,36 @@ fn b_deref(vm: &mut VM, argc: u8) -> Value {
         Some(HostObj::Ptr { target }) => Value::Obj(*target),
         _ => p.clone(),
     })
+}
+
+/// The pointer object inside a `*T` interface box of a defined scalar type,
+/// with that type's underlying basic type.
+fn scalar_defined_ptr(v: &Value) -> Option<(u32, String)> {
+    let Value::Obj(id) = v else { return None };
+    let (ty, inner) = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Named { ty, inner }) => Some((ty.clone(), inner.clone())),
+        _ => None,
+    })?;
+    let pointee = ty.strip_prefix('*')?;
+    let kind = underlying_ty(pointee);
+    let Value::Obj(cell) = inner else { return None };
+    (kind != pointee && scalar_ref_get(cell).is_some()).then_some((cell, kind))
+}
+
+/// [`GPTR_ELEM_KIND`].
+fn b_ptr_elem_kind(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let kind = args.first().and_then(scalar_defined_ptr).map(|(_, k)| k);
+    Value::str(kind.unwrap_or_default())
+}
+
+/// [`GPTR_ELEM_SET`].
+fn b_ptr_elem_set(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    if let (Some((cell, _)), Some(v)) = (args.first().and_then(scalar_defined_ptr), args.get(1)) {
+        scalar_ref_set(cell, &unname(v));
+    }
+    Value::Undef
 }
 
 /// [`GUNNAME`] — the value inside an interface box.

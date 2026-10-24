@@ -742,7 +742,7 @@ case 3:
         <article class="doc-entry" id="doc-package-fmt-8">
           <h3><a class="doc-anchor" href="#doc-package-fmt-8">#</a> <code>fmt.Scan</code></h3>
           <pre><code class="lang-go">fmt.Scan(a …any) (n int, err error)</code></pre>
-          <p>Reads space-separated values from standard input into the pointers it is handed, newlines counting as space, and returns how many it stored. Go's own `scan.go` (`goroot/fmt_scan.go`): every `*int`…`*uint64`, `*float32`/`*float64`, `*string`, `*bool` and `*[]byte` operand, base prefixes and `_` separators under `%v`, a type implementing `fmt.Scanner`, and Go's error text (`expected integer`, `unexpected newline`, `EOF`).</p>
+          <p>Reads space-separated values from standard input into the pointers it is handed, newlines counting as space, and returns how many it stored. Go's own `scan.go` (`goroot/fmt_scan.go`): every `*int`…`*uint64`, `*float32`/`*float64`, `*string`, `*bool` and `*[]byte` operand and a pointer to a defined type over one of them (`*Celsius`), base prefixes and `_` separators under `%v`, a type implementing `fmt.Scanner`, and Go's error text (`expected integer`, `unexpected newline`, `EOF`).</p>
           <pre><code class="lang-go">var n int
 fmt.Scan(&amp;n)</code></pre>
         </article>

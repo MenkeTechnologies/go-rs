@@ -52,8 +52,9 @@ display copy, `parity-scripts/stringer_struct_fields.go`) are rendered through
 the method, and so is a top-level `map[K]V` whose keys or values print
 through one (`HostObj::MapShown`, which keeps the original keys for `fmt`'s
 sort; `parity-scripts/stringer_map_keys_values.go`). The same erasure keeps `float32` / `uint64` widths out of an `any`,
-and a `*Weekday` is named `main.Weekday` rather than `*main.Weekday`, because
-`&x` on a scalar has no address (the entry below).
+and a `*Weekday` handed to a type parameter (`show(&w)`) prints `%T` as
+`*int`: the pointer is the variable's cell, and only an interface box
+(`emit_iface_box`) records that it points at a `Weekday`.
 
 ## A nil pointer in an interface compares equal to nil
 
@@ -523,42 +524,21 @@ and a nil interface field is written `T(nil)`. What stays untyped is a nil
 pointer reached only through a *value* whose static type go-rs does not carry:
 a result of a call through a function value, or an `any` holding one.
 
-## A pointer to a defined non-struct type in an interface is tagged as the type
+## A conversion between pointers to two struct types keeps the operand's type
 
 ```go
-type Celsius float64
-var c Celsius
-fmt.Printf("%T\n", &c)            // go: *main.Celsius   go-rs: main.Celsius
-n, err := fmt.Sscan("21.5", &c)   // go: 1 <nil>         go-rs: 0 type not a pointer: main.Celsius
+type U struct{ A int }
+type V U
+u := U{1}
+fmt.Printf("%T\n", (*V)(&u))   // go: *main.V   go-rs: *main.U
 ```
 
-`&c` is `c`'s own cell, and a value entering an interface is boxed with the
-defined type its static type names (`emit_iface_box`) — but that type is read
-off the pointee, so the box says `Celsius`, not `*Celsius`. A pointer to a
-*basic* type is boxed with its pointer type (`*int64`, `*[]uint8`), which is
-what lets `fmt.Sscan`'s `case *int64:` match; doing the same for a defined
-pointee needs dynamic dispatch to accept the `*T` tag for `T`'s methods. Go's
-`fmt.Sscan` scans a `*Celsius` through `reflect` (its underlying kind is
-`float64`); the vendored `scanOne` has no `reflect` and reports the operand
-instead (`goroot/fmt_scan.go`).
-
-## A conversion to a pointer type `(*T)(p)` is dropped
-
-```go
-type stringReader string
-func (r *stringReader) Read(b []byte) (int, error) { return copy(b, *r), nil }
-
-str := "hello"
-var rd io.Reader = (*stringReader)(&str)
-n, _ := rd.Read(b)   // go: 5   go-rs: invalid index of nil
-```
-
-The parser reads `(*T)(x)` as `x` — right for a struct pointer, whose handle
-carries its type, but `&str` is a cell with no type of its own, so the value
-keeps `*string`'s dynamic type and the interface call finds no `Read`. Go's
-`fmt.Sscan` converts `&str` exactly this way; the vendored copy builds a
-`stringReader` from the string instead. Closing it means keeping the
-conversion in the AST and boxing the pointer with `*T` (see the entry above).
+`(*T)(p)` is kept in the AST as a call of `*T`, and a pointer to a defined
+scalar takes `*T` as its static type and interface tag
+(`parity-scripts/pointer_type_conversion.go`). A struct pointer is the
+struct's own handle, which carries its type name and is shared with `u`, so
+re-tagging it as `V` would change what `u` reports too. It keeps `*U`; field
+access and writes through it are unaffected.
 
 ## Unsupported stdlib calls
 

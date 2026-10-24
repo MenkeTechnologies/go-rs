@@ -1617,9 +1617,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Go's method-set rule: a type's set holds its value-receiver methods, and
     // the pointer type's holds those plus the pointer-receiver ones. A struct
     // value and a pointer to one carry different runtime tags (`T` / `*T`), so
-    // each gets its own set. A pointer to any other type is not addressable
-    // apart from its value in go-rs (`&x` on a scalar is the value), so a
-    // non-struct type registers the full set under its one tag.
+    // each gets its own set. So does a defined type over a scalar: `&x` is the
+    // variable's cell, which enters an interface tagged `*T`. A defined
+    // composite (`type Stack []int`) shares its handle with a pointer to it, so
+    // it registers the full set under its one tag.
     let mut value_methods: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     let mut all_methods: std::collections::BTreeMap<String, Vec<String>> =
@@ -1679,7 +1680,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut type_methods: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for (ty, ms) in all_methods {
-        if structs.contains(&ty) {
+        if structs.contains(&ty) || prog.is_scalar_defined(&ty) {
             let value = value_methods.get(&ty).cloned().unwrap_or_default();
             type_methods.insert(ty.clone(), value);
             type_methods.insert(format!("*{ty}"), ms);
@@ -3284,6 +3285,17 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
                 Ok(true)
             }
+            // `new(Celsius)` of a defined scalar type, which the parser writes
+            // as `&Celsius(0)`. (Go source cannot take `&` of a conversion.)
+            Expr::Call { func, args, .. }
+                if args.len() == 1
+                    && matches!(func.as_ref(), Expr::Ident(t)
+                        if self.is_scalar_defined_ptr(&format!("*{t}"))) =>
+            {
+                self.expr(operand)?;
+                self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -3291,29 +3303,7 @@ impl Compiler {
     /// Whether `ty` is a scalar — a number, string or bool, or a defined type
     /// over one: a value `&x` can only address through the variable's own cell.
     fn is_scalar_ty(&self, ty: &str) -> bool {
-        let u = self.underlying(&base_type(ty));
-        matches!(
-            u.as_str(),
-            "int"
-                | "int8"
-                | "int16"
-                | "int32"
-                | "int64"
-                | "uint"
-                | "uint8"
-                | "uint16"
-                | "uint32"
-                | "uint64"
-                | "uintptr"
-                | "float32"
-                | "float64"
-                | "complex64"
-                | "complex128"
-                | "string"
-                | "bool"
-                | "byte"
-                | "rune"
-        )
+        is_scalar_basic(&self.underlying(&base_type(ty)))
     }
 
     /// Whether a variable of type `ty` needs its own cell for `&x` to address
@@ -3731,6 +3721,8 @@ impl Compiler {
                             .first()
                             .filter(|t| t.starts_with('*'))
                             .cloned(),
+                        // `p := x.(*T)` (and the comma-ok form's value).
+                        Expr::TypeAssert { ty, .. } if ty.starts_with('*') => Some(ty.clone()),
                         _ => None,
                     };
                     match ptr {
@@ -4456,6 +4448,11 @@ impl Compiler {
                 // Like every declared type here, a pointer is recorded by its
                 // base, which is what field and method lookups key on.
                 self.decl_types.insert(name.clone(), base_type(&bound_ty));
+                // `case *T:` of a defined scalar binds the variable's cell,
+                // which a value method reads through (`Self::is_cell_ptr`).
+                if self.is_scalar_defined_ptr(&bound_ty) {
+                    self.ptr_types.insert(name.clone(), bound_ty.clone());
+                }
                 self.emit_declare(name, line);
             }
             for s in &case.body {
@@ -4495,12 +4492,13 @@ impl Compiler {
     }
 
     /// The runtime tag a value of written type `ty` carries ([`host::GTYPETAG`]):
-    /// [`type_to_tag`], except that a pointer to a struct keeps its `*` — a
-    /// struct value and a pointer to one are distinct dynamic types, which a
-    /// type switch, an assertion and the method-set lookup all tell apart.
+    /// [`type_to_tag`], except that a pointer to a struct or to a defined
+    /// scalar keeps its `*` — a value and a pointer to it are distinct dynamic
+    /// types, which a type switch, an assertion and the method-set lookup all
+    /// tell apart.
     fn runtime_tag(&self, ty: &str) -> String {
         let base = base_type(ty);
-        if ty.starts_with('*') && self.structs.contains(&base) {
+        if ty.starts_with('*') && self.structs.contains(&base) || self.is_scalar_defined_ptr(ty) {
             format!("*{base}")
         } else if let Some(tag) = basic_ptr_tag(ty) {
             tag
@@ -6750,6 +6748,16 @@ impl Compiler {
             // A defined type's method takes the value, not its interface box.
             if self.defined_types.contains_key(t) {
                 self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
+                // Through a `*T` box the receiver is the variable's cell, and
+                // a value method takes what it holds (`(*p).M()`). A `T` box
+                // holds the value itself, which `GDEREF` passes through.
+                if self.is_scalar_defined_ptr(&format!("*{t}"))
+                    && self
+                        .value_recv_methods
+                        .contains(&(t.clone(), method.to_string()))
+                {
+                    self.b.emit(Op::CallBuiltin(host::GDEREF, 1), line);
+                }
             }
             // The dispatch arm knows the concrete type, so the value-vs-pointer
             // receiver question is answerable here even though the static type
@@ -6878,9 +6886,15 @@ impl Compiler {
     /// Every result type of the call `e`, when its callee is a declared
     /// function or a value whose static type spells a signature.
     fn call_result_types(&self, e: &Expr) -> Vec<String> {
-        let Expr::Call { func, .. } = e else {
+        let Expr::Call { func, args, .. } = e else {
             return Vec::new();
         };
+        if let Some((ty, x)) = ptr_conversion(func, args) {
+            return match self.is_scalar_defined_ptr(ty) {
+                true => vec![ty.to_string()],
+                false => self.static_ptr_ty(x).into_iter().collect(),
+            };
+        }
         if let Expr::Ident(name) = func.as_ref() {
             if let Some(sig) = self.funcs.get(name) {
                 return sig.results.clone();
@@ -7014,6 +7028,17 @@ impl Compiler {
                         Some(func_type_spelling(params, variadic, results))
                     })
                     .unwrap_or_default()
+            }
+            // `(*Celsius)(&f)` is a `*Celsius`, recorded by its pointee like
+            // every pointer. A pointer to any other type keeps its operand's
+            // type: a struct handle carries its own type name, which a
+            // conversion to another struct type over it does not change.
+            Expr::Call { func, args, .. } if ptr_conversion(func, args).is_some() => {
+                let (ty, x) = ptr_conversion(func, args).unwrap_or(("", e));
+                match self.is_scalar_defined_ptr(ty) {
+                    true => base_type(ty),
+                    false => self.type_name(x),
+                }
             }
             Expr::Call { func, .. } => match func.as_ref() {
                 // `[]byte(s)` / `[]rune(s)` name the slice type they convert to,
@@ -7199,9 +7224,19 @@ impl Compiler {
             && !self
                 .value_recv_methods
                 .contains(&(base.clone(), "Error".to_string()));
-        let tag = match declared_ptr || only_ptr_errs {
-            true => format!("*{base}"),
-            false => self.runtime_tag(&ty),
+        // A `var target *Code` of a defined scalar is a `*T` tag of its own.
+        let scalar_ptr = match &**target {
+            Expr::Ident(n) => self
+                .ptr_types
+                .get(n)
+                .filter(|t| self.is_scalar_defined_ptr(t))
+                .cloned(),
+            _ => None,
+        };
+        let tag = match (declared_ptr || only_ptr_errs, &scalar_ptr) {
+            (true, _) => format!("*{base}"),
+            (false, Some(t)) => self.runtime_tag(t),
+            (false, None) => self.runtime_tag(&ty),
         };
         if ty.is_empty() {
             return Err(format!(
@@ -7233,6 +7268,10 @@ impl Compiler {
         self.emit_get(&tup, line);
         self.b.emit(Op::LoadInt(0), line);
         self.b.emit(Op::CallBuiltin(host::GINDEX_GET, 2), line);
+        // The pointer leaves its interface box for the `*T` variable.
+        if scalar_ptr.is_some() {
+            self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
+        }
         self.types.insert(hit.clone(), NumType::Unknown);
         self.decl_types.insert(hit.clone(), ty);
         self.emit_set(&hit, line);
@@ -7392,12 +7431,24 @@ impl Compiler {
 
     /// Whether `e` names a pointer held as a cell — see [`Self::cell_ptrs`] —
     /// or a local bound to one (`p := &v`, `var p *Count`), whose declared
-    /// type is `*T` for a defined non-struct `T`.
+    /// type is `*T` for a defined non-struct `T` — or an element or field
+    /// declared `*T` for a defined scalar `T` (`xs[0]` of a `[]*Count`).
     fn is_cell_ptr(&self, e: &Expr) -> bool {
-        matches!(e, Expr::Ident(n) if self.cell_ptrs.contains(n)
-        || self.ptr_types.get(n).is_some_and(|t| {
-            t.starts_with('*') && self.defined_types.contains_key(&base_type(t))
-        }))
+        match e {
+            Expr::Ident(n) => {
+                self.cell_ptrs.contains(n)
+                    || self.ptr_types.get(n).is_some_and(|t| {
+                        t.starts_with('*') && self.defined_types.contains_key(&base_type(t))
+                    })
+            }
+            Expr::Index { recv, .. } => self
+                .elem_ty_of(recv)
+                .is_some_and(|t| self.is_scalar_defined_ptr(&t)),
+            Expr::Selector { recv, field } => {
+                self.is_scalar_defined_ptr(&self.field_ty(recv, field))
+            }
+            _ => false,
+        }
     }
 
     /// The synthesized `$stringifyAll_T` for a `fmt` operand whose static type
@@ -7432,15 +7483,21 @@ impl Compiler {
             return self.funcs.contains_key(&helper).then_some(helper);
         }
         let base = base_type(elem);
+        // A `[]*T` of a defined scalar has a helper of its own, which boxes
+        // each element as a `*T` (`pkg::add_stringify`).
+        if self.is_scalar_defined_ptr(elem) {
+            let helper = format!("$stringifyAll_ptr_{base}");
+            return self.funcs.contains_key(&helper).then_some(helper);
+        }
         let helper = format!("$stringifyAll_{base}");
         if !self.funcs.contains_key(&helper) {
             return None;
         }
-        // The helper sends each element through `$stringify`, whose struct
-        // cases follow Go's method sets exactly. Any other type has one tag
-        // for a value and a pointer (`&x` on a scalar is the value), so a
-        // value element of it uses a method only when the value receiver
-        // declares one.
+        // The helper sends each element through `$stringify`, whose cases
+        // follow Go's method sets exactly — a struct's and a defined scalar's
+        // `T` and `*T` apart. Any other type has one tag for a value and a
+        // pointer, so a value element of it uses a method only when the value
+        // receiver declares one.
         let has = |m: &str| self.methods.contains_key(&(base.clone(), m.to_string()));
         let on_value = ["String", "Error"].iter().any(|m| {
             self.value_recv_methods
@@ -7508,18 +7565,34 @@ impl Compiler {
     /// A pointer to a basic type (`*int64`, `*string`, `*[]byte`) is boxed with
     /// its type too: it is a cell at run time, which says nothing of the width
     /// or kind it points at, so `case *int64:` could not be told from `case
-    /// *int:` — the type switch `fmt.Sscan` dispatches its operands on.
+    /// *int:` — the type switch `fmt.Sscan` dispatches its operands on. So is a
+    /// pointer to a defined scalar type (`&c` of a `Celsius`): its static type
+    /// names only the pointee, and boxed as `Celsius` it printed `%T` as
+    /// `main.Celsius`, missed `case *Celsius:`, and handed value methods the
+    /// cell instead of the value. Its tag is `*Celsius`, whose method set is
+    /// Go's for `*T`.
     fn emit_iface_box(&mut self, e: &Expr, line: u32) {
         let ty = self.type_name(e);
-        if self.defined_types.contains_key(&ty) {
-            let c = self.b.add_constant(Value::str(ty));
-            self.b.emit(Op::LoadConst(c), line);
-            self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
-        } else if let Some(tag) = self.static_ptr_ty(e).and_then(|t| basic_ptr_tag(&t)) {
-            let c = self.b.add_constant(Value::str(tag));
-            self.b.emit(Op::LoadConst(c), line);
-            self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
-        }
+        let ptr_tag = self.static_ptr_ty(e).and_then(|t| {
+            basic_ptr_tag(&t).or_else(|| self.is_scalar_defined_ptr(&t).then_some(t))
+        });
+        let tag = match ptr_tag {
+            Some(tag) => tag,
+            None if self.defined_types.contains_key(&ty) => ty,
+            None => return,
+        };
+        let c = self.b.add_constant(Value::str(tag));
+        self.b.emit(Op::LoadConst(c), line);
+        self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+    }
+
+    /// Whether `ty` is a pointer to a defined type over a scalar (`*Celsius`
+    /// for `type Celsius float64`): a pointer that carries its own `*T`
+    /// interface tag ([`Self::emit_iface_box`], [`Self::runtime_tag`]).
+    fn is_scalar_defined_ptr(&self, ty: &str) -> bool {
+        ty.strip_prefix('*').is_some_and(|p| {
+            self.defined_types.contains_key(p) && !self.structs.contains(p) && self.is_scalar_ty(p)
+        })
     }
 
     /// The type `&rhs` points at. `new(T)` of a basic `T` is parsed as `&` of
@@ -7549,6 +7622,11 @@ impl Compiler {
                 .first()
                 .filter(|t| t.starts_with('*'))
                 .cloned(),
+            // An element of a `[]*T` / `map[K]*T`, or a field declared `*T`.
+            Expr::Index { recv, .. } => self.elem_ty_of(recv).filter(|t| t.starts_with('*')),
+            Expr::Selector { recv, field } => {
+                Some(self.field_ty(recv, field)).filter(|t| t.starts_with('*'))
+            }
             _ => None,
         }
     }
@@ -7712,10 +7790,17 @@ impl Compiler {
     }
 
     /// The defined type a `fmt` argument should be tagged with, or `None` when
-    /// its static type is not one. A `*T` is tagged with `T`: go-rs holds a
-    /// pointer and its pointee as the same handle, and `%T` of a `*Weekday`
-    /// naming `main.Weekday` is nearer than naming `int`.
+    /// its static type is not one. A pointer to a defined scalar is tagged
+    /// `*T`, as it is entering any interface ([`Self::emit_iface_box`]); a
+    /// pointer to a defined composite shares its pointee's handle and is
+    /// tagged `T`, which `GNAMED_BOX` puts behind the pointer.
     fn named_box_spec(&self, e: &Expr) -> Option<String> {
+        if let Some(t) = self
+            .static_ptr_ty(e)
+            .filter(|t| self.is_scalar_defined_ptr(t))
+        {
+            return Some(t);
+        }
         // Arithmetic on a defined type keeps it — `Weekday(3) + 1` is a
         // `Weekday` — so a binary operator reports whichever side names one.
         if let Expr::Binary { lhs, rhs, .. } = e {
@@ -8674,6 +8759,11 @@ impl Compiler {
 
         // Bare-name call: a language builtin or a user function.
         if let Expr::Ident(name) = func {
+            // `(*T)(x)` converts a pointer without touching it; only its
+            // static type changes ([`ptr_conversion`]).
+            if let Some((_, x)) = ptr_conversion(func, args) {
+                return self.expr(x);
+            }
             // `[]T(nil)` / `map[K]V(nil)` — the typed nil of that slice or map
             // type, which is also how the parser spells a slice or map
             // element's zero value. Any other operand of a conversion to a
@@ -8876,8 +8966,9 @@ impl Compiler {
             }
             // The vendored `errors` package's one host intrinsic: the runtime type
             // tag a type switch dispatches on, which `asTag` compares against.
-            // The `os` and `syscall` host intrinsics: the file syscalls behind
-            // `*os.File`, `os.Remove` and `syscall.Errno`, which no Go source
+            // The `os`, `syscall` and `fmt` host intrinsics: the file syscalls
+            // behind `*os.File`, `os.Remove` and `syscall.Errno`, and the two
+            // `reflect` calls `fmt`'s scanner makes, which no Go source here
             // can express.
             if let Some(&(_, id, argc)) = host::FILE_INTRINSICS
                 .iter()
@@ -9574,6 +9665,15 @@ fn basic_ptr_tag(ty: &str) -> Option<String> {
             | "[]uint8"
     );
     basic.then(|| format!("*{pointee}"))
+}
+
+/// The pointer type and operand of a conversion `(*T)(x)`, which the parser
+/// keeps as a call of the name `*T` (no function can be named that).
+fn ptr_conversion<'a>(func: &'a Expr, args: &'a [Expr]) -> Option<(&'a str, &'a Expr)> {
+    match (func, args) {
+        (Expr::Ident(ty), [x]) if ty.starts_with('*') => Some((ty.as_str(), x)),
+        _ => None,
+    }
 }
 
 fn type_to_tag(ty: &str) -> String {

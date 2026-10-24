@@ -52,6 +52,25 @@ pub enum Selected {
 }
 
 impl Program {
+    /// Whether `ty` is a defined type (`type Celsius float64`) whose underlying
+    /// type is a scalar ([`is_scalar_basic`]). Such a value has no address of
+    /// its own, so `&x` is the variable's cell, and in an interface the pointer
+    /// carries the `*T` tag beside the value's `T` (Go's method sets: `T`
+    /// has the value-receiver methods, `*T` all of them).
+    pub fn is_scalar_defined(&self, ty: &str) -> bool {
+        let mut t = ty;
+        // A chain of definitions (`type A B; type B int`) is finite in valid
+        // Go; the bound only guards a cyclic program against looping.
+        for _ in 0..=self.defined.len() {
+            match self.defined.iter().find(|(n, _)| n == t) {
+                Some((_, base)) if base != t => t = base,
+                Some(_) => return false,
+                None => return t != ty && is_scalar_basic(t),
+            }
+        }
+        false
+    }
+
     /// Resolve selector `name` on struct type `ty` ([`Selected`]). Two at the
     /// shallowest depth (`struct { A; B }` where both have `String`) make it
     /// ambiguous, and a field there shadows any method deeper down. A type
@@ -152,6 +171,32 @@ pub struct InterfaceDecl {
 /// are: go-rs cannot tell a named parameter from an unnamed one in an interface
 /// method without a full type parse, and two same-named methods that differ only
 /// in parameter types do not arise in practice.
+/// Whether `ty` names a predeclared scalar type — a number, string or bool.
+pub fn is_scalar_basic(ty: &str) -> bool {
+    matches!(
+        ty,
+        "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "string"
+            | "bool"
+            | "byte"
+            | "rune"
+    )
+}
+
 pub fn method_sig(name: &str, arity: usize, results: &[String]) -> String {
     format!("{name}/{arity}:{}", results.join(","))
 }

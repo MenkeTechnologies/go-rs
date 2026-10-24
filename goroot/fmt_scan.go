@@ -14,15 +14,11 @@
 //   - the `sync.Pool` of `ss` states is gone; each scan allocates its state.
 //   - `*complex64` / `*complex128` operands and the complex helpers are absent:
 //     go-rs has no complex types.
-//   - scanOne's `reflect` fallback is reduced to the two errors it reports:
-//     `type not a pointer: T` and `can't scan type: *T`, the type named by the
-//     `typeString` host intrinsic (`%T`'s text). An operand that is a pointer
-//     to a *defined* basic type (`*Celsius`), which Go scans through reflect,
-//     is one of those errors here.
-//   - Sscan, Sscanln and Sscanf read a `stringReader` holding a copy of the
-//     string rather than converting `&str` to `*stringReader`: go-rs's parser
-//     drops a `(*T)(p)` conversion, so the pointer would keep `*string`'s
-//     dynamic type and miss the `Read` method.
+//   - scanOne's `reflect` fallback calls three host intrinsics: `typeString`
+//     (`%T`'s text, for its errors), `ptrElemKind` (the underlying kind of a
+//     pointer to a defined scalar type such as `*Celsius`) and `setPtrElem`
+//     (the `Set*` through it), with `kindBits` for `Type.Bits`. A pointer to a
+//     defined `[]byte` is not scanned; it reports `can't scan type`.
 package fmt
 
 import (
@@ -116,15 +112,13 @@ func (r *stringReader) Read(b []byte) (n int, err error) {
 // returns the number of items successfully scanned. If that is less
 // than the number of arguments, err will report why.
 func Sscan(str string, a ...any) (n int, err error) {
-	sr := stringReader(str)
-	return Fscan(&sr, a...)
+	return Fscan((*stringReader)(&str), a...)
 }
 
 // Sscanln is similar to [Sscan], but stops scanning at a newline and
 // after the final item there must be a newline or EOF.
 func Sscanln(str string, a ...any) (n int, err error) {
-	sr := stringReader(str)
-	return Fscanln(&sr, a...)
+	return Fscanln((*stringReader)(&str), a...)
 }
 
 // Sscanf scans the argument string, storing successive space-separated
@@ -132,8 +126,7 @@ func Sscanln(str string, a ...any) (n int, err error) {
 // returns the number of items successfully parsed.
 // Newlines in the input must match newlines in the format.
 func Sscanf(str string, format string, a ...any) (n int, err error) {
-	sr := stringReader(str)
-	return Fscanf(&sr, format, a...)
+	return Fscanf((*stringReader)(&str), format, a...)
 }
 
 // Fscan scans text read from r, storing successive space-separated
@@ -993,8 +986,43 @@ func (s *ss) scanOne(verb rune, arg any) {
 			s.errorString("type not a pointer: " + t)
 			return
 		}
-		s.errorString("can't scan type: " + t)
+		// switch v := ptr.Elem(); v.Kind(), for a pointer to a defined
+		// scalar type: `ptrElemKind` is the underlying kind, `setPtrElem`
+		// the reflect.Value.Set* call.
+		switch kind := ptrElemKind(arg); kind {
+		case "bool":
+			setPtrElem(arg, s.scanBool(verb))
+		case "int", "int8", "int16", "int32", "int64":
+			setPtrElem(arg, s.scanInt(verb, kindBits(kind)))
+		case "uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+			setPtrElem(arg, s.scanUint(verb, kindBits(kind)))
+		case "string":
+			setPtrElem(arg, s.convertString(verb))
+		case "float32", "float64":
+			s.SkipSpace()
+			s.notEOF()
+			setPtrElem(arg, s.convertFloat(s.floatToken(), kindBits(kind)))
+		default:
+			s.errorString("can't scan type: " + t)
+		}
 	}
+}
+
+// kindBits is reflect.Type.Bits for the basic kind `ptrElemKind` names.
+func kindBits(kind string) int {
+	switch kind {
+	case "int", "uint":
+		return intBits
+	case "uintptr":
+		return uintptrBits
+	case "int8", "uint8":
+		return 8
+	case "int16", "uint16":
+		return 16
+	case "int32", "uint32", "float32":
+		return 32
+	}
+	return 64
 }
 
 // errorHandler turns local panics into error returns.
