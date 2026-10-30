@@ -5714,7 +5714,10 @@ impl Compiler {
     }
 
     fn emit_map_miss_zero(&mut self, recv: &Expr, line: u32) -> Result<u8, String> {
-        let Some(v_ty) = map_value_ty(&self.type_name(recv)).map(str::to_string) else {
+        // A defined map type (`type Set map[string]bool`) misses with its
+        // base's value zero.
+        let container = self.underlying(&self.type_name(recv));
+        let Some(v_ty) = map_value_ty(&container).map(str::to_string) else {
             return Ok(2);
         };
         if v_ty.is_empty() {
