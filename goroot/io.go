@@ -18,6 +18,13 @@ import "errors"
 
 // ErrShortWrite means that a write accepted fewer bytes than requested
 // but failed to return an explicit error.
+// Seek whence values.
+const (
+	SeekStart   = 0 // seek relative to the origin of the file
+	SeekCurrent = 1 // seek relative to the current offset
+	SeekEnd     = 2 // seek relative to the end
+)
+
 var ErrShortWrite = errors.New("short write")
 
 // Writer is the interface that wraps the basic Write method.
@@ -157,6 +164,21 @@ type RuneReader interface {
 type RuneScanner interface {
 	RuneReader
 	UnreadRune() error
+}
+
+// ByteReader is the interface that wraps the ReadByte method.
+type ByteReader interface {
+	ReadByte() (byte, error)
+}
+
+// Seeker is the interface that wraps the basic Seek method.
+type Seeker interface {
+	Seek(offset int64, whence int) (int64, error)
+}
+
+// WriterTo is the interface that wraps the WriteTo method.
+type WriterTo interface {
+	WriteTo(w Writer) (n int64, err error)
 }
 
 // ReadAtLeast reads from r into buf until it has read at least min bytes.

@@ -70,6 +70,14 @@ pub fn link(mut main: Program) -> Result<Program, String> {
     // `io.Reader`, so a program that calls one links `os` too.
     let uses_scan = uses_fmt_scan(&main);
     let uses_os = uses_scan || main.imports.iter().any(|p| p == "os");
+    // `strings.Reader` (`goroot/strings_reader.go`) is Go's own source, which
+    // imports `errors`, `io` and `unicode/utf8`.
+    let uses_reader = uses_strings_reader(&main);
+    if uses_reader {
+        for path in STRINGS_READER_DEPS {
+            load_recursive(path, &mut loaded, &mut order)?;
+        }
+    }
     if uses_os {
         for path in OS_DEPS {
             load_recursive(path, &mut loaded, &mut order)?;
@@ -139,6 +147,9 @@ pub fn link(mut main: Program) -> Result<Program, String> {
         add_strings_builder(&mut main)?;
         add_strings_func(&mut main)?;
         add_strings_source(&mut main)?;
+        if uses_reader {
+            add_strings_reader(&mut main)?;
+        }
     }
     // `os`'s files and standard streams the same way. Their initializers are
     // package-level vars, so they are spliced ahead of the program's own
@@ -618,6 +629,8 @@ pub const STRINGS_SOURCE: &[&str] = &[
     "FieldsFuncSeq",
     "Replacer",
     "NewReplacer",
+    "Reader",
+    "NewReader",
 ];
 
 /// The names package `math` declares in Go source (`goroot/math_source.go`)
@@ -707,6 +720,39 @@ fn add_strings_source(prog: &mut Program) -> Result<(), String> {
 /// in through [`load_recursive`] like `errors` and `io` do.
 fn add_strings_builder(prog: &mut Program) -> Result<(), String> {
     let mut pkg = crate::parse(include_str!("../goroot/strings_builder.go"))?;
+    qualify(&mut pkg, "strings", true);
+    prog.types.append(&mut pkg.types);
+    prog.funcs.append(&mut pkg.funcs);
+    Ok(())
+}
+
+/// The packages `goroot/strings_reader.go` imports.
+const STRINGS_READER_DEPS: &[&str] = &["errors", "io", "unicode/utf8"];
+
+/// Whether the program names `strings.Reader` — through `strings.NewReader`,
+/// or as a type in a signature or a struct field. Only then is it linked,
+/// with the packages it imports.
+fn uses_strings_reader(prog: &Program) -> bool {
+    if !prog.imports.iter().any(|p| p == "strings") {
+        return false;
+    }
+    let named = |ty: &str| ty.contains("strings.Reader");
+    program_has_expr(prog, &|e| {
+        is_selector(e, "strings", "NewReader") || is_selector(e, "strings", "Reader")
+    }) || prog
+        .funcs
+        .iter()
+        .any(|f| f.params.iter().any(|p| named(&p.ty)) || f.results.iter().any(|t| named(t)))
+        || prog
+            .types
+            .iter()
+            .any(|t| t.fields.iter().any(|f| named(&f.ty)))
+}
+
+/// Synthesize `strings.Reader` from Go's own `strings/reader.go` and qualify it
+/// under `strings`, the way [`add_strings_builder`] does the `Builder`.
+fn add_strings_reader(prog: &mut Program) -> Result<(), String> {
+    let mut pkg = crate::parse(include_str!("../goroot/strings_reader.go"))?;
     qualify(&mut pkg, "strings", true);
     prog.types.append(&mut pkg.types);
     prog.funcs.append(&mut pkg.funcs);
