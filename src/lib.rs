@@ -93,6 +93,15 @@ fn run_scheduled(chunk: fusevm::Chunk) -> Result<Value, String> {
             Some(e) => Err(e),
             None => Ok(Value::Undef),
         },
+        // Go's runtime reports a deadlock as a fatal error on stderr and exits
+        // 2 (`runtime.fatal` -> `exit(2)`), not as a toolchain diagnostic. The
+        // goroutine dump Go prints below that line is not reproduced.
+        Err(fusevm::SchedError::Deadlock) => {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            eprintln!("{}", fusevm::SchedError::Deadlock);
+            std::process::exit(2);
+        }
         Err(e) => Err(format!("go-rs: {e}")),
     }
 }
