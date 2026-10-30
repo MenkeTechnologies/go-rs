@@ -2358,9 +2358,24 @@ impl Compiler {
         self.b.emit(Op::LoadInt(in_goroutine as i64), line);
         self.b.emit(Op::CallBuiltin(host::GPANIC_FATAL, 1), line);
         let skip = self.b.emit(Op::JumpIfFalse(0), line);
+        let idx = self.b.add_name("$stringify");
+        // The panics a deferred call superseded print above this one, each
+        // through `Error()` / `String()` as well.
+        let render = self.b.current_pos();
+        self.b
+            .emit(Op::CallBuiltin(host::GPANIC_CHAIN_TODO, 0), line);
+        let rendered = self.b.emit(Op::JumpIfFalse(0), line);
+        self.b
+            .emit(Op::CallBuiltin(host::GPANIC_CHAIN_NEXT, 0), line);
+        self.b.emit(Op::Call(idx, 1), line);
+        self.b
+            .emit(Op::CallBuiltin(host::GPANIC_CHAIN_RENDER, 1), line);
+        self.b.emit(Op::Pop, line);
+        self.b.emit(Op::Jump(render), line);
+        let done = self.b.current_pos();
+        self.b.patch_jump(rendered, done);
         self.b
             .emit(Op::CallBuiltin(host::GPANIC_FATAL_VALUE, 0), line);
-        let idx = self.b.add_name("$stringify");
         self.b.emit(Op::Call(idx, 1), line);
         self.b.emit(Op::CallBuiltin(host::GPANIC_FINISH, 1), line);
         self.b.emit(Op::Pop, line);

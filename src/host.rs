@@ -100,6 +100,13 @@ pub const GPTR_ELEM_KIND: u16 = 1024;
 /// `fmt.setPtrElem(arg, v)` — `reflect.Value.Elem().Set*`: store `v` through
 /// such a pointer.
 pub const GPTR_ELEM_SET: u16 = 1025;
+/// → `Bool`: whether a panic a deferred call superseded (Go's `_panic.link`
+/// chain, printed above the fatal one) still waits for `$stringify` to render it.
+pub const GPANIC_CHAIN_TODO: u16 = 1026;
+/// → the oldest superseded panic value not yet rendered.
+pub const GPANIC_CHAIN_NEXT: u16 = 1027;
+/// `[rendered]` → record the rendering of [`GPANIC_CHAIN_NEXT`]'s value.
+pub const GPANIC_CHAIN_RENDER: u16 = 1028;
 
 /// The host intrinsics the vendored `os`, `syscall` and `fmt` sources call, by
 /// their qualified name: each lowers to a [`fusevm::Op::CallBuiltin`] of its
@@ -613,6 +620,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(GPANIC_FATAL, b_panic_fatal);
     vm.register_builtin(GPANIC_FATAL_VALUE, b_panic_fatal_value);
     vm.register_builtin(GPANIC_GOROUTINE_EXIT, b_panic_goroutine_exit);
+    vm.register_builtin(GPANIC_CHAIN_TODO, b_panic_chain_todo);
+    vm.register_builtin(GPANIC_CHAIN_NEXT, b_panic_chain_next);
+    vm.register_builtin(GPANIC_CHAIN_RENDER, b_panic_chain_render);
     vm.register_builtin(GSTRUCT_WITH, b_struct_with);
     vm.register_builtin(GMAP_KEYS, b_map_keys);
     vm.register_builtin(GMAP_VALS, b_map_vals);
@@ -1206,6 +1216,7 @@ fn b_defer_park(vm: &mut VM, _argc: u8) -> Value {
     let val = PANIC.with(|p| p.borrow_mut().take());
     PARKED.with(|p| {
         p.borrow_mut().push(Park {
+            orig: val.clone(),
             val,
             depth: vm.frames.len(),
             recovered: false,
@@ -1262,15 +1273,102 @@ fn b_defer_unpark(_vm: &mut VM, _argc: u8) -> Value {
     let Some(park) = PARKED.with(|p| p.borrow_mut().pop()) else {
         return Value::Undef;
     };
-    if let Some(v) = park.val {
-        PANIC.with(|p| {
-            let mut slot = p.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(v);
-            }
-        });
+    let superseded = PANIC.with(|p| p.borrow().is_some());
+    if superseded {
+        // Go keeps the panic this call was deferred for on the `_panic.link`
+        // chain beneath the new one, and prints it above the new one if that
+        // turns fatal — marked `[recovered]` if this call had recovered it.
+        if let Some(val) = park.orig {
+            PANIC_CHAIN.with(|c| {
+                c.borrow_mut().push(Superseded {
+                    val,
+                    recovered: park.recovered,
+                    depth: park.depth,
+                    rendered: None,
+                })
+            });
+        }
+    } else if let Some(v) = park.val {
+        PANIC.with(|p| *p.borrow_mut() = Some(v));
+    } else if park.recovered {
+        // The recovery completed: execution resumes in the frame draining at
+        // `park.depth`, so every superseded panic raised at or below it is
+        // gone, as Go's `recovery` drops the aborted panics it unwinds past.
+        PANIC_CHAIN.with(|c| c.borrow_mut().retain(|s| s.depth < park.depth));
     }
     Value::Undef
+}
+
+/// [`GPANIC_CHAIN_TODO`].
+fn b_panic_chain_todo(_vm: &mut VM, _argc: u8) -> Value {
+    Value::bool(PANIC_CHAIN.with(|c| c.borrow().iter().any(|s| s.rendered.is_none())))
+}
+
+/// [`GPANIC_CHAIN_NEXT`].
+fn b_panic_chain_next(_vm: &mut VM, _argc: u8) -> Value {
+    PANIC_CHAIN.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|s| s.rendered.is_none())
+            .map_or(Value::Undef, |s| s.val.clone())
+    })
+}
+
+/// [`GPANIC_CHAIN_RENDER`].
+fn b_panic_chain_render(vm: &mut VM, argc: u8) -> Value {
+    let rendered = pop_args(vm, argc)
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Undef);
+    PANIC_CHAIN.with(|c| {
+        if let Some(s) = c.borrow_mut().iter_mut().find(|s| s.rendered.is_none()) {
+            s.rendered = Some(rendered);
+        }
+    });
+    Value::Undef
+}
+
+/// The text `printpanicval` prints for a panic value: a run-time fault's
+/// message, else its `$stringify` rendering when there is one.
+fn panic_text(v: &Value, rendered: Option<&Value>) -> String {
+    runtime_error_message(v).unwrap_or_else(|| go_str(rendered.unwrap_or(v)))
+}
+
+/// Go's `printpanics` over the superseded chain plus the fatal panic `last`,
+/// oldest first, every line after the first indented by a tab. A panic whose
+/// successor carries the identical value (`panic(recover())`) is marked
+/// `repanicked`, and that successor is not printed again (`preprintpanics`).
+fn print_panics(last: &Value, last_rendered: Option<&Value>) {
+    let chain = PANIC_CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut out = String::new();
+    let mut prev_repanicked = false;
+    for (i, s) in chain.iter().enumerate() {
+        let next = chain.get(i + 1).map_or(last, |n| &n.val);
+        let repanicked = next == &s.val;
+        if !prev_repanicked {
+            if i > 0 {
+                out.push('\t');
+            }
+            out.push_str("panic: ");
+            out.push_str(&panic_text(&s.val, s.rendered.as_ref()));
+            match (s.recovered, repanicked) {
+                (true, true) => out.push_str(" [recovered, repanicked]"),
+                (true, false) => out.push_str(" [recovered]"),
+                _ => {}
+            }
+            out.push('\n');
+        }
+        prev_repanicked = repanicked;
+    }
+    if !prev_repanicked {
+        if !chain.is_empty() {
+            out.push('\t');
+        }
+        out.push_str("panic: ");
+        out.push_str(&panic_text(last, last_rendered));
+        out.push('\n');
+    }
+    eprint!("{out}");
 }
 
 /// At program end, a still-propagating panic is fatal: print it like Go's first
@@ -1288,9 +1386,7 @@ fn b_panic_finish(vm: &mut VM, argc: u8) -> Value {
     };
     if let Some(v) = live {
         // A run-time fault's error prints its message, as Go prints `Error()`.
-        let shown = rendered.unwrap_or_else(|| v.clone());
-        let msg = runtime_error_message(&v).unwrap_or_else(|| go_str(&shown));
-        eprintln!("panic: {msg}");
+        print_panics(&v, rendered.as_ref());
         std::process::exit(2);
     }
     Value::Undef
@@ -2009,6 +2105,9 @@ const DEFERRED_BODY_DEPTH: usize = 2;
 
 /// A panic parked for the duration of one deferred call — see [`GDEFER_PARK`].
 struct Park {
+    /// The panic value as it was parked; kept after a `recover()` takes `val`
+    /// so a panic the deferred call then raises can print it as `[recovered]`.
+    orig: Option<Value>,
     /// The panic value, taken by the `recover()` that claims it.
     val: Option<Value>,
     /// The VM call depth of the frame that is draining defers. A `recover()` is
@@ -2018,7 +2117,23 @@ struct Park {
     recovered: bool,
 }
 
+/// A panic a deferred call superseded by panicking itself — one link of Go's
+/// `_panic.link` chain.
+struct Superseded {
+    val: Value,
+    /// Whether the deferred call had recovered it before panicking.
+    recovered: bool,
+    /// The depth of the frame whose defer drain it was parked in.
+    depth: usize,
+    /// Its `$stringify` rendering, filled in just before the fatal print.
+    rendered: Option<Value>,
+}
+
 thread_local! {
+    /// Superseded panics, oldest first. Printed above a fatal panic; a
+    /// completed recovery drops the ones it unwinds past.
+    static PANIC_CHAIN: RefCell<Vec<Superseded>> = const { RefCell::new(Vec::new()) };
+
     /// The host-owned Go object heap. `Value::Obj(id)` indexes this slab; it
     /// grows per run and is cleared by [`heap_reset`] at the start of every
     /// program so handles never leak across runs.
@@ -2186,6 +2301,7 @@ pub fn heap_reset() {
     DEFER_FREE.with(|f| f.borrow_mut().clear());
     PANIC.with(|p| *p.borrow_mut() = None);
     PARKED.with(|p| p.borrow_mut().clear());
+    PANIC_CHAIN.with(|c| c.borrow_mut().clear());
     CHAN_CLOSED.with(|c| *c.borrow_mut() = None);
     CLOSED_CHANS.with(|c| c.borrow_mut().clear());
     ADDR_REFS.with(|r| r.borrow_mut().clear());
@@ -2809,6 +2925,12 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
                 }
             };
         }
+        // Indexing through a nil pointer to an array (`var p *[3]int; p[1]`):
+        // every other nil container is a typed nil object.
+        Value::Undef => {
+            runtime_panic(vm, "invalid memory address or nil pointer dereference");
+            return Value::Undef;
+        }
         _ => {
             ffi_fault(vm, "go-rs: invalid index of nil".to_string());
             return Value::Undef;
@@ -2931,6 +3053,11 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
     let val = args.get(2).cloned().unwrap_or(Value::Undef);
     let id = match recv {
         Value::Obj(id) => id,
+        // `p[i] = v` through a nil pointer to an array.
+        Value::Undef => {
+            runtime_panic(vm, "invalid memory address or nil pointer dereference");
+            return Value::Undef;
+        }
         _ => {
             ffi_fault(vm, "go-rs: assignment to entry in nil".to_string());
             return Value::Undef;

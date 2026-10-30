@@ -1008,7 +1008,6 @@ are not told apart once the globals are prepended to `main`'s body.
 An unrecovered panic's first stderr line also differs for values `go` prints
 specially: `panic(S("x"))` for `type S string` prints `panic: main.S("x")`, and a
 struct or slice prints its type and address (`panic: (main.T) 0x…`); go-rs prints
-the value as `%v` would. A re-panic inside a deferred call lacks Go's
-`panic: first [recovered]` chain. `recover()` of a nil panic and of a slice
+the value as `%v` would. `recover()` of a nil panic and of a slice
 conversion failure report `%T` as `runtime.errorString` where Go has
 `*runtime.PanicNilError` / `runtime.boundsError`. Exit codes and stdout agree.
