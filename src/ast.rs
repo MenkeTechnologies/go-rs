@@ -421,6 +421,9 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
+    /// A rune literal: an untyped constant like [`Expr::Int`] whose default
+    /// type is `rune` (`int32`) rather than `int`.
+    Rune(i64),
     /// A float literal: its `f64` value plus, when representable, an exact
     /// decimal `(mantissa, scale)` (`mantissa · 10⁻ˢᶜᵃˡᵉ`) for constant folding.
     Float(f64, Option<(i128, i32)>),

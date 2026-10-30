@@ -2858,6 +2858,7 @@ impl Parser {
         }
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
+            Tok::Rune(n) => Ok(Expr::Rune(n)),
             Tok::Float(f, dec) => Ok(Expr::Float(f, dec)),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::True => Ok(Expr::Bool(true)),
@@ -3527,7 +3528,7 @@ fn vendored_int_consts(path: &str) -> HashMap<String, i128> {
 /// arithmetic would wrap where Go's exact constant arithmetic does not.
 fn const_int_exact(e: &Expr, consts: &HashMap<String, i128>, left_i64: &mut bool) -> Option<i128> {
     let v = match e {
-        Expr::Int(n) => Some(i128::from(*n)),
+        Expr::Int(n) | Expr::Rune(n) => Some(i128::from(*n)),
         Expr::Ident(name) => consts.get(name).copied(),
         // An imported package's constant (`utf8.UTFMax`), keyed by the name
         // the import binds — see [`Parser::seed_imported_consts`].

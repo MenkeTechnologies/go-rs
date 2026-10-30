@@ -1648,7 +1648,7 @@ impl Qualifier {
                 }
                 self.stmts(body, &mut inner);
             }
-            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
+            Expr::Int(_) | Expr::Rune(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
         }
     }
 }

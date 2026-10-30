@@ -28,6 +28,9 @@ pub struct Token {
 pub enum Tok {
     // literals & names
     Int(i64),
+    /// A rune literal (`'a'`): its code point. Kept apart from [`Tok::Int`]
+    /// because an untyped rune constant defaults to `rune` (`int32`), not `int`.
+    Rune(i64),
     /// A float literal: its `f64` value and, when it fits, an exact decimal
     /// `(mantissa, scale)` meaning `mantissa · 10⁻ˢᶜᵃˡᵉ` — used to constant-fold
     /// float expressions with Go's arbitrary-precision rounding.
@@ -135,6 +138,7 @@ impl Tok {
             self,
             Tok::Ident(_)
                 | Tok::Int(_)
+                | Tok::Rune(_)
                 | Tok::Float(..)
                 | Tok::Str(_)
                 | Tok::True
@@ -403,9 +407,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // rune literal — a Go rune is an int32 code point, so it lexes to an
-        // integer token (matching string indexing and `range`, which also yield
-        // int code points). Handles the full Go escape set: `\n \t \r \0 \\ \' \"`,
+        // rune literal — a Go rune is an int32 code point. It lexes to its own
+        // token so the untyped constant keeps its default type `rune`. Handles the full Go escape set: `\n \t \r \0 \\ \' \"`,
         // `\xHH` (hex byte), `\uHHHH` / `\UHHHHHHHH` (Unicode), and `\ooo` (octal).
         if c == '\'' {
             i += 1;
@@ -426,7 +429,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             i += 1;
             out.push(Token {
-                kind: Tok::Int(cp as i64),
+                kind: Tok::Rune(cp as i64),
                 line,
             });
             continue;
@@ -738,8 +741,8 @@ mod tests {
             let toks = lex(src);
             assert!(toks.is_ok(), "failed to lex {src:?}: {:?}", toks.err());
         }
-        assert_eq!(kinds("'世'\n")[0], Tok::Int('世' as i64));
-        assert_eq!(kinds("'a'\n")[0], Tok::Int('a' as i64));
+        assert_eq!(kinds("'世'\n")[0], Tok::Rune('世' as i64));
+        assert_eq!(kinds("'a'\n")[0], Tok::Rune('a' as i64));
     }
 
     /// A truncated or malformed escape is a Go compile error; here it must at
@@ -749,7 +752,7 @@ mod tests {
         for src in ["'\\x", "\"\\x\"", "'\\u12", "\"\\u12\"", "'\\U1234", "'\\7"] {
             let _ = lex(src);
         }
-        assert_eq!(kinds("'\\x41'\n")[0], Tok::Int(0x41));
-        assert_eq!(kinds("'\\u4e16'\n")[0], Tok::Int('世' as i64));
+        assert_eq!(kinds("'\\x41'\n")[0], Tok::Rune(0x41));
+        assert_eq!(kinds("'\\u4e16'\n")[0], Tok::Rune('世' as i64));
     }
 }

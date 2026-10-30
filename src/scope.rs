@@ -343,7 +343,7 @@ impl Resolver {
         match e {
             Expr::Ident(n) => self.reference(n),
             Expr::Instantiate { name, .. } => self.reference(name),
-            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
+            Expr::Int(_) | Expr::Rune(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
             Expr::Unary { rhs, .. } => self.expr(rhs),
             Expr::Binary { lhs, rhs, .. } => {
                 self.expr(lhs);

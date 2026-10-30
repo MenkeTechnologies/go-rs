@@ -3116,7 +3116,7 @@ impl Compiler {
                     self.fv_stmt(s, &mut inner, caps);
                 }
             }
-            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
+            Expr::Int(_) | Expr::Rune(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {}
         }
     }
 
@@ -3228,8 +3228,16 @@ impl Compiler {
                     None => continue,
                 };
                 let aty = match (pass, a) {
-                    (0, Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_)) => continue,
+                    (
+                        0,
+                        Expr::Int(_)
+                        | Expr::Rune(_)
+                        | Expr::Float(..)
+                        | Expr::Str(_)
+                        | Expr::Bool(_),
+                    ) => continue,
                     (1, Expr::Int(_)) => "int".to_string(),
+                    (1, Expr::Rune(_)) => "int32".to_string(),
                     (1, Expr::Float(..)) => "float64".to_string(),
                     (1, Expr::Str(_)) => "string".to_string(),
                     (1, Expr::Bool(_)) => "bool".to_string(),
@@ -3295,7 +3303,7 @@ impl Compiler {
             }
             // `new(int)`: a variable of its own, reachable only through the
             // pointer.
-            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {
+            Expr::Int(_) | Expr::Rune(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {
                 self.expr(operand)?;
                 self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
                 Ok(true)
@@ -3466,7 +3474,7 @@ impl Compiler {
     /// known to be a scalar, or arithmetic over those.
     fn evident_scalar(&self, e: &Expr, known: &HashSet<String>) -> bool {
         match e {
-            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => true,
+            Expr::Int(_) | Expr::Rune(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => true,
             Expr::Ident(n) => known.contains(n),
             Expr::Unary {
                 op: UnOp::Neg | UnOp::Not | UnOp::BitNot,
@@ -5714,7 +5722,7 @@ impl Compiler {
         match e {
             // An instantiation used as a value is the function itself.
             Expr::Instantiate { name, .. } => self.expr(&Expr::Ident(name.clone()))?,
-            Expr::Int(n) => {
+            Expr::Int(n) | Expr::Rune(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
             Expr::Float(f, _) => {
@@ -6213,7 +6221,7 @@ impl Compiler {
         }
         // A literal converts at compile time; anything else goes through the
         // runtime conversion builtin `float64(x)` uses.
-        if let Expr::Int(n) = e {
+        if let Expr::Int(n) | Expr::Rune(n) = e {
             self.b.emit(Op::LoadFloat(*n as f64), 0);
             return Ok(());
         }
@@ -6978,6 +6986,8 @@ impl Compiler {
             // A string literal is an untyped constant whose default type is
             // `string`; a string has no other type to take, so naming it is what
             // lets `s := "abc"` record that `s[i]` is a byte.
+            // A rune literal is an untyped constant whose default type is `rune`.
+            Expr::Rune(_) => "int32".to_string(),
             Expr::Str(_) => "string".to_string(),
             Expr::Ident(n) => match self.decl_types.get(n) {
                 Some(t) => t.clone(),
@@ -7120,6 +7130,10 @@ impl Compiler {
                 lhs,
                 rhs,
             } => {
+                let (lr, rr) = (self.is_rune_const(lhs), self.is_rune_const(rhs));
+                if lr || rr {
+                    return self.rune_const_operand_ty(lhs, rhs, lr, rr);
+                }
                 let l = self.type_name(lhs);
                 if l.is_empty() {
                     self.type_name(rhs)
@@ -7170,6 +7184,33 @@ impl Compiler {
             Expr::Index { recv, .. } => self.elem_type_of(&self.underlying(&self.type_name(recv))),
             _ => String::new(),
         }
+    }
+
+    /// Whether `e` is an untyped integer constant expression with a rune
+    /// literal in it (`'a'`, `'z' - 'a' + 1`), whose default type is `rune`.
+    fn is_rune_const(&self, e: &Expr) -> bool {
+        mentions_rune_literal(e) && self.untyped_int_const(e).is_some()
+    }
+
+    /// The type of a binary operation with an untyped rune constant operand.
+    /// The constant converts to the other operand's type when that one is
+    /// typed (`'a' + n` is `n`'s type, `1.5 * 'a'` a `float64`); two untyped
+    /// integer constants give the rune its default kind's rank, `rune`. A
+    /// non-constant operand of unknown type leaves the result unknown.
+    fn rune_const_operand_ty(&self, lhs: &Expr, rhs: &Expr, lr: bool, rr: bool) -> String {
+        for (rune_side, other) in [(lr, rhs), (rr, lhs)] {
+            if !rune_side {
+                continue;
+            }
+            if matches!(other, Expr::Float(..)) {
+                return "float64".to_string();
+            }
+            if self.is_rune_const(other) || self.untyped_int_const(other).is_some() {
+                continue;
+            }
+            return self.type_name(other);
+        }
+        "int32".to_string()
     }
 
     /// The element type of a written container type: `[]T` and `map[K]V` name
@@ -7305,7 +7346,7 @@ impl Compiler {
                 let integral = f.fract() == 0.0 && f.abs() < 9.0e18;
                 let typed_int = self.infer(other) == NumType::Int
                     && self.untyped_int_const(other).is_none()
-                    && !matches!(other, Expr::Int(_));
+                    && !matches!(other, Expr::Int(_) | Expr::Rune(_));
                 let arith = !matches!(op, BinOp::And | BinOp::Or);
                 if integral && typed_int && arith {
                     let lit = Expr::Int(*f as i64);
@@ -7616,6 +7657,7 @@ impl Compiler {
     fn pointee_ty(&self, rhs: &Expr) -> String {
         match rhs {
             Expr::Int(_) => "int".to_string(),
+            Expr::Rune(_) => "int32".to_string(),
             Expr::Float(..) => "float64".to_string(),
             Expr::Bool(_) => "bool".to_string(),
             _ => self.type_name(rhs),
@@ -9282,7 +9324,7 @@ impl Compiler {
     fn infer(&self, e: &Expr) -> NumType {
         match e {
             Expr::Instantiate { .. } => NumType::Unknown,
-            Expr::Int(_) => NumType::Int,
+            Expr::Int(_) | Expr::Rune(_) => NumType::Int,
             Expr::Float(..) => NumType::Float,
             Expr::Str(_) => NumType::Str,
             Expr::Bool(_) => NumType::Bool,
@@ -9418,6 +9460,7 @@ fn fold_untyped_int(e: &Expr, name: &dyn Fn(&str) -> Option<i128>) -> Option<i12
         // negative one is the bit pattern of a literal above `i64` — the
         // lexer's `18446744073709551615`, the parser's `uint64(-1)` — whose
         // type the pattern alone does not tell.
+        Expr::Rune(n) => Some(i128::from(*n)),
         Expr::Int(n) => (*n >= 0).then(|| i128::from(*n)),
         // A constant above `int64` is written `uint64(<bit pattern>)` by the
         // parser's exact folding; its value is the pattern read unsigned.
@@ -9500,7 +9543,7 @@ fn fold_const_float(e: &Expr) -> Option<f64> {
 /// `den > 0`. `None` if it references a variable/call or overflows `i128`.
 fn fold_rational(e: &Expr) -> Option<(i128, i128)> {
     match e {
-        Expr::Int(n) => Some((*n as i128, 1)),
+        Expr::Int(n) | Expr::Rune(n) => Some((*n as i128, 1)),
         Expr::Float(_, Some((mant, scale))) => {
             if *scale >= 0 {
                 Some((*mant, pow10(*scale as u32)?))
@@ -9748,7 +9791,7 @@ fn is_builtin_call(name: &str) -> bool {
 /// the panic-checking builtin.
 fn const_int(e: &Expr) -> Option<i64> {
     match e {
-        Expr::Int(n) => Some(*n),
+        Expr::Int(n) | Expr::Rune(n) => Some(*n),
         _ => None,
     }
 }
@@ -10174,4 +10217,14 @@ fn global_cells(prog: &Program, globals: &HashSet<String>) -> HashSet<String> {
     }
     captured.retain(|n| globals.contains(n));
     captured
+}
+
+/// Whether a rune literal appears in `e`'s constant arithmetic.
+fn mentions_rune_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Rune(_) => true,
+        Expr::Unary { rhs, .. } => mentions_rune_literal(rhs),
+        Expr::Binary { lhs, rhs, .. } => mentions_rune_literal(lhs) || mentions_rune_literal(rhs),
+        _ => false,
+    }
 }

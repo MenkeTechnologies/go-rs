@@ -878,7 +878,9 @@ impl Walker<'_> {
                     Vec::new()
                 }
             }
-            Expr::Int(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => Vec::new(),
+            Expr::Int(_) | Expr::Rune(_) | Expr::Float(..) | Expr::Str(_) | Expr::Bool(_) => {
+                Vec::new()
+            }
             Expr::Unary { op, rhs } => {
                 let srcs = self.eval(rhs);
                 match op {

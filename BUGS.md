@@ -969,17 +969,21 @@ the type arguments on the value — known at a composite literal outside a
 generic body, but only as type parameters inside one — and stripping them
 wherever the erased name is the key.
 
-## A rune literal is an untyped integer
+## A rune constant reaching a type parameter or an `any` element is an `int`
 
 ```go
-r := 'a'
-fmt.Printf("%T\n", r)   // go: int32   go-rs: int
+func show[T any](v T) { fmt.Printf("%T\n", v) }
+show('a')                          // go: int32   go-rs: int
+fmt.Printf("%T\n", []any{'a'}[0])  // go: int32   go-rs: int
 ```
 
-The lexer folds a rune literal to its integer value, so nothing downstream
-knows it was a rune: a variable it initializes is typed `int`. A rune that
-gets its type from a declaration (`var r rune = 'a'`, a `[]rune` element, a
-`range` over a string) is `int32` as in Go.
+A rune literal is its own token and expression (`Expr::Rune`), so a variable it
+initializes — directly or through constant arithmetic on it — is typed
+`int32`, and `%T` of the literal itself names `int32`. What still loses the
+default type is an untyped rune constant that reaches a type parameter or an
+`any` element: go-rs boxes those by run-time value, and `%T` of any integer
+there is `int` — `show(int8(1))` prints `int` too, the gap `## Two interfaces
+holding two *integer widths* compare equal` describes.
 
 
 ## There is no type checker, so most type and scope errors build
