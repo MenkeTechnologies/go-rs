@@ -3308,6 +3308,27 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
                 Ok(true)
             }
+            // `new(pkg.T)`, which the parser writes as `&pkg.T{}` because it
+            // cannot see the package's types: a `T` that is no struct is a
+            // variable of its own, like `new(int)`, holding `T`'s zero.
+            Expr::StructLit { type_name, fields }
+                if fields.is_empty()
+                    && type_name.contains('.')
+                    && !self.struct_fields.contains_key(type_name) =>
+            {
+                let conv = Expr::Call {
+                    func: Box::new(Expr::Ident(type_name.clone())),
+                    args: vec![Expr::Int(0)],
+                    spread: false,
+                    line: 0,
+                };
+                if self.emit_scalar_addr(&conv)? {
+                    return Ok(true);
+                }
+                self.emit_zero(type_name, 0);
+                self.b.emit(Op::CallBuiltin(host::GCELL_NEW, 1), 0);
+                Ok(true)
+            }
             // `new(Celsius)` of a defined scalar type, which the parser writes
             // as `&Celsius(0)`. (Go source cannot take `&` of a conversion.)
             Expr::Call { func, args, .. }
@@ -6067,6 +6088,16 @@ impl Compiler {
                     return self.expr(&lit);
                 }
             }
+        }
+        // `new(pkg.T)` names a type of an imported package, which the parser
+        // cannot see, so it is parsed as `&pkg.T{}`. A `T` that turns out not
+        // to be a struct (`new(time.Duration)`) takes its own zero value.
+        if given.is_empty()
+            && type_name.contains('.')
+            && !self.struct_fields.contains_key(type_name)
+        {
+            self.emit_zero(type_name, 0);
+            return Ok(());
         }
         let decl = self
             .struct_fields

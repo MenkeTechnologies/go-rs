@@ -3265,7 +3265,11 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let ty = self.type_name()?;
         self.expect(&Tok::RParen)?;
-        let inner = if self.struct_names.contains(&ty) {
+        // A qualified `pkg.T` is a type this file cannot see; the compiler,
+        // which has every linked package's types, zeroes it as a struct or as
+        // whatever else it turns out to be.
+        let imported = ty.contains('.') && ty.starts_with(|c: char| c.is_alphabetic() || c == '_');
+        let inner = if imported || self.struct_names.contains(&ty) {
             Expr::StructLit {
                 type_name: ty,
                 fields: Vec::new(),
