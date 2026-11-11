@@ -70,7 +70,10 @@ fn errors_exit_and_panic() {
     );
     // `os.Exit` from a goroutine while `main` waits on it ends the program.
     let goroutine_exit = "package main\nimport (\n\t\"fmt\"\n\t\"os\"\n)\nfunc main() {\n\tdone := make(chan bool)\n\tgo func() {\n\t\tfmt.Println(\"bye\")\n\t\tos.Exit(4)\n\t}()\n\t<-done\n\tfmt.Println(\"unreached\")\n}\n";
-    assert_eq!(run_program(goroutine_exit, "").unwrap_err(), "exit status 4");
+    assert_eq!(
+        run_program(goroutine_exit, "").unwrap_err(),
+        "exit status 4"
+    );
 }
 
 #[test]
@@ -123,4 +126,20 @@ func main() {{
             assert_eq!(mine, want);
         }
     }
+}
+
+#[test]
+fn os_args_is_the_program_name_not_the_host_arguments() {
+    let src = r#"package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Println(len(os.Args), os.Args[0])
+}
+"#;
+    assert_eq!(run_program(src, "").unwrap(), "1 main\n");
 }

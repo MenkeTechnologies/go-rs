@@ -19,6 +19,9 @@ const STACK_BYTES: usize = 8 * 1024 * 1024;
 /// nonzero status or a panic in the runtime returns `Err`; `os.Exit(0)` returns
 /// `Ok` with the output written before it. The process is never exited.
 ///
+/// `os.Args` is `[]string{"main"}` (what the `go` binary reports for a file
+/// named `main.go`), never the host process's arguments.
+///
 /// When a goroutine other than `main` exits or panics, the remaining goroutines
 /// run on until they block or finish (their output is discarded), since the
 /// scheduler has no way to stop them early.
@@ -29,6 +32,7 @@ pub fn run_program(src: &str, input: &str) -> Result<String, String> {
         .stack_size(STACK_BYTES)
         .spawn(move || {
             stdio::begin(&input);
+            crate::host::set_thread_program_args(vec!["main".to_string()]);
             let outcome = crate::run_str(&src);
             let (out, exit) = stdio::end();
             match (exit, outcome) {

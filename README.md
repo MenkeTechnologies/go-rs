@@ -130,7 +130,9 @@ and safe from any thread. `input` is what `os.Stdin` reads (`bufio.Scanner`,
 the process's stdout. The `println`/`print` builtins and `os.Stderr` still write
 to stderr. A compile error, an unrecovered panic, a deadlock, a nonzero
 `os.Exit` or a runtime panic returns `Err`; `os.Exit(0)` returns `Ok` with the
-output so far. The process is never exited.
+output so far. The process is never exited. `os.Args` is `[]string{"main"}`,
+what the `go` binary reports for a file named `main.go`, whatever the host
+process's own arguments are.
 
 ```rust
 let src = "package main\nimport \"fmt\"\nfunc main() {\n\tvar s string\n\tfmt.Scan(&s)\n\tfmt.Println(\"hi\", s)\n}\n";

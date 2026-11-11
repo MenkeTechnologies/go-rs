@@ -672,6 +672,27 @@ pub fn set_program_args(args: Vec<String>) {
 }
 
 thread_local! {
+    /// `os.Args` for the program running on this thread, ahead of
+    /// [`PROGRAM_ARGS`]: an embedded run sets it so the program never sees the
+    /// host's arguments. Goroutines share the thread, so they see it too.
+    static THREAD_PROGRAM_ARGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// Record `os.Args` for the program about to run on this thread only.
+pub(crate) fn set_thread_program_args(args: Vec<String>) {
+    THREAD_PROGRAM_ARGS.with(|a| *a.borrow_mut() = Some(args));
+}
+
+/// `os.Args`: this thread's, else the process's recorded ones, else the
+/// process's own arguments.
+fn program_args() -> Vec<String> {
+    THREAD_PROGRAM_ARGS
+        .with(|a| a.borrow().clone())
+        .or_else(|| PROGRAM_ARGS.get().cloned())
+        .unwrap_or_else(|| std::env::args().collect())
+}
+
+thread_local! {
     /// The subroutine name-index of the stub a call through a nil func value
     /// lands in ([`set_nil_func`]).
     static NIL_FUNC: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
@@ -7818,10 +7839,7 @@ pub mod stdlib {
         // `os.Args`: the program name, then its arguments.
         vm.register_builtin(OS_ARGS, |vm, a| {
             pop_args(vm, a);
-            let args = super::PROGRAM_ARGS
-                .get()
-                .cloned()
-                .unwrap_or_else(|| std::env::args().collect());
+            let args = super::program_args();
             Value::Obj(heap_alloc(HostObj::slice(
                 args.into_iter().map(Value::str).collect(),
             )))
