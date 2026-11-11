@@ -115,6 +115,29 @@ $ go run fib.go
 
 More programs live in [`examples/`](examples).
 
+## Embedding
+
+The `gors` library crate runs a whole program from Rust:
+
+```rust
+pub fn run_program(src: &str, input: &str) -> Result<String, String>
+```
+
+Each call runs on its own thread with a fresh runtime, so calls are independent
+and safe from any thread. `input` is what `os.Stdin` reads (`bufio.Scanner`,
+`bufio.Reader`, `fmt.Scan`, `io.ReadAll`); the return value is everything
+`fmt.Print*` and `os.Stdout` wrote, from every goroutine, none of which reaches
+the process's stdout. The `println`/`print` builtins and `os.Stderr` still write
+to stderr. A compile error, an unrecovered panic, a deadlock, a nonzero
+`os.Exit` or a runtime panic returns `Err`; `os.Exit(0)` returns `Ok` with the
+output so far. The process is never exited.
+
+```rust
+let src = "package main\nimport \"fmt\"\nfunc main() {\n\tvar s string\n\tfmt.Scan(&s)\n\tfmt.Println(\"hi\", s)\n}\n";
+let out = gors::run_program(src, "world\n")?;
+assert_eq!(out, "hi world\n");
+```
+
 ## Language surface
 
 Real Go, executed on fusevm:

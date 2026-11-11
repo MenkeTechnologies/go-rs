@@ -14,6 +14,7 @@ pub mod banner;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+pub mod embed;
 pub mod escape;
 pub mod host;
 mod isprint;
@@ -24,11 +25,13 @@ pub mod pkg;
 pub mod returns;
 pub mod rust_ffi;
 pub mod scope;
+mod stdio;
 pub mod stdlib_vendor;
 pub mod tiers;
 mod unicase;
 
 pub use banner::version_banner;
+pub use embed::run_program;
 use fusevm::{Op, Scheduler, VMResult, Value, VM};
 
 /// Parse Go `src` to an AST. Inline `rust { ... }` FFI blocks are desugared to
@@ -96,6 +99,10 @@ fn run_scheduled(chunk: fusevm::Chunk) -> Result<Value, String> {
         // Go's runtime reports a deadlock as a fatal error on stderr and exits
         // 2 (`runtime.fatal` -> `exit(2)`), not as a toolchain diagnostic. The
         // goroutine dump Go prints below that line is not reproduced.
+        // An embedded run reports it as an error instead.
+        Err(fusevm::SchedError::Deadlock) if stdio::embedded() => {
+            Err(fusevm::SchedError::Deadlock.to_string())
+        }
         Err(fusevm::SchedError::Deadlock) => {
             use std::io::Write as _;
             let _ = std::io::stdout().flush();

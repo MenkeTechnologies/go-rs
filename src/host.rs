@@ -1338,7 +1338,8 @@ fn panic_text(v: &Value, rendered: Option<&Value>) -> String {
 /// oldest first, every line after the first indented by a tab. A panic whose
 /// successor carries the identical value (`panic(recover())`) is marked
 /// `repanicked`, and that successor is not printed again (`preprintpanics`).
-fn print_panics(last: &Value, last_rendered: Option<&Value>) {
+/// Returns the lines rather than printing them.
+fn panic_lines(last: &Value, last_rendered: Option<&Value>) -> String {
     let chain = PANIC_CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let mut out = String::new();
     let mut prev_repanicked = false;
@@ -1368,7 +1369,7 @@ fn print_panics(last: &Value, last_rendered: Option<&Value>) {
         out.push_str(&panic_text(last, last_rendered));
         out.push('\n');
     }
-    eprint!("{out}");
+    out
 }
 
 /// At program end, a still-propagating panic is fatal: print it like Go's first
@@ -1386,8 +1387,8 @@ fn b_panic_finish(vm: &mut VM, argc: u8) -> Value {
     };
     if let Some(v) = live {
         // A run-time fault's error prints its message, as Go prints `Error()`.
-        print_panics(&v, rendered.as_ref());
-        std::process::exit(2);
+        let lines = panic_lines(&v, rendered.as_ref());
+        crate::stdio::exit(vm, 2, lines);
     }
     Value::Undef
 }
@@ -3791,21 +3792,25 @@ fn last_errno() -> i64 {
 }
 
 /// `os.writeFd(fd, p)` — one `write(2)` of `p` (a `[]byte` or a `string`):
-/// the count written, or the negated errno. Descriptors 1 and 2 go through the
-/// process's own stdout/stderr handles, flushed at once, so a write to
-/// `os.Stdout` interleaves with `fmt.Println` in the order the program made
-/// them.
+/// the count written, or the negated errno. Descriptor 1 goes through
+/// [`crate::stdio::write_stdout`] and 2 through the process's stderr handle,
+/// each flushed at once, so a write to `os.Stdout` interleaves with
+/// `fmt.Println` in the order the program made them.
 fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let bytes = byte_arg(args.get(1));
     let fd = args.first().map(|v| v.to_int()).unwrap_or(1);
-    let std_write = |w: &mut dyn std::io::Write| match w.write_all(&bytes).and_then(|_| w.flush()) {
+    let status = |r: std::io::Result<()>| match r {
         Ok(()) => bytes.len() as i64,
         Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64),
     };
     let n = match fd {
-        1 => std_write(&mut std::io::stdout()),
-        2 => std_write(&mut std::io::stderr()),
+        1 => status(crate::stdio::write_stdout(&bytes).and_then(|_| crate::stdio::flush_stdout())),
+        2 => {
+            use std::io::Write as _;
+            let mut err = std::io::stderr();
+            status(err.write_all(&bytes).and_then(|_| err.flush()))
+        }
         _ => {
             // SAFETY: `bytes` outlives the call and its length is passed with it.
             let n = unsafe { libc::write(fd as i32, bytes.as_ptr().cast(), bytes.len()) };
@@ -3821,9 +3826,8 @@ fn b_write_fd(vm: &mut VM, argc: u8) -> Value {
 /// `os.readFd(fd, p)` — one `read(2)` into `p`: the count read (0 at end of
 /// file), or the negated errno. A short read is returned as is and the caller
 /// (`bufio`, `io.ReadAll`, `os.ReadFile`) asks again. Descriptor 0 reads
-/// through the process's stdin handle.
+/// through [`crate::stdio::read_stdin`].
 fn b_read_fd(vm: &mut VM, argc: u8) -> Value {
-    use std::io::Read as _;
     let args = pop_args(vm, argc);
     let Some(Value::Obj(dst)) = args.get(1).cloned() else {
         return Value::Int(0);
@@ -3831,7 +3835,7 @@ fn b_read_fd(vm: &mut VM, argc: u8) -> Value {
     let want = slice_backing(dst).map(|(_, _, l)| l).unwrap_or(0);
     let mut buf = vec![0u8; want];
     let n = match args.first().map(|v| v.to_int()).unwrap_or(0) {
-        0 => match std::io::stdin().lock().read(&mut buf) {
+        0 => match crate::stdio::read_stdin(&mut buf) {
             Ok(n) => n as i64,
             Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64),
         },
@@ -4257,13 +4261,9 @@ fn plain_panic(vm: &mut VM, full: String) {
         let v = runtime_error_value(&full).unwrap_or_else(|| Value::str(full));
         PANIC.with(|p| *p.borrow_mut() = Some(v));
     } else {
-        // Unrecovered: print like Go's first line and exit 2. Halt the VM too so
-        // no further ops run before the process exits (stdout is flushed first).
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        eprintln!("panic: {full}");
-        vm.request_halt();
-        std::process::exit(2);
+        // Unrecovered: print like Go's first line and exit 2. The VM halts so
+        // no further ops run (stdout is flushed before the message).
+        crate::stdio::exit(vm, 2, format!("panic: {full}\n"));
     }
 }
 
@@ -6129,27 +6129,27 @@ fn trim_zeros(s: &str) -> &str {
 fn b_println(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let text: Vec<String> = args.iter().map(go_str).collect();
-    println!("{}", text.join(" "));
+    let _ = crate::stdio::write_stdout(format!("{}\n", text.join(" ")).as_bytes());
     Value::Undef
 }
 
 fn b_print(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    print!("{}", go_print_spacing(&args));
+    let _ = crate::stdio::write_stdout(go_print_spacing(&args).as_bytes());
     Value::Undef
 }
 
 fn b_printf(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    print!("{}", sprintf(&args));
+    let _ = crate::stdio::write_stdout(sprintf(&args).as_bytes());
     Value::Undef
 }
 
 /// `(n int, err error)` for a print that wrote `text`.
 ///
 /// `n` counts BYTES, not runes — `fmt.Println("héllo")` is 7, matching Go. The
-/// error is always nil here: these three write to stdout through `print!`, which
-/// panics rather than reporting a failure, so there is no failure to report.
+/// error is always nil here: these three do not report a failed write to
+/// stdout.
 fn printed(text: &str) -> Value {
     let n = Value::Int(text.len() as i64);
     Value::Obj(heap_alloc(HostObj::slice(vec![n, Value::Undef])))
@@ -6159,21 +6159,21 @@ fn b_println_n(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let text: Vec<String> = args.iter().map(go_str).collect();
     let line = format!("{}\n", text.join(" "));
-    print!("{line}");
+    let _ = crate::stdio::write_stdout(line.as_bytes());
     printed(&line)
 }
 
 fn b_print_n(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let text = go_print_spacing(&args);
-    print!("{text}");
+    let _ = crate::stdio::write_stdout(text.as_bytes());
     printed(&text)
 }
 
 fn b_printf_n(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let text = sprintf(&args);
-    print!("{text}");
+    let _ = crate::stdio::write_stdout(text.as_bytes());
     printed(&text)
 }
 
@@ -7826,14 +7826,12 @@ pub mod stdlib {
                 args.into_iter().map(Value::str).collect(),
             )))
         });
-        // `os.Exit(code)`: end the process now with `code` — no deferred call
+        // `os.Exit(code)`: end the program now with `code` — no deferred call
         // runs, as in Go. Output already written is flushed first.
         vm.register_builtin(OS_EXIT, |vm, a| {
-            use std::io::Write as _;
             let code = pop_args(vm, a).first().map(|v| v.to_int()).unwrap_or(0);
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
-            std::process::exit(code as i32)
+            crate::stdio::exit(vm, code as i32, String::new());
+            Value::Undef
         });
     }
 
