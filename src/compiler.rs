@@ -3866,7 +3866,13 @@ impl Compiler {
                         // call to one name.
                         self.check_single_value(e, *line)?;
                         let nt = self.infer(e);
-                        let dt = self.type_name(e);
+                        let dt = match self.type_name(e) {
+                            // `n := 0` declares the constant's default type.
+                            t if t.is_empty() => {
+                                untyped_const_default(e).unwrap_or_default().to_string()
+                            }
+                            t => t,
+                        };
                         self.emit_rhs(name, e)?;
                         self.types.insert(name.clone(), nt);
                         self.decl_types.insert(name.clone(), dt);
@@ -7128,6 +7134,27 @@ impl Compiler {
                 // only place its name enters the value flow: `Weekday(3)` is an
                 // `int` at run time and a `main.Weekday` to `%T`.
                 Expr::Ident(name) if self.defined_types.contains_key(name) => name.clone(),
+                // A conversion to a basic type has that type: `g := int8(1)`
+                // declares an `int8`, which wraps at its width and prints
+                // `%T` as `int8`. A local or global of the same name shadows
+                // the type.
+                Expr::Ident(name)
+                    if is_conversion_type(name)
+                        && !self.types.contains_key(name)
+                        && !self.globals.contains(name)
+                        && !self.funcs.contains_key(name) =>
+                {
+                    name.clone()
+                }
+                // The builtins `len`, `cap` and `copy` return an `int`.
+                Expr::Ident(name)
+                    if matches!(name.as_str(), "len" | "cap" | "copy")
+                        && !self.types.contains_key(name)
+                        && !self.globals.contains(name)
+                        && !self.funcs.contains_key(name) =>
+                {
+                    "int".to_string()
+                }
                 Expr::Ident(name) => self
                     .funcs
                     .get(name)
@@ -7967,6 +7994,17 @@ impl Compiler {
     /// because a `type myByte byte` is `main.myByte` to `%T`, not `uint8`.
     fn sized_int_box_spec(&self, e: &Expr) -> Option<String> {
         let named = |t: &str| is_sized_int_ty(t).then(|| t.to_string());
+        // `&h` of a sized integer is a pointer, tagged as one (`*uint8`) the
+        // way it is entering an interface ([`Self::emit_iface_box`]) — not
+        // the `uint8` that [`Self::type_name`], naming only the pointee, says.
+        if let Expr::Unary {
+            op: UnOp::Addr,
+            rhs,
+        } = e
+        {
+            return named(&base_type(&self.type_name(rhs)))
+                .and_then(|t| basic_ptr_tag(&format!("*{t}")));
+        }
         let ty = base_type(&self.type_name(e));
         if let Some(t) = named(&ty) {
             return Some(t);
@@ -10276,5 +10314,52 @@ fn mentions_rune_literal(e: &Expr) -> bool {
         Expr::Unary { rhs, .. } => mentions_rune_literal(rhs),
         Expr::Binary { lhs, rhs, .. } => mentions_rune_literal(lhs) || mentions_rune_literal(rhs),
         _ => false,
+    }
+}
+
+/// The default type of an untyped numeric constant expression — `int` for
+/// `0` or `1 << 3`, `float64` for `0.5` or `1 + 2.0`, `rune` for `'x' + 1` —
+/// which is the type `n := <expr>` gives `n`. `None` when `e` is not built
+/// from numeric literals alone.
+fn untyped_const_default(e: &Expr) -> Option<&'static str> {
+    // Go's ordering of the untyped numeric kinds: an operation between two
+    // takes the later one.
+    let rank = |t: &str| match t {
+        "int" => 0,
+        "int32" => 1,
+        _ => 2,
+    };
+    match e {
+        Expr::Int(_) => Some("int"),
+        Expr::Rune(_) => Some("int32"),
+        Expr::Float(..) => Some("float64"),
+        Expr::Unary {
+            op: UnOp::Neg | UnOp::BitNot,
+            rhs,
+        } => untyped_const_default(rhs),
+        // A shift's result is its left operand's kind.
+        Expr::Binary {
+            op: BinOp::Shl | BinOp::Shr,
+            lhs,
+            rhs,
+        } => untyped_const_default(rhs).and(untyped_const_default(lhs)),
+        Expr::Binary {
+            op:
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::AndNot,
+            lhs,
+            rhs,
+        } => {
+            let (l, r) = (untyped_const_default(lhs)?, untyped_const_default(rhs)?);
+            Some(if rank(l) >= rank(r) { l } else { r })
+        }
+        _ => None,
     }
 }
