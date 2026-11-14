@@ -1618,9 +1618,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // the pointer type's holds those plus the pointer-receiver ones. A struct
     // value and a pointer to one carry different runtime tags (`T` / `*T`), so
     // each gets its own set. So does a defined type over a scalar: `&x` is the
-    // variable's cell, which enters an interface tagged `*T`. A defined
-    // composite (`type Stack []int`) shares its handle with a pointer to it, so
-    // it registers the full set under its one tag.
+    // variable's cell, which enters an interface tagged `*T`. So does a defined
+    // composite (`type Stack []int`): `&s` enters an interface as a `*Stack`
+    // box around the pointer (`emit_iface_box`), apart from a `Stack` value.
     let mut value_methods: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     let mut all_methods: std::collections::BTreeMap<String, Vec<String>> =
@@ -1680,7 +1680,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut type_methods: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for (ty, ms) in all_methods {
-        if structs.contains(&ty) || prog.is_scalar_defined(&ty) {
+        if structs.contains(&ty) || prog.defined.iter().any(|(n, _)| *n == ty) {
             let value = value_methods.get(&ty).cloned().unwrap_or_default();
             type_methods.insert(ty.clone(), value);
             type_methods.insert(format!("*{ty}"), ms);
@@ -1796,9 +1796,21 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // it is not in the plan and stays aliased — Go copies a pointer, not what it
     // points at.
     // A fixed-size array field is a value too, and the plan carries its written
-    // type so the copy knows whether the array's own elements are values.
+    // type so the copy knows whether the array's own elements are values. A
+    // field of a defined array type (`g Grid` for `type Grid [3][3]int`) is
+    // an array too: the host resolves the name to its base when it copies.
     host::set_struct_field_types(struct_fields.clone());
     host::set_defined_bases(prog.defined.iter().cloned().collect());
+    let is_array_ty = |ty: &str| {
+        let mut t = ty;
+        for _ in 0..=prog.defined.len() {
+            match prog.defined.iter().find(|(n, _)| n == t) {
+                Some((_, base)) if base != t => t = base,
+                _ => break,
+            }
+        }
+        array_elem_ty(t).is_some()
+    };
     host::set_struct_plan(
         struct_fields
             .iter()
@@ -1807,9 +1819,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                     name.clone(),
                     fields
                         .iter()
-                        .filter(|(_, ty)| {
-                            structs.contains(ty.as_str()) || array_elem_ty(ty).is_some()
-                        })
+                        .filter(|(_, ty)| structs.contains(ty.as_str()) || is_array_ty(ty))
                         .map(|(f, ty)| (f.clone(), ty.clone()))
                         .collect(),
                 )
@@ -4494,7 +4504,7 @@ impl Compiler {
                 self.decl_types.insert(name.clone(), base_type(&bound_ty));
                 // `case *T:` of a defined scalar binds the variable's cell,
                 // which a value method reads through (`Self::is_cell_ptr`).
-                if self.is_scalar_defined_ptr(&bound_ty) {
+                if self.is_defined_ptr(&bound_ty) {
                     self.ptr_types.insert(name.clone(), bound_ty.clone());
                 }
                 self.emit_declare(name, line);
@@ -4542,7 +4552,7 @@ impl Compiler {
     /// tell apart.
     fn runtime_tag(&self, ty: &str) -> String {
         let base = base_type(ty);
-        if ty.starts_with('*') && self.structs.contains(&base) || self.is_scalar_defined_ptr(ty) {
+        if ty.starts_with('*') && self.structs.contains(&base) || self.is_defined_ptr(ty) {
             format!("*{base}")
         } else if let Some(tag) = basic_ptr_tag(ty) {
             tag
@@ -6805,13 +6815,14 @@ impl Compiler {
             // A defined type's method takes the value, not its interface box.
             if self.defined_types.contains_key(t) {
                 self.b.emit(Op::CallBuiltin(host::GUNNAME, 1), line);
-                // Through a `*T` box the receiver is the variable's cell, and
-                // a value method takes what it holds (`(*p).M()`). A `T` box
-                // holds the value itself, which `GDEREF` passes through.
-                if self.is_scalar_defined_ptr(&format!("*{t}"))
-                    && self
-                        .value_recv_methods
-                        .contains(&(t.clone(), method.to_string()))
+                // Through a `*T` box the receiver is the pointer, and a value
+                // method takes what it points at (`(*p).M()`): a scalar's
+                // cell, or the `Ptr` to a defined slice or map (`&IntHeap{…}`
+                // in a `heap.Interface`). A `T` box holds the value itself,
+                // which `GDEREF` passes through.
+                if self
+                    .value_recv_methods
+                    .contains(&(t.clone(), method.to_string()))
                 {
                     self.b.emit(Op::CallBuiltin(host::GDEREF, 1), line);
                 }
@@ -7663,9 +7674,9 @@ impl Compiler {
     /// Go's for `*T`.
     fn emit_iface_box(&mut self, e: &Expr, line: u32) {
         let ty = self.type_name(e);
-        let ptr_tag = self.static_ptr_ty(e).and_then(|t| {
-            basic_ptr_tag(&t).or_else(|| self.is_scalar_defined_ptr(&t).then_some(t))
-        });
+        let ptr_tag = self
+            .static_ptr_ty(e)
+            .and_then(|t| basic_ptr_tag(&t).or_else(|| self.is_defined_ptr(&t).then_some(t)));
         let tag = match ptr_tag {
             Some(tag) => tag,
             None if self.defined_types.contains_key(&ty) => ty,
@@ -7674,6 +7685,16 @@ impl Compiler {
         let c = self.b.add_constant(Value::str(tag));
         self.b.emit(Op::LoadConst(c), line);
         self.b.emit(Op::CallBuiltin(host::GNAMED_BOX, 2), line);
+    }
+
+    /// Whether `ty` is a pointer to any defined non-struct type (`*Celsius`,
+    /// `*IntHeap` for `type IntHeap []int`). Entering an interface it is boxed
+    /// as `*T` around the pointer itself, so `*T` and `T` are distinct dynamic
+    /// types, an assertion back to `*T` yields the same pointer, and a value
+    /// method called through the box reads the pointee.
+    fn is_defined_ptr(&self, ty: &str) -> bool {
+        ty.strip_prefix('*')
+            .is_some_and(|p| self.defined_types.contains_key(p) && !self.structs.contains(p))
     }
 
     /// Whether `ty` is a pointer to a defined type over a scalar (`*Celsius`
@@ -7881,15 +7902,10 @@ impl Compiler {
     }
 
     /// The defined type a `fmt` argument should be tagged with, or `None` when
-    /// its static type is not one. A pointer to a defined scalar is tagged
-    /// `*T`, as it is entering any interface ([`Self::emit_iface_box`]); a
-    /// pointer to a defined composite shares its pointee's handle and is
-    /// tagged `T`, which `GNAMED_BOX` puts behind the pointer.
+    /// its static type is not one. A pointer to a defined type is tagged `*T`,
+    /// as it is entering any interface ([`Self::emit_iface_box`]).
     fn named_box_spec(&self, e: &Expr) -> Option<String> {
-        if let Some(t) = self
-            .static_ptr_ty(e)
-            .filter(|t| self.is_scalar_defined_ptr(t))
-        {
+        if let Some(t) = self.static_ptr_ty(e).filter(|t| self.is_defined_ptr(t)) {
             return Some(t);
         }
         // Arithmetic on a defined type keeps it — `Weekday(3) + 1` is a

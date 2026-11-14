@@ -874,8 +874,9 @@ fn uses_recover(prog: &Program) -> bool {
 /// value `recover()` returns is an `error` (`r.(error)` holds) whose `%v` is
 /// its message and whose `%T` is Go's: `runtime.boundsError` for an index or
 /// slice bound, `runtime.errorString` for a nil dereference or a division by
-/// zero, `runtime.plainError` for a write to a nil map, and
-/// `*runtime.TypeAssertionError` for a failed assertion (runtime/error.go).
+/// zero, `runtime.plainError` for a write to a nil map,
+/// `*runtime.TypeAssertionError` for a failed assertion (runtime/error.go), and
+/// `*runtime.PanicNilError` for `panic(nil)` (runtime/panic.go).
 ///
 /// Go's `errorString` and `plainError` are `string` types and `boundsError`
 /// keeps its operands to format later; each is a one-field struct holding the
@@ -894,7 +895,10 @@ fn add_runtime_error_types(prog: &mut Program) {
         func (e plainError) RuntimeError() {}\n\
         type TypeAssertionError struct{ s string }\n\
         func (e *TypeAssertionError) Error() string { return e.s }\n\
-        func (*TypeAssertionError) RuntimeError() {}\n";
+        func (*TypeAssertionError) RuntimeError() {}\n\
+        type PanicNilError struct{ s string }\n\
+        func (*PanicNilError) Error() string { return \"runtime error: panic called with nil argument\" }\n\
+        func (*PanicNilError) RuntimeError() {}\n";
     let Ok(mut p) = crate::parse(src) else { return };
     qualify(&mut p, "runtime", true);
     prog.types.append(&mut p.types);
@@ -999,9 +1003,8 @@ fn add_stringify(prog: &mut Program) {
     // A struct value and a pointer to one are distinct dynamic types: the value
     // has only its value-receiver methods, the pointer has them all. So a
     // struct's `T` case calls the method its value has, if any, and its `*T`
-    // case the one the pointer has. So does a defined scalar type, whose
-    // pointer enters an interface tagged `*T`. Any other type has one tag for
-    // both.
+    // case the one the pointer has. So does a defined type, whose pointer
+    // enters an interface tagged `*T`. Any other type has one tag for both.
     let call = |func: Expr, args: Vec<Expr>| Expr::Call {
         func: Box::new(func),
         args,
@@ -1017,16 +1020,21 @@ fn add_stringify(prog: &mut Program) {
             vec![],
         )
     };
-    let mut arms: Vec<(String, Expr)> = Vec::new();
+    // The third element marks a `*T` arm whose method has a value receiver:
+    // called through a nil pointer it dereferences nil, and `fmt`'s
+    // `catchPanic` prints a nil pointer receiver's panic as `<nil>`. The arm
+    // returns the operand unrendered instead, which prints the same.
+    let mut arms: Vec<(String, Expr, bool)> = Vec::new();
     for (ty, on_value, on_ptr) in &reach {
-        if !shown.structs.contains(ty.as_str()) && !prog.is_scalar_defined(ty) {
-            arms.push((ty.clone(), method_call(on_ptr)));
+        if !shown.structs.contains(ty.as_str()) && !prog.defined.iter().any(|(n, _)| n == ty) {
+            arms.push((ty.clone(), method_call(on_ptr), false));
             continue;
         }
         if let Some(m) = on_value {
-            arms.push((ty.clone(), method_call(m)));
+            arms.push((ty.clone(), method_call(m), false));
         }
-        arms.push((format!("*{ty}"), method_call(on_ptr)));
+        let by_value = *on_value == Some(*on_ptr);
+        arms.push((format!("*{ty}"), method_call(on_ptr), by_value));
     }
     // A struct that prints some field through a method: `$withFields($t,
     // "F", rendered, …)` copies it with those fields replaced. The pointer
@@ -1054,16 +1062,33 @@ fn add_stringify(prog: &mut Program) {
             args.push(call(Expr::Ident(helper), vec![field]));
         }
         let rebuild = call(Expr::Ident("$withFields".to_string()), args);
-        arms.push((ty.clone(), rebuild.clone()));
+        arms.push((ty.clone(), rebuild.clone(), false));
         if !shown.any_method.contains(ty) {
-            arms.push((format!("*{ty}"), rebuild));
+            arms.push((format!("*{ty}"), rebuild, false));
         }
     }
     let cases: Vec<TypeSwitchCase> = arms
         .into_iter()
-        .map(|(ty, value)| TypeSwitchCase {
-            types: vec![ty],
-            body: vec![Stmt::Return(vec![value], 0)],
+        .map(|(ty, value, nil_guard)| {
+            let mut body = Vec::new();
+            if nil_guard {
+                body.push(Stmt::If {
+                    init: None,
+                    cond: Expr::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(Expr::Ident("$t".to_string())),
+                        rhs: Box::new(Expr::Ident("nil".to_string())),
+                    },
+                    then: vec![Stmt::Return(vec![Expr::Ident("$v".to_string())], 0)],
+                    els: Vec::new(),
+                    line: 0,
+                });
+            }
+            body.push(Stmt::Return(vec![value], 0));
+            TypeSwitchCase {
+                types: vec![ty],
+                body,
+            }
         })
         .collect();
     prog.funcs.push(Func {

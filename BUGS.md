@@ -866,10 +866,11 @@ to a `go` / `defer` call — still writes only the pointer, and `s` keeps its ol
 value. So does a second pointer to the same variable: `p1, p2 := &s, &s` and
 `*p1 = …` leaves `*p2` on the old slice. Closing these needs `&s` to address
 the variable's storage rather than the slice object — the same change the
-scalar `&x` entry above wants. Every `container/heap` `Push` / `Pop` reaches
-it, whose pointer receiver on a slice type is called through the
-`heap.Interface`: a direct `h.Push(x)` hands the method a cell for the
-receiver, but a call through an interface has no variable to hand back.
+scalar `&x` entry above wants. `container/heap` is not affected: a
+`*IntHeap` enters `heap.Interface` as a `*T` box around the pointer itself, so
+`Push` / `Pop` retarget the same pointer the program holds
+(`parity-scripts/defined_slice_pointer_iface.go`); only a `pq` *variable*
+whose `&pq` was boxed reads the old header until a call hands `&pq` again.
 
 ## A string cannot hold invalid UTF-8
 

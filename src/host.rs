@@ -1186,15 +1186,18 @@ fn b_cell_set(vm: &mut VM, argc: u8) -> Value {
     Value::Undef
 }
 
+/// `(*runtime.PanicNilError).Error()` (runtime/panic.go).
+const PANIC_NIL_MSG: &str = "runtime error: panic called with nil argument";
+
 /// `[value]` → begin a panic: store the value; unwinding is driven by the
 /// compiler (jump to the defer drain, propagate past calls while active).
 fn b_panic(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let mut v = args.into_iter().next().unwrap_or(Value::Undef);
-    // `panic(nil)` panics with a `*runtime.PanicNilError` (Go 1.21).
+    // `panic(nil)` panics with a `*runtime.PanicNilError` (Go 1.21), whose
+    // `Error()` carries the `runtime error: ` prefix.
     if matches!(v, Value::Undef) {
-        v = runtime_error_value("runtime error: panic called with nil argument")
-            .unwrap_or_else(|| Value::str("panic called with nil argument"));
+        v = runtime_error_value(PANIC_NIL_MSG).unwrap_or_else(|| Value::str(PANIC_NIL_MSG));
     }
     PANIC.with(|p| *p.borrow_mut() = Some(v));
     Value::Undef
@@ -1350,9 +1353,49 @@ fn b_panic_chain_render(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// The text `printpanicval` prints for a panic value: a run-time fault's
-/// message, else its `$stringify` rendering when there is one.
+/// message, else its `$stringify` rendering when there is one
+/// (`preprintpanics` turns an `error` or `Stringer` into its string).
+///
+/// A string is written by `printindented`, which follows every newline with
+/// a tab. A value of a defined type over a basic kind is written by
+/// `printanycustomtype` as `main.T(v)`, or `main.T("s")` for a string kind
+/// (runtime/error.go).
 fn panic_text(v: &Value, rendered: Option<&Value>) -> String {
-    runtime_error_message(v).unwrap_or_else(|| go_str(rendered.unwrap_or(v)))
+    if let Some(msg) = runtime_error_message(v) {
+        return print_indented(&msg);
+    }
+    let shown = rendered.unwrap_or(v);
+    let custom = match shown {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Named { ty, inner }) if ty != PRINT_TEXT_TY => {
+                Some((go_type_spelling(ty), inner.clone()))
+            }
+            _ => None,
+        }),
+        _ => None,
+    };
+    match custom {
+        // A basic type's own name (`uint8`) has no package; a defined type's
+        // always does.
+        Some((ty, Value::Str(s))) if ty.contains('.') => {
+            format!("{ty}(\"{}\")", print_indented(&s))
+        }
+        Some((ty, inner @ (Value::Int(_) | Value::Float(_) | Value::Bool(_))))
+            if ty.contains('.') =>
+        {
+            format!("{ty}({})", go_str(&inner))
+        }
+        _ => match shown {
+            Value::Str(s) => print_indented(s),
+            other => go_str(other),
+        },
+    }
+}
+
+/// Go's `printindented`: every newline in `s` is followed by a tab, so a
+/// multi-line panic value stays inside its `panic: ` block.
+fn print_indented(s: &str) -> String {
+    s.replace('\n', "\n\t")
 }
 
 /// Go's `printpanics` over the superseded chain plus the fatal panic `last`,
@@ -4149,10 +4192,10 @@ fn b_array_copy(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// One value copy for a value of written type `ty`: an array copy when `ty` is
-/// `[N]T`, a struct copy otherwise (which is the identity on anything that is
+/// `[N]T` or a defined type over one, a struct copy otherwise (which is the identity on anything that is
 /// not a struct, so a scalar or a reference passes straight through).
 fn value_copy(v: Value, ty: &str) -> Value {
-    match crate::ast::array_elem_ty(ty) {
+    match crate::ast::array_elem_ty(&underlying_ty(ty)) {
         Some(elem) => array_copy(v, elem),
         // A bind, not a copy: a `[2]*T` array's elements are pointers, and Go
         // copies the array while sharing what each element points at.
@@ -4304,7 +4347,9 @@ fn runtime_error_message(v: &Value) -> Option<String> {
 /// calling `recover`): `None` leaves the message a plain string, which is also
 /// what a library panic such as `strconv`'s bad-base message is in Go.
 fn runtime_error_value(full: &str) -> Option<Value> {
-    let (ty, by_ref) = if full.starts_with("runtime error: index out of range")
+    let (ty, by_ref) = if full == PANIC_NIL_MSG {
+        ("runtime.PanicNilError", true)
+    } else if full.starts_with("runtime error: index out of range")
         || full.starts_with("runtime error: slice bounds out of range")
     {
         ("runtime.boundsError", false)
@@ -5492,7 +5537,16 @@ fn obj_str_mode(id: u32, mode: FmtMode) -> String {
     // Go's `printValue` writes a pointer *operand* to an array, slice, struct
     // or map as `&` and the value it points at; nested one level down it is a
     // hex address, which is not reproducible, so only depth 0 takes the form.
-    let amp = depth == 0 && pointer_to_composite(&Value::Obj(id));
+    // A `*T` interface box of a defined slice or map (`emit_iface_box`) holds
+    // the pointer itself, and prints as that pointer does.
+    let amp = depth == 0
+        && (pointer_to_composite(&Value::Obj(id))
+            || HEAP.with(|h| match h.borrow().get(id as usize) {
+                Some(HostObj::Named { ty, inner }) => {
+                    ty.starts_with('*') && pointer_to_composite(inner)
+                }
+                _ => false,
+            }));
     let id = follow(id);
     let body = HEAP.with(|h| {
         let h = h.borrow();
